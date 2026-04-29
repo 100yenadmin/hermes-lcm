@@ -709,19 +709,35 @@ class LCMEngine(ContextEngine):
         kwargs: Dict[str, Any],
     ) -> None:
         previous_session_id = self._session_id
+        requested_conversation_id = kwargs.get("conversation_id")
         old_state = self._lifecycle.get_by_session(old_session_id)
         source_session_id = old_session_id
         source_state = old_state
 
         if previous_session_id and previous_session_id != old_session_id:
             bound_state = self._lifecycle.get_by_session(previous_session_id)
-            bound_is_current_conversation = bool(
+            bound_conversation_matches = bool(
                 bound_state
-                and bound_state.current_session_id == previous_session_id
                 and (not self._conversation_id or bound_state.conversation_id == self._conversation_id)
+                and (
+                    not requested_conversation_id
+                    or bound_state.conversation_id == requested_conversation_id
+                )
+            )
+            bound_is_active_source = bool(
+                bound_state and bound_state.current_session_id == previous_session_id
+            )
+            bound_is_finalized_source = bool(
+                bound_state
+                and bound_state.current_session_id is None
+                and bound_state.last_finalized_session_id == previous_session_id
             )
             bound_has_summary_nodes = bool(self._dag.get_session_nodes(previous_session_id))
-            if bound_is_current_conversation and bound_has_summary_nodes:
+            if (
+                bound_conversation_matches
+                and (bound_is_active_source or bound_is_finalized_source)
+                and bound_has_summary_nodes
+            ):
                 source_session_id = previous_session_id
                 source_state = bound_state
                 logger.warning(
@@ -744,6 +760,7 @@ class LCMEngine(ContextEngine):
         frontier = max(
             int(self._last_compacted_store_id or 0),
             int(source_state.current_frontier_store_id if source_state else 0),
+            int(source_state.last_finalized_frontier_store_id if source_state else 0),
             int(
                 self._pending_reset_frontier_store_id
                 if self._pending_reset_session_id
