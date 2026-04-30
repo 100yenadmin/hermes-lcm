@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import sqlite3
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -74,6 +75,46 @@ def _plugin_metadata() -> dict[str, str]:
 
     _PLUGIN_METADATA = metadata
     return dict(metadata)
+
+
+def _git_runtime_identity(root: Path) -> dict[str, Any]:
+    """Best-effort git identity for source checkouts.
+
+    Packaged installs may not have a `.git` directory. In that case the fields
+    stay empty instead of turning status/doctor into a git dependency.
+    """
+
+    if not (root / ".git").exists():
+        return {
+            "plugin_git_commit": "",
+            "plugin_git_branch": "",
+            "plugin_git_dirty": None,
+            "plugin_git_remote": "",
+        }
+
+    def _git(*args: str) -> str | None:
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(root), *args],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=1,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.debug("LCM git identity probe failed at %s: %s", root, exc)
+            return None
+        if result.returncode != 0:
+            return None
+        return result.stdout.strip()
+
+    dirty_output = _git("status", "--porcelain")
+    return {
+        "plugin_git_commit": _git("rev-parse", "HEAD") or "",
+        "plugin_git_branch": _git("rev-parse", "--abbrev-ref", "HEAD") or "",
+        "plugin_git_dirty": None if dirty_output is None else bool(dirty_output),
+        "plugin_git_remote": _git("config", "--get", "remote.origin.url") or "",
+    }
 
 
 _SYNTHETIC_ASSISTANT_NOISE = {
@@ -1351,6 +1392,7 @@ class LCMEngine(ContextEngine):
     def get_runtime_identity(self) -> Dict[str, Any]:
         """Return operator-facing identity for the loaded LCM runtime."""
         metadata = _plugin_metadata()
+        git_identity = _git_runtime_identity(_PLUGIN_ROOT)
         lifecycle_state = None
         lifecycle_error = ""
         if self._conversation_id:
@@ -1375,6 +1417,7 @@ class LCMEngine(ContextEngine):
             "lifecycle_current_session_id": "",
             "lifecycle_last_finalized_session_id": "",
         }
+        identity.update(git_identity)
         if lifecycle_state is not None:
             identity.update({
                 "lifecycle_current_session_id": lifecycle_state.current_session_id or "",
