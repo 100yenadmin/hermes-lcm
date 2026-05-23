@@ -42,7 +42,9 @@ from .ingest_protection import (
     protect_inline_payloads_in_text,
     protect_messages_for_ingest,
     quarantine_suspicious_assistant_messages,
+    redact_sensitive_value,
     restore_ingest_payload_placeholders,
+    sensitive_pattern_status,
 )
 from .schemas import (
     LCM_DESCRIBE,
@@ -819,7 +821,7 @@ class LCMEngine(ContextEngine):
             )
             self._last_compression_status = "noop"
             self._last_compression_noop_reason = f"bypassed: {reason}"
-            return messages
+            return self._redact_active_replay_messages(messages)
 
         observed_prompt_tokens = current_tokens if current_tokens is not None else None
         force_overflow = self._should_force_overflow_recovery(
@@ -2165,6 +2167,7 @@ class LCMEngine(ContextEngine):
         lifecycle_state = self._lifecycle.get_by_conversation(conversation_id) if conversation_id else None
         status["engine"] = "lcm"
         status["runtime_identity"] = self.get_runtime_identity()
+        status["ingest_protection"] = sensitive_pattern_status(self._config)
         try:
             status["source_lineage"] = self._store.get_source_stats(session_id or None)
         except Exception as exc:  # pragma: no cover - defensive
@@ -2932,6 +2935,25 @@ class LCMEngine(ContextEngine):
         )
         return 0
 
+    def _redact_active_replay_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        redacted_replay_messages: list[Dict[str, Any]] = []
+        for message in messages:
+            redacted_message = dict(message)
+            if "content" in redacted_message:
+                redacted_message["content"] = redact_sensitive_value(
+                    redacted_message.get("content"),
+                    self._config,
+                    parse_json_strings=False,
+                )
+            if "tool_calls" in redacted_message:
+                redacted_message["tool_calls"] = redact_sensitive_value(
+                    redacted_message.get("tool_calls"),
+                    self._config,
+                    parse_json_strings=True,
+                )
+            redacted_replay_messages.append(redacted_message)
+        return redacted_replay_messages
+
     def _ingest_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Persist new messages to the store.
 
@@ -2947,7 +2969,7 @@ class LCMEngine(ContextEngine):
         """
         if not self._session_id:
             logger.debug("Ingest skipped: no session_id")
-            return list(messages)
+            return self._redact_active_replay_messages(messages)
 
         if self._session_ignored or self._session_stateless:
             logger.debug(
@@ -2955,7 +2977,7 @@ class LCMEngine(ContextEngine):
                 "ignored" if self._session_ignored else "stateless",
                 self._session_id,
             )
-            return list(messages)
+            return self._redact_active_replay_messages(messages)
 
         n = len(messages)
         cursor = min(max(self._ingest_cursor, 0), n)
@@ -2978,6 +3000,7 @@ class LCMEngine(ContextEngine):
             externalize=externalize_messages,
             prefer_existing_externalized=prefer_existing_externalized,
         )
+        replay_messages = self._redact_active_replay_messages(replay_messages)
         if self._ingest_cursor_needs_reconcile:
             reconcile_messages = replay_messages
             if self._compiled_ignore_message_patterns:
@@ -3160,7 +3183,11 @@ class LCMEngine(ContextEngine):
         matched_tool_ids = _matched_tool_call_ids(messages)
         for msg in messages:
             role = msg.get("role", "unknown")
-            content = msg.get("content") or ""
+            content = redact_sensitive_value(
+                msg.get("content") or "",
+                self._config,
+                parse_json_strings=False,
+            )
             content = sanitize_pre_compaction_content(content)
 
             if role == "tool":
@@ -3198,6 +3225,11 @@ class LCMEngine(ContextEngine):
                             fn = tc.get("function", {})
                             name = fn.get("name", "?")
                             args = fn.get("arguments", "")
+                            args = redact_sensitive_value(
+                                args,
+                                self._config,
+                                parse_json_strings=True,
+                            )
                             args = sanitize_pre_compaction_tool_arguments(args)
                             if len(args) > 500:
                                 args = args[:400] + "..."
