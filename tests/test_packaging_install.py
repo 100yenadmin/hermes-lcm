@@ -205,6 +205,29 @@ def test_register_gracefully_degrades_when_host_lacks_register_tool():
     assert ctx.engine.name == "lcm"
 
 
+def test_register_gracefully_degrades_when_register_tool_hook_raises():
+    module = _load_plugin_entrypoint_module("hermes_lcm_packaging_register_tool_raises")
+
+    class _CtxRaisesTool:
+        def __init__(self):
+            self.engine = None
+            self.register_tool_calls = []
+
+        def register_context_engine(self, engine):
+            self.engine = engine
+
+        def register_tool(self, name, toolset, schema, handler, description="", emoji=""):
+            self.register_tool_calls.append(name)
+            raise TypeError("host register_tool signature mismatch")
+
+    ctx = _CtxRaisesTool()
+    module.register(ctx)
+
+    assert ctx.engine is not None
+    assert ctx.engine.name == "lcm"
+    assert ctx.register_tool_calls
+
+
 def test_registered_tool_handlers_route_through_engine_handle_tool_call(monkeypatch):
     module = _load_plugin_entrypoint_module("hermes_lcm_packaging_tool_handler_route")
     registered = {}

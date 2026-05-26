@@ -73,13 +73,21 @@ def register(ctx):
     register_tool = getattr(ctx, "register_tool", None)
     if callable(register_tool):
         for name, schema in _TOOLS.items():
-            register_tool(
-                name=name,
-                toolset="context_engine",
-                schema=schema,
-                handler=_make_wrapped_handler(name, engine),
-                description=schema.get("description", ""),
-            )
+            try:
+                register_tool(
+                    name=name,
+                    toolset="context_engine",
+                    schema=schema,
+                    handler=_make_wrapped_handler(name, engine),
+                    description=schema.get("description", ""),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "LCM tool registration failed for %s; "
+                    "continuing with context-engine schemas: %s",
+                    name,
+                    exc,
+                )
     else:
         logger.info(
             "LCM tool registration unavailable on this Hermes host; "
