@@ -11,7 +11,7 @@
 
 ## Demo
 
-[Watch the short Hermes-LCM explainer](docs/hermes-lcm-demo.mp4).
+[Watch/download the short Hermes-LCM explainer](https://github.com/stephenschoettler/hermes-lcm/raw/main/docs/hermes-lcm-demo.mp4).
 
 A short explainer showing how Hermes-LCM persists sessions, compacts older turns into a summary DAG, and keeps exact details recoverable with tools like `lcm_grep`, `lcm_expand_query`, and `lcm_doctor`.
 
