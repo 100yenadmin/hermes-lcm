@@ -3212,6 +3212,18 @@ class LCMEngine(ContextEngine):
             config=self._config,
             hermes_home=self._hermes_home,
         )
+        active_replay_messages = replay_messages
+        for (absolute_idx, _replay_msg), protected_msg in zip(
+            messages_to_store_with_index,
+            protected_messages,
+        ):
+            if self._protected_message_uses_raw_payload_active_stub(protected_msg):
+                if active_replay_messages is replay_messages:
+                    active_replay_messages = [dict(message) for message in replay_messages]
+                active_message = dict(active_replay_messages[absolute_idx])
+                active_message["content"] = protected_msg["content"]
+                active_replay_messages[absolute_idx] = active_message
+
         estimates = [count_message_tokens(m) for m in protected_messages]
         self._store.append_batch(
             self._session_id,
@@ -3219,15 +3231,21 @@ class LCMEngine(ContextEngine):
             estimates,
             source=self._session_platform,
         )
-        active_replay_messages = list(replay_messages)
-        for (absolute_idx, replay_msg), protected_msg in zip(messages_to_store_with_index, protected_messages):
-            active_msg = dict(protected_msg)
-            if "content" not in replay_msg and active_msg.get("content") in (None, ""):
-                active_msg.pop("content", None)
-            active_replay_messages[absolute_idx] = active_msg
         self._ingest_cursor = n
         logger.debug("Ingested %d messages into LCM store", len(messages_to_store_with_index))
+        # Most ``protected_messages`` changes are storage-only: inline media,
+        # tool results, and data/base64 substrings must stay provider-usable in
+        # active replay. Whole-message ``raw_payload`` externalization is the
+        # exception: it intentionally returns a compact active stub so the host
+        # does not replay huge opaque text while SQLite stores only the stub.
         return active_replay_messages
+
+    @staticmethod
+    def _protected_message_uses_raw_payload_active_stub(message: Dict[str, Any]) -> bool:
+        content = message.get("content")
+        return isinstance(content, str) and content.startswith(
+            "[Externalized payload: kind=raw_payload;"
+        )
 
     def _get_store_ids_for_messages(self, messages: List[Dict[str, Any]]) -> List[int]:
         """Map current raw messages back to store_ids in stable store order.
