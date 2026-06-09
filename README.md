@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="banner.png" alt="HERMES-LCM" width="800">
+  <img src="docs/banner.png" alt="HERMES-LCM" width="800">
 </p>
 
 [![CI](https://github.com/stephenschoettler/hermes-lcm/actions/workflows/ci.yml/badge.svg)](https://github.com/stephenschoettler/hermes-lcm/actions/workflows/ci.yml)
@@ -9,11 +9,6 @@
 
 > Bounded context, unbounded memory. Nothing is ever lost.
 
-## Demo
-
-[Watch/download the short Hermes-LCM explainer](https://github.com/stephenschoettler/hermes-lcm/raw/main/docs/hermes-lcm-demo.mp4).
-
-A short explainer showing how Hermes-LCM persists sessions, compacts older turns into a summary DAG, and keeps exact details recoverable with tools like `lcm_grep`, `lcm_expand_query`, and `lcm_doctor`.
 
 Based on the [LCM paper](https://papers.voltropy.com/LCM) by Ehrlich & Blackman (Voltropy PBC, Feb 2026).
 Inspired by [lossless-claw](https://github.com/martian-engineering/lossless-claw) for OpenClaw.
