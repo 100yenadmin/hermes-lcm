@@ -607,13 +607,17 @@ def test_lcm_help_on_unknown_subcommand(engine):
     assert "Unknown subcommand: wat" in result
     assert "/lcm status" in result
     assert "/lcm doctor" in result
+    assert "/lcm doctor clean lifecycle" in result
+    assert "/lcm doctor clean lifecycle apply" in result
 
 
 def test_lcm_doctor_clean_rejects_unknown_extra_args(engine):
     result = handle_lcm_command("doctor clean foo", engine)
 
-    assert "currently supports `clean`, `clean apply`, `repair`, `repair apply`, `source`, `source apply`, and `retention`" in result
+    assert "currently supports `clean`, `clean apply`, `clean lifecycle`, `clean lifecycle apply`, `repair`, `repair apply`, `source`, `source apply`, and `retention`" in result
     assert "/lcm doctor clean apply" in result
+    assert "/lcm doctor clean lifecycle" in result
+    assert "/lcm doctor clean lifecycle apply" in result
     assert "/lcm doctor repair" in result
     assert "/lcm doctor repair apply" in result
     assert "/lcm doctor source" in result
@@ -1033,6 +1037,72 @@ def test_lcm_doctor_clean_apply_denied_by_default(tmp_path):
     assert "status: denied" in result
     assert "disabled by default" in result
     assert len(engine._store.get_range("cron_20260414")) == 1
+
+
+def test_lcm_doctor_clean_lifecycle_reports_empty_candidates(tmp_path):
+    config = LCMConfig(
+        database_path=str(tmp_path / "lcm_clean_lifecycle.db"),
+        empty_lifecycle_gc_enabled=True,
+        empty_lifecycle_gc_threshold=1,
+    )
+    engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes_home"))
+    engine._lifecycle.bind_session("orphan-1")
+    engine._lifecycle.bind_session("orphan-2")
+
+    result = handle_lcm_command("doctor clean lifecycle", engine)
+
+    assert "LCM doctor clean lifecycle" in result
+    assert "status: candidates-found" in result
+    assert "empty_rows: 2" in result
+    assert "empty_current: 2" in result
+    assert "empty_finalized: 0" in result
+    assert "empty_protected: 0" in result
+    assert "no rows were deleted" in result
+
+
+def test_lcm_doctor_clean_lifecycle_apply_is_backup_first_and_deletes_safe_candidates(tmp_path):
+    config = LCMConfig(
+        database_path=str(tmp_path / "lcm_clean_lifecycle_apply.db"),
+        empty_lifecycle_gc_enabled=True,
+        empty_lifecycle_gc_threshold=1,
+        doctor_clean_apply_enabled=True,
+    )
+    engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes_home"))
+    engine._session_id = "live-session"
+    engine._conversation_id = "live-session"
+    engine._lifecycle.bind_session("live-session")
+    engine._lifecycle.bind_session("orphan-1")
+    engine._lifecycle.bind_session("orphan-2")
+
+    result = handle_lcm_command("doctor clean lifecycle apply", engine)
+
+    assert "LCM doctor clean lifecycle apply" in result
+    assert "status: ok" in result
+    assert "lifecycle_rows_deleted: 2" in result
+    assert "lifecycle_rows_remaining: 1" in result
+    assert "backup_path:" in result
+    assert "backup_size_bytes:" in result
+
+    remaining = engine._lifecycle.get_by_conversation("live-session")
+    assert remaining is not None
+    assert remaining.current_session_id == "live-session"
+
+
+def test_lcm_doctor_clean_lifecycle_apply_denied_by_default(tmp_path):
+    config = LCMConfig(
+        database_path=str(tmp_path / "lcm_clean_lifecycle_apply_denied.db"),
+        empty_lifecycle_gc_enabled=True,
+        empty_lifecycle_gc_threshold=1,
+    )
+    engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes_home"))
+    engine._lifecycle.bind_session("orphan-1")
+
+    result = handle_lcm_command("doctor clean lifecycle apply", engine)
+
+    assert "LCM doctor clean lifecycle apply" in result
+    assert "status: denied" in result
+    assert "disabled by default" in result
+    assert engine._lifecycle.row_count() == 1
 
 
 class _FakeCursor:

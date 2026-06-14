@@ -217,6 +217,9 @@ environment variables:
 | `LCM_FTS_INTEGRITY_CHECK_INTERVAL_HOURS` | `24` | Minimum hours between startup FTS5 deep integrity-checks (O(index size)). `0` checks every startup (previous behavior); a negative value never checks on startup. Structural checks always run regardless. |
 | `LCM_ENABLE_SLASH_COMMAND` | `false` | Enable the optional `/lcm` operator command surface |
 | `LCM_DOCTOR_CLEAN_APPLY_ENABLED` | `false` | Permit destructive `/lcm doctor clean apply` in trusted operator contexts |
+| `LCM_EMPTY_LIFECYCLE_GC_ENABLED` | `true` | Master toggle for automatic pruning of lifecycle rows for sessions that never ingested any messages or summary nodes |
+| `LCM_EMPTY_LIFECYCLE_GC_THRESHOLD` | `200` | Number of lifecycle rows at which the GC pass fires (default 200 so fresh installs skip the work) |
+| `LCM_EMPTY_LIFECYCLE_GC_MAX_AGE_HOURS` | `24` | Automatic GC only deletes empty lifecycle rows at least this old; set `0` only in trusted/test environments that intentionally want immediate empty-row pruning |
 
 Advanced compaction, assembly, and extraction knobs are defined in `config.py`.
 
@@ -607,6 +610,8 @@ Available commands:
 - `/lcm doctor` - read-only health checks
 - `/lcm doctor clean` - read-only scan for obvious junk/noise session candidates
 - `/lcm doctor clean apply` - backup-first cleanup for safe pattern-matched candidates; requires `LCM_DOCTOR_CLEAN_APPLY_ENABLED=true`
+- `/lcm doctor clean lifecycle` - read-only scan for lifecycle rows with zero messages/nodes
+- `/lcm doctor clean lifecycle apply` - backup-first cleanup of empty lifecycle rows; requires `LCM_DOCTOR_CLEAN_APPLY_ENABLED=true`
 - `/lcm doctor repair` - read-only SQLite/FTS repair diagnostics
 - `/lcm doctor repair apply` - backup-first SQLite/FTS repair
 - `/lcm doctor source` - read-only scan for legacy blank-source rows
