@@ -114,6 +114,19 @@ For a live session check, send one normal Hermes message after restart, then run
 
 If startup logs say LCM tools are available through `context-engine schemas` or mention the `Path B fallback`, that is expected on older Hermes hosts such as Hermes Agent v0.16. The seven `lcm_*` tools remain available through the context-engine path; standalone plugin-registry registration is not required there.
 
+## Runtime context budgets
+
+LCM budgets compaction against the effective context window it can safely use, not blindly against every raw value the host reports. `lcm_status` exposes both sides when they differ:
+
+- `raw_context_length`: the context length Hermes handed to LCM
+- `context_length`: the effective context length LCM budgets against
+- `effective_context_length_cap` and `effective_context_length_reason`: any provider-route cap LCM applied
+- `configured_context_threshold` and `context_threshold`: configured vs runtime compaction threshold
+
+This matters for provider routes whose enforced window is smaller than the same model on another route. For example, ChatGPT Codex OAuth exposes lower effective windows for Codex-family models than the direct OpenAI API. When Hermes hands LCM a larger raw value because of a config override or stale metadata, LCM caps the effective budget for known Codex OAuth slugs and reports the reason in status.
+
+Codex gpt-5.5 keeps Hermes Agent's route-specific behavior: when LCM is inheriting Hermes `compression.threshold`, the runtime threshold can auto-raise to `0.85` so compaction starts around 85% of the 272k Codex OAuth window instead of wasting half the usable context. Explicit LCM overrides still win: set `LCM_CONTEXT_THRESHOLD` or `lcm.context_threshold` if you want a different LCM threshold. Operators can also opt out of the gpt-5.5 inherited-threshold auto-raise with `compression.codex_gpt55_autoraise: false` in Hermes config.
+
 ## Update
 
 If you cloned directly into the plugin directory:

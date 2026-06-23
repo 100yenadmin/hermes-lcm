@@ -213,10 +213,24 @@ state / cache-break signals.
 
 ### Threshold ownership
 
-When `context.engine: lcm` is active, `LCM_CONTEXT_THRESHOLD` is the compaction
-threshold LCM uses. Hermes core `compression.threshold` belongs to the built-in
-compressor. Hermes core `compression.enabled` is still the global gate that
-allows compaction, so leave it enabled when using LCM.
+When `context.engine: lcm` is active, LCM's runtime threshold is the value shown
+by `lcm_status` as `context_threshold`. Hermes core `compression.enabled` is
+still the global gate that allows compaction, so leave it enabled when using LCM.
+
+Precedence is:
+
+1. `LCM_CONTEXT_THRESHOLD`
+2. `lcm.context_threshold` in Hermes `config.yaml`
+3. inherited Hermes `compression.threshold`
+4. LCM default
+
+Some provider routes may adjust the runtime threshold after config resolution.
+For example, Codex gpt-5.5 on the ChatGPT Codex OAuth route can auto-raise an
+inherited Hermes threshold to `0.85`, matching Hermes Agent's built-in compressor
+behavior for that route. Explicit LCM overrides (`LCM_CONTEXT_THRESHOLD` or
+`lcm.context_threshold`) remain authoritative and are not auto-raised. To opt out
+of the Codex gpt-5.5 inherited-threshold raise, set
+`compression.codex_gpt55_autoraise: false` in Hermes config.
 
 If startup/status output shows a host-side compression percentage that disagrees
 with LCM, trust live LCM status after a normal message has initialized the
@@ -280,13 +294,13 @@ around that budget.
 The basic calculation is:
 
 ```text
-compaction trigger = effective context window * LCM_CONTEXT_THRESHOLD
+compaction trigger = effective context window * runtime context_threshold
 ```
 
 Or, working backwards:
 
 ```text
-LCM_CONTEXT_THRESHOLD = desired compaction trigger / effective context window
+runtime context_threshold = desired compaction trigger / effective context window
 ```
 
 Examples, as math rather than universal recommendations:
