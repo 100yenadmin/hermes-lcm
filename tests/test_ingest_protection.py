@@ -1944,6 +1944,40 @@ def test_externalized_payload_integrity_scan_detects_embedded_content_placeholde
     ]
 
 
+def test_externalized_payload_integrity_scan_ignores_escaped_placeholder_examples_in_logs(tmp_path):
+    engine = _engine(tmp_path)
+    (tmp_path / "externalized").mkdir()
+    escaped_output = (
+        'pytest output: \\\\"[Externalized LCM ingest payload: kind=ingest_payload; '
+        'field=content; chars=1; bytes=1; '
+        'ref=20260510_103254_ingest_payload_content_71c66761c2bb_18ae2db8ba71a961.json]\\\\"'
+    )
+    engine._store._conn.execute(
+        """INSERT INTO messages
+           (session_id, source, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_estimate, pinned)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            engine.current_session_id,
+            "telegram",
+            "tool",
+            escaped_output,
+            None,
+            None,
+            None,
+            1.0,
+            1,
+            0,
+        ),
+    )
+    engine._store._conn.commit()
+
+    detail = scan_externalized_payload_integrity(engine._store._conn, engine._config, hermes_home=engine._hermes_home)
+
+    assert detail["externalized_payload_refs_total"] == 0
+    assert detail["externalized_payload_refs_missing"] == 0
+    assert detail["missing_externalized_payload_refs"] == []
+
+
 def test_lcm_doctor_warns_on_missing_externalized_payload_refs_when_inline_payloads_are_clean(tmp_path):
     engine = _engine(tmp_path)
     (tmp_path / "externalized").mkdir()

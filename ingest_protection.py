@@ -154,7 +154,7 @@ def extract_ingest_externalized_refs(text: str) -> list[str]:
 
 
 def _is_basename_ref(ref: str) -> bool:
-    return bool(ref) and "/" not in ref and "\\" not in ref and Path(ref).name == ref
+    return bool(ref) and ref.endswith(".json") and "/" not in ref and "\\" not in ref and Path(ref).name == ref
 
 
 def extract_all_externalized_payload_refs(text: str) -> list[str]:
@@ -982,6 +982,55 @@ def protect_messages_for_ingest(
     ]
 
 
+def _append_unique_refs(target: list[str], refs: list[str]) -> None:
+    for ref in refs:
+        if ref not in target:
+            target.append(ref)
+
+
+def _walk_string_values(value: Any):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for key, nested in value.items():
+            if isinstance(key, str):
+                yield key
+            yield from _walk_string_values(nested)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _walk_string_values(item)
+
+
+def _refs_for_externalized_integrity_scan(value: str, *, role: str, field: str) -> list[str]:
+    """Return refs that plausibly came from LCM storage-boundary placeholders.
+
+    Tool outputs and tool-call arguments often contain escaped code snippets,
+    pytest failures, or docs that mention placeholder examples. Counting those
+    as live payload references turns doctor into a false-positive machine. Exact
+    placeholders are still counted everywhere; embedded placeholders are counted
+    for normal message content, while tool_calls only count exact placeholder
+    string values after JSON traversal.
+    """
+    if not isinstance(value, str) or not value:
+        return []
+    stripped = value.strip()
+    if is_externalized_ingest_placeholder(stripped) or is_externalized_placeholder(stripped):
+        return extract_all_externalized_payload_refs(stripped)
+    if field == "tool_calls":
+        refs: list[str] = []
+        parsed = _maybe_parse_json_string(value)
+        if parsed is None:
+            return refs
+        for nested in _walk_string_values(parsed):
+            nested_stripped = nested.strip()
+            if is_externalized_ingest_placeholder(nested_stripped) or is_externalized_placeholder(nested_stripped):
+                _append_unique_refs(refs, extract_all_externalized_payload_refs(nested_stripped))
+        return refs
+    if role == "tool":
+        return []
+    return extract_all_externalized_payload_refs(value)
+
+
 def scan_externalized_payload_integrity(conn, config, *, hermes_home: str = "", limit: int = 5) -> dict[str, Any]:
     """Compare externalized payload refs stored in messages with JSON files.
 
@@ -1009,7 +1058,7 @@ def scan_externalized_payload_integrity(conn, config, *, hermes_home: str = "", 
         for field, value in (("content", content), ("tool_calls", tool_calls)):
             if not isinstance(value, str):
                 continue
-            for ref in extract_all_externalized_payload_refs(value):
+            for ref in _refs_for_externalized_integrity_scan(value, role=str(role or ""), field=field):
                 referenced_refs.add(ref)
                 first_location_by_ref.setdefault(
                     ref,
