@@ -490,6 +490,8 @@ process-lifetime `ignored_message_count`.
 
 ### Large tool-output handling
 
+Storage-boundary payload guard contract: LCM prevents media-ish inline payloads from being written into plugin-local SQLite rows at the storage boundary.
+
 Externalization for ordinary large tool output is opt-in. When enabled,
 oversized tool results are written to plugin-managed JSON files and referenced
 from summaries. They remain inspectable through
@@ -514,6 +516,9 @@ externalized-payload stats. Doctor output is metadata-only for these scans.
 This guard is scoped to LCM's own `lcm.db` write boundary. It does not prevent
 Hermes core, or any other host layer, from writing inline payloads to Hermes
 `state.db`, and it does not rewrite historical rows already present in `lcm.db`.
+If bytes already landed in Hermes `state.db`, that is upstream/outside LCM scope;
+use backup-first cleanup or migration procedures before mutating historical host
+rows.
 
 Transcript GC is separate and opt-in. It only rewrites already-externalized,
 already-summarized tool-role rows to compact placeholders. It keeps the same
@@ -538,6 +543,9 @@ search query before result limiting. When a raw-message filter is active,
 `lcm_grep` returns raw rows only and reports `summary_results_omitted`.
 
 Tool responses are bounded so one retrieval call cannot flood the main context.
+
+### Lossless raw recovery contract
+
 Lossless recovery means raw content is stored with stable source lineage and can
 be recovered in deterministic pages:
 
