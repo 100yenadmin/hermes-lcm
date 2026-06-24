@@ -1030,9 +1030,9 @@ def _refs_for_externalized_integrity_scan(value: str, *, role: str, field: str) 
     Tool outputs and tool-call arguments often contain escaped code snippets,
     pytest failures, or docs that mention placeholder examples. Counting those
     as live payload references turns doctor into a false-positive machine. Exact
-    placeholders are still counted everywhere; embedded placeholders are counted
-    for normal message content, while tool_calls only count exact placeholder
-    string values after JSON traversal.
+    placeholders are still counted everywhere; embedded unescaped placeholders
+    are counted for message content and tool-call argument strings so preserved
+    raw/duplicate-key tool arguments do not hide real refs.
     """
     if not isinstance(value, str) or not value:
         return []
@@ -1048,6 +1048,8 @@ def _refs_for_externalized_integrity_scan(value: str, *, role: str, field: str) 
             nested_stripped = nested.strip()
             if is_externalized_ingest_placeholder(nested_stripped) or is_externalized_placeholder(nested_stripped):
                 _append_unique_refs(refs, extract_all_externalized_payload_refs(nested_stripped))
+            else:
+                _append_unique_refs(refs, _extract_unescaped_externalized_payload_refs(nested))
         return refs
     if role == "tool":
         return _extract_unescaped_externalized_payload_refs(value)
