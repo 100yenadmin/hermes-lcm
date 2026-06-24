@@ -1011,15 +1011,15 @@ def _walk_string_values(value: Any):
             yield from _walk_string_values(item)
 
 
-def _walk_tool_call_argument_strings(value: Any):
+def _walk_tool_call_argument_values(value: Any):
     if isinstance(value, dict):
         for key, nested in value.items():
-            if key == "arguments" and isinstance(nested, str):
+            if key == "arguments":
                 yield nested
-            yield from _walk_tool_call_argument_strings(nested)
+            yield from _walk_tool_call_argument_values(nested)
     elif isinstance(value, list):
         for item in value:
-            yield from _walk_tool_call_argument_strings(item)
+            yield from _walk_tool_call_argument_values(item)
 
 
 def _is_escaped_placeholder_example(text: str, start: int) -> bool:
@@ -1065,8 +1065,16 @@ def _refs_for_externalized_integrity_scan(value: str, *, role: str, field: str) 
         parsed = _maybe_parse_json_string(value)
         if parsed is None:
             return refs
-        for arguments in _walk_tool_call_argument_strings(parsed):
-            _append_unique_refs(refs, _extract_unescaped_externalized_payload_refs(arguments))
+        for argument in _walk_tool_call_argument_values(parsed):
+            if isinstance(argument, str):
+                _append_unique_refs(refs, _extract_unescaped_externalized_payload_refs(argument))
+            else:
+                for nested in _walk_string_values(argument):
+                    nested_stripped = nested.strip()
+                    if is_externalized_ingest_placeholder(nested_stripped) or is_externalized_placeholder(nested_stripped):
+                        _append_unique_refs(refs, extract_all_externalized_payload_refs(nested_stripped))
+                    else:
+                        _append_unique_refs(refs, _extract_unescaped_externalized_payload_refs(nested))
         for nested in _walk_string_values(parsed):
             nested_stripped = nested.strip()
             if is_externalized_ingest_placeholder(nested_stripped) or is_externalized_placeholder(nested_stripped):
