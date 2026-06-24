@@ -1034,8 +1034,9 @@ def _is_inside_token_quote_span(text: str, start: int, token: str) -> bool:
     return in_span
 
 
-def _has_escaped_quote_before(text: str, start: int) -> bool:
-    return re.search(r"\\+[\"']", text[:start]) is not None
+def _has_local_escaped_quote_before(text: str, start: int) -> bool:
+    boundary = max(text.rfind(delimiter, 0, start) for delimiter in (",", "{", "[", ":"))
+    return re.search(r"\\+[\"']", text[boundary + 1:start]) is not None
 
 
 def _is_escaped_placeholder_example(text: str, start: int) -> bool:
@@ -1044,7 +1045,7 @@ def _is_escaped_placeholder_example(text: str, start: int) -> bool:
         '\\"' in prefix
         or "\\'" in prefix
         or prefix.endswith("\\")
-        or _has_escaped_quote_before(text, start)
+        or _has_local_escaped_quote_before(text, start)
     )
 
 

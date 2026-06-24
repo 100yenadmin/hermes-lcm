@@ -2039,7 +2039,11 @@ def test_externalized_payload_integrity_scan_detects_embedded_tool_call_argument
         "[Externalized LCM ingest payload: kind=media_payload; field=tool_calls; "
         "chars=1; bytes=1; ref=present-tool-call-media.json]"
     )
-    duplicate_key_arguments = '{"image":"' + placeholder + '","image":"plain text fallback"}'
+    duplicate_key_arguments = (
+        '{"note":"said \\\"hi\\\"","image":"'
+        + placeholder
+        + '","image":"plain text fallback"}'
+    )
     tool_calls = json.dumps(
         [
             {
