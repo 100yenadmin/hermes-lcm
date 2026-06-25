@@ -1069,16 +1069,27 @@ def _looks_like_json_container_string(text: str) -> bool:
     return stripped.startswith("{") or stripped.startswith("[")
 
 
+def _looks_like_example_payload_ref(ref: str) -> bool:
+    name = Path(ref).name.lower()
+    return name.startswith(("example-", "example_", "fake-", "fake_", "dummy-", "dummy_", "placeholder-", "placeholder_"))
+
+
 def _extract_unescaped_externalized_payload_refs(text: str, *, ignore_quoted_spans: bool = False) -> list[str]:
     refs: list[str] = []
     for pattern in (_INGEST_PLACEHOLDER_RE, _EXTERNALIZED_PAYLOAD_PLACEHOLDER_RE):
         for match in pattern.finditer(text):
-            if _is_escaped_placeholder_example(text, match.start()):
-                continue
-            if ignore_quoted_spans and _is_quoted_placeholder_example(text, match.start()):
-                continue
             ref = match.group(1).strip()
-            if _is_basename_ref(ref) and ref not in refs:
+            if not _is_basename_ref(ref):
+                continue
+            if _looks_like_example_payload_ref(ref) and _is_escaped_placeholder_example(text, match.start()):
+                continue
+            if (
+                ignore_quoted_spans
+                and _looks_like_example_payload_ref(ref)
+                and _is_quoted_placeholder_example(text, match.start())
+            ):
+                continue
+            if ref not in refs:
                 refs.append(ref)
     return refs
 
