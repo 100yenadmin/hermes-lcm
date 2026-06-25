@@ -1042,7 +1042,7 @@ def _has_local_escaped_quote_before(text: str, start: int) -> bool:
         return False
     quote = matches[-1]
     context = segment[max(0, quote.start() - 80):quote.start()].lower()
-    return any(marker in context for marker in ("pytest", "output", "log", "example", "traceback", "failure"))
+    return any(marker in context for marker in ("pytest", "log", "example", "traceback", "failure"))
 
 
 def _is_escaped_placeholder_example(text: str, start: int) -> bool:
@@ -1057,7 +1057,7 @@ def _is_quoted_placeholder_example(text: str, start: int) -> bool:
     if quote < 0:
         return False
     context = text[max(0, quote - 80):quote].lower()
-    return any(marker in context for marker in ("pytest", "output", "log", "example", "traceback", "failure"))
+    return any(marker in context for marker in ("pytest", "log", "example", "traceback", "failure"))
 
 
 def _looks_like_json_container_string(text: str) -> bool:

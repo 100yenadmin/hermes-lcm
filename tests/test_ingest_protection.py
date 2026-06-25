@@ -2363,7 +2363,7 @@ def test_externalized_payload_integrity_scan_detects_escaped_json_tool_content_p
         "[Externalized LCM ingest payload: kind=media_payload; field=content; "
         "chars=1; bytes=1; ref=present-tool-content-media.json]"
     )
-    content = '{\\"image\\":\\"x ' + placeholder + '\\"}'
+    content = '{\\"output\\":\\"' + placeholder + '\\",\\"output\\":\\"fallback\\"}'
     engine._store._conn.execute(
         """INSERT INTO messages
            (session_id, source, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_estimate, pinned)
