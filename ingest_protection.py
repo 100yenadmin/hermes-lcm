@@ -108,9 +108,9 @@ _EXTERNALIZED_PAYLOAD_PLACEHOLDER_RE = re.compile(
 _SENSITIVE_PLACEHOLDER_PREFIX = "[LCM sensitive redaction:"
 _SENSITIVE_PATTERN_CATALOG: dict[str, re.Pattern[str]] = {
     "api_key": re.compile(
-        r"(?P<prefix>\b(?:api[_-]?key|api[_-]?token|access[_-]?token|secret[_-]?key|client[_-]?secret)\b\s*[\"']?\s*[:=]\s*[\"']?)"
+        r"(?P<prefix>(?:\\?[\"']?)\b(?:api[_-]?key|api[_-]?token|access[_-]?token|secret[_-]?key|client[_-]?secret)\b\s*(?:\\?[\"']?)\s*[:=]\s*(?:\\?[\"']?))"
         r"(?P<secret>[A-Za-z0-9._~+/=-]{12,})"
-        r"(?P<suffix>[\"']?)",
+        r"(?P<suffix>\\?[\"']?)",
         re.IGNORECASE,
     ),
     "bearer_token": re.compile(
@@ -625,6 +625,8 @@ def _maybe_parse_json_string(text: str) -> Any | None:
     if '\\"' in stripped:
         candidates.append(stripped.replace('\\"', '"'))
     for candidate in candidates:
+        if _json_has_duplicate_object_keys(candidate):
+            return None
         try:
             parsed = json.loads(candidate)
         except Exception:

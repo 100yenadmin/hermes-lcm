@@ -336,10 +336,16 @@ def test_sensitive_patterns_cover_client_secret_duplicate_json_and_quoted_passwo
     client_secret = "oauthsupersecret1234567890"
     first_json_secret = "oldoauthclientsecret1234567890"
     second_json_secret = "newoauthclientsecret1234567890"
+    escaped_first_json_secret = "alphaescapedclientsecret1234567890"
+    escaped_second_json_secret = "betaescapedclientsecret1234567890"
     password_phrase = "correct horse battery staple"
     duplicate_key_json = (
         f'{{"client_secret":"{first_json_secret}",'
         f'"client_secret":"{second_json_secret}"}}'
+    )
+    escaped_duplicate_key_json = (
+        f'{{\\"client_secret\\":\\"{escaped_first_json_secret}\\",'
+        f'\\"client_secret\\":\\"{escaped_second_json_secret}\\"}}'
     )
 
     engine._ingest_messages([
@@ -355,7 +361,12 @@ def test_sensitive_patterns_cover_client_secret_duplicate_json_and_quoted_passwo
                     "id": "call_1",
                     "type": "function",
                     "function": {"name": "oauth", "arguments": duplicate_key_json},
-                }
+                },
+                {
+                    "id": "call_2",
+                    "type": "function",
+                    "function": {"name": "oauth", "arguments": escaped_duplicate_key_json},
+                },
             ],
         },
     ])
@@ -364,7 +375,15 @@ def test_sensitive_patterns_cover_client_secret_duplicate_json_and_quoted_passwo
         "SELECT content, COALESCE(tool_calls, '') FROM messages ORDER BY store_id"
     ).fetchall()
     stored_text = "\n".join("\n".join(row) for row in rows)
-    for raw in (client_secret, first_json_secret, second_json_secret, password_phrase, "horse battery staple"):
+    for raw in (
+        client_secret,
+        first_json_secret,
+        second_json_secret,
+        escaped_first_json_secret,
+        escaped_second_json_secret,
+        password_phrase,
+        "horse battery staple",
+    ):
         assert raw not in stored_text
         assert engine._store.search(raw, session_id=engine.current_session_id) == []
     assert "client_secret=" in stored_text
