@@ -1129,8 +1129,8 @@ def _refs_for_externalized_integrity_scan(value: str, *, role: str, field: str) 
             nested_stripped = nested.strip()
             if is_externalized_ingest_placeholder(nested_stripped) or is_externalized_placeholder(nested_stripped):
                 _append_unique_refs(refs, extract_all_externalized_payload_refs(nested_stripped))
-            elif _looks_like_json_container_string(nested_stripped):
-                _append_unique_refs(refs, _extract_unescaped_externalized_payload_refs(nested))
+            else:
+                _append_unique_refs(refs, _extract_unescaped_externalized_payload_refs(nested, ignore_quoted_spans=True))
         return refs
     if role == "tool":
         refs = _extract_unescaped_externalized_payload_refs(value)
