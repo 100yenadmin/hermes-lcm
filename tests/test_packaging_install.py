@@ -603,6 +603,133 @@ def test_registered_tool_handler_forwards_messages_to_engine_handle_tool_call(mo
         assert kwargs["messages"] == test_messages, f"{name}: messages content mismatch"
 
 
+def test_post_llm_hook_resolves_registered_active_clone_without_host_context_compressor(monkeypatch, tmp_path):
+    module = _load_plugin_entrypoint_module("hermes_lcm_post_hook_registered_clone")
+    manager = types.SimpleNamespace(_hooks={})
+    fake_plugins = types.SimpleNamespace(get_plugin_manager=lambda: manager)
+    fake_hermes_cli = types.SimpleNamespace(plugins=fake_plugins)
+    monkeypatch.setitem(sys.modules, "hermes_cli", fake_hermes_cli)
+    monkeypatch.setitem(sys.modules, "hermes_cli.plugins", fake_plugins)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_home"))
+
+    class _CtxNoTool:
+        def __init__(self):
+            self.engine = None
+
+        def register_context_engine(self, engine):
+            self.engine = engine
+
+    ctx = _CtxNoTool()
+    module.register(ctx)
+    assert ctx.engine is not None
+
+    active_clone = ctx.engine.clone_for_agent()
+    active_clone.on_session_start(
+        "discord-session",
+        platform="discord",
+        conversation_id="agent:main:discord:thread:t:t",
+    )
+    hook = manager._hooks["post_llm_call"][-1]
+    history = [{"role": "user", "content": "registered clone canary"}]
+
+    clone_ingests = []
+    singleton_ingests = []
+
+    def spy_clone_ingest(messages):
+        clone_ingests.append(list(messages))
+
+    def spy_singleton_ingest(messages):
+        singleton_ingests.append(list(messages))
+
+    monkeypatch.setattr(active_clone, "ingest", spy_clone_ingest)
+    monkeypatch.setattr(ctx.engine, "ingest", spy_singleton_ingest)
+
+    hook(
+        session_id="discord-session",
+        conversation_id="agent:main:discord:thread:t:t",
+        platform="discord",
+        conversation_history=history,
+    )
+
+    assert clone_ingests == [history]
+    assert singleton_ingests == []
+    assert active_clone.current_session_id == "discord-session"
+    assert active_clone.current_conversation_id == "agent:main:discord:thread:t:t"
+    assert ctx.engine.current_session_id == ""
+    active_clone.shutdown()
+    ctx.engine.shutdown()
+
+
+def test_post_llm_hook_ignores_stale_registered_clone_after_rebind(monkeypatch, tmp_path):
+    for lookup_mode in ("session", "conversation", "mismatched_conversation"):
+        module = _load_plugin_entrypoint_module(f"hermes_lcm_post_hook_stale_{lookup_mode}")
+        manager = types.SimpleNamespace(_hooks={})
+        fake_plugins = types.SimpleNamespace(get_plugin_manager=lambda: manager)
+        fake_hermes_cli = types.SimpleNamespace(plugins=fake_plugins)
+        monkeypatch.setitem(sys.modules, "hermes_cli", fake_hermes_cli)
+        monkeypatch.setitem(sys.modules, "hermes_cli.plugins", fake_plugins)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / f"hermes_home_{lookup_mode}"))
+
+        class _CtxNoTool:
+            def __init__(self):
+                self.engine = None
+
+            def register_context_engine(self, engine):
+                self.engine = engine
+
+        ctx = _CtxNoTool()
+        module.register(ctx)
+        active_clone = ctx.engine.clone_for_agent()
+        active_clone.on_session_start(
+            "session-a",
+            platform="discord",
+            conversation_id="agent:main:discord:thread:a:a",
+        )
+        active_clone.on_session_start(
+            "session-b",
+            platform="discord",
+            conversation_id="agent:main:discord:thread:b:b",
+        )
+
+        clone_ingests = []
+        singleton_ingests = []
+        monkeypatch.setattr(active_clone, "ingest", lambda messages: clone_ingests.append(list(messages)))
+        monkeypatch.setattr(ctx.engine, "ingest", lambda messages: singleton_ingests.append(list(messages)))
+
+        history = [{"role": "user", "content": f"old {lookup_mode}"}]
+        kwargs = {
+            "conversation_id": "agent:main:discord:thread:a:a",
+            "platform": "discord",
+            "conversation_history": history,
+        }
+        if lookup_mode == "session":
+            kwargs["session_id"] = "session-a"
+        elif lookup_mode == "mismatched_conversation":
+            kwargs["session_id"] = "session-b"
+
+        manager._hooks["post_llm_call"][-1](**kwargs)
+
+        if lookup_mode == "mismatched_conversation":
+            assert clone_ingests == [history]
+            assert singleton_ingests == []
+        else:
+            assert clone_ingests == []
+            assert singleton_ingests == [history]
+        assert active_clone.current_session_id == "session-b"
+        assert active_clone.current_conversation_id == "agent:main:discord:thread:b:b"
+
+        if lookup_mode == "mismatched_conversation":
+            clone_ingests.clear()
+            manager._hooks["post_llm_call"][-1](
+                session_id="session-b",
+                platform="discord",
+                conversation_history=[{"role": "user", "content": "session only"}],
+            )
+            assert clone_ingests == [[{"role": "user", "content": "session only"}]]
+        active_clone.shutdown()
+        ctx.engine.shutdown()
+
+
 def test_post_llm_hook_prefers_active_lcm_clone(monkeypatch, tmp_path):
     module = _load_plugin_entrypoint_module("hermes_lcm_post_hook_active_clone")
     manager = types.SimpleNamespace(_hooks={})

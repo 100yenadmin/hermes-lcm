@@ -50,7 +50,7 @@ def _host_forwards_registered_tool_messages(ctx) -> bool:
 def register(ctx):
     """Plugin entry point — register the LCM context engine and tools."""
     from .config import LCMConfig
-    from .engine import LCMEngine
+    from .engine import LCMEngine, resolve_active_lcm_engine
     from .schemas import (
         LCM_GREP,
         LCM_LOAD_SESSION,
@@ -164,7 +164,7 @@ def register(ctx):
                 and getattr(active_engine, "name", None) == "lcm"
                 and hasattr(active_engine, "ingest")
             ):
-                active_engine = engine
+                active_engine = None
 
             session_id = str(kwargs.get("session_id") or "")
             conversation_id = str(
@@ -174,13 +174,20 @@ def register(ctx):
             )
             platform = str(kwargs.get("platform") or "")
 
+            if active_engine is None:
+                active_engine = resolve_active_lcm_engine(
+                    session_id=session_id,
+                    conversation_id=conversation_id,
+                ) or engine
+
             try:
-                if session_id and (
-                    str(getattr(active_engine, "current_session_id", "") or "") != session_id
-                    or (
-                        conversation_id
-                        and str(getattr(active_engine, "current_conversation_id", "") or "") != conversation_id
-                    )
+                # Session identity is authoritative for rebinding. Older hosts
+                # can deliver stale lane metadata alongside the correct active
+                # session id; rebinding a clone on conversation_id mismatch
+                # alone would move it away from the runtime it is serving.
+                if (
+                    session_id
+                    and str(getattr(active_engine, "current_session_id", "") or "") != session_id
                 ):
                     active_engine.on_session_start(
                         session_id,
