@@ -4,8 +4,18 @@ This repo also publishes GitHub Releases. This file is the repo-root release sur
 
 ## Unreleased
 
-- Preserved raw session ownership across compression rollover after `/new`, so carried-over summaries can still expand back to original raw rows. (#269)
-- Current post-v0.18 follow-up state: adoption and operator-readiness hardening. No broad feature lane is active from this changelog entry.
+- No unreleased changes yet.
+
+## v0.18.1 - 2026-06-30
+
+Release focus: compaction privacy, clone/hook integrity, doctor signal accuracy, and model-context safety.
+
+- Excluded ignored backlog and stripped injected context before compaction, preventing ignored or synthetic context from entering LCM summaries. (#283, #282)
+- Preserved Discord lane metadata, active LCM clone resolution, and context metadata through cloned engines and post hooks. (#292, #293, #289)
+- Hardened runtime identity, raw tool call integrity refs, payload integrity checks, and doctor path/lifecycle diagnostics. (#281, #278, #279, #291, #273, #280)
+- Updated Codex OAuth effective context window safety defaults. (#274, #276)
+- Completed focus-topic demotion behavior and preserved raw session ownership across compression rollover. (#268, #269)
+- Refreshed operator docs, community-health files, and release-validation guidance. (#272)
 
 ## v0.18.0 - 2026-06-18
 

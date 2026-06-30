@@ -92,7 +92,7 @@ Typical output:
 
 ```text
 Plugins (1):
-  ✓ hermes-lcm v0.18.0 (7 tools)
+  ✓ hermes-lcm v0.18.1 (7 tools)
 
 Provider Plugins:
   Context Engine: lcm
