@@ -4379,6 +4379,22 @@ class TestIngestExternalization:
         replay_with_redaction_disabled._ingest_messages(messages)
         assert replay_with_redaction_disabled._store.get_session_count("ingest-session") == 2
 
+        replay_with_different_patterns = LCMEngine(
+            config=replace(
+                engine._config,
+                sensitive_patterns_enabled=False,
+                sensitive_patterns=["password_assignment"],
+            ),
+            hermes_home=str(tmp_path / "hermes"),
+        )
+        replay_with_different_patterns._session_id = "ingest-session"
+        replay_with_different_patterns._ingest_cursor_needs_reconcile = True
+        replay_with_different_patterns._ingest_messages(messages)
+        assert (
+            replay_with_different_patterns._store.get_session_count("ingest-session") == 2
+        )
+        assert len(list(output_dir.glob("*.json"))) == 1
+
         persisted_path.unlink()
         replay_from_active = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
         replay_from_active._session_id = "ingest-session"

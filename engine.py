@@ -5573,6 +5573,17 @@ class LCMEngine(ContextEngine):
         )
         return durable_content is not None
 
+    @staticmethod
+    def _sensitive_redaction_names_from_content(content: str) -> list[str]:
+        names: list[str] = []
+        if not isinstance(content, str) or "[LCM sensitive redaction:" not in content:
+            return names
+        for match in re.finditer(r"\[LCM sensitive redaction:\s*name=([^;\]\s]+)", content):
+            name = match.group(1).strip().lower()
+            if name and name not in names:
+                names.append(name)
+        return names
+
     def _durable_redacted_content_matches_recovered(
         self,
         durable_content: str | None,
@@ -5583,18 +5594,34 @@ class LCMEngine(ContextEngine):
             return False
         if durable_content == current_redacted_content:
             return True
-        redaction_config = copy.copy(self._config)
-        redaction_config.sensitive_patterns_enabled = True
-        if not getattr(redaction_config, "sensitive_patterns", None):
-            redaction_config.sensitive_patterns = LCMConfig().sensitive_patterns
-        expected_redacted = normalize_content_value(
-            redact_sensitive_value(
-                recovered_content,
-                redaction_config,
-                parse_json_strings=False,
-            )
-        ) or ""
-        return durable_content == expected_redacted
+        candidate_pattern_sets: list[list[str]] = []
+        configured_patterns = list(getattr(self._config, "sensitive_patterns", None) or [])
+        durable_redaction_patterns = self._sensitive_redaction_names_from_content(
+            durable_content
+        )
+        default_patterns = list(LCMConfig().sensitive_patterns)
+        for pattern_set in (configured_patterns, durable_redaction_patterns, default_patterns):
+            normalized = [
+                str(pattern).strip().lower()
+                for pattern in pattern_set
+                if str(pattern).strip()
+            ]
+            if normalized and normalized not in candidate_pattern_sets:
+                candidate_pattern_sets.append(normalized)
+        for pattern_set in candidate_pattern_sets:
+            redaction_config = copy.copy(self._config)
+            redaction_config.sensitive_patterns_enabled = True
+            redaction_config.sensitive_patterns = pattern_set
+            expected_redacted = normalize_content_value(
+                redact_sensitive_value(
+                    recovered_content,
+                    redaction_config,
+                    parse_json_strings=False,
+                )
+            ) or ""
+            if durable_content == expected_redacted:
+                return True
+        return False
 
     def _message_replay_identity(self, msg: Dict[str, Any], *, stored_row: bool = False) -> tuple[str, str, str, str]:
         role = str(msg.get("role") or "unknown")
