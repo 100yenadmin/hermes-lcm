@@ -4323,6 +4323,29 @@ class LCMEngine(ContextEngine):
         )
         return durable_content is not None
 
+    def _durable_redacted_content_matches_recovered(
+        self,
+        durable_content: str | None,
+        recovered_content: str,
+        current_redacted_content: str,
+    ) -> bool:
+        if not durable_content or "[LCM sensitive redaction:" not in durable_content:
+            return False
+        if durable_content == current_redacted_content:
+            return True
+        redaction_config = copy.copy(self._config)
+        redaction_config.sensitive_patterns_enabled = True
+        if not getattr(redaction_config, "sensitive_patterns", None):
+            redaction_config.sensitive_patterns = LCMConfig().sensitive_patterns
+        expected_redacted = normalize_content_value(
+            redact_sensitive_value(
+                recovered_content,
+                redaction_config,
+                parse_json_strings=False,
+            )
+        ) or ""
+        return durable_content == expected_redacted
+
     def _message_replay_identity(self, msg: Dict[str, Any], *, stored_row: bool = False) -> tuple[str, str, str, str]:
         role = str(msg.get("role") or "unknown")
         content = normalize_content_value(msg.get("content")) or ""
@@ -4360,10 +4383,10 @@ class LCMEngine(ContextEngine):
                         config=self._config,
                         hermes_home=self._hermes_home,
                     )
-                    if (
-                        durable_content is not None
-                        and durable_content != content
-                        and "[LCM sensitive redaction:" in durable_content
+                    if durable_content is not None and self._durable_redacted_content_matches_recovered(
+                        durable_content,
+                        recovered_content,
+                        content,
                     ):
                         content = durable_content
             elif has_durable_marker_proof:

@@ -4667,6 +4667,66 @@ class TestIngestExternalization:
         assert identity[1] == new_result
         assert identity[1] != old_result
 
+    def test_replay_identity_does_not_let_redacted_durable_payload_mask_live_retry(self, tmp_path, monkeypatch):
+        import tempfile
+        from hermes_lcm.engine import LCMEngine
+
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        engine, output_dir = self._engine(
+            tmp_path,
+            large_output_externalization_threshold_chars=10,
+            sensitive_patterns_enabled=True,
+            sensitive_patterns=["api_key"],
+        )
+        host_storage = tmp_path / "hermes-results"
+        host_storage.mkdir()
+        shared_prefix = "api_key = SECRETSECRET1234567890 SAME_PREFIX:"
+        old_result = shared_prefix + ("a" * 1000)
+        new_result = shared_prefix + ("b" * 1000)
+        assert len(new_result) == len(old_result)
+        preview = old_result[:32]
+        assert preview == new_result[:32]
+        persisted_path = host_storage / "call_secret_retry.txt"
+        persisted_path.write_text(old_result, encoding="utf-8")
+        old_marker = (
+            "<persisted-output>\n"
+            f"This tool result was too large ({len(old_result):,} characters, 1.1 KB).\n"
+            f"Full output saved to: {persisted_path}\n"
+            "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+            f"Preview (first {len(preview)} chars):\n"
+            f"{preview}\n"
+            "</persisted-output>"
+        )
+        engine._ingest_messages([
+            {"role": "assistant", "content": "Calling", "tool_calls": [{"id": "call_secret_retry", "function": {"name": "dump", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_secret_retry", "content": old_marker},
+        ])
+        old_payload = json.loads(next(output_dir.glob("*.json")).read_text())
+        assert "[LCM sensitive redaction:" in old_payload["content"]
+        assert "a" * 20 in old_payload["content"]
+
+        persisted_path.write_text(new_result, encoding="utf-8")
+        new_marker = (
+            "<persisted-output>\n"
+            f"This tool result was too large ({len(new_result):,} characters, 1.1 KB).\n"
+            f"Full output saved to: {persisted_path}\n"
+            "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+            f"Preview (first {len(preview)} chars):\n"
+            f"{preview}\n"
+            "</persisted-output>"
+        )
+        replay = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
+        replay._session_id = "ingest-session"
+
+        identity = replay._message_replay_identity(
+            {"role": "tool", "tool_call_id": "call_secret_retry", "content": new_marker}
+        )
+
+        assert "[LCM sensitive redaction:" in identity[1]
+        assert "b" * 20 in identity[1]
+        assert "a" * 20 not in identity[1]
+        assert identity[1] != old_payload["content"]
+
     def test_ingest_preserves_recoverable_marker_when_externalization_disabled(self, tmp_path, monkeypatch):
         import tempfile
         from hermes_lcm.engine import LCMEngine
