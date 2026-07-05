@@ -577,6 +577,7 @@ class LCMEngine(ContextEngine):
         self._thread_context = threading.local()
         self._auxiliary_session_ids: set[str] = set()
         self._auxiliary_lineage_session_ids: set[str] = set()
+        self._auxiliary_last_prompt_tokens: dict[str, int] = {}
         self._lcm_bypass_lineage_session_ids: set[str] = set()
         self._lcm_bypass_lineage_platforms: dict[str, set[str]] = {}
         self._lcm_non_bypass_platforms: dict[str, set[str]] = {}
@@ -704,6 +705,7 @@ class LCMEngine(ContextEngine):
         with self._auxiliary_session_lock:
             self._auxiliary_session_ids.clear()
             self._auxiliary_lineage_session_ids.clear()
+            self._auxiliary_last_prompt_tokens.clear()
             self._lcm_bypass_lineage_session_ids.clear()
             self._lcm_bypass_lineage_platforms.clear()
             self._lcm_non_bypass_platforms.clear()
@@ -973,6 +975,11 @@ class LCMEngine(ContextEngine):
 
     def update_from_response(self, usage: Dict[str, Any]) -> None:
         if self._thread_context_stateless():
+            auxiliary_session_id = self._thread_context_session_id()
+            if auxiliary_session_id:
+                self._auxiliary_last_prompt_tokens[auxiliary_session_id] = int(
+                    usage.get("prompt_tokens", 0) or 0
+                )
             return
         self.last_prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
         self.last_completion_tokens = int(usage.get("completion_tokens", 0) or 0)
@@ -1519,7 +1526,13 @@ class LCMEngine(ContextEngine):
         if self._bypasses_lcm_context_management():
             if self._compression_boundary_cooldown_active():
                 return False
-            tokens = prompt_tokens if prompt_tokens is not None else self.last_prompt_tokens
+            if prompt_tokens is not None:
+                tokens = prompt_tokens
+            else:
+                tokens = self._auxiliary_last_prompt_tokens.get(
+                    self._thread_context_session_id(),
+                    self.last_prompt_tokens,
+                )
             if self._should_force_overflow_recovery(observed_tokens=tokens):
                 return True
             if self.threshold_tokens <= 0:
@@ -2528,6 +2541,7 @@ class LCMEngine(ContextEngine):
             return
         with self._auxiliary_session_lock:
             self._auxiliary_session_ids.discard(session_id)
+            self._auxiliary_last_prompt_tokens.pop(session_id, None)
 
     def _mark_thread_context_stateless(self, session_id: str) -> None:
         self._register_auxiliary_session(session_id)
@@ -2546,12 +2560,15 @@ class LCMEngine(ContextEngine):
 
     def _handoff_auxiliary_session(self, old_session_id: str, new_session_id: str) -> None:
         with self._auxiliary_session_lock:
+            prompt_tokens = self._auxiliary_last_prompt_tokens.pop(old_session_id, None) if old_session_id else None
             if old_session_id:
                 self._auxiliary_session_ids.discard(old_session_id)
                 self._auxiliary_lineage_session_ids.add(old_session_id)
             if new_session_id:
                 self._auxiliary_session_ids.add(new_session_id)
                 self._auxiliary_lineage_session_ids.add(new_session_id)
+                if prompt_tokens is not None:
+                    self._auxiliary_last_prompt_tokens[new_session_id] = prompt_tokens
         stack = self._thread_context_auxiliary_stack()
         had_thread_marker = old_session_id in stack or new_session_id in stack
         stack[:] = [

@@ -2020,6 +2020,26 @@ class TestEngineABC:
         finally:
             instance.shutdown()
 
+    def test_thread_context_stateless_no_arg_should_compress_uses_auxiliary_usage(self, tmp_path):
+        config = LCMConfig(database_path=str(tmp_path / "thread-stateless-no-arg-usage.db"))
+        instance = LCMEngine(config=config)
+        try:
+            instance.on_session_start("foreground:session", platform="cli", context_length=1_000)
+            instance.threshold_tokens = 20
+            instance._mark_thread_context_stateless("auxiliary:session")
+
+            instance.update_from_response({"prompt_tokens": 25, "completion_tokens": 1, "total_tokens": 26})
+
+            assert instance.last_prompt_tokens == 0
+            assert instance.should_compress()
+            assert instance._store.get_session_count("foreground:session") == 0
+            assert instance._store.get_session_count("auxiliary:session") == 0
+
+            instance._clear_thread_context_stateless("auxiliary:session")
+            assert not instance.should_compress()
+        finally:
+            instance.shutdown()
+
     @pytest.mark.parametrize(
         ("session_id", "config_kwargs"),
         [
