@@ -1475,8 +1475,48 @@ class TestEngineABC:
         try:
             assert count_messages_tokens(messages) >= instance.threshold_tokens
             assert not instance.should_compress_preflight(messages)
-            assert instance._last_compression_status == "noop"
-            assert "below leaf chunk threshold" in instance._last_compression_noop_reason
+            assert instance.last_compression_status == "noop"
+            assert instance.last_compression_was_noop is True
+            assert "below leaf chunk threshold" in instance.last_compression_noop_reason
+        finally:
+            instance.shutdown()
+
+    def test_positive_preflight_clears_prior_noop_status(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_preflight_clears_noop.db"),
+            fresh_tail_count=4,
+            leaf_chunk_tokens=100,
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "test-session"
+        instance.context_length = 1000
+        instance.threshold_tokens = 100
+        noop_messages = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "tiny old backlog"},
+            {"role": "assistant", "content": "tiny old answer"},
+            {"role": "user", "content": "fresh " + "x" * 500},
+            {"role": "assistant", "content": "fresh " + "y" * 500},
+            {"role": "user", "content": "fresh " + "z" * 500},
+        ]
+        eligible_messages = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "old backlog " + "x" * 600},
+            {"role": "assistant", "content": "old answer " + "y" * 600},
+            {"role": "user", "content": "fresh " + "a" * 200},
+            {"role": "assistant", "content": "fresh " + "b" * 200},
+            {"role": "user", "content": "fresh " + "c" * 200},
+        ]
+
+        try:
+            assert instance.should_compress_preflight(noop_messages) is False
+            assert instance.last_compression_was_noop is True
+            assert instance.last_compression_noop_reason
+
+            assert instance.should_compress_preflight(eligible_messages) is True
+            assert instance.last_compression_status == "pending"
+            assert instance.last_compression_was_noop is False
+            assert instance.last_compression_noop_reason == ""
         finally:
             instance.shutdown()
 
@@ -4464,6 +4504,23 @@ class TestEngineABC:
         assert status["engine"] == "lcm"
         assert "store_messages" in status
         assert "dag_nodes" in status
+
+    def test_placeholder_metadata_write_skips_when_unchanged(self, engine):
+        conn = engine._store._conn
+        if not engine._ignored_placeholder_count_metadata_keys():
+            pytest.skip("no placeholder metadata keys bound for this session")
+
+        engine._write_generated_ignored_placeholder_hash_counts({"a" * 16: 2})
+        changes_after_first = conn.total_changes
+
+        # Identical payload: no UPSERT executed, so no fsync commit either.
+        engine._write_generated_ignored_placeholder_hash_counts({"a" * 16: 2})
+        assert conn.total_changes == changes_after_first
+
+        # A changed payload still writes.
+        engine._write_generated_ignored_placeholder_hash_counts({"a" * 16: 3})
+        assert conn.total_changes > changes_after_first
+        assert engine._load_generated_ignored_placeholder_hash_counts().get("a" * 16) == 3
 
     def test_lcm_grep_ingests_live_history_before_search(self, engine):
         engine.on_session_start("live-search", platform="telegram", context_length=200000)
