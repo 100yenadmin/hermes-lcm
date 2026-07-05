@@ -16652,7 +16652,7 @@ class TestSessionRollover:
         engine.on_session_end("background-review-continuation", [])
         assert not engine._thread_context_has_auxiliary_session("background-review-continuation")
 
-        next_child = self._start_host_child(
+        self._start_host_child(
             engine,
             hermes_home,
             "background-review-session-2",
@@ -16968,7 +16968,7 @@ class TestSessionRollover:
             "background-review-continuation",
             context_length=1_000,
         )
-        real_continuation = self.HostAgentFrame(
+        self.HostAgentFrame(
             "background-review-continuation",
             "background-review-session",
             hermes_home,
