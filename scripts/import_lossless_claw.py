@@ -1482,6 +1482,10 @@ def _jsonl_parent_id(row: dict[str, Any]) -> str | None:
     return str(value) if value is not None else None
 
 
+def _jsonl_has_message_shape(row: dict[str, Any]) -> bool:
+    return isinstance(row.get("message"), dict) or "role" in row or "content" in row
+
+
 def _jsonl_importable_row(row: dict[str, Any]) -> bool:
     if _jsonl_has_malformed_type(row):
         return False
@@ -1492,7 +1496,7 @@ def _jsonl_importable_row(row: dict[str, Any]) -> bool:
         | JSONL_OPENCLAW_TOOL_CALL_TYPES
     ):
         return True
-    return row_type is None and ("role" in row or "content" in row)
+    return row_type is None and _jsonl_has_message_shape(row)
 
 
 def _jsonl_valid_importable_row(row: dict[str, Any]) -> bool:
@@ -1502,15 +1506,15 @@ def _jsonl_valid_importable_row(row: dict[str, Any]) -> bool:
     if row_type in JSONL_TOOL_CALL_TYPES:
         return _jsonl_openai_tool_call(row) is not None
     if row_type == "message":
-        if not (isinstance(row.get("message"), dict) or "role" in row or "content" in row):
+        if not _jsonl_has_message_shape(row):
             return False
         return not _jsonl_has_malformed_tool_call_content(_jsonl_row_message(row))
     if row_type == "custom_message":
-        if not (isinstance(row.get("message"), dict) or "role" in row or "content" in row):
+        if not _jsonl_has_message_shape(row):
             return False
         return not _jsonl_has_malformed_tool_call_content(_jsonl_row_message(row))
-    if row_type is None and ("role" in row or "content" in row):
-        return not _jsonl_has_malformed_tool_call_content(row)
+    if row_type is None and _jsonl_has_message_shape(row):
+        return not _jsonl_has_malformed_tool_call_content(_jsonl_row_message(row))
     return _jsonl_importable_row(row)
 
 
@@ -1605,11 +1609,13 @@ def _jsonl_active_leaf_lines(rows: list[tuple[int, dict[str, Any]]]) -> set[int]
     active_lines: set[int] = set()
     seen_ids: set[str] = set()
     current: str | None = last_message_id
-    while current is not None and current not in seen_ids:
+    while current is not None:
+        if current in seen_ids:
+            return None
         seen_ids.add(current)
         line_no = line_by_id.get(current)
         if line_no is None:
-            break
+            return None
         active_lines.add(line_no)
         current = parent_by_id.get(current)
 
@@ -1980,12 +1986,12 @@ def _collect_jsonl_candidates(
                 message = row
                 row_id = _jsonl_row_id(row)
                 timestamp_value = row.get("timestamp")
-            elif row.get("type") is None and ("role" in row or "content" in row):
+            elif row.get("type") is None and _jsonl_has_message_shape(row):
                 flush_pending_native_function_calls()
                 scanned += 1
-                message = row
+                message = _jsonl_row_message(row)
                 row_id = _jsonl_row_id(row)
-                timestamp_value = row.get("timestamp")
+                timestamp_value = row.get("timestamp", message.get("timestamp"))
             else:
                 flush_pending_native_function_calls()
                 scanned += 1

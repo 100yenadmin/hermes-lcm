@@ -4613,6 +4613,60 @@ class TestIngestExternalization:
         assert len(stored) == 4
         assert stored[-1]["content"] == new_marker
 
+    def test_replay_identity_prefers_live_persisted_file_over_matching_durable_payload(self, tmp_path, monkeypatch):
+        import tempfile
+        from hermes_lcm.engine import LCMEngine
+
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        engine, output_dir = self._engine(tmp_path)
+        host_storage = tmp_path / "hermes-results"
+        host_storage.mkdir()
+        shared_prefix = "SAME_PATH_RETRY_PREFIX:" + ("p" * 64)
+        old_result = shared_prefix + ("a" * 1000)
+        new_result = shared_prefix + ("b" * 1000)
+        assert len(new_result) == len(old_result)
+        persisted_path = host_storage / "call_retry_reused.txt"
+        persisted_path.write_text(old_result, encoding="utf-8")
+        old_marker = (
+            "<persisted-output>\n"
+            f"This tool result was too large ({len(old_result):,} characters, 1.1 KB).\n"
+            f"Full output saved to: {persisted_path}\n"
+            "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+            "Preview (first 30 chars):\n"
+            f"{old_result[:30]}\n...\n"
+            "</persisted-output>"
+        )
+        engine._ingest_messages([
+            {"role": "assistant", "content": "Calling", "tool_calls": [{"id": "call_retry", "function": {"name": "dump", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_retry", "content": old_marker},
+        ])
+        assert engine._store.get_session_count("ingest-session") == 2
+        payload_file = next(output_dir.glob("*.json"))
+        payload = json.loads(payload_file.read_text())
+        assert payload["content"] == old_result
+        assert payload["tool_call_id"] == "call_retry"
+        assert payload["persisted_output_source_path"] == str(persisted_path)
+
+        persisted_path.write_text(new_result, encoding="utf-8")
+        new_marker = (
+            "<persisted-output>\n"
+            f"This tool result was too large ({len(new_result):,} characters, 1.1 KB).\n"
+            f"Full output saved to: {persisted_path}\n"
+            "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+            "Preview (first 30 chars):\n"
+            f"{new_result[:30]}\n...\n"
+            "</persisted-output>"
+        )
+        replay = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
+        replay._session_id = "ingest-session"
+
+        identity = replay._message_replay_identity(
+            {"role": "tool", "tool_call_id": "call_retry", "content": new_marker}
+        )
+
+        assert identity[1] == new_result
+        assert identity[1] != old_result
+
     def test_ingest_preserves_recoverable_marker_when_externalization_disabled(self, tmp_path, monkeypatch):
         import tempfile
         from hermes_lcm.engine import LCMEngine

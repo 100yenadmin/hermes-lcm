@@ -4330,13 +4330,43 @@ class LCMEngine(ContextEngine):
             expected_chars = _expected_persisted_output_chars(content)
             persisted_output_source_path = _persisted_output_saved_path(content)
             persisted_output_preview_sha256 = _persisted_output_preview_prefix_digest(content)
-            durable_content = None
-            if (
+            recovered_content = recover_hermes_persisted_output(content)
+            has_durable_marker_proof = (
                 not stored_row
                 and expected_chars is not None
                 and persisted_output_source_path
                 and persisted_output_preview_sha256
-            ):
+            )
+            durable_content = None
+            if recovered_content is not None:
+                content = normalize_content_value(
+                    redact_sensitive_value(
+                        recovered_content,
+                        self._config,
+                        parse_json_strings=False,
+                    )
+                ) or ""
+                if has_durable_marker_proof:
+                    # Live file recovery is authoritative for raw content.  A
+                    # previously stored redacted durable payload remains the
+                    # canonical replay identity so a later config with redaction
+                    # disabled does not duplicate or de-redact an existing row.
+                    durable_content = find_externalized_tool_result_content_for_call(
+                        tool_call_id=str(msg.get("tool_call_id") or ""),
+                        session_id=str(msg.get("session_id") or self._session_id or ""),
+                        expected_chars=expected_chars,
+                        persisted_output_source_path=persisted_output_source_path,
+                        persisted_output_preview_sha256=persisted_output_preview_sha256,
+                        config=self._config,
+                        hermes_home=self._hermes_home,
+                    )
+                    if (
+                        durable_content is not None
+                        and durable_content != content
+                        and "[LCM sensitive redaction:" in durable_content
+                    ):
+                        content = durable_content
+            elif has_durable_marker_proof:
                 durable_content = find_externalized_tool_result_content_for_call(
                     tool_call_id=str(msg.get("tool_call_id") or ""),
                     session_id=str(msg.get("session_id") or self._session_id or ""),
@@ -4346,18 +4376,8 @@ class LCMEngine(ContextEngine):
                     config=self._config,
                     hermes_home=self._hermes_home,
                 )
-            if durable_content is not None:
-                content = durable_content
-            else:
-                recovered_content = recover_hermes_persisted_output(content)
-                if recovered_content is not None:
-                    content = normalize_content_value(
-                        redact_sensitive_value(
-                            recovered_content,
-                            self._config,
-                            parse_json_strings=False,
-                        )
-                    ) or ""
+                if durable_content is not None:
+                    content = durable_content
         tool_calls = msg.get("tool_calls")
         if stored_row:
             session_id = str(msg.get("session_id") or self._session_id or "")

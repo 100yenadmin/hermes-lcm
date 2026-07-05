@@ -1529,6 +1529,88 @@ def test_jsonl_import_follows_active_leaf_path_for_branched_exports(tmp_path: Pa
     assert import_keys == [(jsonl_key("branched", "root"),), (jsonl_key("branched", "leaf"),)]
 
 
+def test_jsonl_import_disables_leaf_pruning_when_parent_chain_is_dangling(tmp_path: Path):
+    importer = load_importer_module()
+    session_file = tmp_path / "dangling-parent.jsonl"
+    target_db = tmp_path / "target-lcm.db"
+    write_jsonl_session(
+        session_file,
+        [
+            jsonl_header("dangling-parent"),
+            jsonl_message("old", "user", "valid prior content"),
+            jsonl_message("child", "assistant", "dangling current content", parent_id="missing"),
+        ],
+    )
+
+    result = importer.import_jsonl_sessions(
+        files=[session_file], target_db=target_db, import_id="dangling-parent", apply=True
+    )
+
+    assert result.scanned == 2
+    assert result.eligible == 2
+    assert result.imported == 2
+    assert result.invalid_rows == 0
+    conn = sqlite3.connect(target_db)
+    rows = conn.execute("SELECT content FROM messages ORDER BY store_id").fetchall()
+    conn.close()
+    assert rows == [("valid prior content",), ("dangling current content",)]
+
+
+def test_jsonl_import_disables_leaf_pruning_when_parent_chain_is_cyclic(tmp_path: Path):
+    importer = load_importer_module()
+    session_file = tmp_path / "cyclic-parent.jsonl"
+    target_db = tmp_path / "target-lcm.db"
+    write_jsonl_session(
+        session_file,
+        [
+            jsonl_header("cyclic-parent"),
+            jsonl_message("old", "user", "valid prior content"),
+            jsonl_message("a", "assistant", "cycle branch a", parent_id="b"),
+            jsonl_message("b", "assistant", "cycle branch b", parent_id="a"),
+        ],
+    )
+
+    result = importer.import_jsonl_sessions(
+        files=[session_file], target_db=target_db, import_id="cyclic-parent", apply=True
+    )
+
+    assert result.scanned == 3
+    assert result.eligible == 3
+    assert result.imported == 3
+    assert result.invalid_rows == 0
+    conn = sqlite3.connect(target_db)
+    rows = conn.execute("SELECT content FROM messages ORDER BY store_id").fetchall()
+    conn.close()
+    assert rows == [("valid prior content",), ("cycle branch a",), ("cycle branch b",)]
+
+
+def test_jsonl_import_accepts_untyped_envelope_message_rows(tmp_path: Path):
+    importer = load_importer_module()
+    session_file = tmp_path / "untyped-envelope.jsonl"
+    target_db = tmp_path / "target-lcm.db"
+    write_jsonl_session(
+        session_file,
+        [
+            jsonl_header("untyped-envelope"),
+            {"id": "m1", "message": {"role": "user", "content": "hi"}},
+        ],
+    )
+
+    result = importer.import_jsonl_sessions(
+        files=[session_file], target_db=target_db, import_id="untyped-envelope", apply=True
+    )
+
+    assert result.scanned == 1
+    assert result.eligible == 1
+    assert result.imported == 1
+    assert result.invalid_rows == 0
+    assert result.warnings == []
+    conn = sqlite3.connect(target_db)
+    rows = conn.execute("SELECT role, content FROM messages ORDER BY store_id").fetchall()
+    conn.close()
+    assert rows == [("user", "hi")]
+
+
 def test_jsonl_import_malformed_message_rows_do_not_drive_leaf_pruning(tmp_path: Path):
     importer = load_importer_module()
     session_file = tmp_path / "malformed-tail.jsonl"
