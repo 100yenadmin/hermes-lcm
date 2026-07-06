@@ -46,6 +46,10 @@ def _parse_bool_env(key: str, default: bool) -> bool:
     return default
 
 
+def _parse_str_env(key: str, default):
+    return os.environ.get(key, default)
+
+
 def _parse_int_env_with_source(
     key: str,
     default: int,
@@ -237,6 +241,92 @@ def _hermes_codex_gpt55_autoraise_with_source(default: bool) -> tuple[bool, str]
         return default, "default"
 
 
+@dataclass(frozen=True)
+class _EnvFieldSpec:
+    """One scalar ``LCM_*`` environment override: which config field it sets,
+    its environment variable, and the Python type used to parse it."""
+
+    name: str
+    env_key: str
+    py_type: type
+
+
+# Single source of truth for the scalar LCM_* env overrides. ``from_env`` applies
+# the non-source-tracked entries uniformly, and ``presets`` derives its
+# preset-field lookups from the same list so the field/env/type mapping is not
+# duplicated. Order mirrors the historical ``from_env`` order for readability.
+ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
+    _EnvFieldSpec("fresh_tail_count", "LCM_FRESH_TAIL_COUNT", int),
+    _EnvFieldSpec("leaf_chunk_tokens", "LCM_LEAF_CHUNK_TOKENS", int),
+    _EnvFieldSpec("context_threshold", "LCM_CONTEXT_THRESHOLD", float),
+    _EnvFieldSpec("incremental_max_depth", "LCM_INCREMENTAL_MAX_DEPTH", int),
+    _EnvFieldSpec("condensation_fanin", "LCM_CONDENSATION_FANIN", int),
+    _EnvFieldSpec("dynamic_leaf_chunk_enabled", "LCM_DYNAMIC_LEAF_CHUNK_ENABLED", bool),
+    _EnvFieldSpec("dynamic_leaf_chunk_max", "LCM_DYNAMIC_LEAF_CHUNK_MAX", int),
+    _EnvFieldSpec("cache_friendly_condensation_enabled", "LCM_CACHE_FRIENDLY_CONDENSATION_ENABLED", bool),
+    _EnvFieldSpec("cache_friendly_min_debt_groups", "LCM_CACHE_FRIENDLY_MIN_DEBT_GROUPS", int),
+    _EnvFieldSpec("deferred_maintenance_enabled", "LCM_DEFERRED_MAINTENANCE_ENABLED", bool),
+    _EnvFieldSpec("deferred_maintenance_max_passes", "LCM_DEFERRED_MAINTENANCE_MAX_PASSES", int),
+    _EnvFieldSpec("critical_budget_pressure_ratio", "LCM_CRITICAL_BUDGET_PRESSURE_RATIO", float),
+    _EnvFieldSpec("l2_budget_ratio", "LCM_L2_BUDGET_RATIO", float),
+    _EnvFieldSpec("l3_truncate_tokens", "LCM_L3_TRUNCATE_TOKENS", int),
+    _EnvFieldSpec("max_assembly_tokens", "LCM_MAX_ASSEMBLY_TOKENS", int),
+    _EnvFieldSpec("reserve_tokens_floor", "LCM_RESERVE_TOKENS_FLOOR", int),
+    _EnvFieldSpec("custom_instructions", "LCM_CUSTOM_INSTRUCTIONS", str),
+    _EnvFieldSpec("extraction_enabled", "LCM_EXTRACTION_ENABLED", bool),
+    _EnvFieldSpec("extraction_model", "LCM_EXTRACTION_MODEL", str),
+    _EnvFieldSpec("extraction_output_path", "LCM_EXTRACTION_OUTPUT_PATH", str),
+    _EnvFieldSpec("sensitive_patterns_enabled", "LCM_SENSITIVE_PATTERNS_ENABLED", bool),
+    _EnvFieldSpec("large_output_externalization_enabled", "LCM_LARGE_OUTPUT_EXTERNALIZATION_ENABLED", bool),
+    _EnvFieldSpec("large_output_externalization_threshold_chars", "LCM_LARGE_OUTPUT_EXTERNALIZATION_THRESHOLD_CHARS", int),
+    _EnvFieldSpec("large_output_externalization_path", "LCM_LARGE_OUTPUT_EXTERNALIZATION_PATH", str),
+    _EnvFieldSpec("large_output_transcript_gc_enabled", "LCM_LARGE_OUTPUT_TRANSCRIPT_GC_ENABLED", bool),
+    _EnvFieldSpec("summary_model", "LCM_SUMMARY_MODEL", str),
+    _EnvFieldSpec("summary_circuit_breaker_failure_threshold", "LCM_SUMMARY_CIRCUIT_BREAKER_FAILURE_THRESHOLD", int),
+    _EnvFieldSpec("summary_circuit_breaker_cooldown_seconds", "LCM_SUMMARY_CIRCUIT_BREAKER_COOLDOWN_SECONDS", int),
+    _EnvFieldSpec("summary_spend_max_calls", "LCM_SUMMARY_SPEND_MAX_CALLS", int),
+    _EnvFieldSpec("summary_spend_window_seconds", "LCM_SUMMARY_SPEND_WINDOW_SECONDS", float),
+    _EnvFieldSpec("summary_spend_backoff_seconds", "LCM_SUMMARY_SPEND_BACKOFF_SECONDS", float),
+    _EnvFieldSpec("expansion_model", "LCM_EXPANSION_MODEL", str),
+    _EnvFieldSpec("expansion_context_tokens", "LCM_EXPANSION_CONTEXT_TOKENS", int),
+    _EnvFieldSpec("summary_timeout_ms", "LCM_SUMMARY_TIMEOUT_MS", int),
+    _EnvFieldSpec("expansion_timeout_ms", "LCM_EXPANSION_TIMEOUT_MS", int),
+    _EnvFieldSpec("database_path", "LCM_DATABASE_PATH", str),
+    _EnvFieldSpec("new_session_retain_depth", "LCM_NEW_SESSION_RETAIN_DEPTH", int),
+    _EnvFieldSpec("doctor_clean_apply_enabled", "LCM_DOCTOR_CLEAN_APPLY_ENABLED", bool),
+    _EnvFieldSpec("empty_lifecycle_gc_enabled", "LCM_EMPTY_LIFECYCLE_GC_ENABLED", bool),
+    _EnvFieldSpec("empty_lifecycle_gc_threshold", "LCM_EMPTY_LIFECYCLE_GC_THRESHOLD", int),
+)
+
+_PARSER_BY_TYPE = {
+    int: _parse_int_env,
+    float: _parse_float_env,
+    bool: _parse_bool_env,
+    str: _parse_str_env,
+}
+
+# Fields whose env reading needs provenance tracking or a computed default;
+# ``from_env`` handles these explicitly, so the uniform loop skips them.
+_SOURCE_TRACKED_ENV_FIELDS = frozenset({
+    "fresh_tail_count",
+    "leaf_chunk_tokens",
+    "context_threshold",
+    "summary_spend_max_calls",
+    "summary_spend_window_seconds",
+    "summary_spend_backoff_seconds",
+    "summary_timeout_ms",
+})
+
+# Fields exposed as runtime preset overrides (consumed by presets.py).
+_PRESET_ENV_FIELDS = frozenset({
+    "context_threshold",
+    "fresh_tail_count",
+    "leaf_chunk_tokens",
+    "condensation_fanin",
+    "incremental_max_depth",
+})
+
+
 @dataclass
 class LCMConfig:
     """All tunables for the LCM engine."""
@@ -395,10 +485,6 @@ class LCMConfig:
     def from_env(cls) -> "LCMConfig":
         """Build config from environment variables (LCM_ prefix)."""
         c = cls()
-        _int = _parse_int_env
-        _float = _parse_float_env
-        def _str(key, default):
-            return os.environ.get(key, default)
         config_sources: dict[str, str] = {}
         config_source_warnings: list[str] = []
 
@@ -409,6 +495,8 @@ class LCMConfig:
 
         c.ignored_config_yaml_lcm_keys = _ignored_lcm_config_yaml_keys()
 
+        # Source-tracked fields (provenance recording and/or a computed default)
+        # stay explicit; the uniform loop below skips them.
         c.fresh_tail_count, source, warning = _parse_int_env_with_source(
             "LCM_FRESH_TAIL_COUNT", c.fresh_tail_count
         )
@@ -428,76 +516,6 @@ class LCMConfig:
             c.codex_gpt55_autoraise_enabled
         )
         _record("codex_gpt55_autoraise_enabled", source)
-        c.incremental_max_depth = _int("LCM_INCREMENTAL_MAX_DEPTH", c.incremental_max_depth)
-        c.condensation_fanin = _int("LCM_CONDENSATION_FANIN", c.condensation_fanin)
-        c.dynamic_leaf_chunk_enabled = _parse_bool_env(
-            "LCM_DYNAMIC_LEAF_CHUNK_ENABLED", c.dynamic_leaf_chunk_enabled
-        )
-        c.dynamic_leaf_chunk_max = _int("LCM_DYNAMIC_LEAF_CHUNK_MAX", c.dynamic_leaf_chunk_max)
-        c.cache_friendly_condensation_enabled = _parse_bool_env(
-            "LCM_CACHE_FRIENDLY_CONDENSATION_ENABLED",
-            c.cache_friendly_condensation_enabled,
-        )
-        c.cache_friendly_min_debt_groups = _int(
-            "LCM_CACHE_FRIENDLY_MIN_DEBT_GROUPS",
-            c.cache_friendly_min_debt_groups,
-        )
-        c.deferred_maintenance_enabled = _parse_bool_env(
-            "LCM_DEFERRED_MAINTENANCE_ENABLED",
-            c.deferred_maintenance_enabled,
-        )
-        c.deferred_maintenance_max_passes = _int(
-            "LCM_DEFERRED_MAINTENANCE_MAX_PASSES",
-            c.deferred_maintenance_max_passes,
-        )
-        c.critical_budget_pressure_ratio = _float(
-            "LCM_CRITICAL_BUDGET_PRESSURE_RATIO",
-            c.critical_budget_pressure_ratio,
-        )
-        c.l2_budget_ratio = _float("LCM_L2_BUDGET_RATIO", c.l2_budget_ratio)
-        c.l3_truncate_tokens = _int("LCM_L3_TRUNCATE_TOKENS", c.l3_truncate_tokens)
-        c.max_assembly_tokens = _int("LCM_MAX_ASSEMBLY_TOKENS", c.max_assembly_tokens)
-        c.reserve_tokens_floor = _int("LCM_RESERVE_TOKENS_FLOOR", c.reserve_tokens_floor)
-        c.custom_instructions = _str("LCM_CUSTOM_INSTRUCTIONS", c.custom_instructions)
-        c.extraction_enabled = _parse_bool_env("LCM_EXTRACTION_ENABLED", c.extraction_enabled)
-        c.extraction_model = _str("LCM_EXTRACTION_MODEL", c.extraction_model)
-        c.extraction_output_path = _str("LCM_EXTRACTION_OUTPUT_PATH", c.extraction_output_path)
-        c.sensitive_patterns_enabled = _parse_bool_env(
-            "LCM_SENSITIVE_PATTERNS_ENABLED",
-            c.sensitive_patterns_enabled,
-        )
-        raw_sensitive_patterns = os.environ.get("LCM_SENSITIVE_PATTERNS")
-        if raw_sensitive_patterns is not None:
-            c.sensitive_patterns = _parse_pattern_list(raw_sensitive_patterns)
-            c.sensitive_patterns_source = "env"
-        c.large_output_externalization_enabled = _parse_bool_env(
-            "LCM_LARGE_OUTPUT_EXTERNALIZATION_ENABLED",
-            c.large_output_externalization_enabled,
-        )
-        c.large_output_externalization_threshold_chars = _int(
-            "LCM_LARGE_OUTPUT_EXTERNALIZATION_THRESHOLD_CHARS",
-            c.large_output_externalization_threshold_chars,
-        )
-        c.large_output_externalization_path = _str(
-            "LCM_LARGE_OUTPUT_EXTERNALIZATION_PATH",
-            c.large_output_externalization_path,
-        )
-        c.large_output_transcript_gc_enabled = _parse_bool_env(
-            "LCM_LARGE_OUTPUT_TRANSCRIPT_GC_ENABLED",
-            c.large_output_transcript_gc_enabled,
-        )
-        c.summary_model = _str("LCM_SUMMARY_MODEL", c.summary_model)
-        raw_summary_fallback_models = os.environ.get("LCM_SUMMARY_FALLBACK_MODELS")
-        if raw_summary_fallback_models is not None:
-            c.summary_fallback_models = _parse_pattern_list(raw_summary_fallback_models)
-        c.summary_circuit_breaker_failure_threshold = _int(
-            "LCM_SUMMARY_CIRCUIT_BREAKER_FAILURE_THRESHOLD",
-            c.summary_circuit_breaker_failure_threshold,
-        )
-        c.summary_circuit_breaker_cooldown_seconds = _int(
-            "LCM_SUMMARY_CIRCUIT_BREAKER_COOLDOWN_SECONDS",
-            c.summary_circuit_breaker_cooldown_seconds,
-        )
         c.summary_spend_max_calls, source, warning = _parse_int_env_with_source(
             "LCM_SUMMARY_SPEND_MAX_CALLS",
             c.summary_spend_max_calls,
@@ -513,8 +531,6 @@ class LCMConfig:
             c.summary_spend_backoff_seconds,
         )
         _record("summary_spend_backoff_seconds", source, warning)
-        c.expansion_model = _str("LCM_EXPANSION_MODEL", c.expansion_model)
-        c.expansion_context_tokens = _int("LCM_EXPANSION_CONTEXT_TOKENS", c.expansion_context_tokens)
         summary_timeout_default, summary_timeout_source = _hermes_auxiliary_compression_timeout_ms_with_source(
             c.summary_timeout_ms
         )
@@ -524,22 +540,23 @@ class LCMConfig:
             default_source=summary_timeout_source,
         )
         _record("summary_timeout_ms", source, warning)
-        c.expansion_timeout_ms = _int("LCM_EXPANSION_TIMEOUT_MS", c.expansion_timeout_ms)
-        c.database_path = _str("LCM_DATABASE_PATH", c.database_path)
-        c.new_session_retain_depth = _int("LCM_NEW_SESSION_RETAIN_DEPTH", c.new_session_retain_depth)
-        c.doctor_clean_apply_enabled = _parse_bool_env(
-            "LCM_DOCTOR_CLEAN_APPLY_ENABLED",
-            c.doctor_clean_apply_enabled,
-        )
 
-        c.empty_lifecycle_gc_enabled = _parse_bool_env(
-            "LCM_EMPTY_LIFECYCLE_GC_ENABLED",
-            c.empty_lifecycle_gc_enabled,
-        )
-        c.empty_lifecycle_gc_threshold = _int(
-            "LCM_EMPTY_LIFECYCLE_GC_THRESHOLD",
-            c.empty_lifecycle_gc_threshold,
-        )
+        # Every other scalar LCM_* override is applied uniformly from the spec.
+        for spec in ENV_FIELD_SPECS:
+            if spec.name in _SOURCE_TRACKED_ENV_FIELDS:
+                continue
+            parser = _PARSER_BY_TYPE[spec.py_type]
+            setattr(c, spec.name, parser(spec.env_key, getattr(c, spec.name)))
+
+        # Pattern-list overrides carry a source sidecar and stay explicit.
+        raw_sensitive_patterns = os.environ.get("LCM_SENSITIVE_PATTERNS")
+        if raw_sensitive_patterns is not None:
+            c.sensitive_patterns = _parse_pattern_list(raw_sensitive_patterns)
+            c.sensitive_patterns_source = "env"
+        raw_summary_fallback_models = os.environ.get("LCM_SUMMARY_FALLBACK_MODELS")
+        if raw_summary_fallback_models is not None:
+            c.summary_fallback_models = _parse_pattern_list(raw_summary_fallback_models)
+
         raw_max_age = os.environ.get("LCM_EMPTY_LIFECYCLE_GC_MAX_AGE_HOURS")
         if raw_max_age is not None:
             try:

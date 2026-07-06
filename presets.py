@@ -6,6 +6,8 @@ from dataclasses import dataclass, field as dataclass_field
 import os
 from typing import Any, Mapping
 
+from .config import ENV_FIELD_SPECS
+
 
 @dataclass(frozen=True)
 class LCMPreset:
@@ -31,21 +33,19 @@ class LCMPreset:
         return f"{self.name}@{self.policy_version}"
 
 
-_FIELD_ENV = {
-    "context_threshold": "LCM_CONTEXT_THRESHOLD",
-    "fresh_tail_count": "LCM_FRESH_TAIL_COUNT",
-    "leaf_chunk_tokens": "LCM_LEAF_CHUNK_TOKENS",
-    "condensation_fanin": "LCM_CONDENSATION_FANIN",
-    "incremental_max_depth": "LCM_INCREMENTAL_MAX_DEPTH",
-}
-
-_FIELD_PARSERS = {
-    "context_threshold": float,
-    "fresh_tail_count": int,
-    "leaf_chunk_tokens": int,
-    "condensation_fanin": int,
-    "incremental_max_depth": int,
-}
+# Fields a runtime preset may override. Their env var and parse type come from
+# the shared config field spec (config.ENV_FIELD_SPECS) so the mapping is not
+# duplicated between config parsing and preset dry-run.
+_PRESET_FIELDS = (
+    "context_threshold",
+    "fresh_tail_count",
+    "leaf_chunk_tokens",
+    "condensation_fanin",
+    "incremental_max_depth",
+)
+_ENV_SPEC_BY_FIELD = {spec.name: spec for spec in ENV_FIELD_SPECS}
+_FIELD_ENV = {name: _ENV_SPEC_BY_FIELD[name].env_key for name in _PRESET_FIELDS}
+_FIELD_PARSERS = {name: _ENV_SPEC_BY_FIELD[name].py_type for name in _PRESET_FIELDS}
 
 _CODEX_GPT_LONG_CONTEXT = LCMPreset(
     name="codex_gpt_long_context",
