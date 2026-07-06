@@ -17,11 +17,66 @@ from __future__ import annotations
 import inspect
 import logging
 import sqlite3
+import threading
 import weakref
 from pathlib import Path
 from typing import Any, Dict
 
 logger = logging.getLogger(__name__)
+
+
+# --- Explicit subagent lineage (WS5.7) --------------------------------------
+#
+# Hosts that expose the plugin hook bus fire ``subagent_start`` / ``subagent_stop``
+# with the explicit ``child_session_id`` / ``parent_session_id`` linkage when a
+# delegate/subagent is spawned (see ``__init__.py`` registration). We record that
+# linkage here, keyed by child session id, so auxiliary-session detection can use
+# the host's own explicit signal instead of walking the call stack and reading
+# private agent attributes. The ``inspect.currentframe()`` frame walk below stays
+# as a legacy fallback for hosts that do not fire these hooks.
+_SUBAGENT_LINEAGE_LOCK = threading.RLock()
+_SUBAGENT_LINEAGE_BY_SESSION_ID: "dict[str, dict[str, str]]" = {}
+_SUBAGENT_LINEAGE_MAX = 4096
+
+
+def record_subagent_start(payload: Dict[str, Any]) -> None:
+    """Record an explicit child→parent subagent linkage from a ``subagent_start`` hook."""
+    child_session_id = str((payload or {}).get("child_session_id") or "")
+    if not child_session_id:
+        return
+    record = {
+        "parent_session_id": str(payload.get("parent_session_id") or ""),
+        "child_subagent_id": str(payload.get("child_subagent_id") or ""),
+        "parent_subagent_id": str(payload.get("parent_subagent_id") or ""),
+        "role": str(payload.get("child_role") or ""),
+    }
+    with _SUBAGENT_LINEAGE_LOCK:
+        _SUBAGENT_LINEAGE_BY_SESSION_ID[child_session_id] = record
+        # Bound memory: the child's on_session_start consumes the record long
+        # before subagent_stop, so evicting the oldest entries is safe.
+        overflow = len(_SUBAGENT_LINEAGE_BY_SESSION_ID) - _SUBAGENT_LINEAGE_MAX
+        if overflow > 0:
+            for stale in list(_SUBAGENT_LINEAGE_BY_SESSION_ID)[:overflow]:
+                _SUBAGENT_LINEAGE_BY_SESSION_ID.pop(stale, None)
+
+
+def record_subagent_stop(payload: Dict[str, Any]) -> None:
+    """Drop an explicit subagent linkage when its ``subagent_stop`` hook fires."""
+    child_session_id = str((payload or {}).get("child_session_id") or "")
+    if not child_session_id:
+        return
+    with _SUBAGENT_LINEAGE_LOCK:
+        _SUBAGENT_LINEAGE_BY_SESSION_ID.pop(child_session_id, None)
+
+
+def explicit_subagent_lineage(session_id: str) -> Dict[str, str]:
+    """Return the recorded explicit subagent linkage for a session id, or ``{}``."""
+    key = str(session_id or "")
+    if not key:
+        return {}
+    with _SUBAGENT_LINEAGE_LOCK:
+        record = _SUBAGENT_LINEAGE_BY_SESSION_ID.get(key)
+        return dict(record) if record else {}
 
 
 class AuxiliarySessionMixin:
@@ -536,6 +591,12 @@ class AuxiliarySessionMixin:
         if include_explicit and explicit:
             return explicit
         target_session_id = str(session_id or kwargs.get("session_id") or "")
+        if include_explicit and target_session_id:
+            explicit_parent = str(
+                explicit_subagent_lineage(target_session_id).get("parent_session_id") or ""
+            )
+            if explicit_parent:
+                return explicit_parent
         frame = inspect.currentframe()
         try:
             frame = frame.f_back if frame is not None else None
