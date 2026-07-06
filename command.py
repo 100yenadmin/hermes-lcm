@@ -221,37 +221,8 @@ def _status_text(engine) -> str:
 
 
 def _scan_clean_candidates(engine) -> dict[str, Any]:
-    conn = engine._store.connection
     try:
-        rows = conn.execute(
-            """
-            WITH session_ids AS (
-                SELECT session_id FROM messages
-                UNION
-                SELECT session_id FROM summary_nodes
-            ),
-            message_stats AS (
-                SELECT session_id,
-                       COUNT(*) AS message_count,
-                       COALESCE(SUM(token_estimate), 0) AS token_total
-                FROM messages
-                GROUP BY session_id
-            ),
-            node_stats AS (
-                SELECT session_id, COUNT(*) AS node_count
-                FROM summary_nodes
-                GROUP BY session_id
-            )
-            SELECT s.session_id,
-                   COALESCE(m.message_count, 0) AS message_count,
-                   COALESCE(m.token_total, 0) AS token_total,
-                   COALESCE(n.node_count, 0) AS node_count
-            FROM session_ids s
-            LEFT JOIN message_stats m ON m.session_id = s.session_id
-            LEFT JOIN node_stats n ON n.session_id = s.session_id
-            ORDER BY s.session_id
-            """
-        ).fetchall()
+        rows = engine._store.scan_session_cleanup_stats()
     except Exception as exc:  # pragma: no cover - defensive
         return {
             "error": str(exc),
@@ -306,7 +277,6 @@ def _scan_clean_candidates(engine) -> dict[str, Any]:
 
 
 def _scan_retention_candidates(engine) -> dict[str, Any]:
-    conn = engine._store.connection
     now = datetime.now().timestamp()
     # SQL is scoped to the foreground session so /lcm doctor retention
     # reports the operator's real conversation rather than whatever side
@@ -327,48 +297,7 @@ def _scan_retention_candidates(engine) -> dict[str, Any]:
             "protected_count": 0,
         }
     try:
-        rows = conn.execute(
-            """
-            WITH session_ids AS (
-                SELECT session_id FROM messages
-                UNION
-                SELECT session_id FROM summary_nodes
-            ),
-            message_stats AS (
-                SELECT session_id,
-                       COUNT(*) AS message_count,
-                       COALESCE(SUM(token_estimate), 0) AS token_total,
-                       MIN(timestamp) AS first_message_at,
-                       MAX(timestamp) AS last_message_at
-                FROM messages
-                GROUP BY session_id
-            ),
-            node_stats AS (
-                SELECT session_id,
-                       COUNT(*) AS node_count,
-                       COALESCE(SUM(token_count), 0) AS node_token_total,
-                       MIN(COALESCE(earliest_at, created_at)) AS first_node_at,
-                       MAX(COALESCE(latest_at, created_at)) AS last_node_at
-                FROM summary_nodes
-                GROUP BY session_id
-            )
-            SELECT s.session_id,
-                   COALESCE(m.message_count, 0) AS message_count,
-                   COALESCE(m.token_total, 0) AS token_total,
-                   COALESCE(n.node_count, 0) AS node_count,
-                   COALESCE(n.node_token_total, 0) AS node_token_total,
-                   m.first_message_at,
-                   m.last_message_at,
-                   n.first_node_at,
-                   n.last_node_at
-            FROM session_ids s
-            LEFT JOIN message_stats m ON m.session_id = s.session_id
-            LEFT JOIN node_stats n ON n.session_id = s.session_id
-            WHERE s.session_id = ?
-            ORDER BY s.session_id
-            """,
-            (session_id,),
-        ).fetchall()
+        rows = engine._store.scan_session_retention_stats(session_id)
     except Exception as exc:  # pragma: no cover - defensive
         return {
             "error": str(exc),
