@@ -29,7 +29,6 @@ from .diagnostics import _enforce_state_db_containment
 from .escalation import (
     SummaryCircuitBreaker,
     SummarySpendGuard,
-    _strip_reasoning_blocks,
     summarize_with_escalation,
 )
 from .externalize import (
@@ -81,6 +80,11 @@ from .schemas import (
     LCM_INSPECT,
     LCM_LOAD_SESSION,
     LCM_STATUS,
+)
+from .sanitize import (
+    _clean_active_assistant_message,
+    _contains_sensitive_redaction,
+    _should_drop_active_assistant_message,
 )
 from .session_patterns import (
     build_session_match_keys,
@@ -250,17 +254,6 @@ def _is_codex_gpt55_route(model: str | None, provider: str | None) -> bool:
 _AUTO_FOCUS_MAX_TURNS = 3
 _AUTO_FOCUS_TURN_MAX_CHARS = 260
 _AUTO_FOCUS_MAX_CHARS = 700
-_VISIBLE_TEXT_PART_TYPES = {"text", "input_text", "output_text"}
-_INTERNAL_ASSISTANT_PART_TYPES = {
-    "analysis",
-    "chain_of_thought",
-    "internal",
-    "reasoning",
-    "redacted_thinking",
-    "scratchpad",
-    "thought",
-    "thinking",
-}
 
 
 def _strip_metadata_scalar(value: str) -> str:
@@ -1047,18 +1040,27 @@ class LCMEngine(ContextEngine):
                                 auxiliary_session_id
                             )
                         self._auxiliary_last_prompt_tokens.pop(auxiliary_session_id, None)
+                        if self._host_fallback_session_id == auxiliary_session_id:
+                            self._end_host_fallback_compressor_for_session(
+                                auxiliary_session_id,
+                                [],
+                                current_session_bypasses=True,
+                            )
                         self._auxiliary_session_generations[
                             auxiliary_session_id
                         ] = caller_generation
-                        self._auxiliary_handoff_parent_session_ids.pop(
-                            auxiliary_session_id,
-                            None,
-                        )
                         active_generation = caller_generation
+                    stack = self._thread_context_auxiliary_stack()
+                    stack_marks_current_session = bool(
+                        active_generation is not None
+                        and caller_generation == 0
+                        and stack
+                        and stack[-1] == auxiliary_session_id
+                    )
                     generation_matches = (
                         caller_generation == 0
                         if active_generation is None
-                        else caller_generation == active_generation
+                        else caller_generation == active_generation or stack_marks_current_session
                     )
                     if generation_matches:
                         self._auxiliary_last_prompt_tokens[auxiliary_session_id] = prompt_tokens
@@ -1861,28 +1863,14 @@ class LCMEngine(ContextEngine):
                     return True
                 if "[LCM sensitive redaction:" in replay_text:
                     return True
-            if original_msg.get("content") != replay_msg.get("content") and self._contains_sensitive_redaction(
+            if original_msg.get("content") != replay_msg.get("content") and _contains_sensitive_redaction(
                 replay_msg.get("content")
             ):
                 return True
-            if original_msg.get("tool_calls") != replay_msg.get("tool_calls") and self._contains_sensitive_redaction(
+            if original_msg.get("tool_calls") != replay_msg.get("tool_calls") and _contains_sensitive_redaction(
                 replay_msg.get("tool_calls")
             ):
                 return True
-        return False
-
-    @staticmethod
-    def _contains_sensitive_redaction(value: Any) -> bool:
-        if isinstance(value, str):
-            return "[LCM sensitive redaction:" in value
-        if isinstance(value, dict):
-            return any(
-                LCMEngine._contains_sensitive_redaction(item)
-                for pair in value.items()
-                for item in pair
-            )
-        if isinstance(value, list):
-            return any(LCMEngine._contains_sensitive_redaction(item) for item in value)
         return False
 
     def _has_ignored_backlog_outside_fresh_tail(self, messages: List[Dict[str, Any]]) -> bool:
@@ -2112,7 +2100,7 @@ class LCMEngine(ContextEngine):
 
         if self._bypasses_lcm_context_management():
             bypass_current_tokens = current_tokens
-            if bypass_current_tokens is None:
+            if bypass_current_tokens is None or bypass_current_tokens <= 0:
                 auxiliary_session_id = self._thread_context_session_id()
                 if auxiliary_session_id:
                     auxiliary_prompt_tokens = self._current_auxiliary_prompt_tokens(
@@ -2811,6 +2799,12 @@ class LCMEngine(ContextEngine):
                 if previous_generation != generation:
                     if previous_generation is not None:
                         self._retire_auxiliary_generation(session_id, previous_generation)
+                    if self._host_fallback_session_id == session_id:
+                        self._end_host_fallback_compressor_for_session(
+                            session_id,
+                            [],
+                            current_session_bypasses=True,
+                        )
                     if (
                         had_active_session
                         or had_cached_usage
@@ -2821,6 +2815,8 @@ class LCMEngine(ContextEngine):
                 self._auxiliary_session_generations[session_id] = generation
                 self._auxiliary_handoff_parent_session_ids.pop(session_id, None)
             else:
+                if previous_generation is not None and had_active_session:
+                    return True
                 if previous_generation is not None:
                     self._retire_auxiliary_generation(session_id, previous_generation)
                 self._auxiliary_last_prompt_tokens.pop(session_id, None)
@@ -2875,7 +2871,7 @@ class LCMEngine(ContextEngine):
                 has_cached_usage = session_id in self._auxiliary_last_prompt_tokens
                 if generation != 0 or (
                     session_id in self._auxiliary_direct_end_guard_session_ids
-                    and not (expected_parent and has_cached_usage)
+                    and not has_cached_usage
                 ):
                     return False
             self._auxiliary_session_ids.discard(session_id)
@@ -2919,9 +2915,15 @@ class LCMEngine(ContextEngine):
         preserve_old_foreground_marker: bool = False,
     ) -> None:
         generation = self._in_process_auxiliary_caller_generation(new_session_id)
+        if generation and self._auxiliary_generation_is_retired(new_session_id, generation):
+            with self._auxiliary_session_lock:
+                if new_session_id:
+                    self._auxiliary_lineage_session_ids.add(new_session_id)
+            return
         stack = self._thread_context_auxiliary_stack()
         handoff_from_active_thread_marker = old_session_id in stack
         with self._auxiliary_session_lock:
+            old_session_was_active = old_session_id in self._auxiliary_session_ids
             if old_session_id:
                 if not preserve_old_session:
                     self._auxiliary_last_prompt_tokens.pop(old_session_id, None)
@@ -2947,16 +2949,48 @@ class LCMEngine(ContextEngine):
                     or new_session_id in self._auxiliary_lineage_session_ids
                 )
                 had_direct_end_guard = new_session_id in self._auxiliary_direct_end_guard_session_ids
+                expected_new_parent = self._auxiliary_handoff_parent_session_ids.get(new_session_id)
+                stale_generationless_parent_handoff = bool(
+                    previous_new_generation is not None
+                    and not generation
+                    and old_session_id
+                    and not old_session_was_active
+                    and self._auxiliary_retired_session_generations.get(old_session_id)
+                    and old_session_id != expected_new_parent
+                )
+                if stale_generationless_parent_handoff:
+                    self._auxiliary_lineage_session_ids.add(new_session_id)
+                    return
                 new_generation_replaces_old = (
                     previous_new_generation is not None
                     and (
                         (bool(generation) and previous_new_generation != generation)
-                        or (not generation and had_direct_end_guard)
+                        or (
+                            not generation
+                            and had_direct_end_guard
+                            and (
+                                new_session_id not in self._auxiliary_last_prompt_tokens
+                                or not expected_new_parent
+                                or old_session_id == expected_new_parent
+                            )
+                        )
                     )
                 )
                 if had_new_session_state and new_generation_replaces_old:
                     self._retire_auxiliary_generation(new_session_id, previous_new_generation)
                 boundary_from_live_new_generation = bool(generation) and previous_new_generation == generation
+                if (
+                    previous_new_generation is not None
+                    and not generation
+                    and had_direct_end_guard
+                    and new_session_id in self._auxiliary_last_prompt_tokens
+                    and expected_new_parent
+                    and old_session_id
+                    and not old_session_was_active
+                    and old_session_id != expected_new_parent
+                ):
+                    self._auxiliary_lineage_session_ids.add(new_session_id)
+                    return
                 preserve_new_foreground_marker = (
                     new_session_id in self._auxiliary_foreground_reused_session_ids
                     and not boundary_from_live_new_generation
@@ -2991,10 +3025,46 @@ class LCMEngine(ContextEngine):
                     self._auxiliary_session_ids.add(new_session_id)
                     self._auxiliary_foreground_reused_session_ids.discard(new_session_id)
                     if generation:
+                        if previous_new_generation != generation and self._host_fallback_session_id == new_session_id:
+                            self._end_host_fallback_compressor_for_session(
+                                new_session_id,
+                                [],
+                                current_session_bypasses=True,
+                            )
                         self._auxiliary_session_generations[new_session_id] = generation
                         self._auxiliary_handoff_parent_session_ids.pop(new_session_id, None)
                     elif previous_new_generation is None or new_generation_replaces_old:
                         self._auxiliary_session_generations.pop(new_session_id, None)
+                elif generation:
+                    if previous_new_generation != generation:
+                        if previous_new_generation is not None:
+                            self._retire_auxiliary_generation(new_session_id, previous_new_generation)
+                        self._auxiliary_last_prompt_tokens.pop(new_session_id, None)
+                        self._auxiliary_direct_end_guard_session_ids.discard(new_session_id)
+                        if self._host_fallback_session_id == new_session_id:
+                            self._end_host_fallback_compressor_for_session(
+                                new_session_id,
+                                [],
+                                current_session_bypasses=True,
+                            )
+                    self._auxiliary_session_ids.add(new_session_id)
+                    self._auxiliary_session_generations[new_session_id] = generation
+                    self._auxiliary_handoff_parent_session_ids.pop(new_session_id, None)
+                else:
+                    if previous_new_generation is not None:
+                        self._retire_auxiliary_generation(new_session_id, previous_new_generation)
+                    self._auxiliary_last_prompt_tokens.pop(new_session_id, None)
+                    self._auxiliary_direct_end_guard_session_ids.discard(new_session_id)
+                    if self._host_fallback_session_id == new_session_id:
+                        self._end_host_fallback_compressor_for_session(
+                            new_session_id,
+                            [],
+                            current_session_bypasses=True,
+                        )
+                    self._auxiliary_session_ids.add(new_session_id)
+                    self._auxiliary_session_generations.pop(new_session_id, None)
+                    if old_session_id:
+                        self._auxiliary_handoff_parent_session_ids[new_session_id] = old_session_id
                 self._auxiliary_lineage_session_ids.add(new_session_id)
         stack = self._thread_context_auxiliary_stack()
         had_thread_marker = old_session_id in stack or new_session_id in stack
@@ -3287,14 +3357,21 @@ class LCMEngine(ContextEngine):
         active_auxiliary_ids = self._active_auxiliary_session_ids()
         known_auxiliary_ids = self._known_auxiliary_lineage_session_ids()
         known_auxiliary_parent_ids = self._known_auxiliary_parent_lineage_session_ids()
+        bypassed_auxiliary_ids = {
+            str(auxiliary_id or "")
+            for auxiliary_id in known_auxiliary_ids
+            if self._lcm_session_last_bypassed.get(str(auxiliary_id or ""))
+        }
         if child_parent_id in active_auxiliary_ids:
             return True
         if child_parent_id in known_auxiliary_parent_ids and child_parent_id != self._session_id:
             return True
+        if child_parent_id in bypassed_auxiliary_ids:
+            return True
         if child_parent_id != parent_session_id:
             return self._session_has_auxiliary_ancestor(
                 str(child_parent_id or ""),
-                known_auxiliary_parent_ids | active_auxiliary_ids,
+                known_auxiliary_parent_ids | active_auxiliary_ids | bypassed_auxiliary_ids,
                 path,
             )
         return False
@@ -3942,8 +4019,69 @@ class LCMEngine(ContextEngine):
         previous_session_id = self._session_id
         self._lcm_current_start_allows_bypass_lineage = False
         requested_platform = str(kwargs.get("platform") or self._session_platform or "")
+        pre_reset_preserve_ambiguous_no_frame_old_session = False
+        if boundary_reason == "compression" and old_session_id and old_session_id != session_id:
+            old_session_auxiliary_generation = self._in_process_auxiliary_caller_generation(
+                old_session_id
+            )
+            new_session_auxiliary_parent = self._in_process_parent_session_id(
+                {},
+                session_id=session_id,
+                include_explicit=False,
+            )
+            new_session_auxiliary_generation = self._in_process_auxiliary_caller_generation(session_id)
+            with self._auxiliary_session_lock:
+                active_old_auxiliary_generation = self._auxiliary_session_generations.get(
+                    old_session_id
+                )
+                old_session_auxiliary_generation_is_stale = bool(
+                    (
+                        old_session_auxiliary_generation
+                        and self._auxiliary_generation_is_retired(
+                            old_session_id,
+                            old_session_auxiliary_generation,
+                        )
+                    )
+                    or (
+                        new_session_auxiliary_generation
+                        and self._auxiliary_generation_is_retired(
+                            session_id,
+                            new_session_auxiliary_generation,
+                        )
+                    )
+                    or (
+                        active_old_auxiliary_generation is not None
+                        and (
+                            (
+                                old_session_auxiliary_generation
+                                and active_old_auxiliary_generation != old_session_auxiliary_generation
+                            )
+                        )
+                    )
+                )
+                old_session_has_retired_generation = bool(
+                    self._auxiliary_retired_session_generations.get(old_session_id)
+                )
+            if old_session_auxiliary_generation_is_stale:
+                logger.info(
+                    "LCM ignored stale auxiliary compression boundary from %s to %s",
+                    old_session_id,
+                    session_id,
+                )
+                return
+            pre_reset_preserve_ambiguous_no_frame_old_session = bool(
+                active_old_auxiliary_generation is not None
+                and not old_session_auxiliary_generation
+                and old_session_id != self._session_id
+                and old_session_has_retired_generation
+                and old_session_id not in self._auxiliary_direct_end_guard_session_ids
+                and new_session_auxiliary_parent != old_session_id
+            )
         if self._host_fallback_compressor is not None and (
             self._host_fallback_session_id != session_id or requested_platform != self._session_platform
+        ) and not (
+            pre_reset_preserve_ambiguous_no_frame_old_session
+            and self._host_fallback_session_id == old_session_id
         ):
             compressor = self._host_fallback_compressor
             fallback_session_id = self._host_fallback_session_id or previous_session_id
@@ -3973,9 +4111,63 @@ class LCMEngine(ContextEngine):
                 session_id=session_id,
                 include_explicit=False,
             )
+            new_session_auxiliary_generation = self._in_process_auxiliary_caller_generation(session_id)
+            with self._auxiliary_session_lock:
+                active_old_auxiliary_generation = self._auxiliary_session_generations.get(
+                    old_session_id
+                )
+                old_session_auxiliary_generation_is_stale = bool(
+                    (
+                        old_session_auxiliary_generation
+                        and self._auxiliary_generation_is_retired(
+                            old_session_id,
+                            old_session_auxiliary_generation,
+                        )
+                    )
+                    or (
+                        new_session_auxiliary_generation
+                        and self._auxiliary_generation_is_retired(
+                            session_id,
+                            new_session_auxiliary_generation,
+                        )
+                    )
+                    or (
+                        active_old_auxiliary_generation is not None
+                        and (
+                            (
+                                old_session_auxiliary_generation
+                                and active_old_auxiliary_generation != old_session_auxiliary_generation
+                            )
+                        )
+                    )
+                )
+                old_session_has_retired_generation = bool(
+                    self._auxiliary_retired_session_generations.get(old_session_id)
+                )
+            new_session_auxiliary_parent = self._in_process_parent_session_id(
+                {},
+                session_id=session_id,
+                include_explicit=False,
+            )
             new_session_is_auxiliary_continuation = new_session_auxiliary_parent == old_session_id
+            preserve_ambiguous_no_frame_old_session = bool(
+                active_old_auxiliary_generation is not None
+                and not old_session_auxiliary_generation
+                and old_session_id != self._session_id
+                and old_session_has_retired_generation
+                and old_session_id not in self._auxiliary_direct_end_guard_session_ids
+                and not new_session_is_auxiliary_continuation
+            )
+            if old_session_auxiliary_generation_is_stale:
+                logger.info(
+                    "LCM ignored stale auxiliary compression boundary from %s to %s",
+                    old_session_id,
+                    session_id,
+                )
+                return
             if (
                 self._has_auxiliary_lineage_session(old_session_id)
+                and not old_session_auxiliary_generation_is_stale
                 and (
                     old_session_id != self._session_id
                     or old_session_auxiliary_generation
@@ -3990,7 +4182,10 @@ class LCMEngine(ContextEngine):
                 self._handoff_auxiliary_session(
                     old_session_id,
                     session_id,
-                    preserve_old_session=old_session_id == self._session_id,
+                    preserve_old_session=(
+                        old_session_id == self._session_id
+                        or preserve_ambiguous_no_frame_old_session
+                    ),
                     preserve_old_foreground_marker=old_session_is_suppressed_foreground,
                 )
                 logger.info(
@@ -4036,12 +4231,16 @@ class LCMEngine(ContextEngine):
         if self._is_live_auxiliary_child_session(session_id, previous_session_id, kwargs):
             explicit_parent_id = str(kwargs.get("parent_session_id") or "")
             preserve_foreground_reuse_marker = bool(
-                explicit_parent_id
-                and self._lcm_session_last_bypassed.get(explicit_parent_id)
+                (
+                    explicit_parent_id
+                    and self._lcm_session_last_bypassed.get(explicit_parent_id)
+                )
+                or self._lcm_session_last_normal_conversation_id.get(session_id)
             )
             if preserve_foreground_reuse_marker:
                 if self._lcm_session_last_normal_conversation_id.get(session_id):
-                    self._auxiliary_foreground_reused_session_ids.add(session_id)
+                    with self._auxiliary_session_lock:
+                        self._auxiliary_foreground_reused_session_ids.add(session_id)
                 self._mark_thread_context_stateless(
                     session_id,
                     preserve_foreground_reuse_marker=True,
@@ -4443,14 +4642,20 @@ class LCMEngine(ContextEngine):
             )
         ):
             current_thread_session_id = self._thread_context_session_id()
-            if current_thread_session_id == session_id or active_auxiliary_end:
-                self._remember_lcm_bypass_message_prefix(session_id, messages)
             deactivated = self._deactivate_auxiliary_session(
                 session_id,
                 generation=ended_generation,
             )
-            if deactivated and current_thread_session_id == session_id:
-                self._clear_thread_context_stateless(session_id)
+            if deactivated:
+                if current_thread_session_id == session_id or active_auxiliary_end:
+                    self._remember_lcm_bypass_message_prefix(session_id, messages)
+                self._end_host_fallback_compressor_for_session(
+                    session_id,
+                    messages,
+                    current_session_bypasses=False,
+                )
+                if current_thread_session_id == session_id:
+                    self._clear_thread_context_stateless(session_id)
             return
         current_session_bypasses = session_id == self._session_id and self._bypasses_lcm_context_management()
         ended_session_directly_bypasses = self._ended_session_directly_bypasses_lcm(session_id)
@@ -6444,7 +6649,7 @@ class LCMEngine(ContextEngine):
         role, content, _tool_call_id, tool_calls = identity
         if role != "assistant" or tool_calls:
             return False
-        return cls._should_drop_active_assistant_message({
+        return _should_drop_active_assistant_message({
             "role": role,
             "content": cls._identity_content_for_active_cleanup(content),
         })
@@ -6467,7 +6672,7 @@ class LCMEngine(ContextEngine):
             except (TypeError, ValueError, json.JSONDecodeError):
                 decoded_tool_calls = tool_calls
             msg["tool_calls"] = decoded_tool_calls
-        cleaned = cls._clean_active_assistant_message(msg)
+        cleaned = _clean_active_assistant_message(msg)
         if cleaned is None:
             return None
         return (
@@ -7860,139 +8065,6 @@ class LCMEngine(ContextEngine):
 
     # -- Internal: tool-pair sanitization ------------------------------------
 
-    @staticmethod
-    def _structured_part_text(part: Dict[str, Any]) -> str:
-        for key in ("text", "content", "value"):
-            value = part.get(key)
-            if isinstance(value, str):
-                return value
-            if isinstance(value, dict):
-                nested = value.get("value")
-                if isinstance(nested, str):
-                    return nested
-                nested = value.get("content")
-                if isinstance(nested, str):
-                    return nested
-        return ""
-
-    @classmethod
-    def _structured_part_has_visible_assistant_content(cls, part: Any) -> bool:
-        if part is None:
-            return False
-        if isinstance(part, str):
-            return bool(_strip_reasoning_blocks(part).strip())
-        if not isinstance(part, dict):
-            return bool(str(part).strip())
-
-        part_type = str(part.get("type") or "").strip().lower()
-        if part_type in _INTERNAL_ASSISTANT_PART_TYPES:
-            return False
-        if part_type in _VISIBLE_TEXT_PART_TYPES:
-            return bool(_strip_reasoning_blocks(cls._structured_part_text(part)).strip())
-
-        # Unknown non-internal content blocks may be visible (for example
-        # images/audio/annotations in provider-specific formats).  Preserve
-        # them rather than risk dropping a legitimate assistant turn.
-        return True
-
-    @classmethod
-    def _assistant_message_has_visible_content(cls, msg: Dict[str, Any]) -> bool:
-        content = msg.get("content")
-        if content is None:
-            return False
-        if isinstance(content, str):
-            return bool(_strip_reasoning_blocks(content).strip())
-        if isinstance(content, list):
-            return any(cls._structured_part_has_visible_assistant_content(part) for part in content)
-        if isinstance(content, dict):
-            return cls._structured_part_has_visible_assistant_content(content)
-        return bool(str(content).strip())
-
-    @classmethod
-    def _strip_structured_text_part(cls, part: Dict[str, Any]) -> Dict[str, Any] | None:
-        cleaned = dict(part)
-        for key in ("text", "content", "value"):
-            value = cleaned.get(key)
-            if isinstance(value, str):
-                stripped = _strip_reasoning_blocks(value)
-                if not stripped.strip():
-                    return None
-                cleaned[key] = stripped
-                return cleaned
-            if isinstance(value, dict):
-                nested = dict(value)
-                for nested_key in ("value", "content", "text"):
-                    nested_value = nested.get(nested_key)
-                    if isinstance(nested_value, str):
-                        stripped = _strip_reasoning_blocks(nested_value)
-                        if not stripped.strip():
-                            return None
-                        nested[nested_key] = stripped
-                        cleaned[key] = nested
-                        return cleaned
-        return cleaned if cls._structured_part_has_visible_assistant_content(cleaned) else None
-
-    @classmethod
-    def _sanitize_active_assistant_content(cls, content: Any) -> Any | None:
-        if content is None:
-            return None
-        if isinstance(content, str):
-            stripped = _strip_reasoning_blocks(content)
-            return stripped if stripped.strip() else None
-        if isinstance(content, list):
-            cleaned_parts: list[Any] = []
-            for part in content:
-                if isinstance(part, str):
-                    stripped = _strip_reasoning_blocks(part)
-                    if stripped.strip():
-                        cleaned_parts.append(stripped)
-                    continue
-                if isinstance(part, dict):
-                    part_type = str(part.get("type") or "").strip().lower()
-                    if part_type in _INTERNAL_ASSISTANT_PART_TYPES:
-                        continue
-                    if part_type in _VISIBLE_TEXT_PART_TYPES:
-                        cleaned_part = cls._strip_structured_text_part(part)
-                        if cleaned_part is not None:
-                            cleaned_parts.append(cleaned_part)
-                        continue
-                if cls._structured_part_has_visible_assistant_content(part):
-                    cleaned_parts.append(part)
-            return cleaned_parts or None
-        if isinstance(content, dict):
-            part_type = str(content.get("type") or "").strip().lower()
-            if part_type in _INTERNAL_ASSISTANT_PART_TYPES:
-                return None
-            if part_type in _VISIBLE_TEXT_PART_TYPES:
-                return cls._strip_structured_text_part(content)
-            return content if cls._structured_part_has_visible_assistant_content(content) else None
-        return content if str(content).strip() else None
-
-    @classmethod
-    def _clean_active_assistant_message(cls, msg: Dict[str, Any]) -> Dict[str, Any] | None:
-        if msg.get("role") != "assistant":
-            return msg
-        if "content" not in msg:
-            return msg
-        cleaned_content = cls._sanitize_active_assistant_content(msg.get("content"))
-        if cleaned_content is None:
-            if not msg.get("tool_calls"):
-                return None
-            cleaned_content = ""
-        if cleaned_content == msg.get("content"):
-            return msg
-        cleaned = dict(msg)
-        cleaned["content"] = cleaned_content
-        return cleaned
-
-    @classmethod
-    def _should_drop_active_assistant_message(cls, msg: Dict[str, Any]) -> bool:
-        if msg.get("role") != "assistant":
-            return False
-        if msg.get("tool_calls"):
-            return False
-        return cls._clean_active_assistant_message(msg) is None
-
     def _sanitize_active_context_messages(
         self,
         messages: List[Dict[str, Any]],
@@ -8011,7 +8083,7 @@ class LCMEngine(ContextEngine):
         for msg in messages:
             msg = self._sanitize_active_preserved_objective_message(msg)
             if msg.get("role") == "assistant":
-                cleaned_msg = self._clean_active_assistant_message(msg)
+                cleaned_msg = _clean_active_assistant_message(msg)
                 if cleaned_msg is None:
                     dropped_assistant_messages += 1
                     continue
