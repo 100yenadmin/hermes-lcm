@@ -221,7 +221,7 @@ def _status_text(engine) -> str:
 
 
 def _scan_clean_candidates(engine) -> dict[str, Any]:
-    conn = engine._store._conn
+    conn = engine._store.connection
     try:
         rows = conn.execute(
             """
@@ -306,7 +306,7 @@ def _scan_clean_candidates(engine) -> dict[str, Any]:
 
 
 def _scan_retention_candidates(engine) -> dict[str, Any]:
-    conn = engine._store._conn
+    conn = engine._store.connection
     now = datetime.now().timestamp()
     # SQL is scoped to the foreground session so /lcm doctor retention
     # reports the operator's real conversation rather than whatever side
@@ -467,7 +467,7 @@ def _flush_engine_connections(engine) -> None:
     ``_rotate_backup_database`` (rolling backup) so the connection-flush
     contract stays in one place.
     """
-    engine._store._conn.commit()
+    engine._store.commit()
     engine._dag._conn.commit()
     lifecycle_conn = getattr(getattr(engine, "_lifecycle", None), "_conn", None)
     if lifecycle_conn is not None:
@@ -493,7 +493,7 @@ def _backup_database(engine) -> dict[str, Any]:
 
         dest = sqlite3.connect(str(backup_path))
         try:
-            engine._store._conn.backup(dest)
+            engine._store.backup(dest)
         finally:
             dest.close()
     except (OSError, sqlite3.Error) as exc:
@@ -539,7 +539,7 @@ def _rotate_backup_database(engine) -> dict[str, Any]:
             tmp_path.unlink()
         dest = sqlite3.connect(str(tmp_path))
         try:
-            engine._store._conn.backup(dest)
+            engine._store.backup(dest)
         finally:
             dest.close()
         # Atomic replace so the rolling slot is never half-written.
@@ -692,7 +692,7 @@ def _scan_fts_repair(engine) -> dict[str, Any]:
         "messages_fts": build_message_fts_spec(),
         "nodes_fts": build_nodes_fts_spec(),
     }
-    conn = engine._store._conn
+    conn = engine._store.connection
     for label, spec in specs.items():
         try:
             structural_needs_repair = external_content_fts_needs_repair(conn, spec)
@@ -763,7 +763,7 @@ def _doctor_repair_apply_text(engine) -> str:
             "note: repair apply aborted before any FTS tables were repaired",
         ])
 
-    conn = engine._store._conn
+    conn = engine._store.connection
     try:
         messages_result = repair_external_content_fts(conn, build_message_fts_spec())
         nodes_result = repair_external_content_fts(conn, build_nodes_fts_spec())
@@ -896,7 +896,7 @@ def _doctor_source_apply_text(engine) -> str:
 def _doctor_text(engine) -> str:
     db_path = Path(engine._store.db_path)
     runtime_identity = engine.get_runtime_identity()
-    store_conn = engine._store._conn
+    store_conn = engine._store.connection
     dag_conn = engine._dag._conn
 
     issues: list[str] = []
@@ -1421,7 +1421,7 @@ def _delete_clean_candidates_atomically(engine, session_ids: set[str]) -> dict[s
     apply is destructive, so do the coordinated deletes on one connection to
     avoid half-cleaned state if a later table delete fails.
     """
-    conn = engine._store._conn
+    conn = engine._store.connection
     # Protect the actively-bound session id, not current_session_id. While a
     # cron tick has rebound the engine, _session_id is the row the engine is
     # actively writing to via lifecycle hooks; deleting it during cleanup

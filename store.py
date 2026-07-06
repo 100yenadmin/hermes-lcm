@@ -1230,6 +1230,38 @@ class MessageStore:
             msg["name"] = stored["tool_name"]
         return msg
 
+    # -- Connection access --------------------------------------------------
+
+    @property
+    def connection(self) -> sqlite3.Connection | None:
+        """The live SQLite connection, or ``None`` once :meth:`close` has run.
+
+        Exposed for read-oriented diagnostics and inspection -- integrity /
+        quick checks, FTS sync counts, schema health -- that need ad-hoc
+        queries the store does not wrap in a purpose-built method. Callers must
+        treat it as read-only and tolerate ``None``; writes still go through the
+        store's own methods so the ``_write_lock`` contract stays in one place.
+        """
+        return self._conn
+
+    def commit(self) -> None:
+        """Commit pending writes on the store connection.
+
+        Used by the backup path's cross-connection flush so callers do not reach
+        the private connection. Requires a live connection: a closed store
+        raises, matching direct ``_conn.commit()`` use.
+        """
+        self._conn.commit()
+
+    def backup(self, dest: sqlite3.Connection) -> None:
+        """Copy the store's database into the already-open ``dest`` connection.
+
+        Thin wrapper over ``sqlite3.Connection.backup`` so callers snapshot the
+        store without reaching its private connection. Requires a live
+        connection, matching direct ``_conn.backup(dest)`` use.
+        """
+        self._conn.backup(dest)
+
     # -- Lifecycle ----------------------------------------------------------
 
     def close(self) -> None:
