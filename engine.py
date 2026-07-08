@@ -556,6 +556,22 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             )
         return raw_context_length, None, ""
 
+    def _effective_threshold_tokens(self, context_threshold_tokens: int) -> int:
+        """Return the host-visible preflight trigger token count.
+
+        Hermes core uses ``threshold_tokens`` as a cheap gate before it pays for
+        the full request estimate that includes system prompt and tool schemas.
+        LCM can enforce a stricter active-context assembly cap than the normal
+        context-threshold value, so expose the stricter cap here; otherwise a
+        tool/schema-heavy request can skip host preflight entirely.
+        """
+        assembly_cap = self._effective_assembly_token_cap()
+        if assembly_cap is not None and assembly_cap > 0:
+            if context_threshold_tokens > 0:
+                return min(context_threshold_tokens, assembly_cap)
+            return assembly_cap
+        return context_threshold_tokens
+
     def _set_context_length(
         self,
         context_length: Any,
@@ -600,8 +616,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._runtime_context_threshold(model=model, provider=provider)
         )
         self.threshold_percent = self.context_threshold
-        self.threshold_tokens = int(
+        context_threshold_tokens = int(
             effective_context_length * self.context_threshold
+        )
+        self.threshold_tokens = self._effective_threshold_tokens(
+            context_threshold_tokens
         )
         return True
 
@@ -4848,10 +4867,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         emitted inside the summary block so restart reconciliation ignores it
         instead of ingesting a duplicate non-contiguous user message.
 
-        If a previous compaction already emitted the preserved-objective
-        scaffold and no newer real user turn exists, carry that scaffold forward
-        as the next anchor source so repeated compaction does not summarize the
-        active objective away one compression later.
+        Previous preserved-objective scaffolds are derived context, not real
+        user turns, so they are not eligible as the next anchor source. Once a
+        reverse scan reaches one, older user turns are stale relative to that
+        synthetic continuity marker and must not be promoted as current intent.
         """
         selected_tail_messages = [msg for msg in selected_tail if isinstance(msg, dict)]
         for message in reversed(messages):
@@ -4868,14 +4887,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 or self._is_ignored_active_replay_placeholder(message, content_text)
             ):
                 continue
-            sanitized_preserved_objective = self._sanitized_preserved_objective_context_content(message)
-            if sanitized_preserved_objective:
-                if any(
-                    self._sanitized_preserved_objective_context_content(selected) == sanitized_preserved_objective
-                    for selected in selected_tail_messages
-                ):
-                    return None
-                return sanitized_preserved_objective
+            if self._preserved_objective_context_content(message):
+                return None
             if message.get("role") != "user":
                 continue
             if self._is_preserved_todo_context_message(message):
