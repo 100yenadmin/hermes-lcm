@@ -177,6 +177,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._foreground_session_id: str = ""
         self._foreground_session_platform: str = ""
         self._foreground_conversation_id: str = ""
+        self._foreground_rebind_session_id: str = ""
+        self._foreground_rebind_previous_session_id: str = ""
+        self._foreground_rebind_previous_platform: str = ""
+        self._foreground_rebind_previous_conversation_id: str = ""
         self._conversation_id: str = ""
         self._session_match_keys: list[str] = []
         self._session_ignored = False
@@ -434,6 +438,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._foreground_session_id = ""
         self._foreground_session_platform = ""
         self._foreground_conversation_id = ""
+        self._clear_foreground_rebind_candidate()
         self._conversation_id = ""
         self._session_match_keys = []
         self._session_ignored = False
@@ -944,6 +949,54 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         else:
             logger.warning(message, *args)
 
+    def _clear_foreground_rebind_candidate(self) -> None:
+        self._foreground_rebind_session_id = ""
+        self._foreground_rebind_previous_session_id = ""
+        self._foreground_rebind_previous_platform = ""
+        self._foreground_rebind_previous_conversation_id = ""
+
+    def _remember_foreground_rebind_candidate(self, session_id: str) -> None:
+        """Remember the foreground view displaced by a provisional normal bind.
+
+        Bind-time auxiliary detection can miss background-review children when
+        the host seeds its marker late. If that happens, ``on_session_start``
+        temporarily classifies the child as a normal foreground and overwrites
+        the operator-facing foreground pointer. The first-ingest recheck may
+        later prove the child is auxiliary; this snapshot lets that recovery
+        restore the parent foreground instead of falling back to the child.
+        """
+        session_id = str(session_id or "")
+        if not session_id:
+            self._clear_foreground_rebind_candidate()
+            return
+        if self._foreground_rebind_session_id == session_id:
+            return
+        if self._foreground_session_id and self._foreground_session_id != session_id:
+            self._foreground_rebind_session_id = session_id
+            self._foreground_rebind_previous_session_id = self._foreground_session_id
+            self._foreground_rebind_previous_platform = self._foreground_session_platform
+            self._foreground_rebind_previous_conversation_id = self._foreground_conversation_id
+            return
+        self._clear_foreground_rebind_candidate()
+
+    def _restore_foreground_after_late_auxiliary_reclassification(self, session_id: str) -> None:
+        if self._foreground_session_id != session_id:
+            if self._foreground_rebind_session_id == session_id:
+                self._clear_foreground_rebind_candidate()
+            return
+        if (
+            self._foreground_rebind_session_id == session_id
+            and self._foreground_rebind_previous_session_id
+        ):
+            self._foreground_session_id = self._foreground_rebind_previous_session_id
+            self._foreground_session_platform = self._foreground_rebind_previous_platform
+            self._foreground_conversation_id = self._foreground_rebind_previous_conversation_id
+        else:
+            self._foreground_session_id = ""
+            self._foreground_session_platform = ""
+            self._foreground_conversation_id = ""
+        self._clear_foreground_rebind_candidate()
+
     def _maybe_reclassify_current_session_as_auxiliary_at_ingest(self) -> bool:
         """Defense-in-depth for host markers that arrive after session binding.
 
@@ -972,10 +1025,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             return False
 
         self._mark_thread_context_stateless(session_id)
-        if self._foreground_session_id == session_id:
-            self._foreground_session_id = ""
-            self._foreground_session_platform = ""
-            self._foreground_conversation_id = ""
+        self._restore_foreground_after_late_auxiliary_reclassification(session_id)
         logger.info(
             "LCM reclassified session %s as auxiliary at first ingest after bind-time detection missed",
             session_id,
@@ -1123,6 +1173,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._last_compacted_store_id = state.current_frontier_store_id
         self._register_active_engine_binding()
         if not self._session_ignored and not self._session_stateless:
+            self._remember_foreground_rebind_candidate(session_id)
             self._lcm_session_last_normal_conversation_id[session_id] = state.conversation_id
             self._foreground_session_id = session_id
             self._foreground_session_platform = self._session_platform
@@ -1421,6 +1472,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # directly so cron's compress short-circuits correctly via the
         # _session_ignored / _session_stateless gates.
         if not self._session_ignored and not self._session_stateless:
+            self._remember_foreground_rebind_candidate(session_id)
             self._foreground_session_id = session_id
             self._foreground_session_platform = self._session_platform
         if "hermes_home" in kwargs:

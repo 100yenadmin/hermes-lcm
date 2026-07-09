@@ -1,3 +1,6 @@
+import json
+
+from hermes_lcm import tools as lcm_tools
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.engine import LCMEngine
 
@@ -57,6 +60,46 @@ def test_first_ingest_rechecks_background_review_marker_after_missed_bind_time(t
 
         assert engine._store.get_session_count("review-session") == 0
         assert engine._thread_context_has_auxiliary_session("review-session")
+    finally:
+        engine.shutdown()
+
+
+def test_late_first_ingest_auxiliary_reclassification_restores_foreground_view(tmp_path):
+    engine = _engine(tmp_path)
+    foreground = _ForegroundAgent(engine, "foreground-session")
+    review = _FakeAgent(engine, "review-session", parent_session_id="foreground-session")
+
+    try:
+        foreground.start_session()
+        foreground.ingest_history_as_foreground(
+            [{"role": "user", "content": "operator durable anchor"}]
+        )
+        assert engine.current_session_id == "foreground-session"
+        assert engine.current_conversation_id == "conversation:foreground-session"
+
+        # Host bug shape: bind-time detection sees the foreground defaults, so
+        # on_session_start briefly rebinds the child as a normal foreground.
+        review.start_session()
+        assert engine.current_session_id == "review-session"
+
+        review.ingest_history_after_background_marker(
+            [{"role": "user", "content": "background review replay must not persist"}]
+        )
+
+        assert engine._store.get_session_count("review-session") == 0
+        assert engine._thread_context_has_auxiliary_session("review-session")
+        assert engine.current_session_id == "foreground-session"
+        assert engine.current_conversation_id == "conversation:foreground-session"
+        assert engine.side_channel_active is True
+
+        status = json.loads(lcm_tools.lcm_status({}, engine=engine))
+        assert status["session_id"] == "foreground-session"
+        assert status["session_filters"]["side_channel_active"] is True
+        assert status["session_filters"]["side_channel_session_id"] == "review-session"
+
+        grep = json.loads(lcm_tools.lcm_grep({"query": "operator"}, engine=engine))
+        assert grep["session_scope"] == "current"
+        assert [hit["session_id"] for hit in grep["results"]] == ["foreground-session"]
     finally:
         engine.shutdown()
 
