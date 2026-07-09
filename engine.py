@@ -3866,6 +3866,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._compression_boundary_active_placeholder_digest_budget = {}
             self._compression_boundary_active_placeholder_digest_ordinals = {}
             self._compression_boundary_stored_placeholder_digest_counts = {}
+            self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
             if cached_replay is not None:
                 return cached_replay
             return self._remember_active_replay_messages(messages, replay_messages)
@@ -4096,6 +4097,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._compression_boundary_active_placeholder_digest_budget = {}
             self._compression_boundary_active_placeholder_digest_ordinals = {}
             self._compression_boundary_stored_placeholder_digest_counts = {}
+            self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
             return self._remember_active_replay_messages(messages, active_replay_messages)
 
         protected_messages = protect_messages_for_ingest(
@@ -4131,6 +4133,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._compression_boundary_active_placeholder_digest_ordinals = {}
         self._compression_boundary_stored_placeholder_digest_counts = {}
         logger.debug("Ingested %d messages into LCM store", len(messages_to_store_with_index))
+        self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
         # Most ``protected_messages`` changes are storage-only: inline media,
         # tool results, and data/base64 substrings must stay provider-usable in
         # active replay. Whole-message ``raw_payload`` externalization is the

@@ -39,6 +39,9 @@ class _FakeAgent:
     def ingest_history_as_foreground(self, history):
         self.engine.ingest(history)
 
+    def preflight_history_as_foreground(self, history):
+        return self.engine.should_compress_preflight(history)
+
 
 class _ForegroundAgent(_FakeAgent):
     pass
@@ -368,6 +371,43 @@ def test_tool_call_foreground_ingest_clears_late_auxiliary_restore_candidate(tmp
         review.start_session()
         review.ingest_history_after_background_marker(
             [{"role": "user", "content": "late background review replay"}]
+        )
+
+        assert engine._store.get_session_count("foreground-a") == 1
+        assert engine._store.get_session_count("foreground-b") == 1
+        assert engine._store.get_session_count("review-session") == 0
+        assert engine.current_session_id == "foreground-b"
+        assert engine.current_conversation_id == "conversation:foreground-b"
+        assert engine.bound_session_id == "review-session"
+    finally:
+        engine.shutdown()
+
+
+def test_preflight_foreground_ingest_clears_late_auxiliary_restore_candidate(tmp_path):
+    engine = _engine(tmp_path)
+    first_foreground = _ForegroundAgent(engine, "foreground-a")
+    second_foreground = _ForegroundAgent(
+        engine,
+        "foreground-b",
+        parent_session_id="foreground-a",
+    )
+    stale_review = _FakeAgent(engine, "review-session", parent_session_id="foreground-stale")
+
+    try:
+        first_foreground.start_session()
+        first_foreground.ingest_history_as_foreground(
+            [{"role": "user", "content": "first foreground turn"}]
+        )
+        _record_state_db_branch(tmp_path, "foreground-b", "foreground-a")
+
+        second_foreground.start_session()
+        second_foreground.preflight_history_as_foreground(
+            [{"role": "user", "content": "second foreground preflight turn"}]
+        )
+
+        stale_review.start_session()
+        stale_review.ingest_history_after_background_marker(
+            [{"role": "user", "content": "late stale-parent review replay"}]
         )
 
         assert engine._store.get_session_count("foreground-a") == 1
