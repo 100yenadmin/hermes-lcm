@@ -3726,6 +3726,133 @@ class TestEngineABC:
         assert "Current user objective preserved" in combined_context
         assert latest_request in combined_context
 
+    def test_compaction_preserves_single_initial_user_query_anchor(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "single-initial-user-anchor.db"
+        config = LCMConfig(
+            fresh_tail_count=4,
+            leaf_chunk_tokens=1,
+            database_path=str(db_path),
+        )
+        engine = LCMEngine(config=config)
+        engine.on_session_start(
+            "single-initial-user-anchor-session",
+            platform="cli",
+            conversation_id="single-initial-user-anchor-conversation",
+            context_length=200000,
+        )
+
+        def mock_summary(**kwargs):
+            return "Assistant/tool chain summary.\nExpand for details about: qwen anchor", 1
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", mock_summary)
+
+        user_query = "diagnose why the Qwen template rejects this request"
+        messages = [
+            {"role": "system", "content": "You are concise."},
+            {"role": "user", "content": user_query},
+            {
+                "role": "assistant",
+                "content": "checking logs",
+                "tool_calls": [{"id": "call_logs", "type": "function"}],
+            },
+            {"role": "tool", "tool_call_id": "call_logs", "content": "log output " + "x" * 200},
+            {
+                "role": "assistant",
+                "content": "checking template",
+                "tool_calls": [{"id": "call_template", "type": "function"}],
+            },
+            {"role": "tool", "tool_call_id": "call_template", "content": "template output"},
+            {"role": "assistant", "content": "still investigating"},
+            {"role": "assistant", "content": "final diagnostic"},
+        ]
+        try:
+            assert engine._leading_anchor_count(messages) == 2
+            active_context = engine.compress(messages)
+        finally:
+            engine.shutdown()
+
+        assert [msg.get("role") for msg in active_context[:2]] == ["system", "user"]
+        assert active_context[1].get("content") == user_query
+
+    def test_overflow_recovery_keeps_single_initial_user_anchor(self, tmp_path):
+        db_path = tmp_path / "single-initial-user-overflow-anchor.db"
+        config = LCMConfig(
+            fresh_tail_count=3,
+            leaf_chunk_tokens=10_000,
+            max_assembly_tokens=180,
+            database_path=str(db_path),
+        )
+        engine = LCMEngine(config=config)
+        engine.on_session_start(
+            "single-initial-user-overflow-anchor-session",
+            platform="cli",
+            conversation_id="single-initial-user-overflow-anchor-conversation",
+            context_length=200000,
+        )
+
+        user_query = "render this request with at least one user message"
+        messages = [
+            {"role": "system", "content": "You are concise."},
+            {"role": "user", "content": user_query},
+            {"role": "assistant", "content": "large derived output " + "x" * 4000},
+            {"role": "assistant", "content": "more derived output " + "y" * 4000},
+            {"role": "assistant", "content": "latest derived output " + "z" * 4000},
+        ]
+        try:
+            assert engine._leading_anchor_count(messages) == 2
+            assert engine.should_compress_preflight(messages)
+            active_context = engine.compress(messages)
+        finally:
+            engine.shutdown()
+
+        assert engine.last_compression_status == "overflow_recovery"
+        assert [msg.get("role") for msg in active_context[:2]] == ["system", "user"]
+        assert active_context[1].get("content") == user_query
+
+    def test_later_user_keeps_initial_user_compactable(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "later-user-keeps-initial-compactable.db"
+        config = LCMConfig(
+            fresh_tail_count=3,
+            leaf_chunk_tokens=1,
+            database_path=str(db_path),
+        )
+        engine = LCMEngine(config=config)
+        engine.on_session_start(
+            "later-user-keeps-initial-compactable-session",
+            platform="cli",
+            conversation_id="later-user-keeps-initial-compactable-conversation",
+            context_length=200000,
+        )
+
+        def mock_summary(**kwargs):
+            return "Earlier user request summary.\nExpand for details about: stale setup", 1
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", mock_summary)
+
+        stale_first_request = "set up the old webhook automation"
+        latest_request = "instead audit the active LCM context"
+        messages = [
+            {"role": "system", "content": "You are concise."},
+            {"role": "user", "content": stale_first_request},
+            {"role": "assistant", "content": "I will set up the webhook."},
+            {"role": "user", "content": latest_request},
+            {"role": "assistant", "content": "checking active context"},
+            {"role": "assistant", "content": "done"},
+        ]
+        try:
+            assert engine._leading_anchor_count(messages) == 1
+            active_context = engine.compress(messages)
+        finally:
+            engine.shutdown()
+
+        assert active_context[1].get("content") != stale_first_request
+        assert not any(
+            msg.get("role") == "user" and msg.get("content") == stale_first_request
+            for msg in active_context
+        )
+        combined_context = "\n".join(str(msg.get("content", "")) for msg in active_context)
+        assert latest_request in combined_context
+
     def test_preserved_objective_anchor_externalizes_inline_payloads(self, tmp_path):
         db_path = tmp_path / "preserved-objective-payload.db"
         data_uri = "data:image/png;base64," + ("QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo=" * 20)
@@ -19929,7 +20056,10 @@ class TestDeferredMaintenanceDebt:
         monkeypatch.setattr(
             engine,
             "_assemble_context",
-            lambda system_msg, tail_messages, assembly_cap_override=None, include_lcm_note=True: [system_msg, *tail_messages],
+            lambda system_msg, tail_messages, leading_anchor_messages=None, assembly_cap_override=None, include_lcm_note=True: [
+                *(leading_anchor_messages or ([system_msg] if system_msg is not None else [])),
+                *tail_messages,
+            ],
         )
 
         compressed = engine.compress(self._make_backlog_messages())
@@ -19956,7 +20086,10 @@ class TestDeferredMaintenanceDebt:
         monkeypatch.setattr(
             engine,
             "_assemble_context",
-            lambda system_msg, tail_messages, assembly_cap_override=None, include_lcm_note=True: [system_msg, *tail_messages],
+            lambda system_msg, tail_messages, leading_anchor_messages=None, assembly_cap_override=None, include_lcm_note=True: [
+                *(leading_anchor_messages or ([system_msg] if system_msg is not None else [])),
+                *tail_messages,
+            ],
         )
 
         first = engine.compress(self._make_backlog_messages())
@@ -19991,7 +20124,10 @@ class TestDeferredMaintenanceDebt:
         monkeypatch.setattr(
             engine,
             "_assemble_context",
-            lambda system_msg, tail_messages, assembly_cap_override=None, include_lcm_note=True: [system_msg, *tail_messages],
+            lambda system_msg, tail_messages, leading_anchor_messages=None, assembly_cap_override=None, include_lcm_note=True: [
+                *(leading_anchor_messages or ([system_msg] if system_msg is not None else [])),
+                *tail_messages,
+            ],
         )
 
         engine.compress(self._make_backlog_messages())
@@ -20023,7 +20159,10 @@ class TestDeferredMaintenanceDebt:
         monkeypatch.setattr(
             engine,
             "_assemble_context",
-            lambda system_msg, tail_messages, assembly_cap_override=None, include_lcm_note=True: [system_msg, *tail_messages],
+            lambda system_msg, tail_messages, leading_anchor_messages=None, assembly_cap_override=None, include_lcm_note=True: [
+                *(leading_anchor_messages or ([system_msg] if system_msg is not None else [])),
+                *tail_messages,
+            ],
         )
 
         compressed = engine.compress(messages, current_tokens=90)
@@ -20058,7 +20197,10 @@ class TestDeferredMaintenanceDebt:
         monkeypatch.setattr(
             engine,
             "_assemble_context",
-            lambda system_msg, tail_messages, assembly_cap_override=None, include_lcm_note=True: [system_msg, *tail_messages],
+            lambda system_msg, tail_messages, leading_anchor_messages=None, assembly_cap_override=None, include_lcm_note=True: [
+                *(leading_anchor_messages or ([system_msg] if system_msg is not None else [])),
+                *tail_messages,
+            ],
         )
 
         engine.compress(messages, current_tokens=90)

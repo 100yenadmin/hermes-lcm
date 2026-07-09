@@ -1486,18 +1486,59 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             return []
         return messages[leading_anchor_count:fresh_tail_start]
 
-    @staticmethod
-    def _leading_anchor_count(messages: List[Dict[str, Any]]) -> int:
+    def _leading_anchor_count(self, messages: List[Dict[str, Any]]) -> int:
         """Return the number of non-compactable leading messages.
 
-        Only the system prompt is a safe permanent anchor. Hermes gateway
-        sessions can begin with a user message when core passes conversation
-        history without a system prompt; preserving that first user turn as raw
-        active context lets stale requests look current after later compaction.
+        The system prompt is always a safe permanent anchor. User turns are
+        usually compactable because replaying one forever can make stale
+        requests look current after later compaction. The exception is the
+        narrow Qwen-family chat-template invariant: when a system prompt is
+        followed by the session's only prompt-bearing user query outside the
+        fresh tail, compacting it can leave active context with no raw user-role
+        query at all. Preserve exactly that initial system+user window and keep
+        no-system, later-user, and multi-user sessions compactable.
         """
-        if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system":
-            return 1
-        return 0
+        if not messages:
+            return 0
+        system_anchor_count = (
+            1
+            if isinstance(messages[0], dict) and messages[0].get("role") == "system"
+            else 0
+        )
+        fresh_tail_start = max(0, len(messages) - self._config.fresh_tail_count)
+        if fresh_tail_start <= system_anchor_count:
+            return system_anchor_count
+        if system_anchor_count == 0:
+            return 0
+
+        first_user_index = system_anchor_count
+        if first_user_index >= fresh_tail_start or not self._is_prompt_bearing_user_message(
+            messages[first_user_index]
+        ):
+            return system_anchor_count
+        if any(
+            self._is_prompt_bearing_user_message(message)
+            for message in messages[first_user_index + 1:]
+        ):
+            return system_anchor_count
+        return first_user_index + 1
+
+    def _is_prompt_bearing_user_message(self, message: Dict[str, Any]) -> bool:
+        if not isinstance(message, dict) or message.get("role") != "user":
+            return False
+        if self._is_preserved_todo_context_message(message):
+            return False
+        content = message.get("content")
+        if self._is_context_summary_content(content):
+            return False
+        content_text = text_content_for_pattern_matching(content) or ""
+        if content_text.lstrip().startswith(_PRESERVED_OBJECTIVE_CONTEXT_PREFIX):
+            return False
+        return not (
+            self._matches_ignore_message_patterns(message)
+            or self._is_volatile_ignored_quarantine_placeholder(message, content_text)
+            or self._is_ignored_active_replay_placeholder(message, content_text)
+        )
 
     def _raw_backlog_tokens(self, messages: List[Dict[str, Any]]) -> int:
         backlog = self._raw_backlog_messages(messages)
@@ -4664,6 +4705,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self,
         system_msg: Optional[Dict[str, Any]],
         tail_messages: List[Dict[str, Any]],
+        leading_anchor_messages: Optional[List[Dict[str, Any]]] = None,
         assembly_cap_override: Optional[int] = None,
         include_lcm_note: bool = True,
     ) -> List[Dict[str, Any]]:
@@ -4674,22 +4716,29 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
           [highest-depth summary nodes first, then lower]
           [fresh tail messages]
         """
-        result = []
+        result: list[Dict[str, Any]] = []
 
-        # Leading anchor with optional LCM annotation. Only a true system prompt
-        # is a safe permanent anchor; gateway sessions can start directly with
-        # user messages, and those user turns must remain compactable.
-        leading_msg = system_msg.copy() if system_msg is not None else None
-        if leading_msg is not None:
+        # Leading anchors with optional LCM annotation. Usually this is just a
+        # true system prompt. In the narrow single-initial-user case,
+        # _leading_anchor_count preserves system+user so provider templates see
+        # the raw prompt-bearing user before any synthetic summaries.
+        if leading_anchor_messages is not None:
+            leading_msgs = [msg.copy() for msg in leading_anchor_messages]
+        elif system_msg is not None:
+            leading_msgs = [system_msg.copy()]
+        else:
+            leading_msgs = []
+        if leading_msgs:
+            first_leading = leading_msgs[0]
             if (
-                leading_msg.get("role") == "system"
+                first_leading.get("role") == "system"
                 and self.compression_count == 0
                 and include_lcm_note
             ):
-                leading_msg["content"] = self._append_lcm_note_to_content(
-                    leading_msg.get("content", "")
+                first_leading["content"] = self._append_lcm_note_to_content(
+                    first_leading.get("content", "")
                 )
-            result.append(leading_msg)
+            result.extend(leading_msgs)
 
         assembly_cap = (
             assembly_cap_override
@@ -4704,7 +4753,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         anchor_part: Optional[str] = None
         summary_budget = None
         if assembly_cap is not None:
-            used = count_message_tokens(leading_msg) if leading_msg is not None else 0
+            used = count_messages_tokens(leading_msgs) if leading_msgs else 0
             kept_tail_reversed: list[Dict[str, Any]] = []
             tail_token_total = 0
             tail_for_selection = self._sanitize_active_context_messages(
@@ -4789,7 +4838,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # Drop assistant turns that carry only blank/internal structured content,
         # then ensure provider-valid tool-call/result sequencing.
         result = self._sanitize_active_context_messages(result)
-        if leading_msg is None:
+        if not leading_msgs:
             while result and result[0].get("role") in {"assistant", "tool"}:
                 result = result[1:]
         if (
@@ -4952,8 +5001,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self,
         system_msg: Optional[Dict[str, Any]],
         tail_messages: List[Dict[str, Any]],
+        leading_anchor_messages: Optional[List[Dict[str, Any]]] = None,
         assembly_cap_override: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
+        leading_anchor_count = len(leading_anchor_messages or ([system_msg] if system_msg is not None else []))
         if tail_messages:
             first = tail_messages[0]
             content = first.get("content") or ""
@@ -4962,24 +5013,26 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 candidate = self._assemble_context(
                     system_msg,
                     tail_messages[1:],
+                    leading_anchor_messages=leading_anchor_messages,
                     assembly_cap_override=assembly_cap_override,
                     include_lcm_note=False,
                 )
                 if any(
                     (msg.get("content") or "") == content
-                    for msg in (candidate[1:] if system_msg is not None else candidate)
+                    for msg in candidate[leading_anchor_count:]
                 ):
                     return candidate
 
         candidate = self._assemble_context(
             system_msg,
             tail_messages,
+            leading_anchor_messages=leading_anchor_messages,
             assembly_cap_override=assembly_cap_override,
             include_lcm_note=False,
         )
-        minimum_candidate_len = 1 if system_msg is not None else 0
+        minimum_candidate_len = leading_anchor_count
         if len(candidate) == minimum_candidate_len and tail_messages:
-            fallback = ([system_msg] if system_msg is not None else []) + [tail_messages[-1]]
+            fallback = list(leading_anchor_messages or ([system_msg] if system_msg is not None else [])) + [tail_messages[-1]]
             return self._sanitize_active_context_messages(fallback)
         return candidate
 

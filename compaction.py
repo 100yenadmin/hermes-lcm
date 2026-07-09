@@ -37,6 +37,22 @@ class CompactionMixin:
         if callable(maybe_reclassify):
             maybe_reclassify()
 
+    @staticmethod
+    def _split_leading_anchor_and_context_tail(
+        messages: List[Dict[str, Any]],
+        leading_anchor_count: int,
+    ) -> tuple[Optional[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+        leading_anchor_count = max(0, min(leading_anchor_count, len(messages)))
+        leading_anchors = messages[:leading_anchor_count]
+        system_msg = (
+            leading_anchors[0]
+            if leading_anchors
+            and isinstance(leading_anchors[0], dict)
+            and leading_anchors[0].get("role") == "system"
+            else None
+        )
+        return system_msg, leading_anchors, messages[leading_anchor_count:]
+
     def should_compress(self, prompt_tokens: int = None) -> bool:
         if self._bypasses_lcm_context_management():
             if self._compression_boundary_cooldown_active():
@@ -408,10 +424,9 @@ class CompactionMixin:
             n = len(working_messages)
             fresh_tail_start = max(0, n - self._config.fresh_tail_count)
 
-            # Keep only a real system prompt anchored. Gateway sessions may
-            # pass only conversation messages, so index 0 can be an old user
-            # turn; that must remain eligible for compaction instead of being
-            # replayed forever as fresh-looking intent.
+            # Keep a real system prompt anchored, plus the narrow single-user
+            # leading query case needed by provider templates that reject a
+            # rendered request with no user-role message.
             leading_anchor_count = self._leading_anchor_count(working_messages)
             if fresh_tail_start <= leading_anchor_count:
                 noop_reason = "no eligible raw backlog outside fresh tail"
@@ -662,10 +677,17 @@ class CompactionMixin:
             )
             if force_overflow and len(messages) >= 1:
                 leading_anchor_count = self._leading_anchor_count(working_messages)
+                system_msg, leading_anchors, context_tail = self._split_leading_anchor_and_context_tail(
+                    working_messages,
+                    leading_anchor_count,
+                )
+                assemble_kwargs = {"assembly_cap_override": recovery_assembly_cap}
+                if len(leading_anchors) > 1:
+                    assemble_kwargs["leading_anchor_messages"] = leading_anchors
                 compressed = self._assemble_overflow_recovery_context(
-                    working_messages[0] if leading_anchor_count else None,
-                    working_messages[leading_anchor_count:],
-                    assembly_cap_override=recovery_assembly_cap,
+                    system_msg if leading_anchor_count else None,
+                    context_tail,
+                    **assemble_kwargs,
                 )
                 return self._finalize_forced_overflow_result(
                     working_messages,
@@ -680,11 +702,18 @@ class CompactionMixin:
                 leading_anchor_count = self._leading_anchor_count(active_context_messages)
                 anchor_leading_count = self._leading_anchor_count(anchor_source_messages)
                 self._pending_context_anchor_messages = anchor_source_messages[anchor_leading_count:]
+                system_msg, leading_anchors, context_tail = self._split_leading_anchor_and_context_tail(
+                    active_context_messages,
+                    leading_anchor_count,
+                )
+                assemble_kwargs = {"assembly_cap_override": recovery_assembly_cap}
+                if len(leading_anchors) > 1:
+                    assemble_kwargs["leading_anchor_messages"] = leading_anchors
                 try:
                     sanitized_messages = self._assemble_context(
-                        active_context_messages[0] if leading_anchor_count else None,
-                        active_context_messages[leading_anchor_count:],
-                        assembly_cap_override=recovery_assembly_cap,
+                        system_msg if leading_anchor_count else None,
+                        context_tail,
+                        **assemble_kwargs,
                     )
                 finally:
                     self._pending_context_anchor_messages = None
@@ -735,11 +764,18 @@ class CompactionMixin:
         leading_anchor_count = self._leading_anchor_count(working_messages)
         anchor_leading_count = self._leading_anchor_count(anchor_source_messages)
         self._pending_context_anchor_messages = anchor_source_messages[anchor_leading_count:]
+        system_msg, leading_anchors, context_tail = self._split_leading_anchor_and_context_tail(
+            working_messages,
+            leading_anchor_count,
+        )
+        assemble_kwargs = {"assembly_cap_override": recovery_assembly_cap}
+        if len(leading_anchors) > 1:
+            assemble_kwargs["leading_anchor_messages"] = leading_anchors
         try:
             compressed = self._assemble_context(
-                working_messages[0] if leading_anchor_count else None,
-                working_messages[leading_anchor_count:],
-                assembly_cap_override=recovery_assembly_cap,
+                system_msg if leading_anchor_count else None,
+                context_tail,
+                **assemble_kwargs,
             )
         finally:
             self._pending_context_anchor_messages = None
