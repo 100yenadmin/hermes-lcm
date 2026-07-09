@@ -267,6 +267,37 @@ def test_tool_call_foreground_ingest_clears_late_auxiliary_restore_candidate(tmp
         engine.shutdown()
 
 
+def test_compression_boundary_bind_clears_late_auxiliary_restore_candidate(tmp_path):
+    engine = _engine(tmp_path)
+    foreground = _ForegroundAgent(engine, "foreground-a")
+    review = _FakeAgent(engine, "review-session", parent_session_id="foreground-b")
+
+    try:
+        foreground.start_session()
+        foreground.ingest_history_as_foreground(
+            [{"role": "user", "content": "first foreground turn"}]
+        )
+
+        engine.on_session_start(
+            "foreground-b",
+            boundary_reason="compression",
+            old_session_id="foreground-a",
+            platform="cli",
+            conversation_id="conversation:foreground-a",
+        )
+
+        review.start_session()
+        review.ingest_history_after_background_marker(
+            [{"role": "user", "content": "late background review replay"}]
+        )
+
+        assert engine._store.get_session_count("review-session") == 0
+        assert engine.current_session_id == "foreground-b"
+        assert engine.bound_session_id == "review-session"
+    finally:
+        engine.shutdown()
+
+
 def test_first_ingest_recheck_does_not_flag_foreground_session(tmp_path):
     engine = _engine(tmp_path)
     agent = _ForegroundAgent(engine, "foreground-session")
