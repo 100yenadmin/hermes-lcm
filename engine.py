@@ -995,6 +995,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 {},
                 session_id=session_id,
                 include_explicit=False,
+                require_auxiliary_frame=False,
             )
             if parent_session_id == self._foreground_rebind_session_id:
                 self._foreground_rebind_previous_session_id = self._foreground_session_id
@@ -1027,6 +1028,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             if (
                 parent_session_id
                 and parent_session_id != session_id
+                and parent_session_id == self._foreground_rebind_previous_session_id
                 and self._lcm_session_last_normal_conversation_id.get(parent_session_id)
             ):
                 self._foreground_session_id = parent_session_id

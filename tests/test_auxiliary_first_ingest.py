@@ -330,6 +330,38 @@ def test_uningested_foreground_bind_remains_foreground_after_late_review_child(t
         engine.shutdown()
 
 
+def test_late_review_child_from_stale_parent_does_not_replace_active_foreground(tmp_path):
+    engine = _engine(tmp_path)
+    first_foreground = _ForegroundAgent(engine, "foreground-a")
+    second_foreground = _ForegroundAgent(engine, "foreground-b")
+    stale_review = _FakeAgent(engine, "review-session", parent_session_id="foreground-a")
+
+    try:
+        first_foreground.start_session()
+        first_foreground.ingest_history_as_foreground(
+            [{"role": "user", "content": "first foreground turn"}]
+        )
+
+        second_foreground.start_session()
+        second_foreground.ingest_history_as_foreground(
+            [{"role": "user", "content": "second foreground turn"}]
+        )
+
+        stale_review.start_session()
+        stale_review.ingest_history_after_background_marker(
+            [{"role": "user", "content": "late stale-parent review replay"}]
+        )
+
+        assert engine._store.get_session_count("foreground-a") == 1
+        assert engine._store.get_session_count("foreground-b") == 1
+        assert engine._store.get_session_count("review-session") == 0
+        assert engine.current_session_id == "foreground-b"
+        assert engine.current_conversation_id == "conversation:foreground-b"
+        assert engine.bound_session_id == "review-session"
+    finally:
+        engine.shutdown()
+
+
 def test_first_ingest_recheck_does_not_flag_foreground_session(tmp_path):
     engine = _engine(tmp_path)
     agent = _ForegroundAgent(engine, "foreground-session")
