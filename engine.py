@@ -181,6 +181,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._foreground_rebind_previous_session_id: str = ""
         self._foreground_rebind_previous_platform: str = ""
         self._foreground_rebind_previous_conversation_id: str = ""
+        self._foreground_rebind_parent_session_id: str = ""
         self._conversation_id: str = ""
         self._session_match_keys: list[str] = []
         self._session_ignored = False
@@ -965,6 +966,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._foreground_rebind_previous_session_id = ""
         self._foreground_rebind_previous_platform = ""
         self._foreground_rebind_previous_conversation_id = ""
+        self._foreground_rebind_parent_session_id = ""
 
     def _clear_foreground_rebind_candidate_if_bound_session_confirmed(self) -> None:
         if self._foreground_rebind_session_id == self._session_id:
@@ -997,17 +999,27 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 include_explicit=False,
                 require_auxiliary_frame=False,
             )
-            if parent_session_id == self._foreground_rebind_session_id:
+            if parent_session_id == self._foreground_rebind_session_id or (
+                parent_session_id and not self._foreground_rebind_parent_session_id
+            ):
                 self._foreground_rebind_previous_session_id = self._foreground_session_id
                 self._foreground_rebind_previous_platform = self._foreground_session_platform
                 self._foreground_rebind_previous_conversation_id = self._foreground_conversation_id
             self._foreground_rebind_session_id = session_id
+            self._foreground_rebind_parent_session_id = parent_session_id
             return
         if self._foreground_session_id and self._foreground_session_id != session_id:
+            parent_session_id = self._in_process_parent_session_id(
+                {},
+                session_id=session_id,
+                include_explicit=False,
+                require_auxiliary_frame=False,
+            )
             self._foreground_rebind_session_id = session_id
             self._foreground_rebind_previous_session_id = self._foreground_session_id
             self._foreground_rebind_previous_platform = self._foreground_session_platform
             self._foreground_rebind_previous_conversation_id = self._foreground_conversation_id
+            self._foreground_rebind_parent_session_id = parent_session_id
             return
         self._clear_foreground_rebind_candidate()
 
