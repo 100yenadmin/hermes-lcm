@@ -36,6 +36,16 @@ class _FakeAgent:
         self._memory_write_context = "background_review"
         return self.engine.handle_tool_call("lcm_status", {}, messages=history)
 
+    def preflight_history_after_background_marker(self, history):
+        self._memory_write_origin = "background_review"
+        self._memory_write_context = "background_review"
+        return self.engine.should_compress_preflight(history)
+
+    def compress_history_after_background_marker(self, history):
+        self._memory_write_origin = "background_review"
+        self._memory_write_context = "background_review"
+        return self.engine.compress(history)
+
     def ingest_history_as_foreground(self, history):
         self.engine.ingest(history)
 
@@ -202,6 +212,63 @@ def test_late_tool_call_first_write_auxiliary_reclassification_restores_foregrou
         assert status["session_filters"]["side_channel_session_id"] == "review-session"
 
         grep = json.loads(lcm_tools.lcm_grep({"query": "tool-call"}, engine=engine))
+        assert grep["results"] == []
+    finally:
+        engine.shutdown()
+
+
+def test_late_preflight_first_write_auxiliary_reclassification_restores_foreground_view(tmp_path):
+    engine = _engine(tmp_path)
+    foreground = _ForegroundAgent(engine, "foreground-session")
+    review = _FakeAgent(engine, "review-session", parent_session_id="foreground-session")
+
+    try:
+        foreground.start_session()
+        foreground.ingest_history_as_foreground(
+            [{"role": "user", "content": "operator durable anchor"}]
+        )
+
+        review.start_session()
+        review.preflight_history_after_background_marker(
+            [{"role": "user", "content": "preflight replay must not persist"}]
+        )
+
+        assert engine._store.get_session_count("review-session") == 0
+        assert engine._thread_context_has_auxiliary_session("review-session")
+        assert engine.current_session_id == "foreground-session"
+        assert engine.current_conversation_id == "conversation:foreground-session"
+        assert engine.side_channel_active is True
+
+        grep = json.loads(lcm_tools.lcm_grep({"query": "preflight"}, engine=engine))
+        assert grep["results"] == []
+    finally:
+        engine.shutdown()
+
+
+def test_late_compress_first_write_auxiliary_reclassification_restores_foreground_view(tmp_path):
+    engine = _engine(tmp_path)
+    foreground = _ForegroundAgent(engine, "foreground-session")
+    review = _FakeAgent(engine, "review-session", parent_session_id="foreground-session")
+
+    try:
+        foreground.start_session()
+        foreground.ingest_history_as_foreground(
+            [{"role": "user", "content": "operator durable anchor"}]
+        )
+
+        review.start_session()
+        compressed = review.compress_history_after_background_marker(
+            [{"role": "user", "content": "compress replay must not persist"}]
+        )
+
+        assert compressed == [{"role": "user", "content": "compress replay must not persist"}]
+        assert engine._store.get_session_count("review-session") == 0
+        assert engine._thread_context_has_auxiliary_session("review-session")
+        assert engine.current_session_id == "foreground-session"
+        assert engine.current_conversation_id == "conversation:foreground-session"
+        assert engine.side_channel_active is True
+
+        grep = json.loads(lcm_tools.lcm_grep({"query": "compress"}, engine=engine))
         assert grep["results"] == []
     finally:
         engine.shutdown()
