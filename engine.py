@@ -991,6 +991,15 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             and self._foreground_rebind_previous_session_id
             and self._foreground_session_id == self._foreground_rebind_session_id
         ):
+            parent_session_id = self._in_process_parent_session_id(
+                {},
+                session_id=session_id,
+                include_explicit=False,
+            )
+            if parent_session_id == self._foreground_rebind_session_id:
+                self._foreground_rebind_previous_session_id = self._foreground_session_id
+                self._foreground_rebind_previous_platform = self._foreground_session_platform
+                self._foreground_rebind_previous_conversation_id = self._foreground_conversation_id
             self._foreground_rebind_session_id = session_id
             return
         if self._foreground_session_id and self._foreground_session_id != session_id:
@@ -1010,9 +1019,28 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._foreground_rebind_session_id == session_id
             and self._foreground_rebind_previous_session_id
         ):
-            self._foreground_session_id = self._foreground_rebind_previous_session_id
-            self._foreground_session_platform = self._foreground_rebind_previous_platform
-            self._foreground_conversation_id = self._foreground_rebind_previous_conversation_id
+            parent_session_id = self._in_process_parent_session_id(
+                {},
+                session_id=session_id,
+                include_explicit=False,
+            )
+            if (
+                parent_session_id
+                and parent_session_id != session_id
+                and self._lcm_session_last_normal_conversation_id.get(parent_session_id)
+            ):
+                self._foreground_session_id = parent_session_id
+                self._foreground_session_platform = self._lcm_session_last_normal_platform.get(
+                    parent_session_id,
+                    self._foreground_rebind_previous_platform,
+                )
+                self._foreground_conversation_id = self._lcm_session_last_normal_conversation_id[
+                    parent_session_id
+                ]
+            else:
+                self._foreground_session_id = self._foreground_rebind_previous_session_id
+                self._foreground_session_platform = self._foreground_rebind_previous_platform
+                self._foreground_conversation_id = self._foreground_rebind_previous_conversation_id
         else:
             self._foreground_session_id = ""
             self._foreground_session_platform = ""
