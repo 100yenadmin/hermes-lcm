@@ -1122,15 +1122,15 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._foreground_conversation_id = ""
         self._clear_foreground_rebind_candidate()
 
-    def _maybe_reclassify_current_session_as_auxiliary_at_ingest(self) -> bool:
+    def _maybe_reclassify_current_session_as_auxiliary_before_message_ingest(self) -> bool:
         """Defense-in-depth for host markers that arrive after session binding.
 
         Older Hermes Agent background-review forks seed ``_memory_write_origin``
-        too late for ``on_session_start`` frame-walk detection. By first ingest
-        the marker is present on the running agent frame, so re-check only while
-        the bound session is still empty. That keeps normal foreground session
-        starts/resets writable and avoids reclassifying sessions after real data
-        has already been stored.
+        too late for ``on_session_start`` frame-walk detection. By the first
+        message-writing entry point the marker is present on the running agent
+        frame, so re-check only while the bound session is still empty. That
+        keeps normal foreground session starts/resets writable and avoids
+        reclassifying sessions after real data has already been stored.
         """
         session_id = str(self._session_id or "")
         if not session_id:
@@ -1170,7 +1170,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         compression runs later the same turn, already-ingested messages
         are skipped (no duplicates).
         """
-        if self._maybe_reclassify_current_session_as_auxiliary_at_ingest():
+        if self._maybe_reclassify_current_session_as_auxiliary_before_message_ingest():
             self._remember_lcm_bypass_message_prefix(self._bypass_lcm_session_id(), messages)
             return
         if self._bypasses_lcm_context_management():
@@ -3072,15 +3072,18 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # Ingest live messages if passed (enables current-turn search)
         messages = kwargs.get("messages")
 
-        if name != "lcm_inspect" and messages and self._session_id and not (
-            self._session_ignored or self._session_stateless or self._thread_context_stateless()
-        ):
-            try:
-                self._ingest_messages(messages)
-                self._record_ingest_success()
-                self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
-            except Exception as e:
-                self._record_ingest_failure("tool-call ingest", e)
+        if name != "lcm_inspect" and messages and self._session_id:
+            if self._maybe_reclassify_current_session_as_auxiliary_before_message_ingest():
+                self._remember_lcm_bypass_message_prefix(self._bypass_lcm_session_id(), messages)
+            elif not (
+                self._session_ignored or self._session_stateless or self._thread_context_stateless()
+            ):
+                try:
+                    self._ingest_messages(messages)
+                    self._record_ingest_success()
+                    self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
+                except Exception as e:
+                    self._record_ingest_failure("tool-call ingest", e)
 
         handlers = {
             "lcm_grep": lcm_tools.lcm_grep,

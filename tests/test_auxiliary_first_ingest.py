@@ -31,6 +31,11 @@ class _FakeAgent:
         self._memory_write_context = "background_review"
         self.engine.ingest(history)
 
+    def handle_tool_call_after_background_marker(self, history):
+        self._memory_write_origin = "background_review"
+        self._memory_write_context = "background_review"
+        return self.engine.handle_tool_call("lcm_status", {}, messages=history)
+
     def ingest_history_as_foreground(self, history):
         self.engine.ingest(history)
 
@@ -158,6 +163,43 @@ def test_late_first_ingest_auxiliary_reclassification_restores_foreground_view(t
         grep = json.loads(lcm_tools.lcm_grep({"query": "operator"}, engine=engine))
         assert grep["session_scope"] == "current"
         assert [hit["session_id"] for hit in grep["results"]] == ["foreground-session"]
+    finally:
+        engine.shutdown()
+
+
+def test_late_tool_call_first_write_auxiliary_reclassification_restores_foreground_view(tmp_path):
+    engine = _engine(tmp_path)
+    foreground = _ForegroundAgent(engine, "foreground-session")
+    review = _FakeAgent(engine, "review-session", parent_session_id="foreground-session")
+
+    try:
+        foreground.start_session()
+        foreground.ingest_history_as_foreground(
+            [{"role": "user", "content": "operator durable anchor"}]
+        )
+
+        # Bind-time auxiliary detection can miss the review child before the
+        # host marks it as background_review. If the child's first LCM entry
+        # point is a tool call, that path must reclassify before writing the
+        # passed replay messages, just like post-LLM ingest does.
+        review.start_session()
+        status = json.loads(
+            review.handle_tool_call_after_background_marker(
+                [{"role": "user", "content": "tool-call replay must not persist"}]
+            )
+        )
+
+        assert engine._store.get_session_count("review-session") == 0
+        assert engine._thread_context_has_auxiliary_session("review-session")
+        assert engine.current_session_id == "foreground-session"
+        assert engine.current_conversation_id == "conversation:foreground-session"
+        assert engine.side_channel_active is True
+        assert status["session_id"] == "foreground-session"
+        assert status["session_filters"]["side_channel_active"] is True
+        assert status["session_filters"]["side_channel_session_id"] == "review-session"
+
+        grep = json.loads(lcm_tools.lcm_grep({"query": "tool-call"}, engine=engine))
+        assert grep["results"] == []
     finally:
         engine.shutdown()
 
