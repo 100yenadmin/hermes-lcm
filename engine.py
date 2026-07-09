@@ -677,6 +677,17 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         return True
 
     @property
+    def bound_session_id(self) -> str:
+        """Session id this engine is actively servicing for ingest/lifecycle.
+
+        This differs from ``current_session_id`` while a side-channel session is
+        bound but operator-facing tools should keep showing the foreground
+        session. Host lifecycle hooks must compare against this value before
+        deciding whether a post-turn ingest needs to rebind the engine.
+        """
+        return self._session_id
+
+    @property
     def current_session_id(self) -> str:
         """User-facing "current session" id surfaced by LCM tools.
 

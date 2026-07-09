@@ -1,4 +1,7 @@
 import json
+import importlib.util
+import sys
+from pathlib import Path
 
 from hermes_lcm import tools as lcm_tools
 from hermes_lcm.config import LCMConfig
@@ -38,6 +41,21 @@ class _ForegroundAgent(_FakeAgent):
 def _engine(tmp_path):
     config = LCMConfig(database_path=str(tmp_path / "lcm.db"))
     return LCMEngine(config=config, hermes_home=str(tmp_path / "home"))
+
+
+def _load_plugin_entrypoint_module(module_name: str):
+    repo_root = Path(__file__).resolve().parent.parent
+    spec = importlib.util.spec_from_file_location(
+        module_name,
+        str(repo_root / "__init__.py"),
+        submodule_search_locations=[str(repo_root)],
+    )
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def test_first_ingest_rechecks_background_review_marker_after_missed_bind_time(tmp_path):
@@ -100,6 +118,54 @@ def test_late_first_ingest_auxiliary_reclassification_restores_foreground_view(t
         grep = json.loads(lcm_tools.lcm_grep({"query": "operator"}, engine=engine))
         assert grep["session_scope"] == "current"
         assert [hit["session_id"] for hit in grep["results"]] == ["foreground-session"]
+    finally:
+        engine.shutdown()
+
+
+def test_foreground_post_turn_rebinds_after_late_auxiliary_reclassification(tmp_path):
+    lcm_plugin = _load_plugin_entrypoint_module("hermes_lcm_post_hook_rebind_regression")
+    engine = _engine(tmp_path)
+    foreground = _ForegroundAgent(engine, "foreground-session")
+    review = _FakeAgent(engine, "review-session", parent_session_id="foreground-session")
+
+    try:
+        foreground.start_session()
+        foreground.ingest_history_as_foreground(
+            [{"role": "user", "content": "operator durable anchor"}]
+        )
+
+        review.start_session()
+        review.ingest_history_after_background_marker(
+            [{"role": "user", "content": "background review replay must not persist"}]
+        )
+        assert engine.current_session_id == "foreground-session"
+        assert engine.bound_session_id == "review-session"
+        assert engine.side_channel_active is True
+
+        # The auxiliary thread has ended; the next post_llm_call is a foreground
+        # turn. The hook must compare against the bound ingest session, not the
+        # operator-facing current_session_id, before deciding whether to rebind.
+        engine._clear_thread_context_stateless()
+        lcm_plugin._ensure_engine_bound_to_session(
+            engine,
+            foreground.session_id,
+            platform="cli",
+            conversation_id="conversation:foreground-session",
+        )
+        engine.ingest(
+            [
+                {"role": "user", "content": "operator durable anchor"},
+                {"role": "assistant", "content": "foreground follow-up"},
+            ]
+        )
+
+        assert engine.bound_session_id == "foreground-session"
+        assert engine.current_session_id == "foreground-session"
+        assert engine._store.get_session_count("review-session") == 0
+        foreground_rows = engine._store.get_range("foreground-session", limit=10)
+        review_rows = engine._store.get_range("review-session", limit=10)
+        assert any(row["content"] == "foreground follow-up" for row in foreground_rows)
+        assert all(row["content"] != "foreground follow-up" for row in review_rows)
     finally:
         engine.shutdown()
 
