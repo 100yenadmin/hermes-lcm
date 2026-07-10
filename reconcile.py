@@ -423,6 +423,7 @@ class ReconcileMixin:
         candidate_messages: list[Dict[str, Any]],
         stored_head: list[tuple[str, str, str, str]],
         stored_uncompacted_tail: list[tuple[str, str, str, str]],
+        following_messages: list[Dict[str, Any]],
     ) -> bool:
         """Recognize compacted replay with a raw initial-user provider anchor.
 
@@ -433,23 +434,39 @@ class ReconcileMixin:
         optionally followed by generated summary scaffolding, while omitting a
         durable fresh tail that does not fit the assembly cap. These replays are
         not contiguous store suffixes, so generic restart reconciliation cannot
-        prove them. Accept that scaffold-only anchor prefix when a durable
-        compaction frontier proves it came from compaction; otherwise require
-        both durable-head and full visible post-frontier tail coverage before
-        advancing the cursor.
+        prove them. Accept an exact raw system/user head replay, or a scaffold-only
+        anchor prefix when a durable compaction frontier proves it came from LCM;
+        otherwise require both durable-head and full visible post-frontier tail
+        coverage before advancing the cursor.
         """
         if len(candidate_messages) < 2 or len(stored_head) < 2:
             return False
-        if (
-            str(candidate_messages[0].get("role") or "") != "system"
-            or not self._is_replayed_context_scaffold_message(candidate_messages[0])
-            or not self._is_prompt_bearing_user_message(candidate_messages[1])
-        ):
+        if str(candidate_messages[0].get("role") or "") != "system":
             return False
         if stored_head[0][0] != "system" or stored_head[1][0] != "user":
             return False
+        candidate_system_identity = self._message_replay_identity(candidate_messages[0])
+        has_raw_durable_system_anchor = candidate_system_identity == stored_head[0]
+        has_generated_system_anchor = self._is_replayed_context_scaffold_message(  # type: ignore[attr-defined]
+            candidate_messages[0]
+        )
+        if not (
+            has_raw_durable_system_anchor or has_generated_system_anchor
+        ) or not self._is_prompt_bearing_user_message(  # type: ignore[attr-defined]
+            candidate_messages[1]
+        ):
+            return False
         if self._message_replay_identity(candidate_messages[1]) != stored_head[1]:
             return False
+        if has_raw_durable_system_anchor:
+            if len(candidate_messages) != 2:
+                return False
+            return (
+                not following_messages
+                or len(stored_head) < 3
+                or self._message_replay_identity(following_messages[0])
+                != stored_head[2]
+            )
         if candidate_messages[2:] and not any(
             self._is_replayed_context_scaffold_message(message)
             for message in candidate_messages[2:]
@@ -466,8 +483,7 @@ class ReconcileMixin:
             int(getattr(self, "_last_compacted_store_id", 0) or 0) > 0
         )
         return (
-            not visible_after_anchor
-            and has_durable_compaction_frontier
+            not visible_after_anchor and has_durable_compaction_frontier
         ) or visible_after_anchor == stored_uncompacted_tail
 
     def _find_reconciled_cursor_for_store_tail(
@@ -538,6 +554,7 @@ class ReconcileMixin:
                 candidate_messages,
                 stored_head,
                 stored_uncompacted_tail,
+                messages[cursor:],
             ):
                 return cursor
             if not candidate_prefix:
@@ -900,7 +917,10 @@ class ReconcileMixin:
             self._message_replay_identity(row, stored_row=True)
             for row in stored_tail_rows
         ]
-        stored_head_rows = self._store.get_session_messages(self._session_id, limit=2)
+        stored_head_rows = self._store.get_session_messages(  # type: ignore[attr-defined]
+            self._session_id,  # type: ignore[attr-defined]
+            limit=3,
+        )
         stored_head = [
             self._message_replay_identity(row, stored_row=True)
             for row in stored_head_rows
