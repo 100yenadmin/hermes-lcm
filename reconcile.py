@@ -423,7 +423,6 @@ class ReconcileMixin:
         candidate_messages: list[Dict[str, Any]],
         stored_head: list[tuple[str, str, str, str]],
         stored_uncompacted_tail: list[tuple[str, str, str, str]],
-        following_messages: list[Dict[str, Any]],
     ) -> bool:
         """Recognize compacted replay with a raw initial-user provider anchor.
 
@@ -461,12 +460,7 @@ class ReconcileMixin:
         if has_raw_durable_system_anchor:
             if len(candidate_messages) != 2:
                 return False
-            return (
-                not following_messages
-                or len(stored_head) < 3
-                or self._message_replay_identity(following_messages[0])
-                != stored_head[2]
-            )
+            return True
         if candidate_messages[2:] and not any(
             self._is_replayed_context_scaffold_message(message)
             for message in candidate_messages[2:]
@@ -554,7 +548,6 @@ class ReconcileMixin:
                 candidate_messages,
                 stored_head,
                 stored_uncompacted_tail,
-                messages[cursor:],
             ):
                 return cursor
             if not candidate_prefix:
@@ -935,6 +928,46 @@ class ReconcileMixin:
             for row in uncompacted_rows
             if not self._matches_ignore_message_patterns(row, stored_row=True)
         ]
+        incoming_identities = self._effective_replay_identities(messages)
+        # Stale-snapshot proof uses the raw durable prefix. Ignore-message
+        # filters may suppress noisy rows for tail reconciliation, but filtered
+        # history alone must not create replay evidence for skipping a batch.
+        incoming_has_unproofed_raw_persisted_marker = any(
+            str(msg.get("role") or "") == "tool"
+            and _is_hermes_persisted_output_marker(normalize_content_value(msg.get("content")) or "")
+            and recover_hermes_persisted_output_with_file_stat(
+                normalize_content_value(msg.get("content")) or ""
+            )
+            is None
+            for msg in messages
+        )
+        if (
+            not incoming_has_unproofed_raw_persisted_marker
+            and self._is_suspicious_stale_no_overlap_snapshot(
+                incoming_identities,
+                stored_tail,
+                stored_head,
+            )
+        ):
+            self._record_ingest_reconciliation(
+                action="skipped batch",
+                reason="skipped stale no-overlap snapshot",
+                cursor=len(messages),
+                incoming=len(messages),
+                session_count=session_count,
+                stored_tail_count=len(stored_tail),
+                effective_incoming=len(incoming_identities),
+            )
+            logger.warning(
+                "LCM skipped stale no-overlap snapshot after existing-session bind: session=%s incoming=%d effective_incoming=%d stored_tail=%d session_count=%d",
+                self._session_id,  # type: ignore[attr-defined]
+                len(messages),
+                len(incoming_identities),
+                len(stored_tail),
+                session_count,
+            )
+            return len(messages)
+
         cursor = self._find_reconciled_cursor_for_store_tail(
             messages,
             stored_tail,
@@ -970,51 +1003,6 @@ class ReconcileMixin:
                 reason,
             )
             return cursor
-
-        incoming_identities = self._effective_replay_identities(messages)
-        stored_head_rows = self._store.get_session_messages(
-            self._session_id,
-            limit=tail_limit,
-        )
-        stored_head = [self._message_replay_identity(row, stored_row=True) for row in stored_head_rows]
-        # Stale-snapshot proof uses the raw durable prefix.  Ignore-message
-        # filters may suppress noisy rows for tail reconciliation, but filtered
-        # history alone must not create replay evidence for skipping a batch.
-        incoming_has_unproofed_raw_persisted_marker = any(
-            str(msg.get("role") or "") == "tool"
-            and _is_hermes_persisted_output_marker(normalize_content_value(msg.get("content")) or "")
-            and recover_hermes_persisted_output_with_file_stat(
-                normalize_content_value(msg.get("content")) or ""
-            )
-            is None
-            for msg in messages
-        )
-        if (
-            not incoming_has_unproofed_raw_persisted_marker
-            and self._is_suspicious_stale_no_overlap_snapshot(
-                incoming_identities,
-                stored_tail,
-                stored_head,
-            )
-        ):
-            self._record_ingest_reconciliation(
-                action="skipped batch",
-                reason="skipped stale no-overlap snapshot",
-                cursor=len(messages),
-                incoming=len(messages),
-                session_count=session_count,
-                stored_tail_count=len(stored_tail),
-                effective_incoming=len(incoming_identities),
-            )
-            logger.warning(
-                "LCM skipped stale no-overlap snapshot after existing-session bind: session=%s incoming=%d effective_incoming=%d stored_tail=%d session_count=%d",
-                self._session_id,
-                len(messages),
-                len(incoming_identities),
-                len(stored_tail),
-                session_count,
-            )
-            return len(messages)
 
         self._record_ingest_reconciliation(
             action="persisted batch",
