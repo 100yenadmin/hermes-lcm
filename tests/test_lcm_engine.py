@@ -4144,6 +4144,79 @@ class TestEngineABC:
         if followup is not None:
             assert rows[-1]["content"] == followup["content"]
 
+    def test_anchor_summary_with_omitted_fresh_tail_does_not_persist_scaffold_on_restart(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        db_path = tmp_path / "anchor-summary-omitted-tail-restart.db"
+        config = LCMConfig(
+            fresh_tail_count=1,
+            leaf_chunk_tokens=10_000,
+            max_assembly_tokens=180,
+            database_path=str(db_path),
+        )
+        engine = LCMEngine(config=config)
+        engine.on_session_start(
+            "anchor-summary-omitted-tail-session",
+            platform="cli",
+            conversation_id="anchor-summary-omitted-tail-conversation",
+            context_length=200000,
+        )
+        monkeypatch.setattr(
+            lcm_engine,
+            "summarize_with_escalation",
+            lambda **kwargs: ("Compact restart summary.\nExpand for details about: restart", 1),
+        )
+
+        user_query = "preserve this provider anchor without ingesting generated summary"
+        messages = [
+            {"role": "system", "content": "You are concise."},
+            {"role": "user", "content": user_query},
+            {"role": "assistant", "content": "large derived output " + "x" * 4000},
+            {"role": "assistant", "content": "more derived output " + "y" * 4000},
+            {"role": "assistant", "content": "durable omitted fresh tail " + "z" * 4000},
+        ]
+        try:
+            active_context = engine.compress(messages)
+            uncompacted_rows = engine._store.get_session_messages_after(
+                "anchor-summary-omitted-tail-session",
+                after_store_id=engine._last_compacted_store_id,
+                limit=len(messages),
+            )
+        finally:
+            engine.shutdown()
+
+        assert [message.get("role") for message in active_context] == [
+            "system",
+            "user",
+            "assistant",
+        ]
+        assert engine._is_replayed_context_scaffold_message(active_context[-1])
+        assert [row["content"] for row in uncompacted_rows] == [messages[-1]["content"]]
+
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            "anchor-summary-omitted-tail-session",
+            platform="cli",
+            conversation_id="anchor-summary-omitted-tail-conversation",
+            context_length=200000,
+        )
+        try:
+            after_restart._ingest_messages(active_context)
+            rows = after_restart._store.get_session_messages(
+                "anchor-summary-omitted-tail-session"
+            )
+        finally:
+            after_restart.shutdown()
+
+        assert len(rows) == len(messages)
+        assert [row["content"] for row in rows].count(user_query) == 1
+        assert all(
+            not after_restart._is_replayed_context_scaffold_message(row)
+            for row in rows
+        )
+
     def test_overflow_recovery_keeps_sole_user_inside_fresh_tail(self, tmp_path, monkeypatch):
         config = LCMConfig(
             fresh_tail_count=32,

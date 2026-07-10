@@ -429,13 +429,14 @@ class ReconcileMixin:
         Normal compaction annotates the durable system prompt, preserves the
         sole initial user as a raw provider anchor, inserts generated summary
         scaffolding, then appends the durable post-frontier tail. Overflow
-        recovery may reduce that shape to only the annotated system and user
-        anchor, omitting even a durable fresh tail that does not fit the assembly
-        cap. These replays are not contiguous store suffixes, so generic restart
-        reconciliation cannot prove them. Accept that exact two-message anchor
-        only when a durable compaction frontier proves it came from compaction;
-        otherwise require both durable-head and full visible post-frontier tail
-        coverage before advancing the cursor.
+        recovery may reduce that shape to the annotated system and user anchor,
+        optionally followed by generated summary scaffolding, while omitting a
+        durable fresh tail that does not fit the assembly cap. These replays are
+        not contiguous store suffixes, so generic restart reconciliation cannot
+        prove them. Accept that scaffold-only anchor prefix when a durable
+        compaction frontier proves it came from compaction; otherwise require
+        both durable-head and full visible post-frontier tail coverage before
+        advancing the cursor.
         """
         if len(candidate_messages) < 2 or len(stored_head) < 2:
             return False
@@ -465,7 +466,7 @@ class ReconcileMixin:
             int(getattr(self, "_last_compacted_store_id", 0) or 0) > 0
         )
         return (
-            len(candidate_messages) == 2
+            not visible_after_anchor
             and has_durable_compaction_frontier
         ) or visible_after_anchor == stored_uncompacted_tail
 
