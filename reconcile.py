@@ -1004,6 +1004,60 @@ class ReconcileMixin:
             str(msg.get("tool_call_id") or ""),
         )
 
+    def _get_formerly_anchored_user_source_map(
+        self,
+        messages: List[Dict[str, Any]],
+    ) -> dict[int, int]:
+        """Recover the durable source for an initial user leaving the anchor.
+
+        The normal source mapper is intentionally suffix-only. This exception
+        is safe only when the first active raw is the durable initial user and
+        the active context still covers every durable prompt-bearing user in
+        order. Requiring that full replay coverage prevents a newer
+        repeated-content turn from claiming the older row.
+        """
+        frontier = max(0, int(self._last_compacted_store_id or 0))
+        if (
+            frontier <= 0
+            or not messages
+            or not self._is_prompt_bearing_user_message(messages[0])
+            or not any(
+                self._is_prompt_bearing_user_message(message)
+                for message in messages[1:]
+            )
+        ):
+            return {}
+
+        durable_users = self._store.get_session_nonblank_role_messages(
+            self._session_id,
+            "user",
+            limit=max(1, self._store.get_session_count(self._session_id)),
+        )
+        if not durable_users:
+            return {}
+        durable_prompt_users = [
+            message for message in durable_users
+            if self._is_prompt_bearing_user_message(message)
+        ]
+        active_prompt_users = [
+            message for message in messages
+            if self._is_prompt_bearing_user_message(message)
+        ]
+        if [
+            self._message_replay_identity(message, stored_row=True)
+            for message in durable_prompt_users
+        ] != [
+            self._message_replay_identity(message)
+            for message in active_prompt_users
+        ]:
+            return {}
+
+        initial_user = durable_prompt_users[0]
+        initial_store_id = int(initial_user["store_id"])
+        if initial_store_id > frontier:
+            return {}
+        return {id(messages[0]): initial_store_id}
+
     def _get_store_id_map_for_messages(self, messages: List[Dict[str, Any]]) -> dict[int, int]:
         """Map current raw message objects back to store_ids in stable order.
 

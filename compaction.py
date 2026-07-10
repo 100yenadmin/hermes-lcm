@@ -617,7 +617,15 @@ class CompactionMixin:
             source_lineage_chunk = [
                 message for message in source_lookup_chunk if id(message) not in dependent_reply_message_ids
             ]
+            pre_frontier_sources = self._get_formerly_anchored_user_source_map(
+                working_messages[leading_anchor_count:]
+            )
             source_store_ids = self._get_store_ids_for_messages(source_lineage_chunk)
+            source_store_ids.extend(
+                pre_frontier_sources[id(message)]
+                for message in source_lineage_chunk
+                if id(message) in pre_frontier_sources
+            )
             source_store_ids = sorted(dict.fromkeys(source_store_ids))
             consumed_store_ids = self._get_store_ids_for_messages(source_lookup_chunk)
             consumed_store_ids = sorted(dict.fromkeys(consumed_store_ids))

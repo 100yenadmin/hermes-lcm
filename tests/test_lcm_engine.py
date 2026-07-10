@@ -3774,6 +3774,68 @@ class TestEngineABC:
         assert [msg.get("role") for msg in active_context[:2]] == ["system", "user"]
         assert active_context[1].get("content") == user_query
 
+    def test_second_compaction_keeps_former_initial_user_source_lineage(self, tmp_path, monkeypatch):
+        config = LCMConfig(
+            fresh_tail_count=2,
+            leaf_chunk_tokens=1,
+            database_path=str(tmp_path / "former-initial-user-lineage.db"),
+        )
+        engine = LCMEngine(config=config)
+        engine.on_session_start(
+            "former-initial-user-lineage-session",
+            platform="cli",
+            conversation_id="former-initial-user-lineage-conversation",
+            context_length=200000,
+        )
+
+        summaries = iter([
+            "First-stage assistant summary.\nExpand for details about: initial work",
+            "Second-stage user summary.\nExpand for details about: original request",
+        ])
+        monkeypatch.setattr(
+            lcm_engine,
+            "summarize_with_escalation",
+            lambda **kwargs: (next(summaries), 1),
+        )
+        original_user = "diagnose the original Qwen template failure"
+        messages = [
+            {"role": "system", "content": "You are concise."},
+            {"role": "user", "content": original_user},
+            {"role": "assistant", "content": "checking logs"},
+            {"role": "assistant", "content": "checking template"},
+            {"role": "assistant", "content": "still investigating"},
+            {"role": "assistant", "content": "first-stage tail"},
+        ]
+
+        try:
+            first_active_context = engine.compress(messages)
+            original_row = engine._store.get_session_nonblank_role_messages(
+                engine._session_id,
+                "user",
+                limit=1,
+            )[0]
+            original_store_id = original_row["store_id"]
+            assert engine._last_compacted_store_id > original_store_id
+            assert first_active_context[1]["content"] == original_user
+
+            second_messages = first_active_context + [
+                {"role": "user", "content": "now inspect the durable lineage"},
+                {"role": "assistant", "content": "checking source ids"},
+                {"role": "assistant", "content": "checking expansion"},
+            ]
+            assert engine._leading_anchor_count(second_messages) == 1
+            engine.compress(second_messages)
+
+            second_node = engine._dag.get_session_nodes(engine._session_id)[-1]
+            expanded = json.loads(
+                engine.handle_tool_call("lcm_expand", {"node_id": second_node.node_id})
+            )
+        finally:
+            engine.shutdown()
+
+        assert original_store_id in second_node.source_ids
+        assert any(item["content"] == original_user for item in expanded["expanded"])
+
     def _single_initial_user_restart_fixture(
         self,
         tmp_path,
@@ -11996,6 +12058,31 @@ class TestStoreIdMapping:
             assert all(store_id > first_max for store_id in second_node.source_ids)
         finally:
             esc._call_llm_for_summary = original_fn
+
+    def test_former_anchor_source_does_not_hijack_lone_later_duplicate(self, engine):
+        initial_store_id = engine._store.append(
+            "test-session",
+            {"role": "user", "content": "repeat"},
+        )
+        engine._last_compacted_store_id = initial_store_id
+        later_duplicate_id = engine._store.append(
+            "test-session",
+            {"role": "user", "content": "repeat"},
+        )
+        later_user_id = engine._store.append(
+            "test-session",
+            {"role": "user", "content": "different follow-up"},
+        )
+        active_duplicate = {"role": "user", "content": "repeat"}
+        active_later_user = {"role": "user", "content": "different follow-up"}
+        active_messages = [active_duplicate, active_later_user]
+
+        pre_frontier_sources = engine._get_formerly_anchored_user_source_map(active_messages)
+        ids_by_message_id = engine._get_store_id_map_for_messages(active_messages)
+
+        assert pre_frontier_sources == {}
+        assert ids_by_message_id[id(active_duplicate)] == later_duplicate_id
+        assert ids_by_message_id[id(active_later_user)] == later_user_id
 
     def test_singleton_externalized_placeholder_does_not_skip_later_visible_row(self, engine):
         placeholder = (
