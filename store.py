@@ -609,13 +609,23 @@ class MessageStore:
         session_id: str,
         role: str,
         limit: int = 2,
+        conversation_id: str | None = None,
     ) -> List[Dict[str, Any]]:
         """Get the earliest nonblank messages for one role in a session."""
+        where = ["session_id = ?", "role = ?", "TRIM(COALESCE(content, '')) <> ''"]
+        args: list[Any] = [session_id, role]
+        conversation_clause, conversation_args = _conversation_filter_clause(
+            "conversation_id", conversation_id
+        )
+        if conversation_clause:
+            where.append(conversation_clause)
+            args.extend(conversation_args)
+        args.append(limit)
         rows = self._conn.execute(
             f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
-               WHERE session_id = ? AND role = ? AND TRIM(COALESCE(content, '')) <> ''
+               WHERE {' AND '.join(where)}
                ORDER BY store_id LIMIT ?""",
-            (session_id, role, limit),
+            args,
         ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 

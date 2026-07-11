@@ -1333,6 +1333,26 @@ class TestMessageStore:
             "conv a second",
         ]
 
+    def test_nonblank_role_messages_can_filter_by_conversation_id(self, store):
+        store.append(
+            "sess1",
+            {"role": "user", "content": "prior conversation"},
+            conversation_id="conv-a",
+        )
+        store.append(
+            "sess1",
+            {"role": "user", "content": "current conversation"},
+            conversation_id="conv-b",
+        )
+
+        filtered = store.get_session_nonblank_role_messages(
+            "sess1",
+            "user",
+            conversation_id="conv-b",
+        )
+
+        assert [row["content"] for row in filtered] == ["current conversation"]
+
     def test_session_count(self, store):
         store.append("sess1", {"role": "user", "content": "a"})
         store.append("sess1", {"role": "assistant", "content": "b"})

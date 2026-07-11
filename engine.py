@@ -1523,6 +1523,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._session_id,
             "user",
             limit=max(2, self._store.get_session_count(self._session_id)),
+            conversation_id=self._conversation_id,
         )
         durable_users = [
             message for message in durable_users

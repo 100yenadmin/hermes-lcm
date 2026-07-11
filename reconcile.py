@@ -459,13 +459,18 @@ class ReconcileMixin:
         if self._message_replay_identity(candidate_messages[1]) != stored_head[1]:
             return False
         replay_tail = candidate_messages[2:]
+        has_durable_compaction_frontier = (
+            int(getattr(self, "_last_compacted_store_id", 0) or 0) > 0
+        )
         # _assemble_context emits at most one combined summary message directly
         # after this exact system/user anchor.  That position and assistant role
-        # are the provenance proof; summary-shaped content later in the batch may
-        # be a genuine user delta and must not be discarded merely by its text.
+        # identify generated scaffolding only when a durable frontier proves LCM
+        # previously compacted this session. Summary-shaped content without that
+        # provenance may be a genuine assistant delta and must remain ingestible.
         generated_summary_count = (
             1
             if replay_tail
+            and has_durable_compaction_frontier
             and str(replay_tail[0].get("role") or "") == "assistant"
             and self._is_replayed_context_scaffold_message(replay_tail[0])  # type: ignore[attr-defined]
             else 0
@@ -477,9 +482,6 @@ class ReconcileMixin:
             for message in replay_tail[generated_summary_count:]
             if not self._matches_ignore_message_patterns(message)  # type: ignore[attr-defined]
         ]
-        has_durable_compaction_frontier = (
-            int(getattr(self, "_last_compacted_store_id", 0) or 0) > 0
-        )
         assembly_cap = self._effective_assembly_token_cap()  # type: ignore[attr-defined]
         # A tail row that assembly could not fit cannot be replay evidence here;
         # an identical post-restart row is an ambiguous new delta and must survive.
@@ -1065,6 +1067,7 @@ class ReconcileMixin:
             self._session_id,
             "user",
             limit=max(1, self._store.get_session_count(self._session_id)),
+            conversation_id=getattr(self, "_conversation_id", ""),
         )
         if not durable_users:
             return {}

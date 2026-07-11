@@ -3774,6 +3774,40 @@ class TestEngineABC:
         assert [msg.get("role") for msg in active_context[:2]] == ["system", "user"]
         assert active_context[1].get("content") == user_query
 
+    def test_single_user_anchor_ignores_prior_conversation_on_reused_session(self, tmp_path):
+        engine = LCMEngine(
+            config=LCMConfig(database_path=str(tmp_path / "reused-session-anchor.db"))
+        )
+        session_id = "reused-session-anchor"
+        current_conversation_id = "current-anchor-conversation"
+        engine.on_session_start(
+            session_id,
+            platform="cli",
+            conversation_id=current_conversation_id,
+            context_length=200000,
+        )
+        engine._store.append(
+            session_id,
+            {"role": "user", "content": "user from an earlier conversation"},
+            conversation_id="prior-anchor-conversation",
+        )
+        current_user = {"role": "user", "content": "only user in the active conversation"}
+        engine._store.append(
+            session_id,
+            current_user,
+            conversation_id=current_conversation_id,
+        )
+        messages = [
+            {"role": "system", "content": "You are concise."},
+            current_user,
+            {"role": "assistant", "content": "working"},
+        ]
+
+        try:
+            assert engine._leading_anchor_count(messages) == 2
+        finally:
+            engine.shutdown()
+
     def test_second_compaction_keeps_former_initial_user_source_lineage_and_frontier(self, tmp_path, monkeypatch):
         config = LCMConfig(
             fresh_tail_count=2,
@@ -4151,7 +4185,7 @@ class TestEngineABC:
         ],
         ids=["no-delta", "new-delta"],
     )
-    def test_frontier_zero_overflow_anchor_restart_skips_generated_summary_scaffold(
+    def test_frontier_zero_overflow_anchor_restart_preserves_ambiguous_summary_shaped_assistant(
         self,
         tmp_path,
         followup,
@@ -4214,9 +4248,12 @@ class TestEngineABC:
         finally:
             after_restart.shutdown()
 
-        assert len(rows) == len(messages) + (1 if followup is not None else 0)
+        assert len(rows) == len(messages) + 1 + (1 if followup is not None else 0)
         assert [row["content"] for row in rows].count(user_query) == 1
-        assert all("[Recent Summary" not in row["content"] for row in rows)
+        assert sum(
+            row["role"] == "assistant" and row["content"] == summary_scaffold["content"]
+            for row in rows
+        ) == 1
         if followup is not None:
             assert rows[-1]["content"] == followup["content"]
 
