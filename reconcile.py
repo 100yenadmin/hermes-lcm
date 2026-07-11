@@ -463,14 +463,15 @@ class ReconcileMixin:
             int(getattr(self, "_last_compacted_store_id", 0) or 0) > 0
         )
         # _assemble_context emits at most one combined summary message directly
-        # after this exact system/user anchor.  That position and assistant role
-        # identify generated scaffolding only when a durable frontier proves LCM
-        # previously compacted this session. Summary-shaped content without that
-        # provenance may be a genuine assistant delta and must remain ingestible.
+        # after this exact system/user anchor.  Its generated system annotation
+        # plus a durable frontier prove the whole prefix came from LCM. A raw
+        # system anchor followed by summary-shaped content is ambiguous: the
+        # assistant message may be a new delta and must remain ingestible.
         generated_summary_count = (
             1
             if replay_tail
             and has_durable_compaction_frontier
+            and has_generated_system_anchor
             and str(replay_tail[0].get("role") or "") == "assistant"
             and self._is_replayed_context_scaffold_message(replay_tail[0])  # type: ignore[attr-defined]
             else 0

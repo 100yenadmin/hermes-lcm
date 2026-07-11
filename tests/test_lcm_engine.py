@@ -4013,6 +4013,43 @@ class TestEngineABC:
         assert rows[-1]["content"] == repeated_assistant["content"]
         assert all("[Recent Summary" not in row["content"] for row in rows)
 
+    def test_compacted_restart_raw_anchor_preserves_summary_shaped_assistant_delta(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        after_restart, _active_context, messages, user_query = (
+            self._single_initial_user_restart_fixture(
+                tmp_path,
+                monkeypatch,
+                "single-initial-user-restart-summary-shaped-assistant.db",
+            )
+        )
+        raw_anchor = messages[:2]
+        summary_shaped_assistant = {
+            "role": "assistant",
+            "content": (
+                "[Recent Summary (d0, node 999)]\n"
+                "This is a new real assistant delta after restart.\n"
+                "[Expand for details: literal assistant response]"
+            ),
+        }
+        try:
+            assert after_restart._last_compacted_store_id > 0
+            assert not after_restart._is_replayed_context_scaffold_message(raw_anchor[0])
+            assert after_restart._is_replayed_context_scaffold_message(summary_shaped_assistant)
+            after_restart._ingest_messages(raw_anchor + [summary_shaped_assistant])
+            rows = after_restart._store.get_session_messages(
+                "single-initial-user-restart-session"
+            )
+        finally:
+            after_restart.shutdown()
+
+        assert len(rows) == len(messages) + 1
+        assert [row["content"] for row in rows].count(user_query) == 1
+        assert rows[-1]["role"] == "assistant"
+        assert rows[-1]["content"] == summary_shaped_assistant["content"]
+
     def test_overflow_recovery_keeps_single_initial_user_anchor(self, tmp_path):
         db_path = tmp_path / "single-initial-user-overflow-anchor.db"
         config = LCMConfig(
