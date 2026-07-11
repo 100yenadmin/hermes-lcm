@@ -433,16 +433,29 @@ class CompactionMixin:
                 break
 
             candidate_start = leading_anchor_count
-            while (
-                candidate_start < fresh_tail_start
-                and self._is_replayed_context_scaffold_message(working_messages[candidate_start])
-            ):
-                candidate_start += 1
-            if candidate_start > leading_anchor_count:
+            compactable_pairs = list(
+                zip(
+                    working_messages[candidate_start:fresh_tail_start],
+                    pressure_messages[candidate_start:fresh_tail_start],
+                )
+            )
+            raw_compactable_pairs = [
+                (working_msg, pressure_msg)
+                for working_msg, pressure_msg in compactable_pairs
+                if not self._is_replayed_context_scaffold_message(working_msg)  # type: ignore[attr-defined]
+            ]
+            if len(raw_compactable_pairs) != len(compactable_pairs):
                 dropped_replayed_scaffold_messages = True
-                working_messages = working_messages[:leading_anchor_count] + working_messages[candidate_start:]
-                pressure_messages = pressure_messages[:leading_anchor_count] + pressure_messages[candidate_start:]
-                candidate_start = leading_anchor_count
+                working_messages = (
+                    working_messages[:candidate_start]
+                    + [working_msg for working_msg, _pressure_msg in raw_compactable_pairs]
+                    + working_messages[fresh_tail_start:]
+                )
+                pressure_messages = (
+                    pressure_messages[:candidate_start]
+                    + [pressure_msg for _working_msg, pressure_msg in raw_compactable_pairs]
+                    + pressure_messages[fresh_tail_start:]
+                )
                 n = len(working_messages)
                 fresh_tail_start = max(0, n - self._config.fresh_tail_count)
                 if fresh_tail_start <= leading_anchor_count:

@@ -3827,7 +3827,7 @@ class TestEngineABC:
                 {"role": "assistant", "content": "checking expansion"},
             ]
             assert engine._leading_anchor_count(second_messages) == 1
-            engine.compress(second_messages)
+            second_active_context = engine.compress(second_messages)
 
             second_node = engine._dag.get_session_nodes(engine._session_id)[-1]
             assert engine._last_compacted_store_id >= first_frontier
@@ -3839,6 +3839,12 @@ class TestEngineABC:
 
         assert original_store_id in second_node.source_ids
         assert any(item["content"] == original_user for item in expanded["expanded"])
+        assert (
+            "\n".join(str(message.get("content", "")) for message in second_active_context).count(
+                "First-stage assistant summary."
+            )
+            == 1
+        )
 
     def _single_initial_user_restart_fixture(
         self,
