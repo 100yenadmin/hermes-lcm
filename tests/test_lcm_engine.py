@@ -3777,9 +3777,7 @@ class TestEngineABC:
     def test_second_compaction_keeps_former_initial_user_source_lineage_and_frontier(self, tmp_path, monkeypatch):
         config = LCMConfig(
             fresh_tail_count=2,
-            leaf_chunk_tokens=1,
-            dynamic_leaf_chunk_enabled=True,
-            dynamic_leaf_chunk_max=1,
+            leaf_chunk_tokens=40,
             database_path=str(tmp_path / "former-initial-user-lineage.db"),
         )
         engine = LCMEngine(config=config)
@@ -3794,19 +3792,25 @@ class TestEngineABC:
             "First-stage assistant summary.\nExpand for details about: initial work",
             "Second-stage user summary.\nExpand for details about: original request",
         ])
+        summary_inputs = []
+
+        def mock_summary(**kwargs):
+            summary_inputs.append(kwargs["text"])
+            return next(summaries), 1
+
         monkeypatch.setattr(
             lcm_engine,
             "summarize_with_escalation",
-            lambda **kwargs: (next(summaries), 1),
+            mock_summary,
         )
         original_user = "diagnose the original Qwen template failure"
         messages = [
             {"role": "system", "content": "You are concise."},
             {"role": "user", "content": original_user},
-            {"role": "assistant", "content": "checking logs"},
-            {"role": "assistant", "content": "checking template"},
-            {"role": "assistant", "content": "still investigating"},
-            {"role": "assistant", "content": "first-stage tail"},
+            {"role": "assistant", "content": "checking logs " + "detail " * 30},
+            {"role": "assistant", "content": "checking template " + "detail " * 30},
+            {"role": "assistant", "content": "still investigating " + "detail " * 30},
+            {"role": "assistant", "content": "first-stage tail " + "detail " * 30},
         ]
 
         try:
@@ -3839,6 +3843,8 @@ class TestEngineABC:
 
         assert original_store_id in second_node.source_ids
         assert any(item["content"] == original_user for item in expanded["expanded"])
+        assert len(summary_inputs) == 2
+        assert "[Recent Summary" not in summary_inputs[1]
         assert (
             "\n".join(str(message.get("content", "")) for message in second_active_context).count(
                 "First-stage assistant summary."
