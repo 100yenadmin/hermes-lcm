@@ -458,16 +458,24 @@ class ReconcileMixin:
             return False
         if self._message_replay_identity(candidate_messages[1]) != stored_head[1]:
             return False
+        replay_tail = candidate_messages[2:]
+        # _assemble_context emits at most one combined summary message directly
+        # after this exact system/user anchor.  That position and assistant role
+        # are the provenance proof; summary-shaped content later in the batch may
+        # be a genuine user delta and must not be discarded merely by its text.
+        generated_summary_count = (
+            1
+            if replay_tail
+            and str(replay_tail[0].get("role") or "") == "assistant"
+            and self._is_replayed_context_scaffold_message(replay_tail[0])  # type: ignore[attr-defined]
+            else 0
+        )
         if has_raw_durable_system_anchor:
-            return all(
-                self._is_replayed_context_scaffold_message(message)  # type: ignore[attr-defined]
-                for message in candidate_messages[2:]
-            )
+            return len(replay_tail) == generated_summary_count
         visible_after_anchor = [
             self._message_replay_identity(message)
-            for message in candidate_messages[2:]
-            if not self._is_replayed_context_scaffold_message(message)
-            and not self._matches_ignore_message_patterns(message)
+            for message in replay_tail[generated_summary_count:]
+            if not self._matches_ignore_message_patterns(message)  # type: ignore[attr-defined]
         ]
         has_durable_compaction_frontier = (
             int(getattr(self, "_last_compacted_store_id", 0) or 0) > 0

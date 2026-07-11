@@ -4413,6 +4413,11 @@ class TestEngineABC:
         assert engine._is_replayed_context_scaffold_message(active_context[-1])
         assert [row["content"] for row in uncompacted_rows] == [messages[-1]["content"]]
 
+        literal_user_delta = {
+            "role": "user",
+            "content": active_context[-1]["content"],
+        }
+
         after_restart = LCMEngine(config=config)
         after_restart.on_session_start(
             "anchor-summary-omitted-tail-session",
@@ -4421,17 +4426,21 @@ class TestEngineABC:
             context_length=200000,
         )
         try:
-            after_restart._ingest_messages(active_context)
+            after_restart._ingest_messages(active_context + [literal_user_delta])
             rows = after_restart._store.get_session_messages(
                 "anchor-summary-omitted-tail-session"
             )
         finally:
             after_restart.shutdown()
 
-        assert len(rows) == len(messages)
+        assert len(rows) == len(messages) + 1
         assert [row["content"] for row in rows].count(user_query) == 1
-        assert all(
-            not after_restart._is_replayed_context_scaffold_message(row)
+        assert sum(
+            row["role"] == "user" and row["content"] == literal_user_delta["content"]
+            for row in rows
+        ) == 1
+        assert not any(
+            row["role"] == "assistant" and row["content"] == active_context[-1]["content"]
             for row in rows
         )
 
