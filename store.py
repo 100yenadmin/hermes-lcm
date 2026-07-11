@@ -92,6 +92,10 @@ def _conversation_filter_clause(column: str, conversation_id: str | None) -> tup
     return f"{column} = ?", [normalized]
 
 
+def _legacy_blank_conversation_filter_clause(column: str) -> tuple[str, list[str]]:
+    return f"TRIM(COALESCE({column}, '')) = ''", []
+
+
 def _message_role_bias(role: str | None) -> float:
     if role == "user":
         return 0.0
@@ -595,11 +599,17 @@ class MessageStore:
 
     def get_session_messages(self, session_id: str,
                              limit: int = 10000,
-                             conversation_id: str | None = None) -> List[Dict[str, Any]]:
+                             conversation_id: str | None = None,
+                             legacy_blank_conversation_only: bool = False) -> List[Dict[str, Any]]:
         """Get all messages for a session, ordered by store_id."""
-        conversation_clause, conversation_args = _conversation_filter_clause(
-            "conversation_id", conversation_id
-        )
+        if legacy_blank_conversation_only:
+            conversation_clause, conversation_args = _legacy_blank_conversation_filter_clause(
+                "conversation_id"
+            )
+        else:
+            conversation_clause, conversation_args = _conversation_filter_clause(
+                "conversation_id", conversation_id
+            )
         where = "session_id = ?"
         args: list[Any] = [session_id]
         if conversation_clause:
@@ -642,11 +652,17 @@ class MessageStore:
     def get_session_messages_after(self, session_id: str,
                                    after_store_id: int = 0,
                                    limit: int = 10000,
-                                   conversation_id: str | None = None) -> List[Dict[str, Any]]:
+                                   conversation_id: str | None = None,
+                                   legacy_blank_conversation_only: bool = False) -> List[Dict[str, Any]]:
         """Get session messages after a store_id, ordered by store_id."""
-        conversation_clause, conversation_args = _conversation_filter_clause(
-            "conversation_id", conversation_id
-        )
+        if legacy_blank_conversation_only:
+            conversation_clause, conversation_args = _legacy_blank_conversation_filter_clause(
+                "conversation_id"
+            )
+        else:
+            conversation_clause, conversation_args = _conversation_filter_clause(
+                "conversation_id", conversation_id
+            )
         where = "session_id = ? AND store_id > ?"
         args: list[Any] = [session_id, after_store_id]
         if conversation_clause:
@@ -662,13 +678,19 @@ class MessageStore:
         return [self._row_to_dict(r) for r in rows]
 
     def get_session_tail(self, session_id: str, limit: int = 1000,
-                         conversation_id: str | None = None) -> List[Dict[str, Any]]:
+                         conversation_id: str | None = None,
+                         legacy_blank_conversation_only: bool = False) -> List[Dict[str, Any]]:
         """Get the latest messages for a session, returned in store order."""
         if limit <= 0:
             return []
-        conversation_clause, conversation_args = _conversation_filter_clause(
-            "conversation_id", conversation_id
-        )
+        if legacy_blank_conversation_only:
+            conversation_clause, conversation_args = _legacy_blank_conversation_filter_clause(
+                "conversation_id"
+            )
+        else:
+            conversation_clause, conversation_args = _conversation_filter_clause(
+                "conversation_id", conversation_id
+            )
         where = "session_id = ?"
         args: list[Any] = [session_id]
         if conversation_clause:
@@ -690,11 +712,17 @@ class MessageStore:
         return [self._row_to_dict(r) for r in rows]
 
     def get_session_count(self, session_id: str,
-                          conversation_id: str | None = None) -> int:
+                          conversation_id: str | None = None,
+                          legacy_blank_conversation_only: bool = False) -> int:
         """Count messages in a session."""
-        conversation_clause, conversation_args = _conversation_filter_clause(
-            "conversation_id", conversation_id
-        )
+        if legacy_blank_conversation_only:
+            conversation_clause, conversation_args = _legacy_blank_conversation_filter_clause(
+                "conversation_id"
+            )
+        else:
+            conversation_clause, conversation_args = _conversation_filter_clause(
+                "conversation_id", conversation_id
+            )
         where = "session_id = ?"
         args: list[Any] = [session_id]
         if conversation_clause:

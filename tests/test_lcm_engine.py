@@ -4092,6 +4092,98 @@ class TestEngineABC:
             "current-conversation",
         ]
 
+    def test_reused_session_new_conversation_does_not_reconcile_against_prior_conversation(
+        self,
+        tmp_path,
+    ):
+        db_path = tmp_path / "reused-session-new-conversation.db"
+        config = LCMConfig(database_path=str(db_path))
+        session_id = "reused-session-new-conversation"
+        shared_prefix = [
+            {"role": "system", "content": "Shared system prompt."},
+            {"role": "user", "content": "shared first request"},
+        ]
+
+        old_engine = LCMEngine(config=config)
+        old_engine.on_session_start(
+            session_id,
+            platform="cli",
+            conversation_id="old-conversation",
+            context_length=200000,
+        )
+        try:
+            old_engine._ingest_messages(shared_prefix)
+        finally:
+            old_engine.shutdown()
+
+        current_engine = LCMEngine(config=config)
+        current_engine.on_session_start(
+            session_id,
+            platform="cli",
+            conversation_id="current-conversation",
+            context_length=200000,
+        )
+        try:
+            current_engine._ingest_messages(shared_prefix)
+            current_rows = current_engine._store.get_session_messages(
+                session_id,
+                conversation_id="current-conversation",
+            )
+            all_rows = current_engine._store.get_session_messages(session_id)
+            ingest_cursor = current_engine._ingest_cursor
+        finally:
+            current_engine.shutdown()
+
+        assert ingest_cursor == len(shared_prefix)
+        assert [row["role"] for row in current_rows] == ["system", "user"]
+        assert [row["content"] for row in current_rows] == [
+            "Shared system prompt.",
+            "shared first request",
+        ]
+        assert all(row["conversation_id"] == "current-conversation" for row in current_rows)
+        assert len(all_rows) == 4
+
+    def test_reused_session_new_conversation_reconciles_legacy_blank_conversation_rows(
+        self,
+        tmp_path,
+    ):
+        db_path = tmp_path / "reused-session-legacy-blank-conversation.db"
+        config = LCMConfig(database_path=str(db_path))
+        session_id = "reused-session-legacy-blank-conversation"
+        shared_prefix = [
+            {"role": "system", "content": "Legacy system prompt."},
+            {"role": "user", "content": "legacy first request"},
+        ]
+
+        seed_engine = LCMEngine(config=config)
+        try:
+            seed_engine._store.append_batch(
+                session_id,
+                shared_prefix,
+                conversation_id="",
+            )
+        finally:
+            seed_engine.shutdown()
+
+        current_engine = LCMEngine(config=config)
+        current_engine.on_session_start(
+            session_id,
+            platform="cli",
+            conversation_id="current-conversation",
+            context_length=200000,
+        )
+        try:
+            current_engine._ingest_messages(shared_prefix)
+            rows = current_engine._store.get_session_messages(session_id)
+            reconciliation = current_engine._last_ingest_reconciliation
+        finally:
+            current_engine.shutdown()
+
+        assert reconciliation["action"] == "advanced cursor"
+        assert reconciliation["cursor"] == len(shared_prefix)
+        assert len(rows) == len(shared_prefix)
+        assert all(not row["conversation_id"] for row in rows)
+
     def test_single_initial_user_anchor_restart_one_followup_only_persists_delta(
         self,
         tmp_path,

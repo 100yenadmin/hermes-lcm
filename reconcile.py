@@ -880,18 +880,21 @@ class ReconcileMixin:
             return 0
 
         conversation_id = getattr(self, "_conversation_id", "")
+        legacy_blank_conversation_only = False
         try:
             session_count = self._store.get_session_count(  # type: ignore[attr-defined]
                 self._session_id,  # type: ignore[attr-defined]
                 conversation_id=conversation_id,
             )
-            # Legacy rows may predate conversation provenance. Preserve the
-            # existing session-wide reconciliation path when the active
-            # conversation has no attributed durable rows to prove its scope.
+            # Legacy rows may predate conversation provenance. Preserve their
+            # reconciliation path without allowing rows attributed to another
+            # conversation on a reused session to become replay evidence.
             if conversation_id and session_count <= 0:
                 conversation_id = ""
+                legacy_blank_conversation_only = True
                 session_count = self._store.get_session_count(  # type: ignore[attr-defined]
-                    self._session_id  # type: ignore[attr-defined]
+                    self._session_id,  # type: ignore[attr-defined]
+                    legacy_blank_conversation_only=True,
                 )
         except Exception as exc:  # pragma: no cover - defensive only
             logger.debug("LCM ingest cursor reconciliation count failed: %s", exc)
@@ -931,6 +934,7 @@ class ReconcileMixin:
             self._session_id,  # type: ignore[attr-defined]
             limit=tail_limit,
             conversation_id=conversation_id,
+            legacy_blank_conversation_only=legacy_blank_conversation_only,
         )
         if not stored_rows:
             return 0
@@ -947,6 +951,7 @@ class ReconcileMixin:
             self._session_id,  # type: ignore[attr-defined]
             limit=tail_limit,
             conversation_id=conversation_id,
+            legacy_blank_conversation_only=legacy_blank_conversation_only,
         )
         stored_head = [
             self._message_replay_identity(row, stored_row=True)
@@ -957,6 +962,7 @@ class ReconcileMixin:
             after_store_id=max(0, int(self._last_compacted_store_id or 0)),
             limit=session_count,
             conversation_id=conversation_id,
+            legacy_blank_conversation_only=legacy_blank_conversation_only,
         )
         stored_uncompacted_tail = [
             self._message_replay_identity(row, stored_row=True)
