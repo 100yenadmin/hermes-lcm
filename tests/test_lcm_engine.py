@@ -4536,6 +4536,78 @@ class TestEngineABC:
         if followup is not None:
             assert rows[-1]["content"] == followup["content"]
 
+    @pytest.mark.parametrize(
+        "followup",
+        [
+            None,
+            {"role": "user", "content": "new delta after partial tail replay"},
+        ],
+        ids=["no-delta", "new-delta"],
+    )
+    def test_frontier_zero_overflow_partial_tail_replay_does_not_duplicate_tail(
+        self,
+        tmp_path,
+        followup,
+    ):
+        db_path = tmp_path / "frontier-zero-overflow-partial-tail-restart.db"
+        config = LCMConfig(
+            fresh_tail_count=3,
+            leaf_chunk_tokens=10_000,
+            max_assembly_tokens=180,
+            database_path=str(db_path),
+        )
+        session_id = "frontier-zero-overflow-partial-tail-session"
+        conversation_id = "frontier-zero-overflow-partial-tail-conversation"
+        messages = [
+            {"role": "system", "content": "You are concise."},
+            {"role": "user", "content": "preserve this provider anchor"},
+            {"role": "assistant", "content": "large derived output " + "x" * 4000},
+            {"role": "assistant", "content": "more derived output " + "y" * 4000},
+            {"role": "assistant", "content": "latest compact durable tail"},
+        ]
+
+        engine = LCMEngine(config=config)
+        engine.on_session_start(
+            session_id,
+            platform="cli",
+            conversation_id=conversation_id,
+            context_length=200000,
+        )
+        try:
+            active_context = engine.compress(messages)
+            assert engine.last_compression_status == "overflow_recovery"
+            assert engine._last_compacted_store_id == 0
+        finally:
+            engine.shutdown()
+
+        assert [message.get("content") for message in active_context] == [
+            messages[0]["content"],
+            messages[1]["content"],
+            messages[-1]["content"],
+        ]
+
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            session_id,
+            platform="cli",
+            conversation_id=conversation_id,
+            context_length=200000,
+        )
+        try:
+            replay = active_context + ([followup] if followup is not None else [])
+            after_restart._ingest_messages(replay)
+            rows = after_restart._store.get_session_messages(session_id)
+            reconciliation = after_restart._last_ingest_reconciliation
+        finally:
+            after_restart.shutdown()
+
+        assert reconciliation["action"] == "advanced cursor"
+        assert reconciliation["cursor"] == len(active_context)
+        assert len(rows) == len(messages) + (1 if followup is not None else 0)
+        assert [row["content"] for row in rows].count(messages[-1]["content"]) == 1
+        if followup is not None:
+            assert rows[-1]["content"] == followup["content"]
+
     def test_frontier_zero_overflow_anchor_restart_repeated_assistant_persists_delta_once(
         self,
         tmp_path,

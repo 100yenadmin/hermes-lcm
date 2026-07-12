@@ -424,6 +424,8 @@ class ReconcileMixin:
         candidate_messages: list[Dict[str, Any]],
         stored_head: list[tuple[str, str, str, str]],
         stored_uncompacted_tail: list[tuple[str, str, str, str]],
+        *,
+        uncompacted_tail_exceeds_assembly_cap: bool,
     ) -> bool:
         """Recognize compacted replay with a raw initial-user provider anchor.
 
@@ -476,14 +478,33 @@ class ReconcileMixin:
             and self._is_replayed_context_scaffold_message(replay_tail[0])  # type: ignore[attr-defined]
             else 0
         )
-        if has_raw_durable_system_anchor:
-            return len(replay_tail) == generated_summary_count
         visible_after_anchor = [
             self._message_replay_identity(message)
             for message in replay_tail[generated_summary_count:]
             if not self._matches_ignore_message_patterns(message)  # type: ignore[attr-defined]
         ]
         assembly_cap = self._effective_assembly_token_cap()  # type: ignore[attr-defined]
+        if has_raw_durable_system_anchor:
+            # Frontier-zero overflow can replay the raw provider anchor plus the
+            # newest durable suffix while omitting an over-cap middle. Accept
+            # that complete incoming prefix only when both the durable history
+            # and the incoming replay prove the exact capped assembly shape.
+            has_capped_partial_tail_replay = (
+                not has_durable_compaction_frontier
+                and uncompacted_tail_exceeds_assembly_cap
+                and bool(visible_after_anchor)
+                and len(visible_after_anchor) < len(stored_uncompacted_tail)
+                and self._matches_store_tail_suffix(
+                    stored_uncompacted_tail,
+                    visible_after_anchor,
+                )
+                and assembly_cap is not None
+                and count_messages_tokens(candidate_messages) <= assembly_cap
+            )
+            return (
+                len(replay_tail) == generated_summary_count
+                or has_capped_partial_tail_replay
+            )
         # A tail row that assembly could not fit cannot be replay evidence here;
         # an identical post-restart row is an ambiguous new delta and must survive.
         has_feasible_full_tail_replay = (
@@ -508,6 +529,7 @@ class ReconcileMixin:
         allow_empty_prefix: bool,
         session_count: int,
         raw_session_count: int,
+        uncompacted_tail_exceeds_assembly_cap: bool,
     ) -> int | None:
         sanitized_replay_tail = self._stored_tail_for_sanitized_active_replay(stored_tail)
         effective_session_count = len(sanitized_replay_tail)
@@ -565,6 +587,9 @@ class ReconcileMixin:
                 candidate_messages,
                 stored_head,
                 stored_uncompacted_tail,
+                uncompacted_tail_exceeds_assembly_cap=(
+                    uncompacted_tail_exceeds_assembly_cap
+                ),
             ):
                 return cursor
             if not candidate_prefix:
@@ -1023,6 +1048,11 @@ class ReconcileMixin:
             for row in uncompacted_rows
             if not self._matches_ignore_message_patterns(row, stored_row=True)
         ]
+        assembly_cap = self._effective_assembly_token_cap()  # type: ignore[attr-defined]
+        uncompacted_tail_exceeds_assembly_cap = (
+            assembly_cap is not None
+            and count_messages_tokens(uncompacted_rows) > assembly_cap
+        )
         incoming_identities = self._effective_replay_identities(messages)
         # Stale-snapshot proof uses the raw durable prefix. Ignore-message
         # filters may suppress noisy rows for tail reconciliation, but filtered
@@ -1072,6 +1102,9 @@ class ReconcileMixin:
             allow_empty_prefix=True,
             session_count=len(stored_tail),
             raw_session_count=session_count,
+            uncompacted_tail_exceeds_assembly_cap=(
+                uncompacted_tail_exceeds_assembly_cap
+            ),
         )
         if cursor is not None and cursor > 0:
             reason = (
