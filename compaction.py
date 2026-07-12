@@ -386,10 +386,23 @@ class CompactionMixin:
         # or provider context after the durable row has been written.
         working_messages = self._ingest_messages(messages)
         ingest_cleanup_changed_active_context = working_messages != messages
+        restored_working_messages = [
+            self._strip_coalesced_generated_summary_scaffold(message)  # type: ignore[attr-defined]
+            for message in working_messages
+        ]
+        restored_coalesced_summary_tail = any(
+            restored is not original
+            for original, restored in zip(working_messages, restored_working_messages)
+        )
+        if restored_coalesced_summary_tail:
+            working_messages = restored_working_messages
+            ingest_cleanup_changed_active_context = True
         anchor_source_messages = list(working_messages)
         pressure_messages = messages if len(messages) == len(working_messages) else working_messages
+        if restored_coalesced_summary_tail:
+            pressure_messages = working_messages
         leaf_compacted_this_turn = False
-        dropped_replayed_scaffold_messages = False
+        dropped_replayed_scaffold_messages = restored_coalesced_summary_tail
         leaf_passes = 0
         critical_budget_pressure = self._critical_budget_pressure_reached(
             observed_tokens=observed_prompt_tokens,

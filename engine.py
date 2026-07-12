@@ -3756,6 +3756,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     def _is_known_generated_summary_scaffold_message(self, msg: Dict[str, Any]) -> bool:
         content = normalize_content_value(msg.get("content")) or ""
+        prefix = self._known_generated_summary_scaffold_prefix(content)
+        return bool(prefix) and prefix == content
+
+    def _known_generated_summary_scaffold_prefix(self, content: str) -> str:
+        """Return the exact DAG-backed summary prefix at the start of content."""
         generated_summaries: set[str] = set()
         for match in re.finditer(
             r"\[(?:Recent|Session Arc|Durable|Depth-\d+) Summary "
@@ -3776,10 +3781,71 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 f"[Expand for details: {node.expand_hint}]"
             )
             generated_summaries.add(generated)
-        if content in generated_summaries:
-            return True
-        parts = content.split("\n\n---\n\n")
-        return bool(parts) and all(part in generated_summaries for part in parts)
+        if not generated_summaries:
+            return ""
+
+        cursor = 0
+        matched_parts = 0
+        while True:
+            generated = next(
+                (
+                    candidate
+                    for candidate in sorted(generated_summaries, key=len, reverse=True)
+                    if content.startswith(candidate, cursor)
+                ),
+                None,
+            )
+            if generated is None:
+                break
+            cursor += len(generated)
+            matched_parts += 1
+            if content.startswith("\n\n---\n\n", cursor):
+                cursor += len("\n\n---\n\n")
+                continue
+            break
+        if not matched_parts:
+            return ""
+        if content[:cursor].endswith("\n\n---\n\n"):
+            cursor -= len("\n\n---\n\n")
+        return content[:cursor]
+
+    def _strip_coalesced_generated_summary_scaffold(
+        self,
+        msg: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Restore a durable assistant tail coalesced behind generated summary text."""
+        if str(msg.get("role") or "") != "assistant":
+            return msg
+        content = msg.get("content")
+        if isinstance(content, str):
+            prefix = self._known_generated_summary_scaffold_prefix(content)
+            separator = "\n\n"
+            if not prefix or not content.startswith(prefix + separator):
+                return msg
+            restored = copy.deepcopy(msg)
+            restored["content"] = content[len(prefix + separator) :]
+            return restored
+        if not isinstance(content, list) or not content:
+            return msg
+        first = content[0]
+        if not isinstance(first, dict) or first.get("type") != "text":
+            return msg
+        text = str(first.get("text") or "")
+        prefix = self._known_generated_summary_scaffold_prefix(text)
+        if not prefix:
+            return msg
+        restored = copy.deepcopy(msg)
+        restored_content = restored["content"]
+        if text == prefix:
+            if len(restored_content) == 1:
+                return msg
+            restored["content"] = restored_content[1:]
+            return restored
+        separator = "\n\n"
+        if not text.startswith(prefix + separator):
+            return msg
+        restored_content[0]["text"] = text[len(prefix + separator) :]
+        return restored
 
     def _restore_ingest_payload_placeholders_in_value(self, value: Any, *, session_id: str) -> Any:
         if isinstance(value, dict):

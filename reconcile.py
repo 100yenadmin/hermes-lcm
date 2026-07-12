@@ -291,7 +291,39 @@ class ReconcileMixin:
         incoming = [self._message_replay_identity(message) for message in messages]
         if len(incoming) >= len(snapshot) and incoming[: len(snapshot)] == snapshot:
             self._historical_active_replay_matched = True
-            return len(snapshot)
+            cursor = len(snapshot)
+            suffix = incoming[cursor:]
+            if suffix:
+                conversation_id = str(getattr(self, "_conversation_id", "") or "")
+                try:
+                    session_count = self._store.get_session_count(  # type: ignore[attr-defined]
+                        self._session_id,  # type: ignore[attr-defined]
+                        conversation_id=conversation_id,
+                    )
+                    durable_rows = self._store.get_session_messages(  # type: ignore[attr-defined]
+                        self._session_id,  # type: ignore[attr-defined]
+                        limit=max(1, session_count),
+                        conversation_id=conversation_id,
+                    )
+                except Exception:
+                    durable_rows = []
+                durable = [
+                    self._message_replay_identity(row, stored_row=True)
+                    for row in durable_rows
+                ]
+                snapshot_endpoint = next(
+                    (
+                        index
+                        for index in range(len(durable) - 1, -1, -1)
+                        if durable[index] == snapshot[-1]
+                    ),
+                    None,
+                )
+                if snapshot_endpoint is not None:
+                    durable_suffix = durable[snapshot_endpoint + 1 :]
+                    if durable_suffix and suffix[: len(durable_suffix)] == durable_suffix:
+                        cursor += len(durable_suffix)
+            return cursor
         logger.debug(
             "LCM historical active replay mismatch: incoming=%d snapshot=%d first_diff=%s",
             len(incoming),
@@ -623,10 +655,11 @@ class ReconcileMixin:
         for cursor in range(len(messages), -1, -1):
             candidate_messages = messages[:cursor]
             candidate_visible_messages = [
-                msg
+                restored
                 for msg in candidate_messages
-                if not self._is_replayed_context_scaffold_message(msg)
-                and not self._matches_ignore_message_patterns(msg)
+                for restored in [self._strip_coalesced_generated_summary_scaffold(msg)]  # type: ignore[attr-defined]
+                if not self._is_replayed_context_scaffold_message(restored)  # type: ignore[attr-defined]
+                and not self._matches_ignore_message_patterns(restored)  # type: ignore[attr-defined]
             ]
             candidate_non_placeholder_messages = [
                 msg
@@ -951,10 +984,11 @@ class ReconcileMixin:
         messages: List[Dict[str, Any]],
     ) -> list[tuple[str, str, str, str]]:
         return [
-            self._message_replay_identity(msg)
+            self._message_replay_identity(restored)
             for msg in messages
-            if not self._is_replayed_context_scaffold_message(msg)
-            and not self._matches_ignore_message_patterns(msg)
+            for restored in [self._strip_coalesced_generated_summary_scaffold(msg)]  # type: ignore[attr-defined]
+            if not self._is_replayed_context_scaffold_message(restored)  # type: ignore[attr-defined]
+            and not self._matches_ignore_message_patterns(restored)  # type: ignore[attr-defined]
         ]
 
     def _is_suspicious_stale_no_overlap_snapshot(

@@ -4859,6 +4859,48 @@ class TestEngineABC:
             repeated_restart.shutdown()
         assert len(repeated_rows) == len(rows)
 
+    def test_restart_snapshot_prefix_reconciles_already_durable_suffix(self, tmp_path):
+        db_path = tmp_path / "snapshot-prefix-durable-suffix.db"
+        config = LCMConfig(database_path=str(db_path))
+        session_id = "snapshot-prefix-durable-suffix-session"
+        conversation_id = "snapshot-prefix-durable-suffix-conversation"
+        snapshot = [
+            {"role": "system", "content": "System anchor."},
+            {"role": "user", "content": "Durable request."},
+        ]
+        durable_suffix = [
+            {"role": "assistant", "content": "Already durable response."},
+            {"role": "user", "content": "Already durable follow-up."},
+        ]
+        before = LCMEngine(config=config)
+        before.on_session_start(
+            session_id, platform="cli", conversation_id=conversation_id, context_length=200000
+        )
+        try:
+            before._store.append_batch(
+                session_id,
+                [*snapshot, *durable_suffix],
+                conversation_id=conversation_id,
+            )
+            before._write_active_replay_snapshot(snapshot)
+        finally:
+            before.shutdown()
+
+        after = LCMEngine(config=config)
+        after.on_session_start(
+            session_id, platform="cli", conversation_id=conversation_id, context_length=200000
+        )
+        fresh_delta = {"role": "assistant", "content": "Fresh response after replay."}
+        try:
+            after._ingest_messages([*snapshot, *durable_suffix, fresh_delta])
+            rows = after._store.get_session_messages(session_id, conversation_id=conversation_id)
+        finally:
+            after.shutdown()
+
+        assert [row["content"] for row in rows] == [
+            message["content"] for message in [*snapshot, *durable_suffix, fresh_delta]
+        ]
+
     def test_new_system_message_with_lcm_annotation_phrases_persists_exactly_once(self, tmp_path):
         db_path = tmp_path / "literal-lcm-system-phrases.db"
         config = LCMConfig(database_path=str(db_path))
@@ -12051,6 +12093,81 @@ class TestEngineCompress:
             messages.append({"role": "user", "content": f"Question {i}: " + "x" * 200})
             messages.append({"role": "assistant", "content": f"Answer {i}: " + "y" * 200})
         return messages
+
+    def test_compaction_restores_durable_tail_coalesced_with_generated_summary(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        db_path = tmp_path / "coalesced-summary-durable-tail.db"
+        config = LCMConfig(
+            database_path=str(db_path),
+            fresh_tail_count=1,
+            leaf_chunk_tokens=1,
+        )
+        session_id = "coalesced-summary-durable-tail-session"
+        conversation_id = "coalesced-summary-durable-tail-conversation"
+        durable = [
+            {"role": "system", "content": "System anchor."},
+            {"role": "user", "content": "Initial durable request."},
+            {"role": "assistant", "content": "Genuine durable assistant tail."},
+        ]
+        before = LCMEngine(config=config)
+        before.on_session_start(
+            session_id, platform="cli", conversation_id=conversation_id, context_length=200000
+        )
+        try:
+            store_ids = before._store.append_batch(
+                session_id, durable, conversation_id=conversation_id
+            )
+            before._dag.add_node(SummaryNode(
+                session_id=session_id,
+                depth=0,
+                summary="Generated replay material.",
+                token_count=4,
+                source_token_count=4,
+                source_ids=[store_ids[0]],
+                source_type="messages",
+                expand_hint="earlier system context",
+            ))
+            active_context = before._assemble_context(
+                durable[0],
+                [durable[-1]],
+                leading_anchor_messages=durable[:2],
+            )
+            before._write_active_replay_snapshot(active_context)
+        finally:
+            before.shutdown()
+
+        assert [message["role"] for message in active_context] == ["system", "user", "assistant"]
+        assert "Generated replay material." in active_context[-1]["content"]
+        assert durable[-1]["content"] in active_context[-1]["content"]
+
+        monkeypatch.setattr(
+            lcm_engine,
+            "summarize_with_escalation",
+            lambda **kwargs: ("New compacted summary.\nExpand for details about: durable tail", 1),
+        )
+        after = LCMEngine(config=config)
+        after.on_session_start(
+            session_id, platform="cli", conversation_id=conversation_id, context_length=200000
+        )
+        try:
+            after.compress(
+                [*active_context, {"role": "user", "content": "Fresh user turn."}],
+                force=True,
+            )
+            nodes = after._dag.get_session_nodes(session_id)
+            expanded = json.loads(
+                after.handle_tool_call("lcm_expand", {"node_id": nodes[-1].node_id})
+            )
+        finally:
+            after.shutdown()
+
+        assert len(nodes) == 2
+        assert store_ids[-1] in nodes[-1].source_ids
+        assert durable[-1]["content"] in json.dumps(expanded)
+        assert "Generated replay material." not in nodes[-1].summary
 
     def test_compression_serialization_skips_empty_assistant_and_heartbeat_noise(self, engine):
         messages = [
