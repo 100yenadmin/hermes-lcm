@@ -455,7 +455,8 @@ class ReconcileMixin:
         if not (
             has_raw_durable_system_anchor or has_generated_system_anchor
         ) or not self._is_prompt_bearing_user_message(  # type: ignore[attr-defined]
-            candidate_messages[1]
+            candidate_messages[1],
+            allow_literal_summary_scaffold=True,
         ):
             return False
         if self._message_replay_identity(candidate_messages[1]) != stored_head[1]:
@@ -1166,15 +1167,21 @@ class ReconcileMixin:
         order. Requiring that full replay coverage prevents a newer
         repeated-content turn from claiming the older row.
         """
+        def is_prompt_user(message: Dict[str, Any]) -> bool:
+            # Literal summary-shaped users are eligible only in this
+            # identity-proven lineage path. DAG-backed generated scaffolds
+            # remain excluded by _is_prompt_bearing_user_message.
+            return self._is_prompt_bearing_user_message(  # type: ignore[attr-defined]
+                message,
+                allow_literal_summary_scaffold=True,
+            )
+
         frontier = max(0, int(self._last_compacted_store_id or 0))
         if (
             frontier <= 0
             or not messages
-            or not self._is_prompt_bearing_user_message(messages[0])
-            or not any(
-                self._is_prompt_bearing_user_message(message)
-                for message in messages[1:]
-            )
+            or not is_prompt_user(messages[0])
+            or not any(is_prompt_user(message) for message in messages[1:])
         ):
             return {}
 
@@ -1191,11 +1198,11 @@ class ReconcileMixin:
         )
         durable_prompt_users = [
             message for message in durable_users
-            if self._is_prompt_bearing_user_message(message)
+            if is_prompt_user(message)
         ]
         active_prompt_users = [
             message for message in messages
-            if self._is_prompt_bearing_user_message(message)
+            if is_prompt_user(message)
         ]
         active_prompt_identities = [
             self._message_replay_identity(message)
@@ -1219,7 +1226,7 @@ class ReconcileMixin:
                 [
                     message
                     for message in [*legacy_users, *durable_users]
-                    if self._is_prompt_bearing_user_message(message)  # type: ignore[attr-defined]
+                    if is_prompt_user(message)
                 ],
                 key=lambda message: int(message["store_id"]),
             )
@@ -1454,4 +1461,7 @@ class ReconcileMixin:
                 ids_by_message_id[id(msg)] = candidates[match_idx]["store_id"]
                 store_idx = match_idx + 1
 
+        ids_by_message_id.update(
+            self._get_formerly_anchored_user_source_map(messages)
+        )
         return ids_by_message_id

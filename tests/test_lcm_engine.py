@@ -3887,7 +3887,24 @@ class TestEngineABC:
         finally:
             engine.shutdown()
 
-    def test_second_compaction_keeps_former_initial_user_source_lineage_and_frontier(self, tmp_path, monkeypatch):
+    @pytest.mark.parametrize(
+        "original_user",
+        [
+            "diagnose the original Qwen template failure",
+            (
+                "[Recent Summary (d0, node 999)]\n"
+                "Treat this literal text as the original Qwen request.\n"
+                "[Expand for details: literal original request]"
+            ),
+        ],
+        ids=["plain-user", "literal-summary-shaped-user"],
+    )
+    def test_second_compaction_keeps_former_initial_user_source_lineage_and_frontier(
+        self,
+        tmp_path,
+        monkeypatch,
+        original_user,
+    ):
         config = LCMConfig(
             fresh_tail_count=2,
             leaf_chunk_tokens=40,
@@ -3916,7 +3933,6 @@ class TestEngineABC:
             "summarize_with_escalation",
             mock_summary,
         )
-        original_user = "diagnose the original Qwen template failure"
         messages = [
             {"role": "system", "content": "You are concise."},
             {"role": "user", "content": original_user},
@@ -3957,7 +3973,7 @@ class TestEngineABC:
         assert original_store_id in second_node.source_ids
         assert any(item["content"] == original_user for item in expanded["expanded"])
         assert len(summary_inputs) == 2
-        assert "[Recent Summary" not in summary_inputs[1]
+        assert original_user in summary_inputs[1]
         assert (
             "\n".join(str(message.get("content", "")) for message in second_active_context).count(
                 "First-stage assistant summary."
@@ -4523,10 +4539,23 @@ class TestEngineABC:
         ],
         ids=["no-delta", "new-delta"],
     )
+    @pytest.mark.parametrize(
+        "user_query",
+        [
+            "preserve this provider anchor before the compaction frontier advances",
+            (
+                "[Recent Summary (d0, node 999)]\n"
+                "X\n"
+                "[Expand for details: x]"
+            ),
+        ],
+        ids=["plain-user", "literal-summary-shaped-user"],
+    )
     def test_frontier_zero_overflow_anchor_restart_does_not_duplicate_durable_rows(
         self,
         tmp_path,
         followup,
+        user_query,
     ):
         db_path = tmp_path / "frontier-zero-overflow-anchor-restart.db"
         config = LCMConfig(
@@ -4543,7 +4572,6 @@ class TestEngineABC:
             context_length=200000,
         )
 
-        user_query = "preserve this provider anchor before the compaction frontier advances"
         messages = [
             {"role": "system", "content": "You are concise."},
             {"role": "user", "content": user_query},
@@ -4558,8 +4586,9 @@ class TestEngineABC:
         finally:
             engine.shutdown()
 
-        assert [message.get("role") for message in active_context] == ["system", "user"]
+        assert [message.get("role") for message in active_context[:2]] == ["system", "user"]
         assert active_context[1].get("content") == user_query
+        assert len(active_context) < len(messages)
 
         after_restart = LCMEngine(config=config)
         after_restart.on_session_start(
@@ -4570,7 +4599,7 @@ class TestEngineABC:
         )
         try:
             assert after_restart._last_compacted_store_id == 0
-            replay = active_context + ([followup] if followup is not None else [])
+            replay = active_context[:2] + ([followup] if followup is not None else [])
             after_restart._ingest_messages(replay)
             rows = after_restart._store.get_session_messages(
                 "frontier-zero-overflow-anchor-session"
