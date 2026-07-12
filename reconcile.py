@@ -881,6 +881,7 @@ class ReconcileMixin:
 
         conversation_id = getattr(self, "_conversation_id", "")
         legacy_blank_conversation_only = False
+        include_legacy_blank_conversation = False
         try:
             session_count = self._store.get_session_count(  # type: ignore[attr-defined]
                 self._session_id,  # type: ignore[attr-defined]
@@ -896,6 +897,18 @@ class ReconcileMixin:
                     self._session_id,  # type: ignore[attr-defined]
                     legacy_blank_conversation_only=True,
                 )
+            elif conversation_id:
+                legacy_blank_count = self._store.get_session_count(  # type: ignore[attr-defined]
+                    self._session_id,  # type: ignore[attr-defined]
+                    legacy_blank_conversation_only=True,
+                )
+                if legacy_blank_count > 0:
+                    # Upgraded sessions can have blank-provenance anchors before
+                    # current-conversation rows. Reconcile against that ordered
+                    # union only; attributed rows from other conversations stay
+                    # excluded from replay proof.
+                    include_legacy_blank_conversation = True
+                    session_count += legacy_blank_count
         except Exception as exc:  # pragma: no cover - defensive only
             logger.debug("LCM ingest cursor reconciliation count failed: %s", exc)
             return 0
@@ -936,6 +949,18 @@ class ReconcileMixin:
             conversation_id=conversation_id,
             legacy_blank_conversation_only=legacy_blank_conversation_only,
         )
+        if include_legacy_blank_conversation:
+            stored_rows = sorted(
+                [
+                    *stored_rows,
+                    *self._store.get_session_tail(  # type: ignore[attr-defined]
+                        self._session_id,  # type: ignore[attr-defined]
+                        limit=tail_limit,
+                        legacy_blank_conversation_only=True,
+                    ),
+                ],
+                key=lambda row: int(row["store_id"]),
+            )[-tail_limit:]
         if not stored_rows:
             return 0
         stored_tail_rows = [
@@ -953,17 +978,46 @@ class ReconcileMixin:
             conversation_id=conversation_id,
             legacy_blank_conversation_only=legacy_blank_conversation_only,
         )
+        if include_legacy_blank_conversation:
+            stored_head_rows = sorted(
+                [
+                    *stored_head_rows,
+                    *self._store.get_session_messages(  # type: ignore[attr-defined]
+                        self._session_id,  # type: ignore[attr-defined]
+                        limit=tail_limit,
+                        legacy_blank_conversation_only=True,
+                    ),
+                ],
+                key=lambda row: int(row["store_id"]),
+            )[:tail_limit]
         stored_head = [
             self._message_replay_identity(row, stored_row=True)
             for row in stored_head_rows
         ]
+        uncompacted_after_store_id = max(
+            0,
+            int(self._last_compacted_store_id or 0),  # type: ignore[attr-defined]
+        )
         uncompacted_rows = self._store.get_session_messages_after(
             self._session_id,
-            after_store_id=max(0, int(self._last_compacted_store_id or 0)),
+            after_store_id=uncompacted_after_store_id,
             limit=session_count,
             conversation_id=conversation_id,
             legacy_blank_conversation_only=legacy_blank_conversation_only,
         )
+        if include_legacy_blank_conversation:
+            uncompacted_rows = sorted(
+                [
+                    *uncompacted_rows,
+                    *self._store.get_session_messages_after(  # type: ignore[attr-defined]
+                        self._session_id,  # type: ignore[attr-defined]
+                        after_store_id=uncompacted_after_store_id,
+                        limit=session_count,
+                        legacy_blank_conversation_only=True,
+                    ),
+                ],
+                key=lambda row: int(row["store_id"]),
+            )[:session_count]
         stored_uncompacted_tail = [
             self._message_replay_identity(row, stored_row=True)
             for row in uncompacted_rows

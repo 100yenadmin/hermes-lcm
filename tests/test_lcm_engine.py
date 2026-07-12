@@ -4295,6 +4295,59 @@ class TestEngineABC:
         assert len(rows) == len(shared_prefix)
         assert all(not row["conversation_id"] for row in rows)
 
+    def test_restart_reconciles_legacy_anchor_prefix_with_current_conversation_tail(
+        self,
+        tmp_path,
+    ):
+        db_path = tmp_path / "mixed-legacy-current-restart.db"
+        config = LCMConfig(database_path=str(db_path))
+        session_id = "mixed-legacy-current-restart"
+        conversation_id = "current-conversation"
+        legacy_anchor = [
+            {"role": "system", "content": "Legacy system prompt."},
+            {"role": "user", "content": "legacy first request"},
+        ]
+
+        seed_engine = LCMEngine(config=config)
+        try:
+            seed_engine._store.append_batch(
+                session_id,
+                legacy_anchor,
+                conversation_id="",
+            )
+            seed_engine._store.append(
+                session_id,
+                {"role": "assistant", "content": "current durable tail"},
+                conversation_id=conversation_id,
+            )
+            seed_engine._store.append_batch(
+                session_id,
+                legacy_anchor,
+                conversation_id="unrelated-conversation",
+            )
+        finally:
+            seed_engine.shutdown()
+
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            session_id,
+            platform="cli",
+            conversation_id=conversation_id,
+            context_length=200000,
+        )
+        try:
+            after_restart._ingest_messages(legacy_anchor)
+            rows = after_restart._store.get_session_messages(session_id)
+            reconciliation = after_restart._last_ingest_reconciliation
+        finally:
+            after_restart.shutdown()
+
+        assert reconciliation["action"] == "advanced cursor"
+        assert reconciliation["cursor"] == len(legacy_anchor)
+        assert reconciliation["session_count"] == 3
+        assert len(rows) == 5
+        assert [row["conversation_id"] for row in rows].count(conversation_id) == 1
+
     def test_single_initial_user_anchor_restart_one_followup_only_persists_delta(
         self,
         tmp_path,
