@@ -3715,7 +3715,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             if not rows:
                 return False
             if rows[0].get("role") != "system":
-                return exact_annotation
+                return False
             stored_content = normalize_content_value(rows[0].get("content")) or ""
             restored_stored_content = self._identity_content_for_active_cleanup(stored_content)
             expected_current = dict(rows[0])

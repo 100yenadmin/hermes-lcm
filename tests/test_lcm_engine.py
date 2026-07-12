@@ -5102,6 +5102,44 @@ class TestEngineABC:
             for row in rows
         ) == 1
 
+    def test_new_annotated_system_persists_after_current_conversation_user_only_row(
+        self,
+        tmp_path,
+    ):
+        db_path = tmp_path / "fresh-annotated-system-after-user-only-row.db"
+        config = LCMConfig(database_path=str(db_path))
+        session_id = "fresh-annotated-system-after-user-only-row-session"
+        conversation_id = "fresh-annotated-system-after-user-only-row-conversation"
+        durable_user = {"role": "user", "content": "Durable user-only row."}
+
+        engine = LCMEngine(config=config)
+        engine.on_session_start(
+            session_id, platform="cli", conversation_id=conversation_id, context_length=200000
+        )
+        try:
+            engine._store.append_batch(
+                session_id,
+                [durable_user],
+                conversation_id=conversation_id,
+            )
+            fresh_system = {
+                "role": "system",
+                "content": engine._append_lcm_note_to_content("Genuinely new system message."),
+            }
+
+            assert not engine._is_replayed_context_scaffold_message(fresh_system)
+            engine._ingest_messages([fresh_system])
+            rows = engine._store.get_session_messages(
+                session_id, conversation_id=conversation_id
+            )
+        finally:
+            engine.shutdown()
+
+        assert [(row["role"], row["content"]) for row in rows] == [
+            ("user", durable_user["content"]),
+            ("system", fresh_system["content"]),
+        ]
+
     def test_new_annotated_system_persists_when_only_legacy_blank_conversation_rows_exist(
         self,
         tmp_path,
@@ -6176,6 +6214,7 @@ class TestEngineABC:
             context_length=200000,
         )
         persisted_messages = [
+            {"role": "system", "content": "You are concise."},
             {"role": "user", "content": "initial question"},
             {"role": "assistant", "content": "initial answer"},
             {"role": "user", "content": "retry"},
@@ -6221,6 +6260,7 @@ class TestEngineABC:
             context_length=200000,
         )
         persisted_messages = [
+            {"role": "system", "content": "You are concise."},
             {"role": "user", "content": "initial question"},
             {"role": "assistant", "content": "initial answer"},
             {"role": "user", "content": "retry"},
@@ -6272,6 +6312,7 @@ class TestEngineABC:
             sort_keys=True,
         )
         persisted_messages = [
+            {"role": "system", "content": "You are concise."},
             {"role": "user", "content": "older question"},
             {"role": "assistant", "content": "older answer"},
             {"role": "user", "content": "retry"},
@@ -6329,6 +6370,7 @@ class TestEngineABC:
             sort_keys=True,
         )
         persisted_messages = [
+            {"role": "system", "content": "You are concise."},
             {"role": "user", "content": "older question"},
             {"role": "assistant", "content": "older answer"},
             {"role": "user", "content": "retry"},
@@ -6471,6 +6513,7 @@ class TestEngineABC:
             context_length=200000,
         )
         before_restart._ingest_messages([
+            {"role": "system", "content": "You are concise."},
             {"role": "user", "content": "tail before restart"},
         ])
         before_restart._store.close()
@@ -6494,8 +6537,11 @@ class TestEngineABC:
         after_restart._ingest_messages(active_context)
 
         rows = after_restart._store.get_session_messages("system-scaffold-session")
-        assert len(rows) == 1
-        assert rows[0]["content"] == "tail before restart"
+        assert len(rows) == 2
+        assert [row["content"] for row in rows] == [
+            "You are concise.",
+            "tail before restart",
+        ]
         assert after_restart._ingest_cursor == len(active_context)
 
     def test_existing_session_restart_skips_stale_short_no_overlap_snapshot(self, tmp_path, caplog):
@@ -6764,6 +6810,7 @@ class TestEngineABC:
             context_length=200000,
         )
         persisted_messages = [
+            {"role": "system", "content": "You are concise."},
             {"role": "user", "content": "old first question"},
             {"role": "assistant", "content": "old first answer"},
         ]
@@ -6786,7 +6833,7 @@ class TestEngineABC:
         stale_replay = [
             {
                 "role": "system",
-                "content": "[Note: This conversation uses Lossless Context Management (LCM). Earlier turns have been compacted into hierarchical summaries below.]",
+                "content": "You are concise.\n\n[Note: This conversation uses Lossless Context Management (LCM). Earlier turns have been compacted into hierarchical summaries below.]",
             },
             {
                 "role": "assistant",
