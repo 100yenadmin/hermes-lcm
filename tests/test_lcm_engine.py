@@ -3808,6 +3808,38 @@ class TestEngineABC:
         finally:
             engine.shutdown()
 
+    def test_single_user_anchor_falls_back_to_legacy_blank_conversation_rows(self, tmp_path):
+        engine = LCMEngine(
+            config=LCMConfig(database_path=str(tmp_path / "legacy-blank-anchor.db"))
+        )
+        session_id = "legacy-blank-anchor"
+        initial_user = {"role": "user", "content": "legacy initial request"}
+        engine._store.append_batch(
+            session_id,
+            [
+                {"role": "system", "content": "You are concise."},
+                initial_user,
+                {"role": "assistant", "content": "initial response"},
+                {"role": "user", "content": "legacy follow-up request"},
+            ],
+            conversation_id="",
+        )
+        engine.on_session_start(
+            session_id,
+            platform="cli",
+            conversation_id="current-anchor-conversation",
+            context_length=200000,
+        )
+
+        try:
+            assert engine._leading_anchor_count([
+                {"role": "system", "content": "You are concise."},
+                initial_user,
+                {"role": "assistant", "content": "working"},
+            ]) == 1
+        finally:
+            engine.shutdown()
+
     def test_second_compaction_keeps_former_initial_user_source_lineage_and_frontier(self, tmp_path, monkeypatch):
         config = LCMConfig(
             fresh_tail_count=2,

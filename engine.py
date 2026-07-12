@@ -1519,11 +1519,25 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             for message in messages[first_user_index + 1:]
         ):
             return system_anchor_count
+        durable_conversation_id = self._conversation_id
+        legacy_blank_conversation_only = False
+        durable_message_count = self._store.get_session_count(
+            self._session_id,
+            conversation_id=durable_conversation_id,
+        )
+        if durable_conversation_id and durable_message_count <= 0:
+            durable_conversation_id = ""
+            legacy_blank_conversation_only = True
+            durable_message_count = self._store.get_session_count(
+                self._session_id,
+                legacy_blank_conversation_only=True,
+            )
         durable_users = self._store.get_session_nonblank_role_messages(
             self._session_id,
             "user",
-            limit=max(2, self._store.get_session_count(self._session_id)),
-            conversation_id=self._conversation_id,
+            limit=max(2, durable_message_count),
+            conversation_id=durable_conversation_id,
+            legacy_blank_conversation_only=legacy_blank_conversation_only,
         )
         durable_users = [
             message for message in durable_users
