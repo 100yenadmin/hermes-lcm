@@ -1510,14 +1510,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             return 0
 
         first_user_index = system_anchor_count
-        if first_user_index >= len(messages) or not self._is_prompt_bearing_user_message(
-            messages[first_user_index]
-        ):
-            return system_anchor_count
-        if any(
-            self._is_prompt_bearing_user_message(message)
-            for message in messages[first_user_index + 1:]
-        ):
+        if first_user_index >= len(messages):
             return system_anchor_count
         durable_conversation_id = self._conversation_id
         legacy_blank_conversation_only = False
@@ -1532,7 +1525,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 self._session_id,
                 legacy_blank_conversation_only=True,
             )
-        durable_users = self._store.get_session_nonblank_role_messages(
+        raw_durable_users = self._store.get_session_nonblank_role_messages(
             self._session_id,
             "user",
             limit=max(2, durable_message_count),
@@ -1540,9 +1533,53 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             legacy_blank_conversation_only=legacy_blank_conversation_only,
         )
         durable_users = [
-            message for message in durable_users
+            message for message in raw_durable_users
             if self._is_prompt_bearing_user_message(message)
         ]
+
+        # A summary-shaped user message is prompt-bearing only when its exact
+        # identity is durable and it is not backed by an actual local DAG node.
+        scaffold_candidate_identities = {
+            self._message_replay_identity(message)
+            for message in messages[first_user_index:]
+            if (
+                not self._is_prompt_bearing_user_message(message)
+                and self._is_prompt_bearing_user_message(
+                    message,
+                    allow_literal_summary_scaffold=True,
+                )
+            )
+        }
+        durable_users.extend(
+            message for message in raw_durable_users
+            if (
+                not self._is_prompt_bearing_user_message(message)
+                and self._message_replay_identity(message, stored_row=True)
+                in scaffold_candidate_identities
+            )
+        )
+
+        def is_durable_prompt_bearing(message: Dict[str, Any]) -> bool:
+            if self._is_prompt_bearing_user_message(message):
+                return True
+            if not self._is_prompt_bearing_user_message(
+                message,
+                allow_literal_summary_scaffold=True,
+            ):
+                return False
+            identity = self._message_replay_identity(message)
+            return any(
+                identity == self._message_replay_identity(user, stored_row=True)
+                for user in durable_users
+            )
+
+        if not is_durable_prompt_bearing(messages[first_user_index]):
+            return system_anchor_count
+        if any(
+            is_durable_prompt_bearing(message)
+            for message in messages[first_user_index + 1:]
+        ):
+            return system_anchor_count
         if durable_users:
             if len(durable_users) != 1:
                 return system_anchor_count
@@ -1553,10 +1590,21 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 return system_anchor_count
         return first_user_index + 1
 
-    def _is_prompt_bearing_user_message(self, message: Dict[str, Any]) -> bool:
+    def _is_prompt_bearing_user_message(
+        self,
+        message: Dict[str, Any],
+        *,
+        allow_literal_summary_scaffold: bool = False,
+    ) -> bool:
         if not isinstance(message, dict) or message.get("role") != "user":
             return False
-        if self._is_replayed_context_scaffold_message(message):
+        if (
+            self._is_replayed_context_scaffold_message(message)
+            and (
+                not allow_literal_summary_scaffold
+                or self._is_known_generated_summary_scaffold_message(message)
+            )
+        ):
             return False
         if self._is_preserved_todo_context_message(message):
             return False
@@ -3654,6 +3702,30 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 content,
             )
         )
+
+    def _is_known_generated_summary_scaffold_message(self, msg: Dict[str, Any]) -> bool:
+        content = normalize_content_value(msg.get("content")) or ""
+        for match in re.finditer(
+            r"\[(?:Recent|Session Arc|Durable|Depth-\d+) Summary "
+            r"\(d\d+, node (\d+)\)\]",
+            content,
+        ):
+            node = self._dag.get_node(int(match.group(1)))
+            if node is None or node.session_id != self._session_id:
+                continue
+            depth_label = {
+                0: "Recent",
+                1: "Session Arc",
+                2: "Durable",
+            }.get(node.depth, f"Depth-{node.depth}")
+            generated = (
+                f"[{depth_label} Summary (d{node.depth}, node {node.node_id})]\n"
+                f"{node.summary}\n"
+                f"[Expand for details: {node.expand_hint}]"
+            )
+            if generated in content:
+                return True
+        return False
 
     def _restore_ingest_payload_placeholders_in_value(self, value: Any, *, session_id: str) -> Any:
         if isinstance(value, dict):

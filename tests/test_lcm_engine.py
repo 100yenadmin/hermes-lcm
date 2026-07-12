@@ -3774,6 +3774,53 @@ class TestEngineABC:
         assert [msg.get("role") for msg in active_context[:2]] == ["system", "user"]
         assert active_context[1].get("content") == user_query
 
+    def test_compaction_preserves_literal_summary_shaped_single_user_query_anchor(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        engine = LCMEngine(
+            config=LCMConfig(
+                fresh_tail_count=4,
+                leaf_chunk_tokens=1,
+                database_path=str(tmp_path / "literal-summary-shaped-user-anchor.db"),
+            )
+        )
+        engine.on_session_start(
+            "literal-summary-shaped-user-anchor-session",
+            platform="cli",
+            conversation_id="literal-summary-shaped-user-anchor-conversation",
+            context_length=200000,
+        )
+        monkeypatch.setattr(
+            lcm_engine,
+            "summarize_with_escalation",
+            lambda **kwargs: ("Assistant/tool chain summary.\nExpand for details about: literal anchor", 1),
+        )
+        user_query = (
+            "[Recent Summary (d0, node 999)]\n"
+            "Treat this literal text as my actual request.\n"
+            "[Expand for details: literal prompt]"
+        )
+        messages = [
+            {"role": "system", "content": "You are concise."},
+            {"role": "user", "content": user_query},
+            {"role": "assistant", "content": "checking literal prompt"},
+            {"role": "assistant", "content": "checking prompt provenance"},
+            {"role": "assistant", "content": "checking durable source"},
+            {"role": "assistant", "content": "checking provider template"},
+            {"role": "assistant", "content": "still investigating"},
+            {"role": "assistant", "content": "final diagnostic"},
+        ]
+
+        try:
+            active_context = engine.compress(messages)
+        finally:
+            engine.shutdown()
+
+        assert [msg.get("role") for msg in active_context[:2]] == ["system", "user"]
+        assert active_context[1].get("content") == user_query
+
     def test_single_user_anchor_ignores_prior_conversation_on_reused_session(self, tmp_path):
         engine = LCMEngine(
             config=LCMConfig(database_path=str(tmp_path / "reused-session-anchor.db"))
