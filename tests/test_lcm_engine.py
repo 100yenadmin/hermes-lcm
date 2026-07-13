@@ -5045,6 +5045,55 @@ class TestEngineABC:
         assert sum(row["content"] == appended_turn["content"] for row in reconciled_rows) == 1
         assert sum(row["content"] == later_delta["content"] for row in rows) == 1
 
+    def test_restart_changed_system_snapshot_suppresses_durable_suffix_and_keeps_delta(
+        self,
+        tmp_path,
+    ):
+        db_path = tmp_path / "changed-system-snapshot-durable-suffix.db"
+        config = LCMConfig(database_path=str(db_path))
+        session_id = "changed-system-snapshot-durable-suffix-session"
+        conversation_id = "changed-system-snapshot-durable-suffix-conversation"
+        snapshot = [
+            {"role": "system", "content": "Original system."},
+            {"role": "user", "content": "Durable user turn."},
+        ]
+        durable_suffix = {"role": "assistant", "content": "Durable assistant suffix."}
+        before = LCMEngine(config=config)
+        before.on_session_start(
+            session_id, platform="cli", conversation_id=conversation_id, context_length=200000
+        )
+        try:
+            before._store.append_batch(
+                session_id,
+                [*snapshot, durable_suffix],
+                conversation_id=conversation_id,
+            )
+            before._write_active_replay_snapshot(snapshot)
+        finally:
+            before.shutdown()
+
+        changed_system = {"role": "system", "content": "Changed system."}
+        new_delta = {"role": "user", "content": "Genuinely new trailing delta."}
+        incoming = [changed_system, snapshot[1], durable_suffix, new_delta]
+        after = LCMEngine(config=config)
+        after.on_session_start(
+            session_id, platform="cli", conversation_id=conversation_id, context_length=200000
+        )
+        try:
+            after._ingest_messages(incoming)
+            rows = after._store.get_session_messages(session_id, conversation_id=conversation_id)
+        finally:
+            after.shutdown()
+
+        assert [row["content"] for row in rows] == [
+            snapshot[0]["content"],
+            snapshot[1]["content"],
+            durable_suffix["content"],
+            changed_system["content"],
+            new_delta["content"],
+        ]
+        assert sum(row["content"] == durable_suffix["content"] for row in rows) == 1
+
     def test_restart_changed_system_partial_snapshot_resemblance_remains_new_content(
         self,
         tmp_path,

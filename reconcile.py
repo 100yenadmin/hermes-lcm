@@ -262,6 +262,39 @@ class ReconcileMixin:
         except Exception:
             logger.debug("LCM active replay snapshot write failed", exc_info=True)
 
+    def _durable_suffix_after_snapshot(
+        self,
+        snapshot: list[tuple[str, str, str, str]],
+    ) -> list[tuple[str, str, str, str]] | None:
+        conversation_id = str(getattr(self, "_conversation_id", "") or "")
+        try:
+            session_count = self._store.get_session_count(  # type: ignore[attr-defined]
+                self._session_id,  # type: ignore[attr-defined]
+                conversation_id=conversation_id,
+            )
+            durable_rows = self._store.get_session_messages(  # type: ignore[attr-defined]
+                self._session_id,  # type: ignore[attr-defined]
+                limit=max(1, session_count),
+                conversation_id=conversation_id,
+            )
+        except Exception:
+            return None
+        durable = [
+            self._message_replay_identity(row, stored_row=True)
+            for row in durable_rows
+        ]
+        snapshot_endpoint = next(
+            (
+                start + len(snapshot) - 1
+                for start in range(len(durable) - len(snapshot), -1, -1)
+                if durable[start : start + len(snapshot)] == snapshot
+            ),
+            None,
+        )
+        if snapshot_endpoint is None:
+            return None
+        return durable[snapshot_endpoint + 1 :]
+
     def _historical_active_replay_cursor(self, messages: List[Dict[str, Any]]) -> int | None:
         """Return a replay cursor proven by the exact last emitted snapshot.
 
@@ -294,35 +327,9 @@ class ReconcileMixin:
             cursor = len(snapshot)
             suffix = incoming[cursor:]
             if suffix:
-                conversation_id = str(getattr(self, "_conversation_id", "") or "")
-                try:
-                    session_count = self._store.get_session_count(  # type: ignore[attr-defined]
-                        self._session_id,  # type: ignore[attr-defined]
-                        conversation_id=conversation_id,
-                    )
-                    durable_rows = self._store.get_session_messages(  # type: ignore[attr-defined]
-                        self._session_id,  # type: ignore[attr-defined]
-                        limit=max(1, session_count),
-                        conversation_id=conversation_id,
-                    )
-                except Exception:
-                    durable_rows = []
-                durable = [
-                    self._message_replay_identity(row, stored_row=True)
-                    for row in durable_rows
-                ]
-                snapshot_endpoint = next(
-                    (
-                        start + len(snapshot) - 1
-                        for start in range(len(durable) - len(snapshot), -1, -1)
-                        if durable[start : start + len(snapshot)] == snapshot
-                    ),
-                    None,
-                )
-                if snapshot_endpoint is not None:
-                    durable_suffix = durable[snapshot_endpoint + 1 :]
-                    if durable_suffix and suffix[: len(durable_suffix)] == durable_suffix:
-                        cursor += len(durable_suffix)
+                durable_suffix = self._durable_suffix_after_snapshot(snapshot)
+                if durable_suffix and suffix[: len(durable_suffix)] == durable_suffix:
+                    cursor += len(durable_suffix)
             return cursor
         logger.debug(
             "LCM historical active replay mismatch: incoming=%d snapshot=%d first_diff=%s",
@@ -353,6 +360,13 @@ class ReconcileMixin:
         ):
             self._historical_active_replay_matched = True
             self._reconciled_replay_message_indexes = set(range(1, len(snapshot)))
+            suffix = incoming[len(snapshot) :]
+            if suffix:
+                durable_suffix = self._durable_suffix_after_snapshot(snapshot)
+                if durable_suffix and suffix[: len(durable_suffix)] == durable_suffix:
+                    self._reconciled_replay_message_indexes.update(
+                        range(len(snapshot), len(snapshot) + len(durable_suffix))
+                    )
             return 0
         return None
 
