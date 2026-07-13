@@ -4901,6 +4901,103 @@ class TestEngineABC:
             message["content"] for message in [*snapshot, *durable_suffix, fresh_delta]
         ]
 
+    def test_restart_compacted_snapshot_reconciles_durable_suffix_and_new_delta(self, tmp_path):
+        db_path = tmp_path / "compacted-snapshot-durable-suffix.db"
+        config = LCMConfig(database_path=str(db_path))
+        session_id = "compacted-snapshot-durable-suffix-session"
+        conversation_id = "compacted-snapshot-durable-suffix-conversation"
+        durable = [
+            {"role": "system", "content": "System anchor."},
+            {"role": "user", "content": "Durable request."},
+            {"role": "assistant", "content": "Durable assistant tail."},
+        ]
+        durable_suffix = {"role": "user", "content": "Already durable follow-up."}
+        before = LCMEngine(config=config)
+        before.on_session_start(
+            session_id, platform="cli", conversation_id=conversation_id, context_length=200000
+        )
+        try:
+            store_ids = before._store.append_batch(
+                session_id, [*durable, durable_suffix], conversation_id=conversation_id
+            )
+            before._dag.add_node(SummaryNode(
+                session_id=session_id,
+                depth=0,
+                summary="Generated compacted history.",
+                token_count=4,
+                source_token_count=4,
+                source_ids=[store_ids[0]],
+                source_type="messages",
+                expand_hint="older context",
+            ))
+            snapshot = before._assemble_context(
+                durable[0], [durable[-1]], leading_anchor_messages=durable[:2]
+            )
+            before._write_active_replay_snapshot(snapshot)
+        finally:
+            before.shutdown()
+
+        assert "Generated compacted history." in snapshot[-1]["content"]
+        assert durable[-1]["content"] in snapshot[-1]["content"]
+
+        fresh_delta = {"role": "assistant", "content": "Fresh response after restart."}
+        after = LCMEngine(config=config)
+        after.on_session_start(
+            session_id, platform="cli", conversation_id=conversation_id, context_length=200000
+        )
+        try:
+            after._ingest_messages([*snapshot, durable_suffix, fresh_delta])
+            rows = after._store.get_session_messages(session_id, conversation_id=conversation_id)
+        finally:
+            after.shutdown()
+
+        assert [row["content"] for row in rows] == [
+            message["content"] for message in [*durable, durable_suffix, fresh_delta]
+        ]
+
+    def test_restart_snapshot_suffix_proof_ignores_filtered_durable_rows(self, tmp_path):
+        db_path = tmp_path / "snapshot-filtered-durable-suffix.db"
+        config = LCMConfig(
+            database_path=str(db_path), ignore_message_patterns=["^Cronjob Response:"]
+        )
+        session_id = "snapshot-filtered-durable-suffix-session"
+        conversation_id = "snapshot-filtered-durable-suffix-conversation"
+        snapshot = [
+            {"role": "system", "content": "System anchor."},
+            {"role": "user", "content": "Durable request."},
+        ]
+        ignored = {"role": "user", "content": "Cronjob Response: old heartbeat"}
+        visible_suffix = {"role": "assistant", "content": "Already durable response."}
+        before = LCMEngine(config=config)
+        before.on_session_start(
+            session_id, platform="cli", conversation_id=conversation_id, context_length=200000
+        )
+        try:
+            before._store.append_batch(
+                session_id,
+                [*snapshot, ignored, visible_suffix],
+                conversation_id=conversation_id,
+            )
+            before._write_active_replay_snapshot(snapshot)
+        finally:
+            before.shutdown()
+
+        fresh_delta = {"role": "user", "content": "Fresh request after restart."}
+        after = LCMEngine(config=config)
+        after.on_session_start(
+            session_id, platform="cli", conversation_id=conversation_id, context_length=200000
+        )
+        try:
+            after._ingest_messages([*snapshot, visible_suffix, fresh_delta])
+            rows = after._store.get_session_messages(session_id, conversation_id=conversation_id)
+        finally:
+            after.shutdown()
+
+        assert [row["content"] for row in rows] == [
+            message["content"]
+            for message in [*snapshot, ignored, visible_suffix, fresh_delta]
+        ]
+
     def test_restart_snapshot_prefix_uses_full_alignment_before_suppressing_suffix(
         self, tmp_path
     ):
@@ -12263,6 +12360,88 @@ class TestEngineCompress:
         assert store_ids[-1] in nodes[-1].source_ids
         assert durable[-1]["content"] in json.dumps(expanded)
         assert "Generated replay material." not in nodes[-1].summary
+
+    def test_compaction_restores_assistant_tool_tail_coalesced_with_preserved_objective(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        config = LCMConfig(
+            database_path=str(tmp_path / "coalesced-objective-tool-tail.db"),
+            fresh_tail_count=2,
+            leaf_chunk_tokens=1,
+        )
+        session_id = "coalesced-objective-tool-tail-session"
+        conversation_id = "coalesced-objective-tool-tail-conversation"
+        objective = {"role": "user", "content": "Preserve the current objective."}
+        tool_call = {
+            "role": "assistant",
+            "content": "Running the required tool.",
+            "tool_calls": [{
+                "id": "call_preserved",
+                "type": "function",
+                "function": {"name": "terminal", "arguments": "{\"command\":\"true\"}"},
+            }],
+        }
+        tool_result = {
+            "role": "tool",
+            "tool_call_id": "call_preserved",
+            "content": "Tool result must remain durable.",
+        }
+        durable = [
+            {"role": "system", "content": "System anchor."},
+            objective,
+            {"role": "user", "content": "Provider-visible user anchor."},
+            tool_call,
+            tool_result,
+        ]
+        before = LCMEngine(config=config)
+        before.on_session_start(
+            session_id, platform="cli", conversation_id=conversation_id, context_length=200000
+        )
+        try:
+            before._store.append_batch(session_id, durable, conversation_id=conversation_id)
+            before._pending_context_anchor_messages = [objective]
+            active_context = before._assemble_context(
+                durable[0],
+                [tool_call, tool_result],
+                leading_anchor_messages=[durable[0], durable[2]],
+            )
+            before._write_active_replay_snapshot(active_context)
+        finally:
+            before.shutdown()
+
+        assert "[Current user objective preserved" in active_context[-2]["content"]
+        assert active_context[-2]["tool_calls"] == tool_call["tool_calls"]
+        assert active_context[-1] == tool_result
+
+        monkeypatch.setattr(
+            lcm_engine,
+            "summarize_with_escalation",
+            lambda **kwargs: ("Compacted tool work.\nExpand for details about: tool result", 1),
+        )
+        after = LCMEngine(config=config)
+        after.on_session_start(
+            session_id, platform="cli", conversation_id=conversation_id, context_length=200000
+        )
+        try:
+            after.compress(
+                [*active_context, {"role": "user", "content": "Fresh user delta."}],
+                force=True,
+            )
+            rows = after._store.get_session_messages(session_id, conversation_id=conversation_id)
+            nodes = after._dag.get_session_nodes(session_id)
+        finally:
+            after.shutdown()
+
+        assert sum(row["content"] == tool_call["content"] for row in rows) == 1
+        assert sum(row["content"] == tool_result["content"] for row in rows) == 1
+        assert rows[3]["tool_calls"] == tool_call["tool_calls"]
+        assert rows[4]["tool_call_id"] == tool_result["tool_call_id"]
+        assert any(
+            store_id in nodes[-1].source_ids
+            for store_id in (rows[3]["store_id"], rows[4]["store_id"])
+        )
 
     def test_compression_serialization_skips_empty_assistant_and_heartbeat_noise(self, engine):
         messages = [

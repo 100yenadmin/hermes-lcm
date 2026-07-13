@@ -3813,10 +3813,53 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self,
         msg: Dict[str, Any],
     ) -> Dict[str, Any]:
-        """Restore a durable assistant tail coalesced behind generated summary text."""
+        """Restore a durable assistant tail coalesced behind replay scaffolding."""
         if str(msg.get("role") or "") != "assistant":
             return msg
         content = msg.get("content")
+        content_text = normalize_content_value(content) or ""
+        if content_text.lstrip().startswith(_PRESERVED_OBJECTIVE_CONTEXT_PREFIX):
+            # Objective text has no closing delimiter, so recover the exact tail
+            # from its durable row instead of guessing where user content ends.
+            try:
+                durable_rows = self._store.get_session_messages(
+                    self._session_id,
+                    conversation_id=self._conversation_id,
+                )
+            except Exception:
+                durable_rows = []
+            incoming_tool_calls = self._stable_tool_calls_identity(msg.get("tool_calls"))
+            incoming_tool_call_id = str(msg.get("tool_call_id") or "")
+            for row in reversed(durable_rows):
+                if str(row.get("role") or "") != "assistant":
+                    continue
+                if self._stable_tool_calls_identity(row.get("tool_calls")) != incoming_tool_calls:
+                    continue
+                if str(row.get("tool_call_id") or "") != incoming_tool_call_id:
+                    continue
+                durable_content = self._identity_content_for_active_cleanup(
+                    normalize_content_value(row.get("content")) or ""
+                )
+                if isinstance(content, str):
+                    durable_text = "" if durable_content is None else str(durable_content)
+                    if durable_text and content.endswith("\n\n" + durable_text):
+                        restored = copy.deepcopy(msg)
+                        restored["content"] = durable_content
+                        return restored
+                    if durable_content is None and incoming_tool_calls:
+                        restored = copy.deepcopy(msg)
+                        restored["content"] = None
+                        return restored
+                    continue
+                if (
+                    isinstance(content, list)
+                    and content
+                    and normalize_content_value(content[1:])
+                    == normalize_content_value(durable_content)
+                ):
+                    restored = copy.deepcopy(msg)
+                    restored["content"] = durable_content
+                    return restored
         if isinstance(content, str):
             prefix = self._known_generated_summary_scaffold_prefix(content)
             separator = "\n\n"

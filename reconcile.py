@@ -282,12 +282,32 @@ class ReconcileMixin:
         durable = [
             self._message_replay_identity(row, stored_row=True)
             for row in durable_rows
+            if not self._matches_ignore_message_patterns(row, stored_row=True)  # type: ignore[attr-defined]
         ]
+        normalized_snapshot: list[tuple[str, str, str, str]] = []
+        for identity in snapshot:
+            role, content, tool_call_id, tool_calls_identity = identity
+            message: dict[str, Any] = {"role": role, "content": content}
+            if tool_call_id:
+                message["tool_call_id"] = tool_call_id
+            if tool_calls_identity:
+                try:
+                    message["tool_calls"] = json.loads(tool_calls_identity)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    message["tool_calls"] = tool_calls_identity
+            restored = self._strip_coalesced_generated_summary_scaffold(message)  # type: ignore[attr-defined]
+            if self._is_replayed_context_scaffold_message(restored):  # type: ignore[attr-defined]
+                continue
+            if self._matches_ignore_message_patterns(restored):  # type: ignore[attr-defined]
+                continue
+            normalized_snapshot.append(self._message_replay_identity(restored))
+        if not normalized_snapshot:
+            return None
         snapshot_endpoint = next(
             (
-                start + len(snapshot) - 1
-                for start in range(len(durable) - len(snapshot), -1, -1)
-                if durable[start : start + len(snapshot)] == snapshot
+                start + len(normalized_snapshot) - 1
+                for start in range(len(durable) - len(normalized_snapshot), -1, -1)
+                if durable[start : start + len(normalized_snapshot)] == normalized_snapshot
             ),
             None,
         )
