@@ -4987,12 +4987,21 @@ class TestEngineABC:
         after.on_session_start(
             session_id, platform="cli", conversation_id=conversation_id, context_length=200000
         )
+        matched_texts = []
+
+        class _PrefixMatcher:
+            def search(self, text, timeout=None):
+                matched_texts.append(str(text))
+                return object() if str(text).startswith("Cronjob Response:") else None
+
+        after._compiled_ignore_message_patterns = [_PrefixMatcher()]
         try:
             after._ingest_messages([*snapshot, visible_suffix, fresh_delta])
             rows = after._store.get_session_messages(session_id, conversation_id=conversation_id)
         finally:
             after.shutdown()
 
+        assert ignored["content"] in matched_texts
         assert [row["content"] for row in rows] == [
             message["content"]
             for message in [*snapshot, ignored, visible_suffix, fresh_delta]
