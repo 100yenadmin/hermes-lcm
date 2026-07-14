@@ -9,6 +9,17 @@ The benchmark harness is offline by default:
 - no live Hermes config mutation
 - writes isolated to the requested output directory
 
+For the opt-in threshold full-sweep policy, compare one ordinary incremental
+invocation with one sweep using an offline synthetic workload:
+
+```bash
+python scripts/benchmark_threshold_full_sweep.py
+```
+
+The JSON report compares prompt-prefix publication count, summary-call count,
+compression ratio, latency, and retained/recoverable synthetic facts. It never
+includes message contents, temporary paths, or session identifiers.
+
 ## Run the default replay suite
 
 ```bash

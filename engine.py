@@ -283,6 +283,20 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         )
         self._last_overflow_recovery_failed = False
         self._last_condensation_suppressed_reason = ""
+        self._last_threshold_full_sweep: dict[str, Any] = {
+            "status": "never_run",
+            "leaf_passes": 0,
+            "condensation_passes": 0,
+            "total_passes": 0,
+            "duration_ms": 0.0,
+            "tokens_before": 0,
+            "tokens_after": 0,
+            "summary_prefix_tokens_before": 0,
+            "summary_prefix_tokens_after": 0,
+            "summary_prefix_target_tokens": 0,
+            "stop_reason": "",
+            "budget_exhausted": False,
+        }
         self._last_compression_status = "idle"
         self._last_compression_noop_reason = ""
         # Ingest-failure tracking. The core promise is that nothing is ever
@@ -1249,6 +1263,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self,
         initial_chunk: List[Dict[str, Any]],
         focus_topic: Optional[str] = None,
+        deadline: Optional[float] = None,
     ) -> tuple[List[Dict[str, Any]], int, str, int, int]:
         attempt_chunk = list(initial_chunk)
         max_attempts = 3
@@ -1262,6 +1277,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             token_budget = min(token_budget, 12000)
 
             try:
+                timeout_seconds = self._config.summary_timeout_ms / 1000
+                if deadline is not None:
+                    remaining_seconds = deadline - time.monotonic()
+                    if remaining_seconds <= 0:
+                        raise TimeoutError("threshold full sweep time budget exhausted")
+                    timeout_seconds = min(timeout_seconds, remaining_seconds)
                 summary_text, level = summarize_with_escalation(
                     text=serialized,
                     source_tokens=source_tokens,
@@ -1271,7 +1292,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     fallback_models=self._config.summary_fallback_models,
                     circuit_breaker=self._summary_circuit_breaker,
                     spend_guard=self._summary_spend_guard,
-                    timeout=self._config.summary_timeout_ms / 1000,
+                    timeout=timeout_seconds,
                     l2_budget_ratio=self._config.l2_budget_ratio,
                     l3_truncate_tokens=self._config.l3_truncate_tokens,
                     focus_topic=focus_topic or "",
@@ -3236,6 +3257,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "threshold_tokens": self.threshold_tokens,
             "last_compression_status": self._last_compression_status,
             "last_compression_noop_reason": self._last_compression_noop_reason,
+            "threshold_full_sweep": dict(self._last_threshold_full_sweep),
             "ingest_failure_count": self._ingest_failure_count,
             "consecutive_ingest_failures": self._consecutive_ingest_failures,
             "last_ingest_error": self._last_ingest_error,
@@ -4201,7 +4223,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     # -- Internal: summarization -------------------------------------------
 
-    def _run_pre_compaction_extraction(self, messages: List[Dict[str, Any]]) -> None:
+    def _run_pre_compaction_extraction(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        timeout_seconds: Optional[float] = None,
+    ) -> None:
         """Best-effort extraction of decisions before compaction."""
         try:
             serialized = self._serialize_messages(messages)
@@ -4215,7 +4242,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 output_path=output_path,
                 session_id=self._session_id or "",
                 model=extraction_model,
-                timeout=self._config.summary_timeout_ms / 1000,
+                timeout=(
+                    timeout_seconds
+                    if timeout_seconds is not None
+                    else self._config.summary_timeout_ms / 1000
+                ),
             )
         except Exception as e:
             logger.warning("Pre-compaction extraction failed (non-blocking): %s", e)
@@ -4527,12 +4558,13 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
         condensed_any = False
         suppression_reason = ""
+        fanin = max(1, self._config.condensation_fanin)
 
         for depth in range(upper):
             uncondensed = self._dag.get_uncondensed_at_depth(
                 self._session_id, depth
             )
-            if len(uncondensed) < self._config.condensation_fanin:
+            if len(uncondensed) < fanin:
                 continue
 
             allow_condense, reason = self._should_allow_follow_on_condensation(
@@ -4546,48 +4578,17 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 continue
 
             # Take the first fanin nodes and condense
-            to_condense = uncondensed[:self._config.condensation_fanin]
-            combined_text = "\n\n---\n\n".join(n.summary for n in to_condense)
-            source_tokens = sum(n.token_count for n in to_condense)
-            token_budget = max(1000, int(source_tokens * 0.40))
-
-            summary_text, level = summarize_with_escalation(
-                text=combined_text,
-                source_tokens=source_tokens,
-                token_budget=token_budget,
-                depth=depth + 1,
-                model=self._config.summary_model,
-                fallback_models=self._config.summary_fallback_models,
-                circuit_breaker=self._summary_circuit_breaker,
-                spend_guard=self._summary_spend_guard,
-                timeout=self._config.summary_timeout_ms / 1000,
-                l2_budget_ratio=self._config.l2_budget_ratio,
-                l3_truncate_tokens=self._config.l3_truncate_tokens,
-                focus_topic=focus_topic or "",
-                custom_instructions=self._config.custom_instructions,
+            to_condense = uncondensed[:fanin]
+            source_tokens, summary_tokens, level = self._condense_summary_nodes(
+                to_condense,
+                focus_topic=focus_topic,
             )
-
-            earliest_at, latest_at = self._dag.get_source_time_window([n.node_id for n in to_condense])
-            node = SummaryNode(
-                session_id=self._session_id,
-                depth=depth + 1,
-                summary=summary_text,
-                token_count=count_tokens(summary_text),
-                source_token_count=source_tokens,
-                source_ids=[n.node_id for n in to_condense],
-                source_type="nodes",
-                created_at=time.time(),
-                earliest_at=earliest_at,
-                latest_at=latest_at,
-                expand_hint=self._extract_expand_hint(summary_text),
-            )
-            self._dag.add_node(node)
             condensed_any = True
 
             logger.info(
                 "LCM condensation: d%d × %d → d%d (L%d, %d→%d tokens)",
                 depth, len(to_condense), depth + 1, level,
-                source_tokens, count_tokens(summary_text),
+                source_tokens, summary_tokens,
             )
 
             if leaf_compacted_this_turn and self._config.cache_friendly_condensation_enabled:
@@ -4595,6 +4596,137 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
         if not condensed_any and leaf_compacted_this_turn and self._config.cache_friendly_condensation_enabled:
             self._last_condensation_suppressed_reason = suppression_reason
+
+    def _condense_summary_nodes(
+        self,
+        nodes: List[SummaryNode],
+        *,
+        focus_topic: Optional[str] = None,
+        deadline: Optional[float] = None,
+    ) -> tuple[int, int, int]:
+        """Persist one same-depth condensation and return source/output tokens and level."""
+        if not nodes:
+            raise ValueError("condensation requires at least one summary node")
+        depth = nodes[0].depth
+        if any(node.depth != depth for node in nodes):
+            raise ValueError("condensation requires same-depth summary nodes")
+        combined_text = "\n\n---\n\n".join(node.summary for node in nodes)
+        source_tokens = sum(node.token_count for node in nodes)
+        token_budget = max(1000, int(source_tokens * 0.40))
+        timeout_seconds = self._config.summary_timeout_ms / 1000
+        if deadline is not None:
+            remaining_seconds = deadline - time.monotonic()
+            if remaining_seconds <= 0:
+                raise TimeoutError("threshold full sweep time budget exhausted")
+            timeout_seconds = min(timeout_seconds, remaining_seconds)
+        summary_text, level = summarize_with_escalation(
+            text=combined_text,
+            source_tokens=source_tokens,
+            token_budget=token_budget,
+            depth=depth + 1,
+            model=self._config.summary_model,
+            fallback_models=self._config.summary_fallback_models,
+            circuit_breaker=self._summary_circuit_breaker,
+            spend_guard=self._summary_spend_guard,
+            timeout=timeout_seconds,
+            l2_budget_ratio=self._config.l2_budget_ratio,
+            l3_truncate_tokens=self._config.l3_truncate_tokens,
+            focus_topic=focus_topic or "",
+            custom_instructions=self._config.custom_instructions,
+        )
+        earliest_at, latest_at = self._dag.get_source_time_window(
+            [node.node_id for node in nodes]
+        )
+        summary_tokens = count_tokens(summary_text)
+        self._dag.add_node(SummaryNode(
+            session_id=self._session_id,
+            depth=depth + 1,
+            summary=summary_text,
+            token_count=summary_tokens,
+            source_token_count=source_tokens,
+            source_ids=[node.node_id for node in nodes],
+            source_type="nodes",
+            created_at=time.time(),
+            earliest_at=earliest_at,
+            latest_at=latest_at,
+            expand_hint=self._extract_expand_hint(summary_text),
+        ))
+        return source_tokens, summary_tokens, level
+
+    def _summary_frontier_nodes(self) -> List[SummaryNode]:
+        """Return all provider-visible summary frontier nodes for the active session."""
+        all_nodes = self._dag.get_session_nodes(self._session_id, limit=100_000)
+        referenced = {
+            source_id
+            for node in all_nodes
+            if node.source_type == "nodes"
+            for source_id in node.source_ids
+        }
+        return [node for node in all_nodes if node.node_id not in referenced]
+
+    def _summary_frontier_tokens(self) -> int:
+        return sum(node.token_count for node in self._summary_frontier_nodes())
+
+    def _select_threshold_sweep_condensation_group(self) -> List[SummaryNode]:
+        """Prefer routine fanin/depth, then allow bounded pressure condensation."""
+        by_depth: dict[int, list[SummaryNode]] = {}
+        for node in self._summary_frontier_nodes():
+            by_depth.setdefault(node.depth, []).append(node)
+        if not by_depth:
+            return []
+        fanin = max(2, self._config.condensation_fanin)
+        preferred_max_depth = self._config.incremental_max_depth
+        for depth in sorted(by_depth):
+            nodes = by_depth[depth]
+            within_preferred_depth = preferred_max_depth < 0 or depth < preferred_max_depth
+            if within_preferred_depth and len(nodes) >= fanin:
+                return nodes[:fanin]
+        # The frontier still exceeds its sweep target but no routine group is
+        # available. Permit a same-depth partial group or depth beyond the
+        # preferred routine maximum; the outer sweep budget keeps this bounded.
+        for depth in sorted(by_depth):
+            nodes = by_depth[depth]
+            if len(nodes) >= 2:
+                return nodes[: min(fanin, len(nodes))]
+        return []
+
+    def _run_threshold_sweep_condensation(
+        self,
+        *,
+        target_tokens: int,
+        pass_budget: int,
+        deadline: float,
+        focus_topic: Optional[str] = None,
+    ) -> tuple[int, str]:
+        """Condense an oversized summary frontier within the remaining sweep budget."""
+        passes = 0
+        while self._summary_frontier_tokens() > target_tokens:
+            if passes >= pass_budget:
+                return passes, "pass_budget_exhausted"
+            if time.monotonic() >= deadline:
+                return passes, "time_budget_exhausted"
+            group = self._select_threshold_sweep_condensation_group()
+            if not group:
+                return passes, "no_same_depth_condensation_group"
+            before = self._summary_frontier_tokens()
+            try:
+                self._condense_summary_nodes(
+                    group,
+                    focus_topic=focus_topic,
+                    deadline=deadline,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "LCM threshold full sweep condensation stopped after %d pass(es): %s",
+                    passes,
+                    exc,
+                )
+                return passes, "condensation_error"
+            passes += 1
+            after = self._summary_frontier_tokens()
+            if after >= before:
+                return passes, "condensation_no_progress"
+        return passes, "summary_prefix_target_reached"
 
     # -- Internal: context assembly ----------------------------------------
 

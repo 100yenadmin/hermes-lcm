@@ -555,6 +555,8 @@ class TestConfig:
         assert c.deferred_maintenance_enabled is False
         assert c.deferred_maintenance_max_passes == 4
         assert c.critical_budget_pressure_ratio == 0.0
+        assert c.threshold_full_sweep_enabled is False
+        assert c.summary_prefix_target_tokens == 0
         assert c.ignore_session_patterns == []
         assert c.stateless_session_patterns == []
         assert c.ignore_message_patterns == []
@@ -592,6 +594,8 @@ class TestConfig:
         monkeypatch.setenv("LCM_CACHE_FRIENDLY_CONDENSATION_ENABLED", "1")
         monkeypatch.setenv("LCM_CACHE_FRIENDLY_MIN_DEBT_GROUPS", "3")
         monkeypatch.setenv("LCM_CRITICAL_BUDGET_PRESSURE_RATIO", "0.92")
+        monkeypatch.setenv("LCM_THRESHOLD_FULL_SWEEP_ENABLED", "true")
+        monkeypatch.setenv("LCM_SUMMARY_PREFIX_TARGET_TOKENS", "18000")
         monkeypatch.setenv("LCM_CUSTOM_INSTRUCTIONS", "Write as a neutral documenter.")
         monkeypatch.setenv("LCM_EXTRACTION_ENABLED", "true")
         monkeypatch.setenv("LCM_EXTRACTION_MODEL", "openai/gpt-5.4-mini")
@@ -627,6 +631,8 @@ class TestConfig:
         assert c.cache_friendly_condensation_enabled is True
         assert c.cache_friendly_min_debt_groups == 3
         assert c.critical_budget_pressure_ratio == 0.92
+        assert c.threshold_full_sweep_enabled is True
+        assert c.summary_prefix_target_tokens == 18_000
         assert c.custom_instructions == "Write as a neutral documenter."
         assert c.extraction_enabled is True
         assert c.extraction_model == "openai/gpt-5.4-mini"

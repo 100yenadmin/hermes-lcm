@@ -144,6 +144,8 @@ environment variables:
 | `LCM_LEAF_CHUNK_TOKENS` | `20000` | Raw-backlog floor before leaf compaction; with dynamic chunking enabled, the base chunk target |
 | `LCM_DYNAMIC_LEAF_CHUNK_ENABLED` | `false` | Enable chunk-sized leaf compaction passes instead of compacting the whole non-tail raw backlog per pass |
 | `LCM_DYNAMIC_LEAF_CHUNK_MAX` | `40000` | Upper bound for dynamic leaf chunk targets |
+| `LCM_THRESHOLD_FULL_SWEEP_ENABLED` | `false` | At threshold, opt into one synchronous bounded sweep that drains chunked raw history before publishing one new active context |
+| `LCM_SUMMARY_PREFIX_TARGET_TOKENS` | `0` | Sweep-only summary-frontier target; `0` derives one `LCM_LEAF_CHUNK_TOKENS` budget |
 | `LCM_NEW_SESSION_RETAIN_DEPTH` | `2` | DAG depth retained after manual `/new` (`-1` all, `0` none) |
 | `LCM_IGNORE_SESSION_PATTERNS` | empty | Comma-separated session globs excluded from LCM storage |
 | `LCM_STATELESS_SESSION_PATTERNS` | empty | Comma-separated session globs kept read-only |
@@ -328,6 +330,14 @@ What the main knobs do:
 - `LCM_DYNAMIC_LEAF_CHUNK_ENABLED=true` changes leaf passes into chunk-sized
   work. In that mode `LCM_LEAF_CHUNK_TOKENS` is the base target and
   `LCM_DYNAMIC_LEAF_CHUNK_MAX` is the upper bound for a dynamic chunk target.
+- `LCM_THRESHOLD_FULL_SWEEP_ENABLED=true` makes a threshold-triggered invocation
+  keep draining oldest raw chunks outside the protected tail, even after prompt
+  pressure falls below the trigger. It always uses the configured working leaf
+  size, then condenses a too-large summary frontier toward
+  `LCM_SUMMARY_PREFIX_TARGET_TOKENS` (`0` means one leaf budget). The whole
+  invocation is bounded to 12 summary calls and 120 seconds between calls,
+  persists each completed DAG pass, and publishes one active context at the end.
+  It remains synchronous and does not enable deferred/background maintenance.
 - `LCM_EXPANSION_CONTEXT_TOKENS` controls how much recovered material
   `lcm_expand_query` may feed to the auxiliary model. It does not change what
   LCM stores.
