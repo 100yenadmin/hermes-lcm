@@ -65,6 +65,7 @@ class CompactionMixin:
 
     def should_compress_preflight(self, messages):
         """Pre-flight check — also ingests messages into the store."""
+        self._preflight_cleanup_only_due_to_boundary_cooldown = False
         self._maybe_reclassify_late_auxiliary_before_compaction_write()
         if self._bypasses_lcm_context_management():
             self._remember_lcm_bypass_message_prefix(self._bypass_lcm_session_id(), messages)
@@ -109,13 +110,34 @@ class CompactionMixin:
                     return True
                 return False
         if replay_messages is not None and replay_messages != messages:
+            replay_rough = count_messages_tokens(replay_messages)
+            cleanup_requested = self._replay_diff_requests_ingest_cleanup(
+                messages,
+                replay_messages,
+            )
+            force_overflow_requested = self._should_force_overflow_recovery(
+                observed_tokens=rough,
+                messages=messages,
+            ) or self._should_force_overflow_recovery(
+                observed_tokens=replay_rough,
+                messages=replay_messages,
+            )
+            if cleanup_requested:
+                if (
+                    not force_overflow_requested
+                    and self._compression_boundary_cooldown_active()
+                ):
+                    self._preflight_cleanup_only_due_to_boundary_cooldown = True
+                return self._mark_preflight_compression_requested()
+            if force_overflow_requested:
+                return self._mark_preflight_compression_requested()
+            # A boundary skip cools down summary-producing leaf/condensation
+            # work. It must not prevent the host from adopting a replay cleanup
+            # that ingest has already made durable (for example a live tool
+            # result stub); those returns above are deterministic and add no
+            # summarizer spend.
             if self._compression_boundary_cooldown_active():
                 return False
-            replay_rough = count_messages_tokens(replay_messages)
-            if self._should_force_overflow_recovery(observed_tokens=replay_rough):
-                return self._mark_preflight_compression_requested()
-            if self._replay_diff_requests_ingest_cleanup(messages, replay_messages):
-                return self._mark_preflight_compression_requested()
             if pre_ingest_placeholder_ambiguous_noop:
                 self._last_compression_status = "noop"
                 self._last_compression_noop_reason = pre_ingest_noop_reason
@@ -137,10 +159,10 @@ class CompactionMixin:
             if self._should_run_deferred_maintenance(replay_messages, observed_tokens=replay_rough):
                 return self._mark_preflight_compression_requested()
             return False
-        if self._compression_boundary_cooldown_active():
-            return False
         if self._should_force_overflow_recovery(observed_tokens=rough):
             return self._mark_preflight_compression_requested()
+        if self._compression_boundary_cooldown_active():
+            return False
         if self.threshold_tokens > 0 and rough >= self.threshold_tokens:
             if pre_ingest_placeholder_ambiguous_noop:
                 self._last_compression_status = "noop"
@@ -177,6 +199,8 @@ class CompactionMixin:
                 if replay_text.startswith("[Externalized LCM ingest payload:"):
                     return True
                 if replay_text.startswith("[Externalized payload: kind=raw_payload;"):
+                    return True
+                if replay_text.startswith("[Externalized tool output:"):
                     return True
                 if replay_text.startswith("[LCM active replay placeholder: assistant output quarantined;"):
                     return True
@@ -370,6 +394,34 @@ class CompactionMixin:
         # or provider context after the durable row has been written.
         working_messages = self._ingest_messages(messages)
         ingest_cleanup_changed_active_context = working_messages != messages
+        cleanup_only_due_to_boundary_cooldown = bool(
+            self._preflight_cleanup_only_due_to_boundary_cooldown
+            and not force_overflow
+        )
+        self._preflight_cleanup_only_due_to_boundary_cooldown = False
+        if cleanup_only_due_to_boundary_cooldown:
+            sanitized_messages = self._sanitize_active_context_messages(
+                working_messages,
+                insert_missing_tool_stubs=False,
+            )
+            self._refresh_raw_backlog_debt(
+                sanitized_messages,
+                observed_tokens=observed_prompt_tokens,
+            )
+            self._ingest_cursor = len(sanitized_messages)
+            self._last_compression_status = "sanitized"
+            self._last_compression_noop_reason = ""
+            self._write_generated_ignored_placeholder_hash_counts(
+                self._generated_placeholder_digest_budget_for_active_replay(
+                    sanitized_messages
+                )
+            )
+            self._write_generated_ignored_placeholder_hash_ordinals(
+                self._generated_placeholder_digest_ordinals_for_active_replay(
+                    sanitized_messages
+                )
+            )
+            return sanitized_messages
         anchor_source_messages = list(working_messages)
         pressure_messages = messages if len(messages) == len(working_messages) else working_messages
         leaf_compacted_this_turn = False
@@ -671,6 +723,7 @@ class CompactionMixin:
                     working_messages,
                     compressed,
                     assembly_cap_override=recovery_assembly_cap,
+                    ingest_cleanup_changed_active_context=ingest_cleanup_changed_active_context,
                 )
             active_context_messages = self._drop_preexisting_generated_ignored_dependent_eof_replies(
                 working_messages,
