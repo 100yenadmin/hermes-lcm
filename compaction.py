@@ -197,8 +197,7 @@ class CompactionMixin:
     def _has_ignored_backlog_outside_fresh_tail(self, messages: List[Dict[str, Any]]) -> bool:
         if not self._compiled_ignore_message_patterns or not messages:
             return False
-        n = len(messages)
-        fresh_tail_start = max(0, n - self._config.fresh_tail_count)
+        fresh_tail_start = self._fresh_tail_start(messages)
         leading_anchor_count = self._leading_anchor_count(messages)
         if fresh_tail_start <= leading_anchor_count:
             return False
@@ -232,8 +231,7 @@ class CompactionMixin:
         """
         if not messages:
             return False, "empty message list"
-        n = len(messages)
-        fresh_tail_start = max(0, n - self._config.fresh_tail_count)
+        fresh_tail_start = self._fresh_tail_start(messages)
         leading_anchor_count = self._leading_anchor_count(messages)
         if fresh_tail_start <= leading_anchor_count:
             return False, "no eligible raw backlog outside fresh tail"
@@ -405,8 +403,7 @@ class CompactionMixin:
         preexisting_dependent_reply_records = self._load_generated_ignored_dependent_reply_records()
 
         while leaf_passes < max_leaf_passes:
-            n = len(working_messages)
-            fresh_tail_start = max(0, n - self._config.fresh_tail_count)
+            fresh_tail_start = self._fresh_tail_start(pressure_messages)
 
             # Keep only a real system prompt anchored. Gateway sessions may
             # pass only conversation messages, so index 0 can be an old user
@@ -428,8 +425,7 @@ class CompactionMixin:
                 working_messages = working_messages[:leading_anchor_count] + working_messages[candidate_start:]
                 pressure_messages = pressure_messages[:leading_anchor_count] + pressure_messages[candidate_start:]
                 candidate_start = leading_anchor_count
-                n = len(working_messages)
-                fresh_tail_start = max(0, n - self._config.fresh_tail_count)
+                fresh_tail_start = self._fresh_tail_start(pressure_messages)
                 if fresh_tail_start <= leading_anchor_count:
                     noop_reason = "selected leaf chunk lacks raw store lineage"
                     break
@@ -496,8 +492,7 @@ class CompactionMixin:
                         + kept_pressure
                         + pressure_messages[fresh_tail_start:]
                     )
-                    n = len(working_messages)
-                    fresh_tail_start = max(0, n - self._config.fresh_tail_count)
+                    fresh_tail_start = self._fresh_tail_start(pressure_messages)
                 if drop_dependent_reply_into_tail:
                     tail_scan_start = max(fresh_tail_start, leading_anchor_count)
                     pending_tail_dependents: list[tuple[Dict[str, Any], str]] = []
@@ -641,13 +636,14 @@ class CompactionMixin:
                 if (not deferred_maintenance_active) and self.threshold_tokens > 0 and estimated_active_tokens < self.threshold_tokens:
                     break
                 leading_anchor_count = self._leading_anchor_count(working_messages)
+                remaining_fresh_tail_start = self._fresh_tail_start(pressure_messages)
                 remaining_raw = working_messages[
-                    leading_anchor_count:max(0, len(working_messages) - self._config.fresh_tail_count)
+                    leading_anchor_count:remaining_fresh_tail_start
                 ]
                 if not remaining_raw:
                     break
                 pressure_remaining_raw = pressure_messages[
-                    leading_anchor_count:max(0, len(pressure_messages) - self._config.fresh_tail_count)
+                    leading_anchor_count:remaining_fresh_tail_start
                 ]
                 remaining_raw_tokens = count_messages_tokens(pressure_remaining_raw)
                 remaining_threshold = self._working_leaf_chunk_tokens(remaining_raw_tokens)

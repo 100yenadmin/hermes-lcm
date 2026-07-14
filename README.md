@@ -315,6 +315,7 @@ Most installs only need `plugins.enabled` and `context.engine: lcm`.
 |----------|---------|-----|
 | `LCM_CONTEXT_THRESHOLD` | `0.35` | Fraction of the context window that triggers LCM compaction |
 | `LCM_FRESH_TAIL_COUNT` | `32` | Recent messages protected from compaction |
+| `LCM_FRESH_TAIL_MAX_TOKENS` | `0` | Optional token cap for the protected fresh tail (`0` disables it); always retains the newest message and complete assistant/tool-result groups |
 | `LCM_INCREMENTAL_MAX_DEPTH` | `3` | Max DAG condensation depth (`-1` = unlimited, `0` = leaf only); enables hierarchical summarization |
 | `LCM_LEAF_CHUNK_TOKENS` | `20000` | Raw-backlog floor before leaf compaction; with dynamic chunking enabled, the base chunk target |
 | `LCM_DYNAMIC_LEAF_CHUNK_ENABLED` | `false` | Enable chunk-sized leaf compaction passes instead of compacting the whole non-tail raw backlog per pass |
@@ -323,6 +324,11 @@ Most installs only need `plugins.enabled` and `context.engine: lcm`.
 | `LCM_DATABASE_PATH` | auto | SQLite database path. Empty config resolves to `HERMES_HOME/lcm.db`; plugin installs or operators may set this env var to another profile-scoped path such as `~/.hermes/hermes-lcm.db`. |
 | `LCM_FTS_INTEGRITY_CHECK_INTERVAL_HOURS` | `24` | Minimum hours between startup FTS5 deep integrity-checks (O(index size)). `0` checks every startup; a negative value never checks on startup. Structural checks always run regardless. |
 | `LCM_ENABLE_SLASH_COMMAND` | `false` | Enable the optional `/lcm` operator command surface |
+
+When `LCM_FRESH_TAIL_MAX_TOKENS` is enabled, the protected suffix must satisfy
+both the message-count and token bounds. The newest message is never dropped,
+and a boundary that would begin inside an assistant tool-call/result group is
+moved back to that assistant even when doing so exceeds a configured bound.
 
 ### Filtering and storage settings
 

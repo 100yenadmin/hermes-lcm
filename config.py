@@ -257,6 +257,7 @@ class _EnvFieldSpec:
 # duplicated. Order mirrors the historical ``from_env`` order for readability.
 ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("fresh_tail_count", "LCM_FRESH_TAIL_COUNT", int),
+    _EnvFieldSpec("fresh_tail_max_tokens", "LCM_FRESH_TAIL_MAX_TOKENS", int),
     _EnvFieldSpec("leaf_chunk_tokens", "LCM_LEAF_CHUNK_TOKENS", int),
     _EnvFieldSpec("context_threshold", "LCM_CONTEXT_THRESHOLD", float),
     _EnvFieldSpec("incremental_max_depth", "LCM_INCREMENTAL_MAX_DEPTH", int),
@@ -309,6 +310,7 @@ _PARSER_BY_TYPE = {
 # ``from_env`` handles these explicitly, so the uniform loop skips them.
 _SOURCE_TRACKED_ENV_FIELDS = frozenset({
     "fresh_tail_count",
+    "fresh_tail_max_tokens",
     "leaf_chunk_tokens",
     "context_threshold",
     "summary_spend_max_calls",
@@ -333,6 +335,8 @@ class LCMConfig:
 
     # -- Fresh tail: recent messages never compacted ---
     fresh_tail_count: int = 32
+    # Optional token cap for the protected suffix (0 = disabled)
+    fresh_tail_max_tokens: int = 0
 
     # -- Compaction thresholds ---
     # Max source tokens in a leaf chunk before summarization triggers
@@ -501,6 +505,11 @@ class LCMConfig:
             "LCM_FRESH_TAIL_COUNT", c.fresh_tail_count
         )
         _record("fresh_tail_count", source, warning)
+        c.fresh_tail_max_tokens, source, warning = _parse_int_env_with_source(
+            "LCM_FRESH_TAIL_MAX_TOKENS", c.fresh_tail_max_tokens
+        )
+        c.fresh_tail_max_tokens = max(0, c.fresh_tail_max_tokens)
+        _record("fresh_tail_max_tokens", source, warning)
         c.leaf_chunk_tokens, source, warning = _parse_int_env_with_source(
             "LCM_LEAF_CHUNK_TOKENS", c.leaf_chunk_tokens
         )
