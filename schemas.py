@@ -9,7 +9,8 @@ LCM_GREP = {
         "over rows already present in lcm.db, including externally backfilled rows that may carry source strings "
         "such as openclaw-lcm:* . In broader scopes only raw-message hits are returned; cross-session summary "
         "node expansion is intentionally deferred. Use lcm_expand(store_id=...) on a cross-session message hit "
-        "to drill into its full content. For Hermes-tracked session history outside the LCM database, use session_search."
+        "to drill into its full content. Set content_scope='externalized' or 'both' to opt into bounded, active-session "
+        "search over recoverable payload sidecars. For Hermes-tracked session history outside the LCM database, use session_search."
     ),
     "parameters": {
         "type": "object",
@@ -38,6 +39,25 @@ LCM_GREP = {
                     "and 'hybrid' keeps strong older matches competitive while still boosting newer context."
                 ),
                 "default": "recency",
+            },
+            "content_scope": {
+                "type": "string",
+                "enum": ["history", "externalized", "both"],
+                "description": (
+                    "Content stores to search. 'history' (default) preserves current raw-message and summary behavior. "
+                    "'externalized' searches only bounded externalized-payload prefixes owned by the active session. "
+                    "'both' searches history and those payloads. Externalized search supports session_scope='current' only."
+                ),
+                "default": "history",
+            },
+            "externalized_refs": {
+                "type": "array",
+                "items": {"type": "string"},
+                "maxItems": 256,
+                "description": (
+                    "Optional externalized ref filenames to search. Valid only with content_scope='externalized' or 'both'. "
+                    "Every ref must be a regular payload owned by the active session."
+                ),
             },
             "session_scope": {
                 "type": "string",

@@ -465,6 +465,15 @@ Failure to durably externalize is fail-open: the provider receives the original
 inline payload. Results from `lcm_describe` and `lcm_expand` also stay inline so
 recovery does not recursively create another drilldown step.
 
+`lcm_grep` keeps history-only behavior by default. Operators and agents may opt
+into bounded active-session payload search with
+`content_scope='externalized'|'both'`; optional `externalized_refs` narrows the
+scan to known refs. The payload path rejects symlinks and foreign-session refs,
+scans at most 256 files and 512,000 encoded content bytes per file, and returns
+only bounded snippets plus recovery metadata. See the
+[retrieval tools reference](retrieval-tools.md#searching-externalized-payloads)
+for the exact contract.
+
 The storage-boundary payload guard is separate from that opt-in. LCM always
 scans messages at the store boundary before writing `messages.content` or
 `messages.tool_calls` to SQLite. Inline `data:*;base64,...` payloads and
