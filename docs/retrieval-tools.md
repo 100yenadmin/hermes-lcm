@@ -9,7 +9,7 @@ for earlier separate sessions or broad cross-session history.
 
 | Tool | Use |
 |------|-----|
-| `lcm_grep` | Search current-session raw messages and summaries. Opt into `session_scope='all'` or `session_scope='session'` (with `session_id`) for bounded archive recovery over rows already present in `lcm.db`, including externally backfilled rows that may carry source strings such as `openclaw-lcm:*`; broader scopes return raw-message hits only. Raw-message filters `role`, `time_from`, and `time_to` are pushed into the search query; when any of them is supplied, summary hits are omitted so the filter contract stays exact. Use `session_search` for earlier separate sessions or broad cross-session recall. |
+| `lcm_grep` | Search current-session raw messages and summaries. Opt into `content_scope='externalized'` or `'both'` for bounded literal search over recoverable payload prefixes owned by the active session. Opt into `session_scope='all'` or `session_scope='session'` (with `session_id`) for bounded archive recovery over rows already present in `lcm.db`, including externally backfilled rows that may carry source strings such as `openclaw-lcm:*`; broader scopes return raw-message hits only and cannot search externalized payloads. Raw-message filters `role`, `time_from`, and `time_to` are pushed into the history query; when any is supplied, summary hits are omitted. Use `session_search` for earlier separate sessions or broad cross-session recall. |
 | `lcm_load_session` | Load one ordered raw-message transcript page for an explicit `session_id`. This is not search: it returns raw rows in `store_id` order, bounded by `limit`, with per-message content bounded by `max_content_chars`, and continues with `after_store_id` from `next_cursor`. |
 | `lcm_describe` | Inspect the current-session DAG or preview an `externalized_ref` without loading full content. |
 | `lcm_expand` | Recover source messages, child summaries, or externalized payloads with pagination. Use `store_id` to fetch a single raw message regardless of session, suitable for drilling into a cross-session `lcm_grep` result. |
@@ -52,6 +52,37 @@ be recovered in deterministic pages.
 - oversized raw messages continue with `content_offset`
 - `lcm_expand(externalized_ref=...)` pages payload content with `content_offset`
 - `lcm_expand_query` uses `context_max_tokens` for auxiliary context and reports truncation/pagination hints when needed
+
+### Searching externalized payloads
+
+Externalized-payload search is opt-in so the default `lcm_grep` cost and result
+shape remain unchanged:
+
+```text
+lcm_grep(query="distinctive error", content_scope="externalized")
+lcm_grep(
+  query="distinctive error",
+  content_scope="both",
+  externalized_refs=["20260714_...json"],
+)
+```
+
+Version 1 is deliberately narrow:
+
+- it performs case-insensitive literal matching inside payload content; history
+  keeps its existing FTS5 query behavior
+- it searches only payloads whose stored session id exactly matches the active
+  session, so every returned ref remains recoverable with `lcm_expand`
+- it scans at most 256 files and the first 512,000 encoded content-field bytes
+  per file, and caps externalized result material at 64,000 response characters
+- a result includes the ref, tool-call id, bounded snippet, line and byte
+  position, original content byte/character sizes, and `scan_truncated`
+- `externalized_refs` is optional; explicit invalid, missing, symlinked, or
+  foreign-session refs are rejected rather than silently widened
+
+Cross-session externalized search remains unsupported. Search the historical
+row first, load the intended session, or recover a known current-session ref
+directly with `lcm_expand`.
 
 ### lossless-claw/OpenClaw import utility
 
