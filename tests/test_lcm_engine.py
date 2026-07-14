@@ -11296,6 +11296,288 @@ class TestEngineCompress:
         assert call_count == 1
         assert engine._dag.get_session_nodes("test-session") == []
 
+    def test_threshold_full_sweep_drains_chunked_prefix_and_publishes_once(self, tmp_path, monkeypatch):
+        config = LCMConfig(
+            fresh_tail_count=2,
+            leaf_chunk_tokens=120,
+            threshold_full_sweep_enabled=True,
+            summary_prefix_target_tokens=10_000,
+            database_path=str(tmp_path / "lcm_threshold_sweep.db"),
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "test-session"
+        instance.threshold_tokens = 1
+        messages = [{"role": "system", "content": "system"}]
+        for index in range(10):
+            role = "user" if index % 2 == 0 else "assistant"
+            messages.append({
+                "role": role,
+                "content": f"FACT-{index} " + (f"dense-{index} " * 35),
+            })
+        calls: list[tuple[int, list[str]]] = []
+
+        def fake_leaf(chunk, focus_topic=None, deadline=None):
+            del focus_topic, deadline
+            source_tokens = count_messages_tokens(chunk)
+            calls.append((source_tokens, [message["content"].split()[0] for message in chunk]))
+            summary = "retained " + " ".join(calls[-1][1])
+            return chunk, source_tokens, summary, 1, 0
+
+        publications = 0
+        original_assemble = instance._assemble_context
+
+        def count_publication(*args, **kwargs):
+            nonlocal publications
+            publications += 1
+            return original_assemble(*args, **kwargs)
+
+        monkeypatch.setattr(instance, "_summarize_leaf_chunk_with_rescue", fake_leaf)
+        monkeypatch.setattr(instance, "_assemble_context", count_publication)
+        try:
+            tokens_before = count_messages_tokens(messages)
+            compressed = instance.compress(messages, current_tokens=tokens_before)
+            telemetry = instance.get_status()["threshold_full_sweep"]
+
+            assert len(calls) > 1
+            assert all(tokens <= config.leaf_chunk_tokens or len(labels) == 1 for tokens, labels in calls)
+            assert publications == 1
+            assert compressed[-2:] == messages[-2:]
+            compressed_text = "\n".join(str(message.get("content") or "") for message in compressed)
+            assert all(f"FACT-{index}" in compressed_text for index in range(8))
+            assert "dense-0" not in compressed_text
+            assert telemetry["leaf_passes"] == len(calls)
+            assert telemetry["condensation_passes"] == 0
+            assert telemetry["total_passes"] == len(calls)
+            assert telemetry["status"] == "completed"
+            assert telemetry["stop_reason"] == "summary_prefix_target_reached"
+            assert telemetry["budget_exhausted"] is False
+            assert telemetry["tokens_before"] == tokens_before
+            assert telemetry["tokens_after"] < tokens_before
+        finally:
+            instance.shutdown()
+
+    def test_threshold_full_sweep_preflight_accepts_partial_leaf_at_threshold(self, tmp_path):
+        config = LCMConfig(
+            fresh_tail_count=2,
+            leaf_chunk_tokens=20_000,
+            threshold_full_sweep_enabled=True,
+            database_path=str(tmp_path / "lcm_threshold_sweep_partial_preflight.db"),
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "test-session"
+        messages = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "small historical message"},
+            {"role": "user", "content": "fresh request"},
+            {"role": "assistant", "content": "fresh response"},
+        ]
+        instance.threshold_tokens = count_messages_tokens(messages)
+        try:
+            assert instance.should_compress_preflight(messages) is True
+        finally:
+            instance.shutdown()
+
+    def test_threshold_full_sweep_total_pass_budget_is_shared_and_reported(self, tmp_path, monkeypatch):
+        config = LCMConfig(
+            fresh_tail_count=2,
+            leaf_chunk_tokens=1,
+            threshold_full_sweep_enabled=True,
+            database_path=str(tmp_path / "lcm_threshold_sweep_pass_budget.db"),
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "test-session"
+        instance.threshold_tokens = 1
+        messages = [{"role": "system", "content": "system"}]
+        for index in range(20):
+            messages.append({
+                "role": "user" if index % 2 == 0 else "assistant",
+                "content": f"budget-{index} " + ("token " * 20),
+            })
+
+        def fake_leaf(chunk, focus_topic=None, deadline=None):
+            del focus_topic, deadline
+            return chunk, count_messages_tokens(chunk), "bounded", 1, 0
+
+        monkeypatch.setattr(instance, "_summarize_leaf_chunk_with_rescue", fake_leaf)
+        try:
+            instance.compress(messages, current_tokens=count_messages_tokens(messages))
+            telemetry = instance.get_status()["threshold_full_sweep"]
+
+            assert telemetry["leaf_passes"] == 12
+            assert telemetry["condensation_passes"] == 0
+            assert telemetry["total_passes"] == 12
+            assert telemetry["status"] == "partial"
+            assert telemetry["stop_reason"] == "pass_budget_exhausted"
+            assert telemetry["budget_exhausted"] is True
+        finally:
+            instance.shutdown()
+
+    def test_threshold_full_sweep_condenses_frontier_to_target_and_beyond_preferred_depth(self, tmp_path, monkeypatch):
+        config = LCMConfig(
+            fresh_tail_count=2,
+            leaf_chunk_tokens=200,
+            threshold_full_sweep_enabled=True,
+            summary_prefix_target_tokens=1500,
+            incremental_max_depth=1,
+            condensation_fanin=4,
+            database_path=str(tmp_path / "lcm_threshold_sweep_condense.db"),
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "test-session"
+        instance.threshold_tokens = 1
+        for index in range(4):
+            instance._dag.add_node(SummaryNode(
+                session_id="test-session",
+                depth=1,
+                summary=f"durable fact group {index}",
+                token_count=1000,
+                source_token_count=2000,
+                source_ids=[],
+                source_type="messages",
+                created_at=index,
+            ))
+        messages = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "raw retained fact " + ("detail " * 80)},
+            {"role": "user", "content": "fresh request"},
+            {"role": "assistant", "content": "fresh answer"},
+        ]
+
+        def fake_leaf(chunk, focus_topic=None, deadline=None):
+            del focus_topic, deadline
+            return chunk, count_messages_tokens(chunk), "raw retained fact", 1, 0
+
+        import hermes_lcm.engine as engine_module
+
+        monkeypatch.setattr(instance, "_summarize_leaf_chunk_with_rescue", fake_leaf)
+        monkeypatch.setattr(
+            engine_module,
+            "summarize_with_escalation",
+            lambda **kwargs: ("condensed durable facts", 1),
+        )
+        try:
+            instance.compress(messages, current_tokens=count_messages_tokens(messages))
+            telemetry = instance.get_status()["threshold_full_sweep"]
+
+            assert telemetry["condensation_passes"] == 1
+            assert telemetry["summary_prefix_tokens_before"] == 4000
+            assert telemetry["summary_prefix_tokens_after"] <= 1500
+            assert telemetry["stop_reason"] == "summary_prefix_target_reached"
+            assert any(node.depth == 2 for node in instance._dag.get_session_nodes("test-session"))
+        finally:
+            instance.shutdown()
+
+    def test_threshold_full_sweep_stops_between_calls_at_time_budget(self, tmp_path, monkeypatch):
+        config = LCMConfig(
+            fresh_tail_count=2,
+            leaf_chunk_tokens=1,
+            threshold_full_sweep_enabled=True,
+            database_path=str(tmp_path / "lcm_threshold_sweep_time_budget.db"),
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "test-session"
+        instance.threshold_tokens = 1
+        messages = [{"role": "system", "content": "system"}] + [
+            {"role": "user", "content": f"timed-{index} " + ("token " * 20)}
+            for index in range(5)
+        ] + [
+            {"role": "user", "content": "fresh"},
+            {"role": "assistant", "content": "answer"},
+        ]
+        monotonic_calls = 0
+
+        def fake_monotonic():
+            nonlocal monotonic_calls
+            monotonic_calls += 1
+            return 0.0 if monotonic_calls <= 2 else 121.0
+
+        def fake_leaf(chunk, focus_topic=None, deadline=None):
+            del focus_topic, deadline
+            return chunk, count_messages_tokens(chunk), "timed summary", 1, 0
+
+        import hermes_lcm.compaction as compaction_module
+
+        monkeypatch.setattr(compaction_module.time, "monotonic", fake_monotonic)
+        monkeypatch.setattr(instance, "_summarize_leaf_chunk_with_rescue", fake_leaf)
+        try:
+            instance.compress(messages, current_tokens=count_messages_tokens(messages))
+            telemetry = instance.get_status()["threshold_full_sweep"]
+
+            assert telemetry["leaf_passes"] == 1
+            assert telemetry["status"] == "partial"
+            assert telemetry["stop_reason"] == "time_budget_exhausted"
+            assert telemetry["budget_exhausted"] is True
+        finally:
+            instance.shutdown()
+
+    def test_threshold_full_sweep_publishes_persisted_progress_after_later_leaf_error(self, tmp_path, monkeypatch):
+        config = LCMConfig(
+            fresh_tail_count=2,
+            leaf_chunk_tokens=1,
+            threshold_full_sweep_enabled=True,
+            database_path=str(tmp_path / "lcm_threshold_sweep_partial.db"),
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "test-session"
+        instance.threshold_tokens = 1
+        messages = [{"role": "system", "content": "system"}] + [
+            {"role": "user", "content": f"partial-{index} " + ("token " * 20)}
+            for index in range(4)
+        ] + [
+            {"role": "user", "content": "fresh"},
+            {"role": "assistant", "content": "answer"},
+        ]
+        calls = 0
+
+        def flaky_leaf(chunk, focus_topic=None, deadline=None):
+            del focus_topic, deadline
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                raise RuntimeError("later summary failed")
+            return chunk, count_messages_tokens(chunk), "persisted first pass", 1, 0
+
+        monkeypatch.setattr(instance, "_summarize_leaf_chunk_with_rescue", flaky_leaf)
+        try:
+            compressed = instance.compress(messages, current_tokens=count_messages_tokens(messages))
+            telemetry = instance.get_status()["threshold_full_sweep"]
+
+            assert compressed
+            assert len(instance._dag.get_session_nodes("test-session")) == 1
+            assert telemetry["leaf_passes"] == 1
+            assert telemetry["status"] == "partial"
+            assert telemetry["stop_reason"] == "leaf_summary_error"
+            assert telemetry["budget_exhausted"] is False
+        finally:
+            instance.shutdown()
+
+    def test_threshold_full_sweep_caps_provider_timeout_to_remaining_wall_budget(self, tmp_path, monkeypatch):
+        config = LCMConfig(
+            summary_timeout_ms=300_000,
+            database_path=str(tmp_path / "lcm_threshold_sweep_timeout_cap.db"),
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "test-session"
+        observed_timeout = None
+
+        import hermes_lcm.engine as engine_module
+
+        def capture_timeout(**kwargs):
+            nonlocal observed_timeout
+            observed_timeout = kwargs["timeout"]
+            return "bounded summary", 1
+
+        monkeypatch.setattr(engine_module.time, "monotonic", lambda: 10.0)
+        monkeypatch.setattr(engine_module, "summarize_with_escalation", capture_timeout)
+        try:
+            instance._summarize_leaf_chunk_with_rescue(
+                [{"role": "user", "content": "synthetic input"}],
+                deadline=110.0,
+            )
+            assert observed_timeout == 100.0
+        finally:
+            instance.shutdown()
+
     def test_cache_friendly_gating_suppresses_follow_on_condensation_for_single_fanin_group(self, tmp_path, monkeypatch):
         config = LCMConfig(
             fresh_tail_count=2,

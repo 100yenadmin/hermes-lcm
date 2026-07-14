@@ -25,6 +25,19 @@ python benchmarks/benchmark_active_tool_stubbing.py \
 The result measures provider-visible prompt tokens and local assembly latency.
 It is not a provider billing-cost measurement and contains no raw payload text.
 
+## Threshold full-sweep benchmark
+
+For the opt-in threshold full-sweep policy, compare one ordinary incremental
+invocation with one sweep using an offline synthetic workload:
+
+```bash
+python scripts/benchmark_threshold_full_sweep.py
+```
+
+The JSON report compares prompt-prefix publication count, summary-call count,
+compression ratio, latency, and retained/recoverable synthetic facts. It never
+includes message contents, temporary paths, or session identifiers.
+
 ## Run the default replay suite
 
 ```bash
