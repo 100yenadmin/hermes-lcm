@@ -884,7 +884,7 @@ class ReconcileMixin:
             return 0
 
         assembled_context_cursor = self._reconciled_cursor_from_assembled_active_context(messages)
-        if assembled_context_cursor > 0:
+        if assembled_context_cursor == len(messages):
             self._record_ingest_reconciliation(
                 action="advanced cursor",
                 reason="replayed durable assembled active context",
@@ -909,6 +909,34 @@ class ReconcileMixin:
             self._message_replay_identity(row, stored_row=True)
             for row in stored_tail_rows
         ]
+        if assembled_context_cursor > 0:
+            incoming_suffix = messages[assembled_context_cursor:]
+            suffix_identities = [
+                self._message_replay_identity(message)
+                for message in incoming_suffix
+            ]
+            durable_suffix_overlap = 0
+            for overlap in range(min(len(suffix_identities), len(stored_tail)), 0, -1):
+                if suffix_identities[:overlap] == stored_tail[-overlap:]:
+                    durable_suffix_overlap = overlap
+                    break
+            cursor = assembled_context_cursor + durable_suffix_overlap
+            reason = (
+                "replayed durable assembled active context and stored suffix"
+                if durable_suffix_overlap
+                else "replayed durable assembled active context"
+            )
+            self._record_ingest_reconciliation(
+                action="advanced cursor",
+                reason=reason,
+                cursor=cursor,
+                incoming=len(messages),
+                session_count=session_count,
+                stored_tail_count=len(stored_tail),
+                effective_incoming=cursor,
+            )
+            return cursor
+
         cursor = self._find_reconciled_cursor_for_store_tail(
             messages,
             stored_tail,

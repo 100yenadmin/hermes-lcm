@@ -4845,7 +4845,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             else self._effective_assembly_token_cap()
         )
 
-        tail_selected = tail_messages
+        tail_for_selection = self._sanitize_active_context_messages(
+            tail_messages,
+            insert_missing_tool_stubs=False,
+        )
+        tail_selected = tail_for_selection
         anchor_source = getattr(self, "_pending_context_anchor_messages", None)
         if anchor_source is None:
             anchor_source = tail_messages
@@ -4855,10 +4859,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             used = count_messages_tokens(result)
             kept_tail_reversed: list[Dict[str, Any]] = []
             tail_token_total = 0
-            tail_for_selection = self._sanitize_active_context_messages(
-                tail_messages,
-                insert_missing_tool_stubs=False,
-            )
             skipped_tail_gap = False
             for msg in reversed(tail_for_selection):
                 msg_tokens = count_message_tokens(msg)
@@ -5117,20 +5117,29 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         assembly_cap_override: Optional[int] = None,
         preserve_leading_user: bool = False,
     ) -> List[Dict[str, Any]]:
-        if tail_messages:
-            first = tail_messages[0]
-            content = first.get("content") or ""
-            role = first.get("role") or ""
+        summary_index = 0
+        if (
+            preserve_leading_user
+            and tail_messages
+            and tail_messages[0].get("role") == "user"
+            and (normalize_content_value(tail_messages[0].get("content")) or "").strip()
+        ):
+            summary_index = 1
+        if len(tail_messages) > summary_index:
+            summary_message = tail_messages[summary_index]
+            content = summary_message.get("content") or ""
+            role = summary_message.get("role") or ""
             if role == "assistant" and self._looks_like_active_summary_blob(content):
                 candidate = self._assemble_context(
                     system_msg,
-                    tail_messages[1:],
+                    [*tail_messages[:summary_index], *tail_messages[summary_index + 1 :]],
                     assembly_cap_override=assembly_cap_override,
                     include_lcm_note=False,
                     preserve_leading_user=preserve_leading_user,
                 )
                 if any(
-                    (msg.get("content") or "") == content
+                    (msg_content := (msg.get("content") or "")) == content
+                    or msg_content.startswith(f"{content}\n\n---\n\n")
                     for msg in (candidate[1:] if system_msg is not None else candidate)
                 ):
                     return candidate

@@ -3555,6 +3555,53 @@ class TestEngineABC:
         assert rows[-1]["tool_call_id"] == "call_1"
         assert after_restart._ingest_cursor == len(active_context)
 
+    def test_restart_reconciles_stored_suffix_after_stale_assembled_prefix(self, tmp_path):
+        db_path = tmp_path / "restart-stale-assembled-prefix.db"
+        config = LCMConfig(database_path=str(db_path))
+        session_id = "stale-assembled-prefix-session"
+        conversation_id = "stale-assembled-prefix-conversation"
+        assembled_prefix = [
+            {"role": "system", "content": "You are concise."},
+            {"role": "user", "content": "question before restart"},
+        ]
+        stored_suffix = {"role": "assistant", "content": "answer before restart"}
+
+        before_restart = LCMEngine(config=config)
+        before_restart.on_session_start(
+            session_id,
+            platform="cli",
+            conversation_id=conversation_id,
+            context_length=200000,
+        )
+        before_restart._ingest_messages(assembled_prefix)
+        before_restart._remember_assembled_active_context(assembled_prefix)
+        replay = [*assembled_prefix, stored_suffix]
+        before_restart._ingest_messages(replay)
+        before_restart.shutdown()
+
+        after_restart = LCMEngine(config=config)
+        try:
+            after_restart.on_session_start(
+                session_id,
+                platform="cli",
+                conversation_id=conversation_id,
+                context_length=200000,
+            )
+            after_restart._ingest_messages(replay)
+
+            rows = after_restart._store.get_session_messages(session_id)
+            assert [row["content"] for row in rows] == [
+                "You are concise.",
+                "question before restart",
+                "answer before restart",
+            ]
+            assert after_restart._last_ingest_reconciliation["reason"] == (
+                "replayed durable assembled active context and stored suffix"
+            )
+            assert after_restart._ingest_cursor == len(replay)
+        finally:
+            after_restart.shutdown()
+
     def test_existing_compacted_session_restart_skips_synthetic_context_but_persists_new_tool(self, tmp_path):
         db_path = tmp_path / "restart-compacted.db"
         config = LCMConfig(database_path=str(db_path))
@@ -20873,6 +20920,52 @@ class TestAssemblyGuardrails:
         assert joined.count("[Expand for details:") == 1
         assert not instance.get_status()["overflow_recovery_failed"]
 
+    def test_forced_overflow_recovery_dedupes_summary_after_retained_user(self, tmp_path):
+        config = LCMConfig(
+            fresh_tail_count=10,
+            database_path=str(tmp_path / "lcm_guardrail_retained_user_summary_dup.db"),
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "guardrail-session"
+        instance.compression_count = 1
+
+        node = SummaryNode(
+            session_id="guardrail-session",
+            depth=0,
+            summary="sum",
+            token_count=3,
+            source_token_count=50,
+            source_ids=[],
+            source_type="messages",
+            created_at=time.time(),
+            expand_hint="x",
+        )
+        node_id = instance._dag.add_node(node)
+        summary_blob = (
+            f"[Recent Summary (d0, node {node_id})]\n"
+            "sum\n"
+            "[Expand for details: x]"
+        )
+        system = {"role": "system", "content": "system"}
+        retained_user = {"role": "user", "content": "sole retained prompt"}
+
+        try:
+            result = instance._assemble_overflow_recovery_context(
+                system,
+                [
+                    retained_user,
+                    {"role": "assistant", "content": summary_blob},
+                    {"role": "assistant", "content": "fresh tail"},
+                ],
+                preserve_leading_user=True,
+            )
+        finally:
+            instance.shutdown()
+
+        joined = "\n\n".join(str(msg.get("content", "")) for msg in result)
+        assert result[:2] == [system, retained_user]
+        assert joined.count("[Expand for details:") == 1
+
     def test_forced_overflow_recovery_flags_irreducible_single_tail_overflow(self, tmp_path, monkeypatch):
         import importlib
 
@@ -21070,6 +21163,40 @@ class TestAssemblyToolPairGuardrail:
             if m.get("role") == "tool" and m.get("tool_call_id") == "call_orphan_x"
         ]
         assert len(orphan_ids) == 0, f"Orphan tool result still present: {orphan_ids}"
+
+    def test_assemble_merges_summary_after_dropping_leading_orphan_tool(self, tmp_path):
+        instance = self._make_engine(tmp_path, "lcm_orphan_before_assistant.db")
+        node = SummaryNode(
+            session_id="tool-pair-test",
+            depth=0,
+            summary="earlier work",
+            token_count=3,
+            source_token_count=50,
+            source_ids=[],
+            source_type="messages",
+            created_at=time.time(),
+            expand_hint="earlier work",
+        )
+        instance._dag.add_node(node)
+        system = {"role": "system", "content": "system"}
+        retained_user = {"role": "user", "content": "sole retained prompt"}
+
+        try:
+            result = instance._assemble_context(
+                system,
+                [
+                    retained_user,
+                    {"role": "tool", "tool_call_id": "orphan", "content": "orphan result"},
+                    {"role": "assistant", "content": "fresh assistant tail"},
+                ],
+                preserve_leading_user=True,
+            )
+        finally:
+            instance.shutdown()
+
+        assert [message.get("role") for message in result] == ["system", "user", "assistant"]
+        assert "earlier work" in str(result[-1].get("content"))
+        assert "fresh assistant tail" in str(result[-1].get("content"))
 
     def test_assemble_inserts_stub_for_missing_tool_result(self, tmp_path):
         """When an assistant tool_call has no matching tool result in the
