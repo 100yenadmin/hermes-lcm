@@ -27,7 +27,7 @@ class SchemaVersionTooNewError(RuntimeError):
     """
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 SQLITE_BUSY_TIMEOUT_MS = 30_000
 _MIN_DISK_SPACE_BYTES = 50 * 1024 * 1024
 REQUIRED_CORE_TABLES = (
@@ -266,6 +266,43 @@ def ensure_message_origin_columns(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_msg_conversation_session ON messages(conversation_id, session_id, store_id)"
+    )
+
+
+def ensure_temporal_rollup_tables(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS lcm_rollups (
+            rollup_id INTEGER PRIMARY KEY,
+            period_kind TEXT NOT NULL CHECK (period_kind IN ('day', 'week', 'month')),
+            period_start TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            summary TEXT,
+            token_count INTEGER,
+            status TEXT NOT NULL DEFAULT 'building'
+                CHECK (status IN ('building', 'ready', 'stale', 'failed')),
+            built_at TEXT,
+            source_fingerprint TEXT,
+            error TEXT,
+            UNIQUE(period_kind, period_start, scope)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_lcm_rollups_ready_period
+            ON lcm_rollups(period_kind, period_start DESC)
+            WHERE status = 'ready';
+
+        CREATE TABLE IF NOT EXISTS lcm_rollup_sources (
+            rollup_id INTEGER NOT NULL,
+            node_id INTEGER NOT NULL,
+            PRIMARY KEY(rollup_id, node_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS lcm_rollup_state (
+            period_kind TEXT PRIMARY KEY,
+            last_build_cursor TEXT,
+            last_built_at TEXT
+        );
+        """
     )
 
 
@@ -699,5 +736,10 @@ def run_versioned_migrations(conn: sqlite3.Connection) -> None:
     if current_version < 5:
         mark_migration_step_complete(conn, "v5_message_conversation_id")
         current_version = 5
+
+    ensure_temporal_rollup_tables(conn)
+    if current_version < 6:
+        mark_migration_step_complete(conn, "v6_temporal_rollups")
+        current_version = 6
 
     set_schema_version(conn, current_version)

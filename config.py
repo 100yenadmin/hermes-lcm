@@ -296,6 +296,10 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("doctor_clean_apply_enabled", "LCM_DOCTOR_CLEAN_APPLY_ENABLED", bool),
     _EnvFieldSpec("empty_lifecycle_gc_enabled", "LCM_EMPTY_LIFECYCLE_GC_ENABLED", bool),
     _EnvFieldSpec("empty_lifecycle_gc_threshold", "LCM_EMPTY_LIFECYCLE_GC_THRESHOLD", int),
+    _EnvFieldSpec("temporal_rollups_enabled", "LCM_TEMPORAL_ROLLUPS_ENABLED", bool),
+    _EnvFieldSpec("rollup_daily_target_tokens", "LCM_ROLLUP_DAILY_TARGET_TOKENS", int),
+    _EnvFieldSpec("rollup_daily_max_tokens", "LCM_ROLLUP_DAILY_MAX_TOKENS", int),
+    _EnvFieldSpec("rollup_aggregate_max_tokens", "LCM_ROLLUP_AGGREGATE_MAX_TOKENS", int),
 )
 
 _PARSER_BY_TYPE = {
@@ -473,6 +477,13 @@ class LCMConfig:
     # ingested its first message yet. Set to 0 only in trusted/test
     # environments that intentionally want immediate empty-row pruning.
     empty_lifecycle_gc_max_age_hours: float | None = 24.0
+
+    # -- Temporal rollups ---
+    # Storage/config substrate only. No engine path reads these fields yet.
+    temporal_rollups_enabled: bool = False
+    rollup_daily_target_tokens: int = 5_000
+    rollup_daily_max_tokens: int = 15_000
+    rollup_aggregate_max_tokens: int = 20_000
 
     # -- Diagnostics ---
     # Field-level provenance for values loaded through from_env(). Manual
