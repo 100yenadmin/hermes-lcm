@@ -328,7 +328,7 @@ def test_cursor_round_trip(rollup_store):
     assert rollup_store.get_cursor("day") == "2026-07-16"
 
 
-def test_purge_rollups_for_sources_removes_rollups_and_source_rows(rollup_store):
+def test_purge_rollups_for_sources_restales_affected_windows(rollup_store):
     first = _ready_rollup(
         rollup_store, "day", "2026-07-15", source_node_ids=[1, 2]
     )
@@ -339,17 +339,27 @@ def test_purge_rollups_for_sources_removes_rollups_and_source_rows(rollup_store)
         rollup_store, "day", "2026-07-17", source_node_ids=[4]
     )
 
+    # A hard delete at/before the build cursor would orphan the window (cursor
+    # advanced, no pending row -> never rebuilt). Purge instead re-stales the
+    # affected periods so maintenance rebuilds them from remaining sources.
     assert rollup_store.purge_rollups_for_sources([2, 2]) == 2
-    remaining_rollups = rollup_store.connection.execute(
-        "SELECT rollup_id FROM lcm_rollups ORDER BY rollup_id"
-    ).fetchall()
+
+    first_row = rollup_store.get_rollup("day", "2026-07-15", "global")
+    second_row = rollup_store.get_rollup("day", "2026-07-16", "global")
+    kept_row = rollup_store.get_rollup("day", "2026-07-17", "global")
+    assert first_row["status"] == "stale" and first_row["summary"] is None
+    assert second_row["status"] == "stale" and second_row["summary"] is None
+    # Generation advanced so an in-flight build cannot publish purged content.
+    assert first_row["generation"] == 1 and second_row["generation"] == 1
+    # The rollup with no purged source is left untouched (still ready).
+    assert kept_row["status"] == "ready"
+    assert kept_row["source_node_ids"] == [4]
+    # Affected rollups' source rows are cleared (repopulated on rebuild); only the
+    # kept rollup's sources remain.
     remaining_sources = rollup_store.connection.execute(
-        "SELECT rollup_id, node_id FROM lcm_rollup_sources"
+        "SELECT rollup_id, node_id FROM lcm_rollup_sources ORDER BY rollup_id, node_id"
     ).fetchall()
-    assert [tuple(row) for row in remaining_rollups] == [(kept,)]
     assert [tuple(row) for row in remaining_sources] == [(kept, 4)]
-    assert rollup_store.get_rollup("day", "2026-07-15", "global") is None
-    assert rollup_store.get_rollup("day", "2026-07-16", "global") is None
     assert {first, second}.isdisjoint({kept})
     assert rollup_store.purge_rollups_for_sources([]) == 0
     assert rollup_store.purge_rollups_for_sources([999]) == 0
@@ -451,3 +461,108 @@ def test_temporal_rollup_config_reads_environment(monkeypatch):
     assert config.rollup_daily_target_tokens == 6_000
     assert config.rollup_daily_max_tokens == 16_000
     assert config.rollup_aggregate_max_tokens == 21_000
+
+
+# --- FIXSPEC3 generation/lease-model + index + purge additions -----------------
+
+
+def test_claim_advances_generation_so_racing_claims_get_distinct_leases(rollup_store):
+    # Two builders racing the same stale period must get DISTINCT tokens so only
+    # the latest claimant can publish (maintainer #387 blocker 1).
+    scope = "conversation:conv-1"
+    rollup_store.upsert_stale("day", "2026-07-15", scope)
+    first = rollup_store.upsert_building("day", "2026-07-15", scope)
+    second = rollup_store.upsert_building("day", "2026-07-15", scope)
+
+    assert second.generation == first.generation + 1
+    assert first.generation != second.generation
+    # The older claimant is superseded; only the latest lease publishes.
+    assert rollup_store.mark_ready(first, "stale build", 1, [1], "fp-old") is False
+    assert rollup_store.mark_ready(second, "fresh build", 1, [2], "fp-new") is True
+    row = rollup_store.get_rollup("day", "2026-07-15", scope)
+    assert row["status"] == "ready"
+    assert row["summary"] == "fresh build"
+    assert row["source_node_ids"] == [2]
+
+
+def test_a_fresh_claim_starts_at_generation_zero(rollup_store):
+    token = rollup_store.upsert_building("day", "2026-07-15", "scope-x")
+    assert token.generation == 0
+
+
+def test_mark_failed_generation_guard_rejects_superseded_failure(rollup_store):
+    # A superseded builder's late exception must not flip a newer stale/ready row
+    # to failed (maintainer #387 blocker 2).
+    scope = "conversation:conv-1"
+    token = rollup_store.upsert_building("day", "2026-07-15", scope)
+    rollup_store.mark_stale_for_day("2026-07-15", scope)  # advances generation
+
+    assert rollup_store.mark_failed(token.rollup_id, "late boom", generation=token.generation) is False
+    row = rollup_store.get_rollup("day", "2026-07-15", scope)
+    assert row["status"] == "stale"
+    assert row["error"] is None
+
+    # An unguarded call still writes (used to seed a known failure directly).
+    assert rollup_store.mark_failed(token.rollup_id, "seeded") is True
+    assert rollup_store.get_rollup("day", "2026-07-15", scope)["status"] == "failed"
+
+
+def test_defer_incomplete_is_token_guarded(rollup_store):
+    # Releasing an incomplete aggregate back to stale must not erase a newer
+    # aggregate published by another builder (maintainer #387 blocker 3).
+    scope = "session-agg"
+    token = rollup_store.upsert_building("week", "2026-07-13", scope)
+    rollup_store.mark_stale_for_day("2026-07-15", scope)  # supersedes the week
+
+    assert rollup_store.defer_incomplete(token, "incomplete: superseded") is False
+
+    token2 = rollup_store.upsert_building("week", "2026-07-13", scope)
+    assert rollup_store.defer_incomplete(token2, "incomplete: 2 dailies") is True
+    row = rollup_store.get_rollup("week", "2026-07-13", scope)
+    assert row["status"] == "stale"
+    assert "incomplete: 2 dailies" in row["error"]
+
+
+def test_resolve_no_source_clears_only_when_owned(rollup_store):
+    # A claimed period with no source content is cleared iff still owned, so it
+    # cannot linger stale consuming a build slot (maintainer #388 no-source).
+    scope = "session-empty"
+    token = rollup_store.upsert_building("day", "2026-07-15", scope)
+    rollup_store.mark_stale_for_day("2026-07-15", scope)  # supersede
+
+    assert rollup_store.resolve_no_source(token) is False
+    assert rollup_store.get_rollup("day", "2026-07-15", scope)["status"] == "stale"
+
+    token2 = rollup_store.upsert_building("day", "2026-07-15", scope)
+    rollup_store.connection.execute(
+        "INSERT INTO lcm_rollup_sources(rollup_id, node_id) VALUES(?, ?)",
+        (token2.rollup_id, 9),
+    )
+    rollup_store.connection.commit()
+
+    assert rollup_store.resolve_no_source(token2) is True
+    assert rollup_store.get_rollup("day", "2026-07-15", scope) is None
+    orphan_sources = rollup_store.connection.execute(
+        "SELECT COUNT(*) FROM lcm_rollup_sources WHERE rollup_id = ?",
+        (token2.rollup_id,),
+    ).fetchone()[0]
+    assert orphan_sources == 0
+
+
+def test_rollup_indexes_are_scope_leading_and_cover_source_node(rollup_store):
+    # Reads/stale-scan filter by scope, and purge looks up by node_id
+    # (maintainer #387 perf indexes 18/19).
+    conn = rollup_store.connection
+
+    def index_columns(name):
+        return [row["name"] for row in conn.execute(f"PRAGMA index_info({name})").fetchall()]
+
+    assert index_columns("idx_lcm_rollups_ready_period")[0] == "scope"
+    assert index_columns("idx_lcm_rollups_pending")[0] == "scope"
+    assert index_columns("idx_lcm_rollup_sources_node") == ["node_id"]
+
+    plan = conn.execute(
+        "EXPLAIN QUERY PLAN "
+        "SELECT DISTINCT rollup_id FROM lcm_rollup_sources WHERE node_id IN (1, 2)"
+    ).fetchall()
+    assert any("idx_lcm_rollup_sources_node" in str(row[3]) for row in plan)

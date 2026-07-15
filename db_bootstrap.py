@@ -302,12 +302,18 @@ def ensure_temporal_rollup_tables(conn: sqlite3.Connection) -> None:
             UNIQUE(period_kind, period_start, scope)
         );
 
+        -- Reads and the stale-scan always filter by scope, so scope leads both
+        -- partial indexes; drop any pre-scope revision so upgrades pick up the
+        -- scoped form (the names are stable so query-plan assertions still hold).
+        DROP INDEX IF EXISTS idx_lcm_rollups_ready_period;
+        DROP INDEX IF EXISTS idx_lcm_rollups_pending;
+
         CREATE INDEX IF NOT EXISTS idx_lcm_rollups_ready_period
-            ON lcm_rollups(period_kind, period_start DESC)
+            ON lcm_rollups(scope, period_kind, period_start DESC)
             WHERE status = 'ready';
 
         CREATE INDEX IF NOT EXISTS idx_lcm_rollups_pending
-            ON lcm_rollups(period_start)
+            ON lcm_rollups(scope, period_start)
             WHERE status IN ('stale', 'failed');
 
         CREATE TABLE IF NOT EXISTS lcm_rollup_sources (
@@ -315,6 +321,11 @@ def ensure_temporal_rollup_tables(conn: sqlite3.Connection) -> None:
             node_id INTEGER NOT NULL,
             PRIMARY KEY(rollup_id, node_id)
         );
+
+        -- The (rollup_id, node_id) PK cannot serve purge's node_id lookup; add a
+        -- dedicated index so purging by deleted source node is not a full scan.
+        CREATE INDEX IF NOT EXISTS idx_lcm_rollup_sources_node
+            ON lcm_rollup_sources(node_id);
         """
     )
     # Backfill the generation/lease columns for a table created by an earlier
