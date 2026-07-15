@@ -1288,6 +1288,15 @@ def _delete_clean_candidates_atomically(engine, session_ids: set[str]) -> dict[s
 
     try:
         conn.execute("BEGIN IMMEDIATE")
+        # Capture the node_ids about to be deleted so their embeddings can be
+        # purged after the delete commits (the vectors live in a separate store).
+        purged_node_ids = [
+            int(row[0])
+            for row in conn.execute(
+                f"SELECT node_id FROM summary_nodes WHERE session_id IN ({placeholders})",
+                params,
+            ).fetchall()
+        ]
         msg_cur = conn.execute(f"DELETE FROM messages WHERE session_id IN ({placeholders})", params)
         node_cur = conn.execute(f"DELETE FROM summary_nodes WHERE session_id IN ({placeholders})", params)
         lifecycle_deleted = 0
@@ -1301,6 +1310,13 @@ def _delete_clean_candidates_atomically(engine, session_ids: set[str]) -> dict[s
     except Exception:
         conn.rollback()
         raise
+
+    # Best-effort embedding reclamation for the deleted summaries (no-op unless
+    # embeddings are enabled); runs after commit so a purge issue cannot roll
+    # back the cleanup.
+    purge = getattr(engine, "_purge_embeddings_for_nodes", None)
+    if callable(purge):
+        purge(purged_node_ids)
 
     return {
         "messages_deleted": msg_cur.rowcount if msg_cur.rowcount is not None else 0,
