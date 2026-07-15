@@ -79,6 +79,7 @@ from .runtime_identity import (
 from .rollup_builder import (
     mark_stale_after_ingest,
     mark_stale_for_deleted_nodes,
+    mark_stale_for_published_summary,
     run_rollup_maintenance,
 )
 from .schemas import (
@@ -1350,6 +1351,20 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 circuit_breaker=self._summary_circuit_breaker,
                 spend_guard=self._summary_spend_guard,
             )
+
+    def _invalidate_rollups_for_published_node(self, node: "SummaryNode") -> None:
+        """Stale the rollups covering a just-published summary node's day.
+
+        Rollups consume published summary nodes, so publication — not raw ingest
+        — is the load-bearing staleness signal (maintainer #388 blocker 1). This
+        is called after every ``_dag.add_node`` on the engine so a later summary
+        cannot leave an older rollup ``ready`` and apparently current.
+        """
+        if not self._config.temporal_rollups_enabled:
+            return
+        mark_stale_for_published_summary(
+            self._dag, str(node.session_id or ""), node.latest_at, node.created_at
+        )
 
     def _register_active_engine_binding(self) -> None:
         session_id = str(self._session_id or "")
@@ -4554,6 +4569,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 expand_hint=self._extract_expand_hint(summary_text),
             )
             self._dag.add_node(node)
+            self._invalidate_rollups_for_published_node(node)
             condensed_any = True
 
             logger.info(

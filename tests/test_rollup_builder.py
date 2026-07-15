@@ -78,15 +78,15 @@ def _ready(
     source_ids: list[int],
     fingerprint: str,
 ) -> int:
-    rollup_id = store.upsert_building(kind, start, scope)
+    token = store.upsert_building(kind, start, scope)
     store.mark_ready(
-        rollup_id,
+        token,
         summary,
         count_tokens(summary),
         source_ids,
         fingerprint,
     )
-    return rollup_id
+    return token.rollup_id
 
 
 def test_build_day_uses_newest_source_day_and_mocked_summarizer(rollup_parts):
@@ -147,62 +147,77 @@ def test_build_day_honors_target_and_hard_cap_after_oversize_result(rollup_parts
     assert all(call[1]["l3_truncate_tokens"] == config.rollup_daily_max_tokens for call in calls)
 
 
-def test_aggregates_use_only_ready_dailies_and_refingerprint_when_stale_daily_recovers(
-    rollup_parts,
-):
+def test_week_requires_all_content_dailies_ready_before_publishing(rollup_parts):
+    # Both Monday and Tuesday have summary-node content, so a week must not
+    # publish while Tuesday's daily is stale; it publishes only once every
+    # content day has a ready daily (maintainer #388 blocker 5).
     store, dag, config = rollup_parts
     scope = "session-aggregate"
     monday = date(2026, 7, 13)
+    tuesday = monday + timedelta(days=1)
     monday_node = _add_node(dag, scope, monday, "monday node")
-    tuesday_node = _add_node(dag, scope, monday + timedelta(days=1), "tuesday node")
+    tuesday_node = _add_node(dag, scope, tuesday, "tuesday node")
     _ready(
-        store,
-        "day",
-        monday.isoformat(),
-        scope,
-        summary="ready monday daily",
-        source_ids=[monday_node],
-        fingerprint="monday-v1",
+        store, "day", monday.isoformat(), scope,
+        summary="ready monday daily", source_ids=[monday_node], fingerprint="monday-v1",
     )
     _ready(
-        store,
-        "day",
-        (monday + timedelta(days=1)).isoformat(),
-        scope,
-        summary="stale tuesday daily",
-        source_ids=[tuesday_node],
-        fingerprint="tuesday-v1",
+        store, "day", tuesday.isoformat(), scope,
+        summary="stale tuesday daily", source_ids=[tuesday_node], fingerprint="tuesday-v1",
     )
-    store.mark_stale_for_day(monday + timedelta(days=1), scope)
+    store.mark_stale_for_day(tuesday, scope)
     seen_text = []
 
     def summarize(text, **_kwargs):
         seen_text.append(text)
         return f"aggregate version {len(seen_text)}", 1
 
-    first = build_week(store, dag, config, scope, monday, summarizer=summarize)
+    # Tuesday is a content day but not ready -> the week is left incomplete.
+    blocked = build_week(store, dag, config, scope, monday, summarizer=summarize)
+    assert blocked is None
+    assert seen_text == []
+    incomplete_row = store.get_rollup("week", monday.isoformat(), scope)
+    assert incomplete_row["status"] == "stale"
+    assert "incomplete" in (incomplete_row["error"] or "")
 
-    assert first is not None
-    assert "ready monday daily" in seen_text[0]
-    assert "stale tuesday daily" not in seen_text[0]
-    assert first["source_node_ids"] == [monday_node]
-    first_fingerprint = first["source_fingerprint"]
-
+    # Rebuild Tuesday's daily; now every content day is ready and the week builds.
     rebuilt_daily = build_day(
-        store,
-        dag,
-        config,
-        scope,
-        monday + timedelta(days=1),
+        store, dag, config, scope, tuesday,
         summarizer=lambda _text, **_kwargs: ("ready tuesday rebuilt", 1),
     )
     assert rebuilt_daily is not None
-    second = build_week(store, dag, config, scope, monday, summarizer=summarize)
+    built = build_week(store, dag, config, scope, monday, summarizer=summarize)
 
-    assert second is not None
-    assert "ready tuesday rebuilt" in seen_text[1]
-    assert second["source_node_ids"] == [monday_node, tuesday_node]
-    assert second["source_fingerprint"] != first_fingerprint
+    assert built is not None
+    assert "ready monday daily" in seen_text[0]
+    assert "ready tuesday rebuilt" in seen_text[0]
+    assert built["source_node_ids"] == [monday_node, tuesday_node]
+    assert built["status"] == "ready"
+
+
+def test_rebuilding_a_daily_stales_its_containing_week_and_month(rollup_parts):
+    # A daily rebuild must invalidate any already-published week/month so they
+    # never stay ready against an outdated day (maintainer #388 blocker 5).
+    store, dag, config = rollup_parts
+    scope = "session-cascade"
+    monday = date(2026, 7, 13)
+    monday_node = _add_node(dag, scope, monday, "monday node")
+    _ready(
+        store, "week", monday.isoformat(), scope,
+        summary="published week", source_ids=[monday_node], fingerprint="week-v1",
+    )
+    _ready(
+        store, "month", date(2026, 7, 1).isoformat(), scope,
+        summary="published month", source_ids=[monday_node], fingerprint="month-v1",
+    )
+
+    rebuilt = build_day(
+        store, dag, config, scope, monday,
+        summarizer=lambda _text, **_kwargs: ("fresh monday daily", 1),
+    )
+    assert rebuilt is not None
+    assert store.get_rollup("week", monday.isoformat(), scope)["status"] == "stale"
+    assert store.get_rollup("month", date(2026, 7, 1).isoformat(), scope)["status"] == "stale"
 
 
 def test_month_aggregate_never_queries_dag_when_ready_dailies_exist(rollup_parts, monkeypatch):
@@ -345,8 +360,8 @@ def test_failed_rollup_retry_honors_backoff(rollup_parts, monkeypatch):
     recent_day = date(2026, 7, 15)
     _add_node(dag, scope, old_day, "old failed source")
     _add_node(dag, scope, recent_day, "recent failed source")
-    old_id = store.upsert_building("day", old_day.isoformat(), scope)
-    recent_id = store.upsert_building("day", recent_day.isoformat(), scope)
+    old_id = store.upsert_building("day", old_day.isoformat(), scope).rollup_id
+    recent_id = store.upsert_building("day", recent_day.isoformat(), scope).rollup_id
     store.mark_failed(old_id, "old failure")
     store.mark_failed(recent_id, "recent failure")
     store.connection.execute(
@@ -460,6 +475,79 @@ def test_flag_off_skips_both_engine_hook_helpers(tmp_path, monkeypatch):
         assert calls == []
     finally:
         engine.shutdown()
+
+
+def test_publishing_summary_for_ready_day_marks_it_stale(rollup_parts):
+    # Publication of a summary covering an already-ready day is the load-bearing
+    # staleness signal (maintainer #388 blocker 1): the day (and its week/month)
+    # go stale so a later summary cannot leave an older rollup apparently current.
+    store, dag, config = rollup_parts
+    scope = "session-publish"
+    target_day = date(2026, 7, 15)
+    node_id = _add_node(dag, scope, target_day, "already summarized")
+    for kind, start in (("day", target_day), ("week", date(2026, 7, 13)), ("month", date(2026, 7, 1))):
+        _ready(
+            store, kind, start.isoformat(), scope,
+            summary=f"ready {kind}", source_ids=[node_id], fingerprint=f"{kind}-v1",
+        )
+
+    later_node = _add_node(dag, scope, target_day, "a newer summary covering the same day")
+    latest_at = _timestamp(target_day, 22)
+    from hermes_lcm.rollup_builder import mark_stale_for_published_summary
+
+    assert mark_stale_for_published_summary(dag, scope, latest_at, latest_at) == 3
+    assert later_node  # published node exists
+    assert store.get_rollup("day", target_day.isoformat(), scope)["status"] == "stale"
+    assert store.get_rollup("week", "2026-07-13", scope)["status"] == "stale"
+    assert store.get_rollup("month", "2026-07-01", scope)["status"] == "stale"
+
+
+def test_engine_invalidates_rollups_when_a_node_is_published(tmp_path):
+    db_path = tmp_path / "publish-hook.db"
+    config = LCMConfig(database_path=str(db_path), temporal_rollups_enabled=True)
+    engine = LCMEngine(config=config)
+    scope = "publish-hook-session"
+    target_day = date(2026, 7, 15)
+    try:
+        engine.on_session_start(scope, conversation_id="publish-hook-conversation")
+        node_id = _add_node(engine._dag, scope, target_day, "published node")
+        store = RollupStore(db_path)
+        try:
+            _ready(
+                store, "day", target_day.isoformat(), scope,
+                summary="ready day", source_ids=[node_id], fingerprint="day-v1",
+            )
+            node = engine._dag.get_node(node_id)
+            engine._invalidate_rollups_for_published_node(node)
+            assert store.get_rollup("day", target_day.isoformat(), scope)["status"] == "stale"
+        finally:
+            store.close()
+    finally:
+        engine.shutdown()
+
+
+def test_maintenance_reclaims_crashed_building_row_and_rebuilds(rollup_parts, monkeypatch):
+    # A build that crashed leaves a 'building' row forever; maintenance reclaims
+    # it once its lease has expired and rebuilds it (maintainer #388 blocker 2).
+    store, dag, config = rollup_parts
+    scope = "session-reclaim"
+    target_day = date(2026, 7, 15)
+    _add_node(dag, scope, target_day, "source for reclaimed build")
+    store.upsert_building("day", target_day.isoformat(), scope)
+    store.connection.execute(
+        "UPDATE lcm_rollups SET lease_expires_at = ? WHERE period_kind = 'day'",
+        ("2000-01-01T00:00:00+00:00",),
+    )
+    store.connection.commit()
+    config.rollup_builds_per_pass = 1
+    monkeypatch.setattr(
+        builder_module,
+        "summarize_with_escalation",
+        lambda _text, **_kwargs: ("reclaimed rebuild", 1),
+    )
+
+    assert run_rollup_maintenance(dag, config, scope) == 1
+    assert store.get_rollup("day", target_day.isoformat(), scope)["status"] == "ready"
 
 
 def test_rollup_builds_per_pass_config_default_and_environment(monkeypatch):

@@ -166,7 +166,8 @@ def build_day(
             f"[Summary node {source['node_id']}]\n{source['summary']}"
             for source in sources
         )
-        rollup_id = store.upsert_building("day", day.isoformat(), scope)
+        token = store.upsert_building("day", day.isoformat(), scope)
+        rollup_id = token.rollup_id
         summary, token_count = _summarize_capped(
             text,
             target_tokens=config.rollup_daily_target_tokens,
@@ -176,7 +177,12 @@ def build_day(
             circuit_breaker=circuit_breaker,
             spend_guard=spend_guard,
         )
-        store.mark_ready(rollup_id, summary, token_count, source_ids, fingerprint)
+        published = store.mark_ready(token, summary, token_count, source_ids, fingerprint)
+        if published:
+            # A (re)built daily makes any already-published week/month that
+            # covered the previous daily outdated: stale them so they rebuild
+            # from the new daily (maintainer #388 blocker 5 — aggregate rebuild).
+            store.stale_aggregates_for_day(day, scope)
         return store.get_rollup("day", day.isoformat(), scope)
     except Exception as exc:
         _mark_failed(store, rollup_id, exc)
@@ -227,6 +233,39 @@ def _daily_statuses(
     }
 
 
+def _days_with_content(
+    dag: SummaryDAG,
+    scope: str,
+    start: date,
+    end: date,
+) -> set[str]:
+    """UTC days in ``[start, end]`` that have any summary node for ``scope``.
+
+    A rollup consumes published summary nodes; a day counts as having content
+    when at least one summary node's newest covered timestamp falls on it. This
+    is the set of days that an aggregate is expected to cover — a day with no
+    content legitimately has no daily rollup and must not block the aggregate.
+    """
+    connection = dag.connection
+    if connection is None:
+        return set()
+    window_start = datetime.combine(start, datetime_time.min, tzinfo=timezone.utc).timestamp()
+    window_end = datetime.combine(
+        end + timedelta(days=1), datetime_time.min, tzinfo=timezone.utc
+    ).timestamp()
+    rows = connection.execute(
+        """
+        SELECT DISTINCT date(COALESCE(latest_at, created_at), 'unixepoch')
+        FROM summary_nodes
+        WHERE session_id = ?
+          AND COALESCE(latest_at, created_at) >= ?
+          AND COALESCE(latest_at, created_at) < ?
+        """,
+        (scope, window_start, window_end),
+    ).fetchall()
+    return {str(row[0]) for row in rows if row[0]}
+
+
 def _rollup_source_ids(store: RollupStore, rollup_ids: Sequence[int]) -> list[int]:
     if not rollup_ids or store.connection is None:
         return []
@@ -255,12 +294,33 @@ def _build_aggregate(
     circuit_breaker: object | None,
     spend_guard: object | None,
 ) -> dict[str, object] | None:
-    del dag  # Aggregates deliberately depend only on ready daily rollups.
     rollup_id: int | None = None
     try:
         summarizer = summarizer or summarize_with_escalation
         start, end = _period_window(period_kind, period_start)
         statuses = _daily_statuses(store, start, end, scope)
+
+        # Completeness gate (maintainer #388 blocker 5): only publish a ready
+        # aggregate when every day that HAS content in the window has a ready
+        # daily rollup. A content day that is missing/stale/building blocks the
+        # aggregate, which is left stale with a recorded reason so it rebuilds
+        # once the daily catches up. Days with no content do not block.
+        content_days = _days_with_content(dag, scope, start, end)
+        pending_days = sorted(
+            day_key
+            for day_key in content_days
+            if str((statuses.get(day_key) or {}).get("status")) != "ready"
+        )
+        if pending_days:
+            preview = ", ".join(pending_days[:5])
+            store.record_incomplete_aggregate(
+                period_kind,
+                start.isoformat(),
+                scope,
+                f"incomplete: {len(pending_days)} daily rollup(s) not ready ({preview})",
+            )
+            return None
+
         days: list[dict[str, object]] = []
         ready: list[tuple[str, dict[str, object]]] = []
         current = start
@@ -287,7 +347,8 @@ def _build_aggregate(
             store,
             [int(row["rollup_id"]) for _day_key, row in ready],
         )
-        rollup_id = store.upsert_building(period_kind, start.isoformat(), scope)
+        token = store.upsert_building(period_kind, start.isoformat(), scope)
+        rollup_id = token.rollup_id
         summary, token_count = _summarize_capped(
             text,
             target_tokens=config.rollup_aggregate_max_tokens,
@@ -297,7 +358,7 @@ def _build_aggregate(
             circuit_breaker=circuit_breaker,
             spend_guard=spend_guard,
         )
-        store.mark_ready(rollup_id, summary, token_count, source_ids, fingerprint)
+        store.mark_ready(token, summary, token_count, source_ids, fingerprint)
         return store.get_rollup(period_kind, start.isoformat(), scope)
     except Exception as exc:
         _mark_failed(store, rollup_id, exc)
@@ -373,6 +434,37 @@ def mark_stale_after_ingest(
             store.close()
 
 
+def mark_stale_for_published_summary(
+    dag: SummaryDAG,
+    scope: str,
+    latest_at: float | None,
+    created_at: float | None = None,
+) -> int:
+    """Invalidate the rollups for the day a newly published summary node covers.
+
+    Rollups consume PUBLISHED summary nodes, not raw messages, so publication is
+    the load-bearing staleness signal (maintainer #388 blocker 1): when a summary
+    covering day D is published, D and its containing week/month must go stale so
+    a later summary cannot leave an older rollup ``ready`` and apparently current.
+    ``latest_at`` is the node's newest covered-message timestamp (its day);
+    ``created_at`` is a fallback when coverage bounds are unavailable.
+    """
+    store: RollupStore | None = None
+    try:
+        stamp = latest_at if latest_at is not None else created_at
+        if not scope or stamp is None:
+            return 0
+        day = datetime.fromtimestamp(float(stamp), tz=timezone.utc).date()
+        store = RollupStore(dag.db_path)
+        return store.mark_stale_for_day(day, scope)
+    except Exception:
+        logger.debug("LCM temporal rollup publication staleness update failed", exc_info=True)
+        return 0
+    finally:
+        if store is not None:
+            store.close()
+
+
 def mark_stale_for_deleted_nodes(dag: SummaryDAG, node_ids: Sequence[int]) -> int:
     """Mark rollups that reference deleted summary nodes stale for rebuilding."""
     store: RollupStore | None = None
@@ -422,6 +514,11 @@ def run_rollup_maintenance(
         connection = dag.connection
         if limit <= 0 or budget_ms <= 0 or connection is None:
             return 0
+        store = RollupStore(dag.db_path)
+        # Reclaim rows whose build lease expired (a crashed builder left them
+        # 'building' forever) back to 'stale' so this pass can retry them
+        # (maintainer #388 blocker 2).
+        store.reclaim_stale_building()
         retry_before = (datetime.now(timezone.utc) - _FAILED_ROLLUP_BACKOFF).isoformat()
         rows = connection.execute(
             _PENDING_ROLLUPS_SQL,
@@ -429,7 +526,6 @@ def run_rollup_maintenance(
         ).fetchall()
         if not rows:
             return 0
-        store = RollupStore(dag.db_path)
         builders: dict[str, Callable[..., dict[str, object] | None]] = {
             "day": build_day,
             "week": build_week,
