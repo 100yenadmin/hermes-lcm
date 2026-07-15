@@ -221,6 +221,8 @@ _LCM_INSPECT_DEFAULT_LIMIT = 20
 _LCM_INSPECT_HARD_LIMIT_CAP = 200
 _LCM_INSPECT_REF_SCAN_MESSAGE_LIMIT = 10_000
 _LCM_INSPECT_PAYLOAD_METADATA_READ_BYTES = 16_384
+_TEMPORAL_ROLLUP_PERIOD_KINDS = ("day", "week", "month")
+_TEMPORAL_ROLLUP_STATUSES = ("ready", "stale", "building", "failed")
 
 
 def _slice_content_for_response(content: str, max_tokens: int, content_offset: int = 0) -> dict[str, Any]:
@@ -2615,6 +2617,98 @@ def _inspect_externalized_refs(engine: "LCMEngine", session_id: str, limit: int)
     }
 
 
+def _temporal_rollups_status(engine: "LCMEngine") -> dict[str, Any]:
+    """Return the cheap, read-only temporal-rollup operator status payload."""
+    enabled = bool(engine._config.temporal_rollups_enabled)
+    scope = engine.current_session_id or ""
+    payload: dict[str, Any] = {
+        "enabled": enabled,
+        "scope": scope,
+        "counts": {
+            kind: {status: 0 for status in _TEMPORAL_ROLLUP_STATUSES}
+            for kind in _TEMPORAL_ROLLUP_PERIOD_KINDS
+        },
+        "oldest_stale_age_seconds": None,
+        "last_build_cursors": {kind: None for kind in _TEMPORAL_ROLLUP_PERIOD_KINDS},
+        "last_built_at": {kind: None for kind in _TEMPORAL_ROLLUP_PERIOD_KINDS},
+        "last_error": None,
+    }
+    # Disabled deployments deliberately avoid even the metadata reads. This
+    # keeps the optional feature inert while preserving a stable status shape.
+    if not enabled or not scope:
+        return payload
+
+    conn = engine._dag.connection
+    if conn is None:
+        return payload
+    try:
+        rows = conn.execute(
+            """
+            SELECT period_kind, status, COUNT(*)
+            FROM lcm_rollups INDEXED BY sqlite_autoindex_lcm_rollups_1
+            WHERE period_kind IN ('day', 'week', 'month') AND scope = ?
+            GROUP BY period_kind, status
+            """,
+            (scope,),
+        ).fetchall()
+        for period_kind, status, count in rows:
+            kind_key = str(period_kind)
+            status_key = str(status)
+            if kind_key in payload["counts"] and status_key in payload["counts"][kind_key]:
+                payload["counts"][kind_key][status_key] = int(count or 0)
+
+        oldest_stale = conn.execute(
+            """
+            SELECT period_start
+            FROM lcm_rollups INDEXED BY sqlite_autoindex_lcm_rollups_1
+            WHERE period_kind IN ('day', 'week', 'month')
+              AND scope = ? AND status = 'stale'
+            ORDER BY period_start
+            LIMIT 1
+            """,
+            (scope,),
+        ).fetchone()
+        if oldest_stale and oldest_stale[0]:
+            stale_start = datetime.combine(
+                datetime.fromisoformat(str(oldest_stale[0])).date(),
+                datetime.min.time(),
+                tzinfo=timezone.utc,
+            )
+            payload["oldest_stale_age_seconds"] = max(
+                0, int((datetime.now(timezone.utc) - stale_start).total_seconds())
+            )
+
+        cursor_rows = conn.execute(
+            """
+            SELECT period_kind, last_build_cursor, last_built_at
+            FROM lcm_rollup_state
+            WHERE period_kind IN ('day', 'week', 'month')
+            """
+        ).fetchall()
+        for period_kind, cursor, built_at in cursor_rows:
+            kind_key = str(period_kind)
+            if kind_key in payload["last_build_cursors"]:
+                payload["last_build_cursors"][kind_key] = cursor
+                payload["last_built_at"][kind_key] = built_at
+
+        error_row = conn.execute(
+            """
+            SELECT error
+            FROM lcm_rollups
+            WHERE scope = ? AND error IS NOT NULL AND error != ''
+            ORDER BY rollup_id DESC
+            LIMIT 1
+            """,
+            (scope,),
+        ).fetchone()
+        if error_row:
+            payload["last_error"] = str(error_row[0])
+    except Exception as exc:  # pragma: no cover - defensive legacy-schema degradation
+        logger.debug("LCM temporal rollup status query failed", exc_info=True)
+        payload["query_error"] = f"{type(exc).__name__}: {exc}"
+    return payload
+
+
 def lcm_inspect(args: Dict[str, Any], **kwargs) -> str:
     """Return a read-only metadata inventory of the current LCM session."""
     engine = _require_engine(kwargs)
@@ -2639,6 +2733,7 @@ def lcm_inspect(args: Dict[str, Any], **kwargs) -> str:
             "read_only": True,
             "runtime_identity": full_status.get("runtime_identity") or engine.get_runtime_identity(),
             "ingest_protection": full_status.get("ingest_protection"),
+            "temporal_rollups": _temporal_rollups_status(engine),
         })
 
     full_status = engine.get_status()
@@ -2757,6 +2852,7 @@ def lcm_inspect(args: Dict[str, Any], **kwargs) -> str:
             "depths": {f"d{depth}": info for depth, info in sorted(depth_stats.items())},
             "latest_nodes": latest_nodes,
         },
+        "temporal_rollups": _temporal_rollups_status(engine),
         "externalized_refs": _inspect_externalized_refs(engine, session_id, limit),
         "ingest_protection": full_status.get("ingest_protection"),
         "filters": {

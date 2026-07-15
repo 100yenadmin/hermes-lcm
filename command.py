@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 import os
 import sqlite3
@@ -38,6 +38,8 @@ from .presets import (
     unsupported_runtime_fields_text,
 )
 from .maintenance import backup_database, rotate_backup_database
+from . import rollup_builder
+from .rollup_store import RollupStore
 from .session_patterns import build_session_match_keys, matches_session_pattern
 from .store import build_message_fts_spec
 
@@ -79,6 +81,8 @@ def _help_text(error: str | None = None) -> str:
         "- /lcm backup: create a timestamped SQLite backup before any future cleanup workflow",
         "- /lcm rotate: preview a tail-preserving in-place compact of the active session (read-only)",
         "- /lcm rotate apply: backup-first rotate that advances the lifecycle frontier past pre-tail raw messages",
+        "- /lcm rollups: show temporal-rollup status for the current session",
+        "- /lcm rollups rebuild <day|week|month|all> [date]: synchronously rebuild a bounded UTC target set",
         "- /lcm preset show [name]: inspect shipped preset metadata and benchmark provenance",
         "- /lcm preset suggest: preview the best shipped preset for the current engine state",
         "- /lcm preset apply <name> --dry-run: preview env-var changes without mutating live config",
@@ -1653,6 +1657,163 @@ def _preset_text(tokens: list[str], engine) -> str:
     return _help_text("`/lcm preset` supports `show`, `suggest`, and `apply`.")
 
 
+def _rollups_status_text(engine) -> str:
+    # Import lazily to avoid making the slash-command module part of the tool
+    # module's import path while still guaranteeing both surfaces use one shape.
+    from .tools import _temporal_rollups_status
+
+    status = _temporal_rollups_status(engine)
+    lines = [
+        "LCM temporal rollups",
+        f"enabled: {_fmt_bool(status['enabled'])}",
+        f"scope: {status['scope'] or '(unbound)'}",
+        "period | ready | stale | building | failed",
+    ]
+    for kind in ("day", "week", "month"):
+        counts = status["counts"][kind]
+        lines.append(
+            f"{kind} | {counts['ready']} | {counts['stale']} | "
+            f"{counts['building']} | {counts['failed']}"
+        )
+    oldest_age = status["oldest_stale_age_seconds"]
+    lines.append(
+        "oldest_stale_age_seconds: "
+        + (str(oldest_age) if oldest_age is not None else "(none)")
+    )
+    for kind in ("day", "week", "month"):
+        cursor = status["last_build_cursors"][kind]
+        built_at = status["last_built_at"][kind]
+        lines.append(f"last_build_cursor_{kind}: {cursor or '(none)'}")
+        lines.append(f"last_built_at_{kind}: {built_at or '(never)'}")
+    lines.append(f"last_error: {status['last_error'] or '(none)'}")
+    if status.get("query_error"):
+        lines.append(f"query_error: {status['query_error']}")
+    if not status["enabled"]:
+        lines.append("note: temporal rollups are disabled; set LCM_TEMPORAL_ROLLUPS_ENABLED=true and restart Hermes to enable them")
+    return "\n".join(lines)
+
+
+def _rollup_period_targets(kind: str, target_date: date) -> list[tuple[str, date]]:
+    week_start = target_date.fromordinal(target_date.toordinal() - target_date.weekday())
+    month_start = target_date.replace(day=1)
+    starts = {
+        "day": target_date,
+        "week": week_start,
+        "month": month_start,
+    }
+    kinds = ("day", "week", "month") if kind == "all" else (kind,)
+    return [(period_kind, starts[period_kind]) for period_kind in kinds]
+
+
+def _rollups_rebuild_text(tokens: list[str], engine) -> str:
+    if not engine._config.temporal_rollups_enabled:
+        return "\n".join([
+            "LCM temporal rollup rebuild",
+            "status: disabled",
+            "error: temporal rollups are disabled",
+            "note: set LCM_TEMPORAL_ROLLUPS_ENABLED=true and restart Hermes before rebuilding",
+        ])
+    if not engine.current_session_id:
+        return "\n".join([
+            "LCM temporal rollup rebuild",
+            "status: refused",
+            "error: no active session",
+        ])
+    if not tokens or len(tokens) > 2:
+        return _help_text("`/lcm rollups rebuild` requires <day|week|month|all> and accepts one optional YYYY-MM-DD date.")
+
+    kind = tokens[0].lower()
+    if kind not in {"day", "week", "month", "all"}:
+        return _help_text("`/lcm rollups rebuild` period must be one of: day, week, month, all.")
+    if len(tokens) == 2:
+        try:
+            target_date = date.fromisoformat(tokens[1])
+        except ValueError:
+            return _help_text("`/lcm rollups rebuild` date must be a valid YYYY-MM-DD UTC date.")
+    else:
+        target_date = datetime.now(timezone.utc).date()
+
+    scope = engine.current_session_id
+    targets = _rollup_period_targets(kind, target_date)
+    limit = max(0, int(engine._config.rollup_builds_per_pass))
+    store = RollupStore(engine._dag.db_path)
+    outcomes: list[tuple[str, str, str]] = []
+    try:
+        conn = store.connection
+        if conn is None:  # pragma: no cover - RollupStore initialization contract
+            raise RuntimeError("temporal rollup store is unavailable")
+        for period_kind, period_start in targets:
+            conn.execute(
+                """
+                UPDATE lcm_rollups
+                SET status = 'stale'
+                WHERE period_kind = ? AND period_start = ? AND scope = ?
+                  AND status != 'building'
+                """,
+                (period_kind, period_start.isoformat(), scope),
+            )
+        conn.commit()
+
+        builders = {
+            "day": rollup_builder.build_day,
+            "week": rollup_builder.build_week,
+            "month": rollup_builder.build_month,
+        }
+        for index, (period_kind, period_start) in enumerate(targets):
+            period_key = period_start.isoformat()
+            if index >= limit:
+                row = store.get_rollup(period_kind, period_key, scope)
+                status = str(row["status"]) if row else "missing"
+                outcomes.append((period_kind, period_key, f"{status} (bounded; not attempted)"))
+                continue
+            result = builders[period_kind](
+                store,
+                engine._dag,
+                engine._config,
+                scope,
+                period_start,
+                circuit_breaker=engine._summary_circuit_breaker,
+                spend_guard=engine._summary_spend_guard,
+            )
+            if result is not None:
+                outcome = str(result.get("status") or "ready")
+            else:
+                row = store.get_rollup(period_kind, period_key, scope)
+                outcome = str(row["status"]) if row else "no source summaries"
+            outcomes.append((period_kind, period_key, outcome))
+    except Exception as exc:  # pragma: no cover - defensive operator surface
+        return "\n".join([
+            "LCM temporal rollup rebuild",
+            "status: error",
+            f"error: {type(exc).__name__}: {exc}",
+        ])
+    finally:
+        store.close()
+
+    lines = [
+        "LCM temporal rollup rebuild",
+        "status: complete",
+        f"scope: {scope}",
+        f"requested: {kind}",
+        f"date_utc: {target_date.isoformat()}",
+        f"build_limit: {limit}",
+        "outcomes:",
+    ]
+    lines.extend(
+        f"- {period_kind} {period_start}: {outcome}"
+        for period_kind, period_start, outcome in outcomes
+    )
+    return "\n".join(lines)
+
+
+def _rollups_text(tokens: list[str], engine) -> str:
+    if not tokens:
+        return _rollups_status_text(engine)
+    if tokens[0].lower() == "rebuild":
+        return _rollups_rebuild_text(tokens[1:], engine)
+    return _help_text("`/lcm rollups` accepts only `rebuild <day|week|month|all> [date]`.")
+
+
 def handle_lcm_command(raw_args: str | None, engine) -> str:
     tokens = [part.strip() for part in (raw_args or "").strip().split() if part.strip()]
     if not tokens:
@@ -1700,6 +1861,9 @@ def handle_lcm_command(raw_args: str | None, engine) -> str:
         if len(rest) == 1 and rest[0].lower() == "apply":
             return _rotate_apply_text(engine)
         return _help_text("`/lcm rotate` accepts an optional `apply` subcommand.")
+
+    if head == "rollups":
+        return _rollups_text(rest, engine)
 
     if head == "preset":
         return _preset_text(rest, engine)
