@@ -27,6 +27,10 @@ logger = logging.getLogger(__name__)
 _VOYAGE_URL = "https://api.voyageai.com/v1/embeddings"
 _VOYAGE_MAX_BATCH_TOKENS = 80_000
 _VOYAGE_MAX_DOCUMENT_TOKENS = 27_000
+# Voyage caps a single request at 1000 input items regardless of token count;
+# a batch bounded only by tokens can still exceed it (many short documents), so
+# an item cap is enforced alongside the token budget.
+_VOYAGE_MAX_BATCH_ITEMS = 1000
 _VOYAGE_TOKEN_SAFETY_FACTOR = 0.9
 _VOYAGE_BATCH_TOKEN_BUDGET = int(
     _VOYAGE_MAX_BATCH_TOKENS * _VOYAGE_TOKEN_SAFETY_FACTOR
@@ -312,6 +316,7 @@ class VoyageProvider(_ResilientProvider):
         sleeper: Callable[[float], None] = time.sleep,
         breaker: EmbeddingCircuitBreaker | None = None,
         spend_guard: EmbeddingSpendGuard | None = None,
+        max_batch_items: int = _VOYAGE_MAX_BATCH_ITEMS,
     ) -> None:
         super().__init__(breaker=breaker, spend_guard=spend_guard)
         self._model_id = str(model).strip()
@@ -321,6 +326,7 @@ class VoyageProvider(_ResilientProvider):
         self.timeout = float(timeout)
         self._sleep = sleeper
         self._dim = 0
+        self.max_batch_items = max(1, int(max_batch_items))
         self.last_skipped_documents: list[int] = []
 
     @property
@@ -353,6 +359,7 @@ class VoyageProvider(_ResilientProvider):
         timeout: float | None = None,
         max_attempts: int = _MAX_ATTEMPTS,
         retry_after_budget_s: float = _RETRY_AFTER_BUDGET_S,
+        deadline_budget_s: float | None = None,
     ) -> list[list[float]]:
         api_key = os.environ.get("VOYAGE_API_KEY", "").strip()
         if not api_key:
@@ -367,7 +374,28 @@ class VoyageProvider(_ResilientProvider):
         attempts = max(1, int(max_attempts))
         retry_after_spent = 0.0
         last_error: VoyageError | None = None
+        # ONE monotonic deadline across every attempt AND its backoff sleep, so
+        # a tiny budget returns in ~that budget rather than accumulating
+        # per-attempt timeouts plus exponential backoff.
+        deadline = (
+            time.monotonic() + max(0.0, float(deadline_budget_s))
+            if deadline_budget_s is not None
+            else None
+        )
+
+        def _remaining() -> float | None:
+            return None if deadline is None else deadline - time.monotonic()
+
         for attempt in range(attempts):
+            remaining = _remaining()
+            if remaining is not None:
+                if remaining <= 0:
+                    raise last_error or VoyageError(
+                        "timeout", "Voyage operation deadline exceeded"
+                    )
+                attempt_timeout = min(request_timeout, remaining)
+            else:
+                attempt_timeout = request_timeout
             try:
                 response = self._transport(
                     url=_VOYAGE_URL,
@@ -376,13 +404,15 @@ class VoyageProvider(_ResilientProvider):
                         "Authorization": f"Bearer {api_key}",
                         "Content-Type": "application/json",
                     },
-                    timeout=request_timeout,
+                    timeout=attempt_timeout,
                 )
             except (OSError, TimeoutError, urllib.error.URLError) as exc:
                 last_error = VoyageError("network", f"Voyage network error: {exc}")
                 if attempt + 1 >= attempts:
                     raise last_error from exc
-                self._sleep(min(25.0, 0.5 * (2 ** attempt)))
+                delay = min(25.0, 0.5 * (2 ** attempt))
+                if not self._sleep_within_deadline(delay, deadline):
+                    raise last_error from exc
                 continue
 
             if 200 <= response.status < 300:
@@ -407,14 +437,30 @@ class VoyageProvider(_ResilientProvider):
                 raise last_error
             if response.status == 429:
                 delay = _retry_after_seconds(_header(response.headers, "Retry-After"))
-                remaining = retry_after_budget_s - retry_after_spent
-                if delay > remaining:
+                remaining_retry_after = retry_after_budget_s - retry_after_spent
+                if delay > remaining_retry_after:
                     raise last_error
                 retry_after_spent += delay
             else:
                 delay = min(25.0, 0.5 * (2 ** attempt))
-            self._sleep(delay)
+            if not self._sleep_within_deadline(delay, deadline):
+                raise last_error
         raise last_error or VoyageError("network", "Voyage request failed")
+
+    def _sleep_within_deadline(self, delay: float, deadline: float | None) -> bool:
+        """Sleep ``delay`` only if it fits the absolute deadline; else give up.
+
+        Returns True if the caller may retry (the sleep happened within budget),
+        False if the backoff would blow the deadline and the caller should stop.
+        """
+        if deadline is None:
+            self._sleep(delay)
+            return True
+        remaining = deadline - time.monotonic()
+        if delay >= remaining:
+            return False
+        self._sleep(delay)
+        return True
 
     def _remember_dim(self, vectors: Sequence[Sequence[float]]) -> None:
         for vector in vectors:
@@ -445,7 +491,13 @@ class VoyageProvider(_ResilientProvider):
         batch: list[str] = []
         batch_tokens = 0
         for text, tokens in accepted:
-            if batch and batch_tokens + tokens > _VOYAGE_BATCH_TOKEN_BUDGET:
+            # Flush before the batch would exceed EITHER the token budget or the
+            # provider's per-request item cap, so e.g. 1001 short documents split
+            # into at least two requests.
+            if batch and (
+                batch_tokens + tokens > _VOYAGE_BATCH_TOKEN_BUDGET
+                or len(batch) >= self.max_batch_items
+            ):
                 vectors.extend(
                     self._guarded(lambda current=tuple(batch): self._request(current, input_type="document"))
                 )
@@ -468,14 +520,19 @@ class VoyageProvider(_ResilientProvider):
         return vectors[0]
 
     def embed_query_interactive(self, text: str, *, timeout: float) -> list[float]:
-        """Embed a latency-sensitive query with one bounded HTTP attempt."""
+        """Embed a latency-sensitive query under one absolute time budget.
+
+        Retries are allowed only insofar as they fit ``timeout`` — the single
+        monotonic deadline covers every attempt plus any backoff, so a tiny
+        budget returns within that budget instead of stacking per-attempt waits.
+        """
         vectors = self._guarded(
             lambda: self._request(
                 (str(text),),
                 input_type="query",
                 timeout=timeout,
-                max_attempts=1,
                 retry_after_budget_s=0.0,
+                deadline_budget_s=timeout,
             )
         )
         self._remember_dim(vectors)
@@ -520,21 +577,43 @@ class OllamaProvider(_ResilientProvider):
         *,
         timeout: float | None = None,
         max_attempts: int = _MAX_ATTEMPTS,
+        deadline_budget_s: float | None = None,
     ) -> list[list[float]]:
         request_timeout = self.timeout if timeout is None else max(0.001, float(timeout))
         attempts = max(1, int(max_attempts))
+        deadline = (
+            time.monotonic() + max(0.0, float(deadline_budget_s))
+            if deadline_budget_s is not None
+            else None
+        )
         for attempt in range(attempts):
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise EmbeddingProviderError("Ollama operation deadline exceeded")
+                attempt_timeout = min(request_timeout, remaining)
+            else:
+                attempt_timeout = request_timeout
             try:
                 response = self._transport(
                     url=f"{self.base_url}/api/embed",
-                    payload={"model": self.model_id, "input": list(texts)},
+                    # truncate=false so oversized input fails loudly instead of
+                    # being silently truncated to a misleading embedding.
+                    payload={
+                        "model": self.model_id,
+                        "input": list(texts),
+                        "truncate": False,
+                    },
                     headers={"Content-Type": "application/json"},
-                    timeout=request_timeout,
+                    timeout=attempt_timeout,
                 )
             except (OSError, TimeoutError, urllib.error.URLError) as exc:
                 if attempt + 1 >= attempts:
                     raise EmbeddingProviderError(f"Ollama network error: {exc}") from exc
-                self._sleep(min(25.0, 0.5 * (2 ** attempt)))
+                delay = min(25.0, 0.5 * (2 ** attempt))
+                if deadline is not None and delay >= deadline - time.monotonic():
+                    raise EmbeddingProviderError(f"Ollama network error: {exc}") from exc
+                self._sleep(delay)
                 continue
             if not 200 <= response.status < 300:
                 raise EmbeddingProviderError(
@@ -558,6 +637,7 @@ class OllamaProvider(_ResilientProvider):
         *,
         timeout: float | None = None,
         max_attempts: int = _MAX_ATTEMPTS,
+        deadline_budget_s: float | None = None,
     ) -> list[list[float]]:
         if not texts:
             return []
@@ -566,6 +646,7 @@ class OllamaProvider(_ResilientProvider):
                 tuple(str(text) for text in texts),
                 timeout=timeout,
                 max_attempts=max_attempts,
+                deadline_budget_s=deadline_budget_s,
             )
         )
         for vector in vectors:
@@ -583,8 +664,10 @@ class OllamaProvider(_ResilientProvider):
         return self._embed((text,))[0]
 
     def embed_query_interactive(self, text: str, *, timeout: float) -> list[float]:
-        """Embed a latency-sensitive query with one bounded HTTP attempt."""
-        return self._embed((text,), timeout=timeout, max_attempts=1)[0]
+        """Embed a latency-sensitive query under one absolute time budget."""
+        return self._embed(
+            (text,), timeout=timeout, deadline_budget_s=timeout
+        )[0]
 
 
 def _load_fastembed():
@@ -649,11 +732,18 @@ class FastembedProvider(_ResilientProvider):
             self._model = self._construct(allow_download=False)
         return self._model
 
-    def _embed(self, texts: Sequence[str]) -> list[list[float]]:
+    def _embed(self, texts: Sequence[str], *, query: bool = False) -> list[list[float]]:
         if not texts:
             return []
         model = self._ensure_local()
-        vectors = self._guarded(lambda: _coerce_vectors(list(model.embed(list(texts))), provider="FastEmbed"))
+        # FastEmbed models are asymmetric: queries and passages get different
+        # instruction prefixes. Use the query-specific API for queries and the
+        # passage/document API for documents so retrieval matches training, not
+        # the generic ``embed()`` that treats everything as a passage.
+        encode = model.query_embed if query else model.embed
+        vectors = self._guarded(
+            lambda: _coerce_vectors(list(encode(list(texts))), provider="FastEmbed")
+        )
         if len(vectors) != len(texts):
             raise EmbeddingProviderError(
                 "FastEmbed returned a different number of embeddings than requested"
@@ -673,10 +763,10 @@ class FastembedProvider(_ResilientProvider):
         return self.embed_query("warmup")
 
     def embed_documents(self, texts: Sequence[str]) -> list[list[float]]:
-        return self._embed(tuple(str(text) for text in texts))
+        return self._embed(tuple(str(text) for text in texts), query=False)
 
     def embed_query(self, text: str) -> list[float]:
-        return self._embed((str(text),))[0]
+        return self._embed((str(text),), query=True)[0]
 
 
 def resolve_provider(config: LCMConfig) -> EmbeddingProvider | None:
@@ -691,7 +781,13 @@ def resolve_provider(config: LCMConfig) -> EmbeddingProvider | None:
         )
     timeout = float(getattr(config, "embedding_query_timeout_s", 3.0))
     if provider in {"voyage", "voyageai"}:
-        return VoyageProvider(model, timeout=timeout)
+        return VoyageProvider(
+            model,
+            timeout=timeout,
+            max_batch_items=int(
+                getattr(config, "embedding_max_batch_items", _VOYAGE_MAX_BATCH_ITEMS)
+            ),
+        )
     if provider == "ollama":
         return OllamaProvider(
             model,

@@ -78,6 +78,54 @@ def test_voyage_batch_bin_packing_boundary(monkeypatch):
     assert all(call["payload"]["truncation"] is False for call in transport.calls)
 
 
+def test_voyage_batch_splits_on_item_count_cap(monkeypatch):
+    # Many tiny documents stay well under the token budget but exceed Voyage's
+    # 1000-item per-request cap, so the batch must split.
+    monkeypatch.setattr(provider_mod, "count_tokens", lambda _text: 1)
+    monkeypatch.setenv("VOYAGE_API_KEY", "test-key")
+    transport = FakeTransport(_voyage_success(1000), _voyage_success(1))
+    provider = VoyageProvider("voyage-test", transport=transport)
+
+    docs = [f"doc-{index}" for index in range(1001)]
+    vectors = provider.embed_documents(docs)
+
+    assert len(vectors) == 1001
+    assert [len(call["payload"]["input"]) for call in transport.calls] == [1000, 1]
+
+
+def test_voyage_item_cap_is_configurable(monkeypatch):
+    monkeypatch.setattr(provider_mod, "count_tokens", lambda _text: 1)
+    monkeypatch.setenv("VOYAGE_API_KEY", "test-key")
+    transport = FakeTransport(_voyage_success(2), _voyage_success(2), _voyage_success(1))
+    provider = VoyageProvider("voyage-test", transport=transport, max_batch_items=2)
+
+    provider.embed_documents([f"doc-{index}" for index in range(5)])
+    assert [len(call["payload"]["input"]) for call in transport.calls] == [2, 2, 1]
+
+
+def test_voyage_absolute_deadline_bounds_total_retry_time(monkeypatch):
+    # A tiny budget must return in ~that budget: the backoff between attempts
+    # would blow the deadline, so no retry stacks up despite max_attempts>1.
+    monkeypatch.setattr(provider_mod, "count_tokens", lambda _text: 1)
+    monkeypatch.setenv("VOYAGE_API_KEY", "test-key")
+    slept: list[float] = []
+    # Every attempt returns a retryable 500; without an absolute deadline this
+    # would sleep 0.5 + 1.0s across three attempts.
+    transport = FakeTransport(
+        _response(500, {"error": "x"}),
+        _response(500, {"error": "x"}),
+        _response(500, {"error": "x"}),
+    )
+    provider = VoyageProvider("voyage-test", transport=transport, sleeper=slept.append)
+
+    with pytest.raises(VoyageError):
+        provider.embed_query_interactive("q", timeout=0.02)
+
+    # One attempt, zero backoff sleeps (the 0.5s backoff would exceed 0.02s).
+    assert len(transport.calls) == 1
+    assert slept == []
+
+
 def test_voyage_over_cap_document_is_skipped_and_reported(monkeypatch, caplog):
     monkeypatch.setattr(
         provider_mod,
@@ -202,8 +250,11 @@ def test_interactive_http_calls_use_one_attempt_and_explicit_timeout(monkeypatch
     with pytest.raises(VoyageError, match="network"):
         voyage.embed_query_interactive("question", timeout=0.125)
 
+    # The absolute deadline equals the budget, so the backoff after the first
+    # failure would blow it and no retry is attempted: exactly one HTTP call,
+    # each attempt bounded by (approximately) the remaining budget.
     assert len(voyage_transport.calls) == 1
-    assert voyage_transport.calls[0]["timeout"] == pytest.approx(0.125)
+    assert voyage_transport.calls[0]["timeout"] == pytest.approx(0.125, abs=0.02)
 
     ollama_transport = FakeTransport(OSError("offline"), _response(200, {}))
     ollama = OllamaProvider(
@@ -215,7 +266,7 @@ def test_interactive_http_calls_use_one_attempt_and_explicit_timeout(monkeypatch
         ollama.embed_query_interactive("question", timeout=0.25)
 
     assert len(ollama_transport.calls) == 1
-    assert ollama_transport.calls[0]["timeout"] == pytest.approx(0.25)
+    assert ollama_transport.calls[0]["timeout"] == pytest.approx(0.25, abs=0.02)
 
 
 def test_voyage_network_errors_are_classified(monkeypatch):
@@ -245,6 +296,7 @@ def test_ollama_request_shape_base_url_and_network_only_retry():
     assert transport.calls[1]["payload"] == {
         "model": "nomic-embed-text",
         "input": ["hello"],
+        "truncate": False,
     }
     assert sleeps == [0.5]
 
@@ -260,11 +312,22 @@ class FakeFastembedModel:
 
     def __init__(self, **kwargs):
         self.constructions.append(kwargs)
+        self.embed_calls = []
+        self.query_calls = []
         if kwargs["local_files_only"]:
             raise RuntimeError("not cached")
 
     def embed(self, texts):
+        texts = list(texts)
+        self.embed_calls.append(texts)
         return ([1.0, float(index)] for index, _text in enumerate(texts))
+
+    def query_embed(self, texts):
+        # Distinct marker vector so tests can prove the query API is used for
+        # queries instead of the generic passage embed().
+        texts = list(texts)
+        self.query_calls.append(texts)
+        return ([2.0, float(index)] for index, _text in enumerate(texts))
 
 
 def test_fastembed_not_warmed_never_downloads(monkeypatch, tmp_path):
@@ -287,9 +350,27 @@ def test_fastembed_warmup_is_only_download_path(monkeypatch, tmp_path):
     monkeypatch.setattr(provider_mod, "_load_fastembed", lambda: FakeFastembedModel)
     provider = FastembedProvider("local-model", cache_dir=tmp_path)
 
-    assert provider.warmup() == [1.0, 0.0]
+    # warmup() embeds a query, so it goes through the query-specific API.
+    assert provider.warmup() == [2.0, 0.0]
     assert provider.dim == 2
     assert FakeFastembedModel.constructions[0]["local_files_only"] is False
+
+
+def test_fastembed_documents_and_queries_use_distinct_apis(monkeypatch, tmp_path):
+    FakeFastembedModel.constructions = []
+    monkeypatch.setattr(provider_mod, "_load_fastembed", lambda: FakeFastembedModel)
+    provider = FastembedProvider("local-model", cache_dir=tmp_path)
+    provider.warmup()  # force download-path construction
+    model = provider._model
+
+    docs = provider.embed_documents(["a", "b"])
+    query = provider.embed_query("q")
+
+    # Documents go through embed(); the query goes through query_embed().
+    assert docs == [[1.0, 0.0], [1.0, 1.0]]
+    assert query == [2.0, 0.0]
+    assert model.embed_calls[-1] == ["a", "b"]
+    assert model.query_calls[-1] == ["q"]
 
 
 def test_fastembed_absent_dependency_is_clean(monkeypatch):
@@ -338,16 +419,19 @@ def test_embedding_config_defaults_and_environment(monkeypatch):
     assert defaults.embedding_model == ""
     assert defaults.ollama_base_url == "http://localhost:11434"
     assert defaults.embedding_query_timeout_s == 3.0
+    assert defaults.embedding_max_batch_items == 1000
 
     monkeypatch.setenv("LCM_EMBEDDING_PROVIDER", "ollama")
     monkeypatch.setenv("LCM_EMBEDDING_MODEL", "model-a")
     monkeypatch.setenv("LCM_OLLAMA_BASE_URL", "http://ollama:11434")
     monkeypatch.setenv("LCM_EMBEDDING_QUERY_TIMEOUT_S", "4.5")
+    monkeypatch.setenv("LCM_EMBEDDING_MAX_BATCH_ITEMS", "500")
     configured = LCMConfig.from_env()
     assert configured.embedding_provider == "ollama"
     assert configured.embedding_model == "model-a"
     assert configured.ollama_base_url == "http://ollama:11434"
     assert configured.embedding_query_timeout_s == 4.5
+    assert configured.embedding_max_batch_items == 500
 
 
 class FakeWarmupProvider:
@@ -393,7 +477,10 @@ def test_warmup_command_probes_and_registers_profile(monkeypatch, tmp_path):
         store.close()
 
 
-def test_warmup_command_surfaces_dimension_lock_readably(monkeypatch, tmp_path):
+def test_warmup_command_new_dim_is_a_distinct_identity_no_clobber(monkeypatch, tmp_path):
+    # A different dim is a different canonical identity, so warmup registers a
+    # new active profile rather than clobbering (or erroring against) the old
+    # one — the dim-2 profile and its vectors survive for a future switch back.
     engine = _command_engine(tmp_path)
     store = VectorStore(engine._store.db_path)
     store.register_profile("model-a", "ollama", 2)
@@ -406,9 +493,18 @@ def test_warmup_command_surfaces_dimension_lock_readably(monkeypatch, tmp_path):
 
     result = handle_lcm_command("embed warmup", engine)
 
-    assert "status: error" in result
-    assert "locked at 2, not 3" in result
+    assert "status: ready" in result
+    assert "dim: 3" in result
     assert "Traceback" not in result
+    store = VectorStore(engine._store.db_path)
+    try:
+        rows = store.connection.execute(
+            "SELECT dim, active FROM lcm_embedding_profile "
+            "WHERE model_name = 'model-a' ORDER BY dim"
+        ).fetchall()
+        assert [tuple(r) for r in rows] == [(2, 0), (3, 1)]
+    finally:
+        store.close()
 
 
 def test_warmup_command_fastembed_uses_explicit_download(monkeypatch, tmp_path):
