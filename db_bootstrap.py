@@ -291,6 +291,10 @@ def ensure_temporal_rollup_tables(conn: sqlite3.Connection) -> None:
             ON lcm_rollups(period_kind, period_start DESC)
             WHERE status = 'ready';
 
+        CREATE INDEX IF NOT EXISTS idx_lcm_rollups_pending
+            ON lcm_rollups(period_start)
+            WHERE status IN ('stale', 'failed');
+
         CREATE TABLE IF NOT EXISTS lcm_rollup_sources (
             rollup_id INTEGER NOT NULL,
             node_id INTEGER NOT NULL,
