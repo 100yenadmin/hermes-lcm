@@ -294,6 +294,10 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("database_path", "LCM_DATABASE_PATH", str),
     _EnvFieldSpec("embeddings_enabled", "LCM_EMBEDDINGS_ENABLED", bool),
     _EnvFieldSpec("embedding_bounded_scan_rows", "LCM_EMBEDDING_BOUNDED_SCAN_ROWS", int),
+    _EnvFieldSpec("embedding_provider", "LCM_EMBEDDING_PROVIDER", str),
+    _EnvFieldSpec("embedding_model", "LCM_EMBEDDING_MODEL", str),
+    _EnvFieldSpec("ollama_base_url", "LCM_OLLAMA_BASE_URL", str),
+    _EnvFieldSpec("embedding_query_timeout_s", "LCM_EMBEDDING_QUERY_TIMEOUT_S", float),
     _EnvFieldSpec("new_session_retain_depth", "LCM_NEW_SESSION_RETAIN_DEPTH", int),
     _EnvFieldSpec("doctor_clean_apply_enabled", "LCM_DOCTOR_CLEAN_APPLY_ENABLED", bool),
     _EnvFieldSpec("empty_lifecycle_gc_enabled", "LCM_EMPTY_LIFECYCLE_GC_ENABLED", bool),
@@ -455,9 +459,13 @@ class LCMConfig:
     # -- Storage ---
     database_path: str = ""       # empty = HERMES_HOME/lcm.db; LCM_DATABASE_PATH may override
 
-    # -- Embeddings (store-only in this train step; no provider/tool wiring) ---
+    # -- Embeddings (default-off until a provider/model are configured) ---
     embeddings_enabled: bool = False
     embedding_bounded_scan_rows: int = 2_000
+    embedding_provider: str = ""
+    embedding_model: str = ""
+    ollama_base_url: str = "http://localhost:11434"
+    embedding_query_timeout_s: float = 3.0
 
     # -- Session carry-over ---
     # Depth retained after /new (-1 = all, 0 = nothing, 2 = keep d2+)
