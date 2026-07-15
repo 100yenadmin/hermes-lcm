@@ -4,6 +4,7 @@ import json
 import math
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -163,6 +164,49 @@ def test_semantic_timeout_degrades_to_fts_within_budget(semantic_engine, monkeyp
     assert "latency budget" in payload["degraded_reason"]
 
 
+def test_timeout_worker_is_daemon_and_provider_call_is_bounded(
+    semantic_engine,
+    monkeypatch,
+):
+    semantic_engine._config.embedding_query_timeout_s = 0.02
+    semantic_engine._store.append(
+        "session-a",
+        {"role": "user", "content": "daemon timeout fallback"},
+    )
+    release = threading.Event()
+    observed_timeouts: list[float] = []
+
+    class BlockingProvider(MockProvider):
+        def embed_query_interactive(self, _text, *, timeout):
+            observed_timeouts.append(timeout)
+            release.wait(1.0)
+            return list(self.vector)
+
+    monkeypatch.setattr(lcm_tools, "resolve_provider", lambda _config: BlockingProvider())
+    try:
+        payload = json.loads(
+            lcm_tools.lcm_grep(
+                {"query": "daemon", "mode": "semantic"},
+                engine=semantic_engine,
+            )
+        )
+
+        live_workers = [
+            thread
+            for thread in threading.enumerate()
+            if thread.name == "lcm-query-embed" and thread.is_alive()
+        ]
+        assert payload["degraded_to_fts"] is True
+        assert observed_timeouts == [pytest.approx(0.02)]
+        assert live_workers
+        assert all(thread.daemon for thread in live_workers)
+    finally:
+        release.set()
+        for thread in threading.enumerate():
+            if thread.name == "lcm-query-embed":
+                thread.join(timeout=0.2)
+
+
 def test_semantic_missing_provider_degrades_to_fts(semantic_engine, monkeypatch):
     semantic_engine._store.append(
         "session-a",
@@ -180,6 +224,70 @@ def test_semantic_missing_provider_degrades_to_fts(semantic_engine, monkeypatch)
     assert payload["degraded_to_fts"] is True
     assert payload["results"][0]["type"] == "message"
     assert "not configured" in payload["degraded_reason"]
+
+
+@pytest.mark.parametrize("mode", ["semantic", "hybrid"])
+def test_none_vector_coverage_degrades_to_fts(
+    semantic_engine,
+    monkeypatch,
+    mode,
+):
+    semantic_engine._store.append(
+        "session-a",
+        {"role": "user", "content": "coverage fallback marker"},
+    )
+    monkeypatch.setattr(lcm_tools, "resolve_provider", lambda _config: MockProvider())
+
+    payload = json.loads(
+        lcm_tools.lcm_grep(
+            {"query": "coverage", "mode": mode},
+            engine=semantic_engine,
+        )
+    )
+
+    assert payload["mode"] == mode
+    assert payload["coverage"] == "none"
+    assert payload["degraded_to_fts"] is True
+    assert payload["results"][0]["type"] == "message"
+    assert "coverage=none" in payload["degraded_reason"]
+
+
+def test_provider_is_cached_until_provider_or_model_changes(
+    semantic_engine,
+    monkeypatch,
+):
+    resolved: list[MockProvider] = []
+
+    def factory(config):
+        provider = MockProvider()
+        provider.model_id = config.embedding_model
+        resolved.append(provider)
+        return provider
+
+    monkeypatch.setattr(lcm_tools, "resolve_provider", factory)
+
+    for query in ("first", "second"):
+        json.loads(
+            lcm_tools.lcm_grep(
+                {"query": query, "mode": "semantic"},
+                engine=semantic_engine,
+            )
+        )
+
+    assert len(resolved) == 1
+    assert resolved[0].queries == ["first", "second"]
+
+    semantic_engine._config.embedding_model = "changed-model"
+    json.loads(
+        lcm_tools.lcm_grep(
+            {"query": "third", "mode": "semantic"},
+            engine=semantic_engine,
+        )
+    )
+
+    assert len(resolved) == 2
+    assert resolved[1].model_id == "changed-model"
+    assert resolved[1].queries == ["third"]
 
 
 def test_semantic_auth_error_is_operator_readable_and_does_not_degrade(

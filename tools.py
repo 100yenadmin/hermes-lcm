@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import codecs
-import concurrent.futures
 import json
 import logging
 import re
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -1272,24 +1272,50 @@ def _lcm_grep_confidence(score: float) -> str:
 
 def _lcm_grep_embed_query(provider: Any, query: str, timeout_s: float) -> list[float]:
     """Embed one query without letting provider retries exceed the tool budget."""
-    executor = concurrent.futures.ThreadPoolExecutor(
-        max_workers=1,
-        thread_name_prefix="lcm-query-embed",
+    timeout_s = max(0.001, float(timeout_s))
+    outcome: list[tuple[bool, Any]] = []
+
+    def invoke() -> None:
+        try:
+            interactive = getattr(provider, "embed_query_interactive", None)
+            if callable(interactive):
+                vector = interactive(query, timeout=timeout_s)
+            else:
+                vector = provider.embed_query(query)
+            outcome.append((True, vector))
+        except BaseException as exc:
+            outcome.append((False, exc))
+
+    worker = threading.Thread(
+        target=invoke,
+        name="lcm-query-embed",
+        daemon=True,
     )
-    future = executor.submit(provider.embed_query, query)
-    try:
-        vector = future.result(timeout=max(0.001, float(timeout_s)))
-    except concurrent.futures.TimeoutError as exc:
-        future.cancel()
-        executor.shutdown(wait=False, cancel_futures=True)
+    worker.start()
+    worker.join(timeout_s)
+    if worker.is_alive():
         raise TimeoutError(
-            f"query embedding exceeded the {float(timeout_s):g}s latency budget"
-        ) from exc
-    except BaseException:
-        executor.shutdown(wait=True, cancel_futures=True)
-        raise
-    executor.shutdown(wait=True, cancel_futures=True)
+            f"query embedding exceeded the {timeout_s:g}s latency budget"
+        )
+    succeeded, value = outcome[0]
+    if not succeeded:
+        raise value
+    vector = value
     return [float(value) for value in vector]
+
+
+def _lcm_grep_resolve_provider(engine: "LCMEngine") -> Any:
+    config = engine._config
+    cache_key = (
+        str(getattr(config, "embedding_provider", "") or "").strip().lower(),
+        str(getattr(config, "embedding_model", "") or "").strip(),
+    )
+    cached = getattr(engine, "_lcm_embedding_provider_cache", None)
+    if cached is not None and cached[0] == cache_key:
+        return cached[1]
+    provider = resolve_provider(config)
+    engine._lcm_embedding_provider_cache = (cache_key, provider)
+    return provider
 
 
 def _lcm_grep_semantic(
@@ -1367,7 +1393,7 @@ def _lcm_grep_semantic(
         return degraded("semantic retrieval is disabled")
 
     try:
-        provider = resolve_provider(engine._config)
+        provider = _lcm_grep_resolve_provider(engine)
     except Exception as exc:
         return degraded(f"embedding provider unavailable: {exc}")
     if provider is None:
@@ -1402,6 +1428,11 @@ def _lcm_grep_semantic(
     finally:
         if "vector_store" in locals():
             vector_store.close()
+
+    if coverage == "none":
+        return degraded("semantic vectors are unavailable (coverage=none)")
+    if not ranked_rows:
+        return degraded("semantic retrieval returned no vector candidates")
 
     current_session_id = engine.current_session_id
     has_current_session = bool(current_session_id)
@@ -1440,6 +1471,9 @@ def _lcm_grep_semantic(
         results.append(result)
         if len(results) >= knn_limit:
             break
+
+    if not results:
+        return degraded("semantic vector candidates could not be resolved")
 
     response: dict[str, Any] = {
         "query": query,
