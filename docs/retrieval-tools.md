@@ -62,13 +62,22 @@ The response-level `coverage` value comes directly from the vector store:
 dependency-free bounded-scan fallback was used, and `none` means no usable
 profile/vector coverage was available.
 
-Query embedding has a hard wall-clock budget from
-`embedding_query_timeout_s` (3 seconds by default). Disabled embeddings, a
-missing/unavailable provider, timeouts, transient provider failures, or vector
-search failures fall back to the existing full-text result and add
-`degraded_to_fts: true`, `degraded_reason`, and `coverage: 'none'`. Provider
-authentication failures do not degrade: they return an operator-readable error
-so a missing or invalid credential is repaired instead of silently hidden.
+The whole semantic operation runs under one absolute wall-clock deadline from
+`embedding_query_timeout_s` (3 seconds by default) — covering query embedding,
+vector-store construction, and the KNN scan, not just the embed call. Disabled
+embeddings, a missing/unavailable provider, exceeding the deadline (embed or
+KNN), transient provider failures, or vector search failures fall back to the
+existing full-text result and add `degraded_to_fts: true`, `degraded_reason`,
+and `coverage: 'none'`. Provider authentication failures do not degrade: they
+return an operator-readable error so a missing or invalid credential is repaired
+instead of silently hidden.
+
+`conversation_id`, `source`, `time_from`, and `time_to` are enforced inside the
+KNN eligibility step **before** the top-k cap, so an ineligible high-scoring
+vector cannot displace an eligible lower-scoring one. `conversation_id` resolves
+to the sessions that carry it; `role` is a raw-message dimension summaries do not
+have, so a `role` filter degrades the semantic arm to full-text (which enforces
+role) rather than being ignored.
 
 `mode='hybrid'` runs both arms and deduplicates shared summary nodes by
 `node_id`. It fuses ranks with reciprocal-rank fusion only:
