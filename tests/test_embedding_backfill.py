@@ -113,7 +113,7 @@ def test_dry_run_reports_counts_tokens_and_cost_without_calls_or_writes(
     engine = _engine(tmp_path)
     _seed(engine, 3)
     provider = FakeProvider()
-    monkeypatch.setattr(command_mod, "resolve_provider", lambda _config: provider)
+    monkeypatch.setattr(command_mod, "resolve_provider", lambda _config, **_kw: provider)
     before = engine._store.db_path.read_bytes()
 
     result = handle_lcm_command("embed backfill --limit 2", engine)
@@ -160,7 +160,7 @@ def test_apply_batches_records_correct_meta_and_is_idempotent(monkeypatch, tmp_p
     engine = _engine(tmp_path)
     node_ids = _seed(engine, 35)
     provider = FakeProvider()
-    monkeypatch.setattr(command_mod, "resolve_provider", lambda _config: provider)
+    monkeypatch.setattr(command_mod, "resolve_provider", lambda _config, **_kw: provider)
 
     first = handle_lcm_command("embed backfill --apply", engine)
 
@@ -194,7 +194,7 @@ def test_apply_limit_embeds_newest_rows_first(monkeypatch, tmp_path):
     engine = _engine(tmp_path)
     node_ids = _seed(engine, 4)
     provider = FakeProvider()
-    monkeypatch.setattr(command_mod, "resolve_provider", lambda _config: provider)
+    monkeypatch.setattr(command_mod, "resolve_provider", lambda _config, **_kw: provider)
 
     result = handle_lcm_command("embed backfill --limit 2 --apply", engine)
 
@@ -209,7 +209,7 @@ def test_per_row_record_failure_does_not_lose_rest_of_batch(
     engine = _engine(tmp_path)
     node_ids = _seed(engine, 3)
     provider = FakeProvider()
-    monkeypatch.setattr(command_mod, "resolve_provider", lambda _config: provider)
+    monkeypatch.setattr(command_mod, "resolve_provider", lambda _config, **_kw: provider)
     original = VectorStore.record_embedding
 
     def fail_one(self, embedded_id, kind, model, vector):
@@ -245,7 +245,7 @@ def test_auth_error_aborts_immediately_and_releases_claim(monkeypatch, tmp_path)
     conn.commit()
     conn.close()
     provider.embed_documents = auth_error
-    monkeypatch.setattr(command_mod, "resolve_provider", lambda _config: provider)
+    monkeypatch.setattr(command_mod, "resolve_provider", lambda _config, **_kw: provider)
 
     result = handle_lcm_command("embed backfill --apply", engine)
 
@@ -268,7 +268,7 @@ def test_transient_provider_error_skips_batch_and_continues(monkeypatch, tmp_pat
         return original(texts)
 
     provider.embed_documents = transient_once
-    monkeypatch.setattr(command_mod, "resolve_provider", lambda _config: provider)
+    monkeypatch.setattr(command_mod, "resolve_provider", lambda _config, **_kw: provider)
 
     result = handle_lcm_command("embed backfill --apply", engine)
 
@@ -293,7 +293,7 @@ def test_provider_overcap_rows_are_skipped_and_left_pending(monkeypatch, tmp_pat
         return [[1.0, 1.0], [2.0, 1.0]]
 
     provider.embed_documents = skip_middle
-    monkeypatch.setattr(command_mod, "resolve_provider", lambda _config: provider)
+    monkeypatch.setattr(command_mod, "resolve_provider", lambda _config, **_kw: provider)
 
     result = handle_lcm_command("embed backfill --apply", engine)
 
@@ -309,7 +309,7 @@ def test_fresh_claim_refuses_second_worker_but_stale_claim_is_overridden(
     engine = _engine(tmp_path)
     _seed(engine, 1)
     provider = FakeProvider()
-    monkeypatch.setattr(command_mod, "resolve_provider", lambda _config: provider)
+    monkeypatch.setattr(command_mod, "resolve_provider", lambda _config, **_kw: provider)
     conn = sqlite3.connect(engine._store.db_path)
     conn.execute(
         "INSERT INTO metadata(key, value) VALUES(?, ?)",
@@ -346,7 +346,7 @@ def test_apply_claims_before_discovery_and_skips_already_embedded(monkeypatch, t
     engine = _engine(tmp_path)
     node_ids = _seed(engine, 3)
     provider = FakeProvider()
-    monkeypatch.setattr(command_mod, "resolve_provider", lambda _config: provider)
+    monkeypatch.setattr(command_mod, "resolve_provider", lambda _config, **_kw: provider)
     # Another writer embeds the newest row before this run claims + discovers.
     store = VectorStore(engine._store.db_path, config=engine._config)
     try:
@@ -405,7 +405,7 @@ def test_inflight_row_is_reattempted_after_crash(monkeypatch, tmp_path):
         raise VoyageError("network", "provider crashed mid-batch")
 
     provider.embed_documents = crash
-    monkeypatch.setattr(command_mod, "resolve_provider", lambda _config: provider)
+    monkeypatch.setattr(command_mod, "resolve_provider", lambda _config, **_kw: provider)
 
     first = handle_lcm_command("embed backfill --apply", engine)
     # Nothing recorded; both rows are left marked in_flight.
@@ -415,7 +415,7 @@ def test_inflight_row_is_reattempted_after_crash(monkeypatch, tmp_path):
     assert _meta_ids(engine) == []
 
     healthy = FakeProvider()
-    monkeypatch.setattr(command_mod, "resolve_provider", lambda _config: healthy)
+    monkeypatch.setattr(command_mod, "resolve_provider", lambda _config, **_kw: healthy)
     second = handle_lcm_command("embed backfill --apply", engine)
     # The in_flight rows are re-discovered and embedded; markers clear.
     assert "status: complete" in second
@@ -428,7 +428,7 @@ def test_operation_budget_stops_run_between_batches(monkeypatch, tmp_path):
     engine = _engine(tmp_path)
     _seed(engine, 40)
     provider = FakeProvider()
-    monkeypatch.setattr(command_mod, "resolve_provider", lambda _config: provider)
+    monkeypatch.setattr(command_mod, "resolve_provider", lambda _config, **_kw: provider)
     monkeypatch.setenv("LCM_EMBEDDING_BACKFILL_BUDGET_S", "1")
 
     calls = {"n": 0}
