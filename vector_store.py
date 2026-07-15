@@ -334,7 +334,7 @@ class VectorStore:
                   ON m.embedded_id = v.embedded_id
                  AND m.embedding_model = v.embedding_model
                 WHERE v.embedding_model = ? AND m.archived = 0
-                ORDER BY v.rowid DESC
+                ORDER BY m.embedded_at DESC, v.rowid DESC
                 LIMIT ?
                 """,
                 (model, limit),
@@ -374,24 +374,23 @@ class VectorStore:
             for _, embedded_id, score, kind in ranked[:limit]
         ]
 
-    def _filter_candidates(
+    def _filtered_candidate_indexes(
         self,
-        candidates: Sequence[tuple[str, float, str]],
+        embedded_ids: Sequence[str],
         *,
         since: float | None,
         conversation_ids: Sequence[str] | None,
-        limit: int,
-    ) -> list[tuple[str, float, str]]:
-        if not candidates:
+    ) -> list[int]:
+        if not embedded_ids:
             return []
-        embedded_ids = list(dict.fromkeys(row[0] for row in candidates))
-        placeholders = ",".join("?" for _ in embedded_ids)
+        unique_ids = list(dict.fromkeys(embedded_ids))
+        placeholders = ",".join("?" for _ in unique_ids)
         columns = {
             str(row[1])
             for row in self._conn.execute("PRAGMA table_info(summary_nodes)").fetchall()
         }
         where = [f"CAST(node_id AS TEXT) IN ({placeholders})"]
-        args: list[object] = list(embedded_ids)
+        args: list[object] = list(unique_ids)
         if "suppressed_at" in columns:
             where.append("suppressed_at IS NULL")
         if since is not None:
@@ -409,7 +408,7 @@ class VectorStore:
             args,
         ).fetchall()
         allowed = {str(row[0]) for row in rows}
-        return [row for row in candidates if row[0] in allowed][:limit]
+        return [index for index, embedded_id in enumerate(embedded_ids) if embedded_id in allowed]
 
     def knn(
         self,
@@ -432,8 +431,6 @@ class VectorStore:
         if row_count == 0:
             return KNNResult(coverage="none")
 
-        filters_present = since is not None or conversation_ids is not None
-        candidate_limit = min(k * 10, 500) if filters_present else k
         try:
             numpy = _load_numpy()
         except ImportError:
@@ -445,6 +442,15 @@ class VectorStore:
                 selected_model,
                 dim,
             )
+            filtered_indexes = self._filtered_candidate_indexes(
+                embedded_ids,
+                since=since,
+                conversation_ids=conversation_ids,
+            )
+            rowids = [rowids[index] for index in filtered_indexes]
+            embedded_ids = [embedded_ids[index] for index in filtered_indexes]
+            kinds = [kinds[index] for index in filtered_indexes]
+            matrix = matrix[filtered_indexes]
             query_array = numpy.asarray(query, dtype=numpy.float32)
             scores = matrix @ query_array
             coverage = "full"
@@ -453,6 +459,15 @@ class VectorStore:
                 selected_model,
                 dim,
             )
+            filtered_indexes = self._filtered_candidate_indexes(
+                embedded_ids,
+                since=since,
+                conversation_ids=conversation_ids,
+            )
+            rowids = [rowids[index] for index in filtered_indexes]
+            embedded_ids = [embedded_ids[index] for index in filtered_indexes]
+            kinds = [kinds[index] for index in filtered_indexes]
+            vectors = [vectors[index] for index in filtered_indexes]
             scores = [
                 sum(value * query_value for value, query_value in zip(vector, query))
                 for vector in vectors
@@ -464,15 +479,9 @@ class VectorStore:
             embedded_ids,
             kinds,
             scores,
-            candidate_limit,
+            k,
         )
-        filtered = self._filter_candidates(
-            candidates,
-            since=since,
-            conversation_ids=conversation_ids,
-            limit=k,
-        )
-        return KNNResult(filtered, coverage=coverage)
+        return KNNResult(candidates, coverage=coverage)
 
     def close(self) -> None:
         conn = getattr(self, "_conn", None)

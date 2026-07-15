@@ -278,9 +278,20 @@ def test_bounded_scan_only_scores_most_recent_rows(tmp_path, monkeypatch):
         recent_a = _add_summary(dag, created_at=2.0)
         recent_b = _add_summary(dag, created_at=3.0)
         store.register_profile("bounded", "local", 3)
-        store.record_embedding(oldest, "summary", "bounded", [1.0, 0.0, 0.0])
+        # Backfill writes newest content first, so recent content can have the
+        # lowest vector rowids. The bounded window must use embedded_at instead.
         store.record_embedding(recent_a, "summary", "bounded", [0.0, 1.0, 0.0])
         store.record_embedding(recent_b, "summary", "bounded", [0.0, 0.0, 1.0])
+        store.record_embedding(oldest, "summary", "bounded", [1.0, 0.0, 0.0])
+        store.connection.executemany(
+            "UPDATE lcm_embedding_meta SET embedded_at = ? WHERE embedded_id = ?",
+            [
+                ("2026-07-15T03:00:00+00:00", str(recent_b)),
+                ("2026-07-15T02:00:00+00:00", str(recent_a)),
+                ("2026-07-15T01:00:00+00:00", str(oldest)),
+            ],
+        )
+        store.connection.commit()
 
         def unavailable():
             raise ImportError("numpy not installed")
@@ -342,6 +353,51 @@ def test_filter_overfetch_uses_summary_time_and_session_columns(stores):
         conversation_ids=["conversation-a"],
     )
     assert [row[0] for row in result] == [str(new_a)]
+
+
+def test_filters_are_applied_before_score_top_k_truncation(stores):
+    pytest.importorskip("numpy")
+    dag, store = stores
+    store.register_profile("filter-before-top-k", "local", 2)
+
+    for index in range(501):
+        unfiltered = _add_summary(
+            dag,
+            session_id="conversation-other",
+            created_at=float(index + 1),
+        )
+        store.record_embedding(
+            unfiltered,
+            "summary",
+            "filter-before-top-k",
+            [1.0, 0.0],
+        )
+
+    filtered_ids = [
+        _add_summary(
+            dag,
+            session_id="conversation-target",
+            created_at=1_000.0 + index,
+        )
+        for index in range(2)
+    ]
+    for node_id in filtered_ids:
+        store.record_embedding(
+            node_id,
+            "summary",
+            "filter-before-top-k",
+            [0.0, 1.0],
+        )
+
+    result = store.knn(
+        [1.0, 0.0],
+        k=2,
+        model="filter-before-top-k",
+        conversation_ids=["conversation-target"],
+    )
+
+    assert result.coverage == "full"
+    assert {row[0] for row in result} == {str(node_id) for node_id in filtered_ids}
 
 
 def test_matrix_cache_is_invalidated_on_write(stores):
