@@ -180,9 +180,28 @@ Advanced compaction, assembly, and extraction knobs are defined in `config.py`.
 
 Temporal rollups are opt-in. Set `LCM_TEMPORAL_ROLLUPS_ENABLED=true`, tune the
 four `LCM_ROLLUP_*` controls above if needed, and restart Hermes. Rollup periods
-are UTC calendar periods. Automatic maintenance marks affected rollups stale as
-new messages arrive and rebuilds at most `LCM_ROLLUP_BUILDS_PER_PASS` rows per
-pass, with daily rollups ahead of aggregates.
+are UTC calendar periods. Enabling the feature creates its tables lazily; a
+disabled install creates no rollup tables and leaves the core schema untouched,
+so a base build still opens the database.
+
+Automatic maintenance marks a day (and its containing week and month) stale when
+a **summary node covering that day is published** — publication, not raw
+ingest, is the signal a rollup consumes — and rebuilds at most
+`LCM_ROLLUP_BUILDS_PER_PASS` rows per pass, with daily rollups ahead of
+aggregates. A week or month is only published `ready` once every day in the
+period that has content has a `ready` daily rollup; while any content day is
+missing, stale, or building the aggregate stays stale with a recorded reason and
+`lcm_recent` falls back to daily/leaf summaries for the whole window. Rebuilding
+a daily re-stales its containing week and month so aggregates never remain
+`ready` against an outdated day.
+
+**Scope and rotation boundary.** Rollups are scoped to the LCM session id.
+Summary nodes carry no conversation-family key at this layer, so a rollup does
+not automatically span sessions across a `/new` rotation; after a rotation,
+retained higher-depth summaries are carried into the new session and remain
+retrievable, but per-period rollup rows are rebuilt under the new session scope.
+Build-cursor state is tracked per `(period_kind, scope)` so multiple scopes
+sharing one database never share a cursor.
 
 With `LCM_ENABLE_SLASH_COMMAND=true`, operators can inspect the current
 foreground session and request a bounded synchronous rebuild:
@@ -197,11 +216,14 @@ foreground session and request a bounded synchronous rebuild:
 
 The optional date defaults to the current UTC date. Week targets normalize to
 Monday and month targets to the first day. `all` targets the containing day,
-week, and month in that order. The command first marks existing targets stale,
-then attempts no more than the configured per-pass limit and prints an outcome
-for every target; targets beyond the bound remain stale. Builds run now and may
-invoke the summary model. They use the same summary circuit breaker, fallback
-routes, timeout, and spend guard as normal LCM summarization.
+week, and month in that order. The command first **durably seeds a `stale` row
+for every requested target** (creating one if it does not yet exist), then
+attempts no more than the configured per-pass limit and prints an outcome for
+every target. Targets beyond the bound are reported `stale (bounded; not
+attempted)` and remain as durable `stale` rows, so later automatic maintenance
+builds them. Builds run now and may invoke the summary model. They use the same
+summary circuit breaker, fallback routes, timeout, and spend guard as normal LCM
+summarization.
 
 `lcm_inspect` always includes a `temporal_rollups` block with the enabled flag,
 ready/stale/building/failed counts for each period kind, oldest stale age,

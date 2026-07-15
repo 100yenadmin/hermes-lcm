@@ -2682,8 +2682,9 @@ def _temporal_rollups_status(engine: "LCMEngine") -> dict[str, Any]:
             """
             SELECT period_kind, last_build_cursor, last_built_at
             FROM lcm_rollup_state
-            WHERE period_kind IN ('day', 'week', 'month')
-            """
+            WHERE period_kind IN ('day', 'week', 'month') AND scope = ?
+            """,
+            (scope,),
         ).fetchall()
         for period_kind, cursor, built_at in cursor_rows:
             kind_key = str(period_kind)

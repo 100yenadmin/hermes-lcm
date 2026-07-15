@@ -31,9 +31,9 @@ def engine(tmp_path):
 
 
 def _ready(store, kind, period_start, scope):
-    rollup_id = store.upsert_building(kind, period_start, scope)
-    store.mark_ready(rollup_id, f"old {kind}", 3, [], f"old-{kind}")
-    return rollup_id
+    token = store.upsert_building(kind, period_start, scope)
+    store.mark_ready(token, f"old {kind}", 3, [], f"old-{kind}")
+    return token.rollup_id
 
 
 def _assert_zero_shape(block, *, enabled):
@@ -73,9 +73,9 @@ def test_lcm_inspect_reports_counts_cursor_stale_age_and_last_error(engine):
         store.connection.execute(
             "UPDATE lcm_rollups SET status = 'stale' WHERE period_kind = 'week'"
         )
-        failed_id = store.upsert_building("month", "2026-07-01", engine.current_session_id)
+        failed_id = store.upsert_building("month", "2026-07-01", engine.current_session_id).rollup_id
         store.mark_failed(failed_id, "mocked summary failure")
-        store.set_cursor("day", "2026-07-15", built_at="2026-07-15T12:00:00+00:00")
+        store.set_cursor("day", "2026-07-15", engine.current_session_id, built_at="2026-07-15T12:00:00+00:00")
         store.connection.commit()
 
         block = json.loads(lcm_tools.lcm_inspect({}, engine=engine))["temporal_rollups"]
@@ -164,6 +164,51 @@ def test_rollups_rebuild_marks_all_targets_stale_and_builds_bounded(engine, monk
         assert "- month 2026-07-01: stale (bounded; not attempted)" in result
     finally:
         store.close()
+
+
+def test_rollups_rebuild_all_durably_seeds_unattempted_targets(engine, monkeypatch):
+    # Regression for maintainer #391: targets beyond the per-pass budget must be
+    # durably seeded as 'stale' rows (not absent) so later maintenance builds
+    # them. Start with NO pre-existing rollup rows.
+    scope = engine.current_session_id
+    engine._config.rollup_builds_per_pass = 1
+    timestamp = datetime(2026, 7, 15, 12, tzinfo=timezone.utc).timestamp()
+    engine._dag.add_node(
+        SummaryNode(
+            session_id=scope,
+            depth=0,
+            summary="lone source",
+            token_count=count_tokens("lone source"),
+            source_token_count=4,
+            source_ids=[1],
+            source_type="messages",
+            created_at=timestamp,
+            earliest_at=timestamp,
+            latest_at=timestamp,
+        )
+    )
+    monkeypatch.setattr(
+        builder_module,
+        "summarize_with_escalation",
+        lambda _text, **_kwargs: ("rebuilt", 1),
+    )
+
+    result = handle_lcm_command("rollups rebuild all 2026-07-15", engine)
+
+    store = RollupStore(engine._dag.db_path)
+    try:
+        statuses = {
+            kind: (store.get_rollup(kind, start, scope) or {}).get("status", "missing")
+            for kind, start in (("day", "2026-07-15"), ("week", "2026-07-13"), ("month", "2026-07-01"))
+        }
+    finally:
+        store.close()
+    # Only one build ran (the day), but the unattempted week and month exist as
+    # durable stale rows rather than being absent.
+    assert statuses["day"] == "ready"
+    assert statuses["week"] == "stale"
+    assert statuses["month"] == "stale"
+    assert "not attempted" in result
 
 
 def test_rollups_rebuild_respects_disabled_flag(engine, monkeypatch):
