@@ -142,11 +142,14 @@ class RollupStore:
     def upsert_building(
         self, period_kind: str, period_start: str, scope: str
     ) -> RollupBuildToken:
-        """Claim a build lease, returning the row id and its current generation.
+        """Claim a build lease, returning the row id and its NEW generation.
 
-        The generation is NOT advanced here (only invalidations advance it), so
-        the returned token reflects the input state the build is about to consume.
-        A ``lease_expires_at`` is stamped so a crashed builder's row can later be
+        The claim is itself a compare-and-set: re-claiming an existing row
+        advances ``generation`` so two builders racing the same period get
+        DISTINCT tokens and only the latest claimant's :meth:`mark_ready` /
+        :meth:`mark_failed` succeeds (an older claimant is superseded). A fresh
+        row starts at generation 0 (no prior claimant to race). A
+        ``lease_expires_at`` is stamped so a crashed builder's row can later be
         reclaimed by :meth:`reclaim_stale_building`.
         """
         with self._write_transaction():
@@ -156,6 +159,7 @@ class RollupStore:
                 VALUES(?, ?, ?, 'building', ?, ?)
                 ON CONFLICT(period_kind, period_start, scope) DO UPDATE SET
                     status = 'building',
+                    generation = lcm_rollups.generation + 1,
                     built_at = excluded.built_at,
                     lease_expires_at = excluded.lease_expires_at,
                     source_fingerprint = NULL,
@@ -230,16 +234,38 @@ class RollupStore:
             )
         return True
 
-    def mark_failed(self, rollup_id: int, error: str) -> None:
+    def mark_failed(
+        self, rollup_id: int, error: str, *, generation: int | None = None
+    ) -> bool:
+        """Record a build failure, optionally guarded by ``generation``.
+
+        When ``generation`` is given the update is a compare-and-set (exactly
+        like :meth:`mark_ready`): a superseded builder's late exception cannot
+        flip a newer ready/stale row to ``failed``. Returns ``True`` when a row
+        was updated, ``False`` when the build was superseded. An unguarded call
+        (``generation is None``) always writes and is used only to seed a known
+        failure state directly.
+        """
         with self._write_transaction():
-            self._conn.execute(
-                """
-                UPDATE lcm_rollups
-                SET status = 'failed', error = ?
-                WHERE rollup_id = ?
-                """,
-                (error, int(rollup_id)),
-            )
+            if generation is None:
+                cur = self._conn.execute(
+                    """
+                    UPDATE lcm_rollups
+                    SET status = 'failed', error = ?
+                    WHERE rollup_id = ?
+                    """,
+                    (error, int(rollup_id)),
+                )
+            else:
+                cur = self._conn.execute(
+                    """
+                    UPDATE lcm_rollups
+                    SET status = 'failed', error = ?
+                    WHERE rollup_id = ? AND generation = ?
+                    """,
+                    (error, int(rollup_id), int(generation)),
+                )
+        return int(cur.rowcount or 0) > 0
 
     @staticmethod
     def _period_starts_for_day(day: date | str) -> tuple[str, str, str]:
@@ -327,27 +353,50 @@ class RollupStore:
             )
         return int(cur.rowcount or 0)
 
-    def record_incomplete_aggregate(
-        self, period_kind: str, period_start: str, scope: str, reason: str
-    ) -> None:
-        """Leave an aggregate ``stale`` with a recorded reason when it cannot be
-        published because a constituent daily is missing/stale/building.
+    def defer_incomplete(self, token: RollupBuildToken, reason: str) -> bool:
+        """Release a claimed aggregate build back to ``stale`` with a reason.
 
-        Does not advance ``generation`` (this is a build deferral, not an input
-        change) so a concurrent, still-valid build is not needlessly superseded.
+        Called when a claimed aggregate cannot be published because a constituent
+        daily is missing/stale/building. Guarded by the build token
+        (compare-and-set on ``generation`` for a row this builder still owns), so
+        a superseded builder's deferral cannot erase a newer ready aggregate that
+        another builder published in the meantime. ``generation`` is left
+        unchanged (a deferral is not an input change). Returns ``True`` when the
+        owned ``building`` row was released, ``False`` when superseded.
         """
         with self._write_transaction():
-            self._conn.execute(
+            cur = self._conn.execute(
                 """
-                INSERT INTO lcm_rollups(period_kind, period_start, scope, status, error)
-                VALUES(?, ?, ?, 'stale', ?)
-                ON CONFLICT(period_kind, period_start, scope) DO UPDATE SET
-                    status = 'stale',
-                    error = excluded.error,
-                    lease_expires_at = NULL
+                UPDATE lcm_rollups
+                SET status = 'stale', error = ?, lease_expires_at = NULL
+                WHERE rollup_id = ? AND generation = ? AND status = 'building'
                 """,
-                (period_kind, period_start, scope, reason),
+                (reason, int(token.rollup_id), int(token.generation)),
             )
+        return int(cur.rowcount or 0) > 0
+
+    def resolve_no_source(self, token: RollupBuildToken) -> bool:
+        """Clear a claimed period that turned out to have no source content.
+
+        A period can go ``stale`` yet have no summary node to build from (all its
+        sources were deleted, or a rebuild request seeded a contentless target).
+        Such a period must not linger ``stale`` forever consuming a per-pass build
+        slot: this deletes the claimed row (and its sources) iff this builder
+        still owns it (compare-and-set on ``generation``). A later covering
+        publication re-seeds a fresh ``stale`` row. Returns ``True`` when cleared,
+        ``False`` when superseded (a newer invalidation is left to rebuild).
+        """
+        with self._write_transaction():
+            cur = self._conn.execute(
+                "DELETE FROM lcm_rollups WHERE rollup_id = ? AND generation = ?",
+                (int(token.rollup_id), int(token.generation)),
+            )
+            if int(cur.rowcount or 0) > 0:
+                self._conn.execute(
+                    "DELETE FROM lcm_rollup_sources WHERE rollup_id = ?",
+                    (int(token.rollup_id),),
+                )
+        return int(cur.rowcount or 0) > 0
 
     def reclaim_stale_building(self, now: str | None = None) -> int:
         """Flip expired ``building`` rows back to ``stale`` so a crashed build is
@@ -421,6 +470,17 @@ class RollupStore:
             )
 
     def purge_rollups_for_sources(self, node_ids: Sequence[int]) -> int:
+        """Invalidate rollups built from now-purged source nodes.
+
+        The affected periods are re-seeded ``stale`` (generation advanced, so an
+        in-flight build cannot publish purged content) rather than hard-deleted:
+        a deleted row at/before the build cursor would leave the cursor advanced
+        with no pending row, so the window would never be rebuilt. Re-staling
+        leaves a durable pending row that maintenance rebuilds from whatever
+        sources remain (or clears via :meth:`resolve_no_source` if none do). The
+        rollups' stale source rows are dropped and repopulated on rebuild.
+        Returns the number of periods re-staled.
+        """
         unique_node_ids = list(dict.fromkeys(int(node_id) for node_id in node_ids))
         if not unique_node_ids:
             return 0
@@ -443,7 +503,17 @@ class RollupStore:
                 rollup_ids,
             )
             cur = self._conn.execute(
-                f"DELETE FROM lcm_rollups WHERE rollup_id IN ({rollup_placeholders})",
+                f"""
+                UPDATE lcm_rollups
+                SET status = 'stale',
+                    generation = generation + 1,
+                    summary = NULL,
+                    token_count = NULL,
+                    source_fingerprint = NULL,
+                    error = NULL,
+                    lease_expires_at = NULL
+                WHERE rollup_id IN ({rollup_placeholders})
+                """,
                 rollup_ids,
             )
         return int(cur.rowcount or 0)
