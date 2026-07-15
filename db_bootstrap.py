@@ -27,8 +27,14 @@ class SchemaVersionTooNewError(RuntimeError):
     """
 
 
-SCHEMA_VERSION = 6
-_EMBEDDING_MIGRATION_VERSION = 6
+# The core schema ladder stops at 5. Optional embedding tables are NOT part of
+# this counter: they are created lazily+idempotently by VectorStore on first use
+# (see ``ensure_embedding_tables`` / ``VectorStore._ensure_embedding_schema``) and
+# recorded via the named ``embeddings_v1`` migration-state marker instead of a
+# numeric bump. This keeps a disabled install at schema_version 5 with no
+# embedding tables, fully openable by a base build, and leaves the numeric
+# counter free for the temporal train so neither collides on a v6.
+SCHEMA_VERSION = 5
 SQLITE_BUSY_TIMEOUT_MS = 30_000
 _MIN_DISK_SPACE_BYTES = 50 * 1024 * 1024
 REQUIRED_CORE_TABLES = (
@@ -271,36 +277,61 @@ def ensure_message_origin_columns(conn: sqlite3.Connection) -> None:
 
 
 def ensure_embedding_tables(conn: sqlite3.Connection) -> None:
+    """Create the opt-in embedding tables idempotently.
+
+    These tables are NOT part of the core ``schema_version`` ladder. They are
+    created only when embeddings are actually used (VectorStore construction),
+    so an install with embeddings disabled never materializes them and stays at
+    schema_version 5, openable by a base build.
+
+    Profiles and vectors are keyed on a canonical *identity* — the sha256 of
+    ``(provider, model_name, revision, dim, dtype, byteorder, task)`` — rather
+    than on ``model_name`` alone. Re-registering the same model under a
+    different provider is therefore a new profile row (no metadata clobber),
+    and switching config back to a previously-registered identity reactivates
+    that profile with its vectors still valid. ``data_version`` is a durable
+    per-identity counter bumped inside every vector write/delete transaction so
+    the in-process NumPy matrix cache cannot serve cross-process-stale results.
+    """
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS lcm_embedding_profile (
-            model_name TEXT PRIMARY KEY,
-            provider TEXT,
+            identity_hash TEXT PRIMARY KEY,
+            provider TEXT NOT NULL,
+            model_name TEXT NOT NULL,
+            revision TEXT NOT NULL DEFAULT '',
             dim INTEGER CHECK(dim BETWEEN 1 AND 4096),
+            dtype TEXT NOT NULL DEFAULT 'float32',
+            byteorder TEXT NOT NULL DEFAULT 'little',
+            task TEXT NOT NULL DEFAULT 'summary',
             registered_at TEXT,
             active INTEGER DEFAULT 1,
-            archived_at TEXT NULL
+            archived_at TEXT NULL,
+            data_version INTEGER NOT NULL DEFAULT 0
         );
+
+        CREATE INDEX IF NOT EXISTS idx_lcm_embedding_profile_model
+            ON lcm_embedding_profile(model_name, provider);
 
         CREATE TABLE IF NOT EXISTS lcm_embedding_meta (
             embedded_id TEXT,
             embedded_kind TEXT CHECK(embedded_kind IN ('summary')),
-            embedding_model TEXT,
+            identity_hash TEXT,
             embedded_at TEXT,
             source_token_count INTEGER,
             archived INTEGER DEFAULT 0,
-            PRIMARY KEY(embedded_id, embedded_kind, embedding_model)
+            PRIMARY KEY(embedded_id, embedded_kind, identity_hash)
         );
 
-        CREATE INDEX IF NOT EXISTS idx_lcm_embedding_meta_model_embedded_at
-            ON lcm_embedding_meta(embedding_model, embedded_at DESC)
+        CREATE INDEX IF NOT EXISTS idx_lcm_embedding_meta_identity_embedded_at
+            ON lcm_embedding_meta(identity_hash, embedded_at DESC)
             WHERE archived = 0;
 
         CREATE TABLE IF NOT EXISTS lcm_embedding_vectors (
             embedded_id TEXT,
-            embedding_model TEXT,
+            identity_hash TEXT,
             vec BLOB NOT NULL,
-            PRIMARY KEY(embedded_id, embedding_model)
+            PRIMARY KEY(embedded_id, identity_hash)
         );
         """
     )
@@ -737,12 +768,8 @@ def run_versioned_migrations(conn: sqlite3.Connection) -> None:
         mark_migration_step_complete(conn, "v5_message_conversation_id")
         current_version = 5
 
-    ensure_embedding_tables(conn)
-    if current_version < _EMBEDDING_MIGRATION_VERSION:
-        mark_migration_step_complete(
-            conn,
-            f"v{_EMBEDDING_MIGRATION_VERSION}_embeddings",
-        )
-        current_version = _EMBEDDING_MIGRATION_VERSION
-
+    # Embedding tables are intentionally NOT created here: they are an opt-in
+    # feature materialized lazily by VectorStore (recorded via the named
+    # ``embeddings_v1`` marker), so a disabled install stays at v5 with no
+    # embedding tables and the numeric counter is free for the temporal train.
     set_schema_version(conn, current_version)
