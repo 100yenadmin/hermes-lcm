@@ -300,6 +300,7 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("rollup_daily_target_tokens", "LCM_ROLLUP_DAILY_TARGET_TOKENS", int),
     _EnvFieldSpec("rollup_daily_max_tokens", "LCM_ROLLUP_DAILY_MAX_TOKENS", int),
     _EnvFieldSpec("rollup_aggregate_max_tokens", "LCM_ROLLUP_AGGREGATE_MAX_TOKENS", int),
+    _EnvFieldSpec("rollup_builds_per_pass", "LCM_ROLLUP_BUILDS_PER_PASS", int),
 )
 
 _PARSER_BY_TYPE = {
@@ -479,11 +480,12 @@ class LCMConfig:
     empty_lifecycle_gc_max_age_hours: float | None = 24.0
 
     # -- Temporal rollups ---
-    # Storage/config substrate only. No engine path reads these fields yet.
+    # Disabled by default; the engine's ingest/build hooks are flag-gated.
     temporal_rollups_enabled: bool = False
     rollup_daily_target_tokens: int = 5_000
     rollup_daily_max_tokens: int = 15_000
     rollup_aggregate_max_tokens: int = 20_000
+    rollup_builds_per_pass: int = 2
 
     # -- Diagnostics ---
     # Field-level provenance for values loaded through from_env(). Manual

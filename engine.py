@@ -76,6 +76,7 @@ from .runtime_identity import (
     _git_runtime_identity,
     _plugin_metadata,
 )
+from .rollup_builder import mark_stale_after_ingest, run_rollup_maintenance
 from .schemas import (
     LCM_DESCRIBE,
     LCM_DOCTOR,
@@ -1339,6 +1340,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     deleted,
                     self._config.empty_lifecycle_gc_threshold,
                 )
+        if self._config.temporal_rollups_enabled:
+            run_rollup_maintenance(
+                self._dag, self._config, session_id,
+                circuit_breaker=self._summary_circuit_breaker,
+                spend_guard=self._summary_spend_guard,
+            )
 
     def _register_active_engine_binding(self) -> None:
         session_id = str(self._session_id or "")
@@ -4120,13 +4127,15 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 active_replay_messages[absolute_idx] = active_message
 
         estimates = [count_message_tokens(m) for m in protected_messages]
-        self._store._append_protected_batch(
+        stored_ids = self._store._append_protected_batch(
             self._session_id,
             protected_messages,
             estimates,
             source=self._session_platform,
             conversation_id=self._conversation_id,
         )
+        if self._config.temporal_rollups_enabled:
+            mark_stale_after_ingest(self._dag, self._session_id, stored_ids)
         self._ingest_cursor = n
         self._compression_boundary_ingest_pending = False
         self._compression_boundary_active_placeholder_digest_budget = {}
