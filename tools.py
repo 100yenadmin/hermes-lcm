@@ -54,6 +54,10 @@ def _combined_result_sort_key(result: dict[str, Any], sort: str) -> tuple:
     rank_value = float(rank) if rank is not None else float("inf")
     directness = float(result.get("_sort_directness") or 0.0)
     type_bias = 0 if result.get("type") == "message" else 1
+    # BM25 ranks and payload byte offsets are incomparable. Keep the existing
+    # history ordering in tier 0; sidecars follow in tier 1 and use byte offset
+    # only as their native in-tier tie-break.
+    rank_tier = 1 if result.get("type") == "externalized" else 0
     role = result.get("role")
     if role == "user":
         role_bias = 0
@@ -67,13 +71,21 @@ def _combined_result_sort_key(result: dict[str, Any], sort: str) -> tuple:
     effective_directness = directness if result.get("type") == "message" else (directness * 0.8)
 
     if sort == "relevance":
-        return (rank_value, -effective_directness, role_bias, -sort_timestamp, type_bias)
+        return (rank_tier, rank_value, -effective_directness, role_bias, -sort_timestamp, type_bias)
 
     if sort == "hybrid":
         age_hours = max(0.0, (time.time() - sort_timestamp) / 3600.0)
         blended = rank_value / (1 + (age_hours * AGE_DECAY_RATE)) if rank is not None else float("inf")
         summary_override = int(result.get("_hybrid_summary_override") or 0)
-        return (-summary_override, blended, -effective_directness, role_bias, -sort_timestamp, type_bias)
+        return (
+            -summary_override,
+            rank_tier,
+            blended,
+            -effective_directness,
+            role_bias,
+            -sort_timestamp,
+            type_bias,
+        )
 
     if result.get("type") == "message":
         return (-sort_timestamp, type_bias, role_bias, rank_value, 0.0, float("inf"))
@@ -204,6 +216,7 @@ _LCM_GREP_VALID_SCOPES = frozenset({"current", "all", "session"})
 _LCM_GREP_VALID_CONTENT_SCOPES = frozenset({"history", "externalized", "both"})
 _LCM_GREP_HARD_LIMIT_CAP = 200
 _LCM_GREP_EXTERNALIZED_FILE_CAP = 256
+_LCM_GREP_EXTERNALIZED_DISCOVERY_CAP = 4096
 _LCM_GREP_EXTERNALIZED_CONTENT_BYTES = 512_000
 _LCM_GREP_RESPONSE_CHAR_CAP = 64_000
 _LCM_LOAD_SESSION_DEFAULT_LIMIT = 100
@@ -1254,25 +1267,53 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
             hermes_home=engine._hermes_home,
             create=False,
         )
-        if externalized_refs is None:
-            try:
-                candidate_refs = sorted(
-                    (path.name for path in storage_dir.iterdir() if path.name.endswith(".json")),
-                    reverse=True,
-                )[:_LCM_GREP_EXTERNALIZED_FILE_CAP]
-            except OSError:
-                candidate_refs = []
-        else:
-            candidate_refs = externalized_refs
-
         scan_counts = {
-            "candidate_files": len(candidate_refs),
+            "candidate_files": 0,
+            "discovery_files": 0,
+            "discovery_truncated": False,
             "scanned_files": 0,
             "matched_files": 0,
             "rejected_symlink": 0,
             "rejected_invalid_or_unreadable": 0,
             "rejected_session_mismatch": 0,
         }
+        if externalized_refs is None:
+            try:
+                discovered_refs = sorted(
+                    (path.name for path in storage_dir.iterdir() if path.name.endswith(".json")),
+                    reverse=True,
+                )
+            except OSError:
+                discovered_refs = []
+            # Directory enumeration is cheap, but metadata probes may stat/open
+            # files. Bound those probes separately, then cap owned candidates.
+            scan_counts["discovery_truncated"] = (
+                len(discovered_refs) > _LCM_GREP_EXTERNALIZED_DISCOVERY_CAP
+            )
+            candidate_refs = []
+            for ref in discovered_refs[:_LCM_GREP_EXTERNALIZED_DISCOVERY_CAP]:
+                scan_counts["discovery_files"] += 1
+                path = storage_dir / ref
+                if path.is_symlink():
+                    scan_counts["rejected_symlink"] += 1
+                    continue
+                metadata = _inspect_externalized_payload_metadata(
+                    engine,
+                    ref,
+                    engine.current_session_id,
+                )
+                if metadata.get("readable"):
+                    candidate_refs.append(ref)
+                    if len(candidate_refs) >= _LCM_GREP_EXTERNALIZED_FILE_CAP:
+                        break
+                elif metadata.get("error") == "session_mismatch":
+                    scan_counts["rejected_session_mismatch"] += 1
+                else:
+                    scan_counts["rejected_invalid_or_unreadable"] += 1
+        else:
+            candidate_refs = externalized_refs
+        scan_counts["candidate_files"] = len(candidate_refs)
+
         response_chars = 0
         for ref in candidate_refs:
             payload = read_externalized_payload_search_prefix(
@@ -1334,6 +1375,7 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
         externalized_scan = {
             **scan_counts,
             "file_limit": _LCM_GREP_EXTERNALIZED_FILE_CAP,
+            "discovery_limit": _LCM_GREP_EXTERNALIZED_DISCOVERY_CAP,
             "content_bytes_per_file": _LCM_GREP_EXTERNALIZED_CONTENT_BYTES,
             "response_char_limit": _LCM_GREP_RESPONSE_CHAR_CAP,
             "active_session_only": True,
