@@ -172,15 +172,16 @@ def test_apply_batches_records_correct_meta_and_is_idempotent(monkeypatch, tmp_p
     try:
         rows = conn.execute(
             """
-            SELECT embedded_kind, embedding_model, source_token_count
-            FROM lcm_embedding_meta
-            ORDER BY CAST(embedded_id AS INTEGER)
+            SELECT m.embedded_kind, p.model_name, p.provider, m.source_token_count
+            FROM lcm_embedding_meta m
+            JOIN lcm_embedding_profile p ON p.identity_hash = m.identity_hash
+            ORDER BY CAST(m.embedded_id AS INTEGER)
             """
         ).fetchall()
     finally:
         conn.close()
     assert rows == [
-        ("summary", "model-a", 100 + index) for index in range(35)
+        ("summary", "model-a", "ollama", 100 + index) for index in range(35)
     ]
 
     second = handle_lcm_command("embed backfill --apply", engine)
@@ -271,7 +272,9 @@ def test_transient_provider_error_skips_batch_and_continues(monkeypatch, tmp_pat
 
     result = handle_lcm_command("embed backfill --apply", engine)
 
-    assert "status: complete" in result
+    # A failed batch must NOT be reported as complete — the run only partially
+    # embedded the discovered work.
+    assert "status: partial" in result
     assert "embedded: 1" in result
     assert "failed: 32" in result
     assert "remaining: 32" in result
@@ -320,7 +323,7 @@ def test_fresh_claim_refuses_second_worker_but_stale_claim_is_overridden(
 
     refused = handle_lcm_command("embed backfill --apply", engine)
     assert "status: refused" in refused
-    assert "already running" in refused
+    assert "holds the lease" in refused
     assert provider.calls == []
 
     conn = sqlite3.connect(engine._store.db_path)
@@ -337,6 +340,112 @@ def test_fresh_claim_refuses_second_worker_but_stale_claim_is_overridden(
     assert "status: complete" in applied
     assert "embedded: 1" in applied
     assert _claim_value(engine) is None
+
+
+def test_apply_claims_before_discovery_and_skips_already_embedded(monkeypatch, tmp_path):
+    engine = _engine(tmp_path)
+    node_ids = _seed(engine, 3)
+    provider = FakeProvider()
+    monkeypatch.setattr(command_mod, "resolve_provider", lambda _config: provider)
+    # Another writer embeds the newest row before this run claims + discovers.
+    store = VectorStore(engine._store.db_path, config=engine._config)
+    try:
+        store.record_embedding(str(node_ids[-1]), "summary", "model-a", [1.0, 1.0])
+    finally:
+        store.close()
+
+    result = handle_lcm_command("embed backfill --apply", engine)
+
+    # Discovery runs AFTER the lease is claimed, so the already-embedded newest
+    # row is excluded rather than re-sent to the provider.
+    assert "selected: 2" in result
+    assert "embedded: 2" in result
+    sent = [doc for batch in provider.calls for doc in batch]
+    assert "summary-2" not in sent
+    assert set(_meta_ids(engine)) == {str(node_id) for node_id in node_ids}
+
+
+def test_heartbeat_lease_blocks_takeover_until_expiry(tmp_path):
+    db_path = tmp_path / "lease.db"
+    store = VectorStore(db_path)
+    try:
+        conn = store.connection
+        command_mod._ensure_inflight_table(conn)
+        lease = command_mod._acquire_embedding_backfill_lease(
+            conn, ttl_s=600.0, heartbeat_s=60.0, now=1_000.0
+        )
+        assert lease is not None
+        # A second worker cannot take a live lease within the TTL.
+        assert command_mod._acquire_embedding_backfill_lease(
+            conn, ttl_s=600.0, heartbeat_s=60.0, now=1_100.0
+        ) is None
+        # A heartbeat near the original expiry extends the lease.
+        assert lease.renew(now=1_590.0, force=True) is True
+        assert command_mod._acquire_embedding_backfill_lease(
+            conn, ttl_s=600.0, heartbeat_s=60.0, now=1_595.0
+        ) is None
+        # Only once the lease is truly expired (past last heartbeat + TTL) can a
+        # second worker steal it — and the original can no longer renew.
+        stolen = command_mod._acquire_embedding_backfill_lease(
+            conn, ttl_s=600.0, heartbeat_s=60.0, now=1_590.0 + 601.0
+        )
+        assert stolen is not None
+        assert lease.renew(now=1_590.0 + 602.0, force=True) is False
+    finally:
+        store.close()
+
+
+def test_inflight_row_is_reattempted_after_crash(monkeypatch, tmp_path):
+    engine = _engine(tmp_path)
+    node_ids = _seed(engine, 2)
+    provider = FakeProvider()
+
+    def crash(texts):
+        provider.calls.append(list(texts))
+        raise VoyageError("network", "provider crashed mid-batch")
+
+    provider.embed_documents = crash
+    monkeypatch.setattr(command_mod, "resolve_provider", lambda _config: provider)
+
+    first = handle_lcm_command("embed backfill --apply", engine)
+    # Nothing recorded; both rows are left marked in_flight.
+    assert "status: failed" in first
+    assert "embedded: 0" in first
+    assert "in_flight: 2" in first
+    assert _meta_ids(engine) == []
+
+    healthy = FakeProvider()
+    monkeypatch.setattr(command_mod, "resolve_provider", lambda _config: healthy)
+    second = handle_lcm_command("embed backfill --apply", engine)
+    # The in_flight rows are re-discovered and embedded; markers clear.
+    assert "status: complete" in second
+    assert "embedded: 2" in second
+    assert "in_flight: 0" in second
+    assert _meta_ids(engine) == [str(node_id) for node_id in node_ids]
+
+
+def test_operation_budget_stops_run_between_batches(monkeypatch, tmp_path):
+    engine = _engine(tmp_path)
+    _seed(engine, 40)
+    provider = FakeProvider()
+    monkeypatch.setattr(command_mod, "resolve_provider", lambda _config: provider)
+    monkeypatch.setenv("LCM_EMBEDDING_BACKFILL_BUDGET_S", "1")
+
+    calls = {"n": 0}
+
+    def fake_monotonic():
+        calls["n"] += 1
+        # First call is the run start; every later call is well past the budget.
+        return 0.0 if calls["n"] == 1 else 1_000.0
+
+    monkeypatch.setattr(command_mod.time, "monotonic", fake_monotonic)
+
+    result = handle_lcm_command("embed backfill --apply", engine)
+
+    assert "stop_reason: op_budget_exhausted" in result
+    assert "status: partial" in result
+    assert "embedded: 0" in result
+    assert provider.calls == []
 
 
 def test_disabled_and_missing_profile_refuse_cleanly(tmp_path):
