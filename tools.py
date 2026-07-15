@@ -1231,7 +1231,7 @@ def _bounded_recent_json(response: dict[str, Any], sections: list[dict[str, Any]
 
 
 def lcm_recent(args: Dict[str, Any], **kwargs) -> str:
-    """Serve ready temporal rollups or transparently fall back to leaf summaries."""
+    """Serve conversation rollups or fall back; cross-session rollups are future work."""
     engine = _require_engine(kwargs)
     if engine is None:
         return json.dumps({"error": "LCM engine not initialized"})
@@ -1242,8 +1242,8 @@ def lcm_recent(args: Dict[str, Any], **kwargs) -> str:
         return json.dumps({"error": str(exc)})
 
     requested_scope = str(args.get("scope", "conversation")).strip().lower()
-    if requested_scope not in {"conversation", "global"}:
-        return json.dumps({"error": "scope must be one of: conversation, global"})
+    if requested_scope != "conversation":
+        return json.dumps({"error": "scope must be one of: conversation"})
 
     parsed_limit, limit_error = _parse_strict_int(
         args.get("limit", _LCM_RECENT_DEFAULT_LIMIT),
@@ -1256,7 +1256,7 @@ def lcm_recent(args: Dict[str, Any], **kwargs) -> str:
     requested_limit = parsed_limit
     limit = min(requested_limit, _LCM_RECENT_HARD_LIMIT_CAP)
 
-    rollup_scope = engine.current_session_id if requested_scope == "conversation" else "global"
+    rollup_scope = engine.current_session_id
     rollups, fallback_reason = _recent_ready_rollups(engine, window, rollup_scope)
     fallback = not rollups
     if fallback:

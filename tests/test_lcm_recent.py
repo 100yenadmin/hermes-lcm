@@ -10,11 +10,16 @@ from hermes_lcm.config import LCMConfig
 from hermes_lcm.dag import SummaryDAG, SummaryNode
 from hermes_lcm.rollup_periods import parse_recent_period
 from hermes_lcm.rollup_store import RollupStore
+from hermes_lcm.schemas import LCM_RECENT
 from hermes_lcm.tokens import count_tokens
 from hermes_lcm.tools import lcm_recent
 
 
 NOW = datetime(2026, 7, 15, 15, 30, tzinfo=timezone.utc)
+
+
+def test_lcm_recent_schema_advertises_conversation_scope_only():
+    assert LCM_RECENT["parameters"]["properties"]["scope"]["enum"] == ["conversation"]
 
 
 @pytest.mark.parametrize(
@@ -197,18 +202,18 @@ def test_lcm_recent_limit_order_and_response_char_bound(recent_parts):
     assert result["truncated"] is True
 
 
-def test_lcm_recent_global_scope_uses_global_rollup_and_reports_clamped_limit(recent_parts):
+def test_lcm_recent_conversation_scope_reports_clamped_limit(recent_parts):
     engine, store = recent_parts
-    rollup_id = _ready(store, "day", "2026-07-15", "global")
+    rollup_id = _ready(store, "day", "2026-07-15", engine.current_session_id)
 
     result = json.loads(
         lcm_recent(
-            {"period": "date:2026-07-15", "scope": "global", "limit": 500},
+            {"period": "date:2026-07-15", "scope": "conversation", "limit": 500},
             engine=engine,
         )
     )
 
-    assert result["scope"] == "global"
+    assert result["scope"] == "conversation"
     assert result["limit"] == 200
     assert result["limit_clamped_from"] == 500
     assert result["provenance"]["rollups"][0]["rollup_id"] == rollup_id
@@ -219,6 +224,7 @@ def test_lcm_recent_global_scope_uses_global_rollup_and_reports_clamped_limit(re
     [
         ({}, "period is required"),
         ({"period": "today", "scope": "workspace"}, "scope must be one of"),
+        ({"period": "today", "scope": "global"}, "scope must be one of"),
         ({"period": "today", "limit": 0}, "limit must be a positive integer"),
         ({"period": "today", "limit": True}, "limit must be an integer"),
     ],
