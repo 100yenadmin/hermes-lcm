@@ -62,7 +62,7 @@ def _voyage_success(count: int, dim: int = 3) -> HttpResponse:
 
 
 def test_voyage_batch_bin_packing_boundary(monkeypatch):
-    token_counts = {"a": 27_000, "b": 27_000, "c": 26_000, "d": 1}
+    token_counts = {"a": 24_000, "b": 24_000, "c": 24_000, "d": 1}
     monkeypatch.setattr(provider_mod, "count_tokens", token_counts.__getitem__)
     monkeypatch.setenv("VOYAGE_API_KEY", "test-key")
     transport = FakeTransport(_voyage_success(3), _voyage_success(1))
@@ -82,7 +82,7 @@ def test_voyage_over_cap_document_is_skipped_and_reported(monkeypatch, caplog):
     monkeypatch.setattr(
         provider_mod,
         "count_tokens",
-        lambda text: 27_001 if text == "too large" else 2,
+        lambda text: 24_301 if text == "too large" else 2,
     )
     monkeypatch.setenv("VOYAGE_API_KEY", "test-key")
     transport = FakeTransport(_voyage_success(1))
@@ -166,7 +166,9 @@ def test_voyage_4xx_is_classified_without_retry(monkeypatch, status, kind):
 def test_voyage_error_logging_scrubs_echoed_inputs(monkeypatch, caplog):
     monkeypatch.setenv("VOYAGE_API_KEY", "test-key")
     body = {
-        "error": "invalid request",
+        "error": {"kind": "invalid_request", "message": "secret error content"},
+        "detail": "private detail content",
+        "msg": "private message content",
         "input": "private prompt",
         "nested": {"texts": ["secret text"], "documents": ["secret doc"]},
     }
@@ -175,11 +177,45 @@ def test_voyage_error_logging_scrubs_echoed_inputs(monkeypatch, caplog):
     with caplog.at_level(logging.WARNING), pytest.raises(VoyageError):
         provider.embed_query("question")
 
-    assert "invalid request" in caplog.text
-    assert "private prompt" not in caplog.text
-    assert "secret text" not in caplog.text
-    assert "secret doc" not in caplog.text
+    for private_text in (
+        "secret error content",
+        "private detail content",
+        "private message content",
+        "private prompt",
+        "secret text",
+        "secret doc",
+    ):
+        assert private_text not in caplog.text
+    assert "status=400" in caplog.text
     assert "REDACTED" in caplog.text
+
+
+def test_interactive_http_calls_use_one_attempt_and_explicit_timeout(monkeypatch):
+    monkeypatch.setenv("VOYAGE_API_KEY", "test-key")
+    voyage_transport = FakeTransport(OSError("offline"), _voyage_success(1))
+    voyage = VoyageProvider(
+        "voyage-test",
+        transport=voyage_transport,
+        sleeper=lambda _delay: None,
+    )
+
+    with pytest.raises(VoyageError, match="network"):
+        voyage.embed_query_interactive("question", timeout=0.125)
+
+    assert len(voyage_transport.calls) == 1
+    assert voyage_transport.calls[0]["timeout"] == pytest.approx(0.125)
+
+    ollama_transport = FakeTransport(OSError("offline"), _response(200, {}))
+    ollama = OllamaProvider(
+        "model",
+        transport=ollama_transport,
+        sleeper=lambda _delay: None,
+    )
+    with pytest.raises(EmbeddingProviderError, match="network"):
+        ollama.embed_query_interactive("question", timeout=0.25)
+
+    assert len(ollama_transport.calls) == 1
+    assert ollama_transport.calls[0]["timeout"] == pytest.approx(0.25)
 
 
 def test_voyage_network_errors_are_classified(monkeypatch):
