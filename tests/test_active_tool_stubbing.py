@@ -3,6 +3,7 @@
 import json
 import time
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
@@ -67,6 +68,20 @@ def assembled_tool(result, call_id):
         for message in result
         if message.get("role") == "tool" and message.get("tool_call_id") == call_id
     )
+
+
+def externalized_raw_cleanup_messages():
+    original = [{"role": "user", "content": "large raw payload"}]
+    cleanup = [
+        {
+            "role": "user",
+            "content": (
+                "[Externalized payload: kind=raw_payload; role=user; "
+                "chars=17; bytes=17; ref=raw-payload.json]"
+            ),
+        }
+    ]
+    return original, cleanup
 
 
 def test_active_stubbing_is_default_off(tmp_path):
@@ -349,6 +364,72 @@ def test_live_stub_adoption_outranks_compression_boundary_cooldown(make_engine):
     assert recovered["content"] == payload
     assert engine._dag.get_session_node_count(engine._session_id) == 0
     assert engine.last_compression_status == "sanitized"
+
+
+def test_flag_off_plain_preflight_cooldown_blocks_threshold_and_overflow(make_engine):
+    engine = make_engine(
+        large_output_active_replay_stubbing_enabled=False,
+        max_assembly_tokens=10,
+    )
+    engine.threshold_tokens = 1
+    engine._last_boundary_skip_time = time.time()
+    messages = [{"role": "user", "content": "plain branch pressure " * 100}]
+
+    assert engine._should_force_overflow_recovery(messages=messages) is True
+    assert engine.should_compress_preflight(messages) is False
+
+
+def test_flag_off_replay_cleanup_preflight_outranks_boundary_cooldown(
+    make_engine,
+    monkeypatch,
+):
+    engine = make_engine(large_output_active_replay_stubbing_enabled=False)
+    engine.threshold_tokens = 100_000
+    engine._last_boundary_skip_time = time.time()
+    messages, cleanup_messages = externalized_raw_cleanup_messages()
+    monkeypatch.setattr(engine, "_ingest_messages", lambda _messages: cleanup_messages)
+
+    assert engine.should_compress_preflight(messages) is True
+    assert engine._preflight_cleanup_only_due_to_boundary_cooldown is True
+
+
+def test_flag_off_replay_cleanup_cooldown_publishes_without_summary_llm(
+    make_engine,
+    monkeypatch,
+):
+    engine = make_engine(large_output_active_replay_stubbing_enabled=False)
+    engine.threshold_tokens = 100_000
+    engine._last_boundary_skip_time = time.time()
+    messages, cleanup_messages = externalized_raw_cleanup_messages()
+    monkeypatch.setattr(engine, "_ingest_messages", lambda _messages: cleanup_messages)
+    summary_spy = Mock(
+        side_effect=AssertionError("cooldown-limited replay cleanup must not summarize")
+    )
+    monkeypatch.setattr(lcm_engine, "summarize_with_escalation", summary_spy)
+
+    assert engine.should_compress_preflight(messages) is True
+    result = engine.compress(messages, current_tokens=1_000)
+
+    assert result == cleanup_messages
+    assert engine.last_compression_status == "sanitized"
+    assert engine._dag.get_session_node_count(engine._session_id) == 0
+    summary_spy.assert_not_called()
+
+
+def test_flag_off_noncleanup_replay_diff_remains_blocked_during_cooldown(
+    make_engine,
+    monkeypatch,
+):
+    engine = make_engine(large_output_active_replay_stubbing_enabled=False)
+    engine.threshold_tokens = 1
+    engine._last_boundary_skip_time = time.time()
+    messages = [{"role": "user", "content": "original visible payload"}]
+    replay_messages = [{"role": "user", "content": "normalized visible payload"}]
+    monkeypatch.setattr(engine, "_ingest_messages", lambda _messages: replay_messages)
+
+    assert engine._replay_diff_requests_ingest_cleanup(messages, replay_messages) is False
+    assert engine._should_force_overflow_recovery(messages=replay_messages) is False
+    assert engine.should_compress_preflight(messages) is False
 
 
 def test_live_stub_cooldown_adoption_skips_eligible_leaf_work(make_engine, monkeypatch):
