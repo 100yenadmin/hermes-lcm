@@ -4,6 +4,8 @@ import importlib.util
 import json
 from pathlib import Path
 
+import pytest
+
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.externalize import get_large_output_storage_dir
 from hermes_lcm.store import MessageStore
@@ -101,6 +103,21 @@ def test_media_shaped_tool_rows_are_skipped(tmp_path):
     assert result["counts"]["created"] == 0
 
 
+def test_dry_run_counts_already_externalized_rows(tmp_path):
+    module = _load_script()
+    placeholder = (
+        "[Externalized tool output: tool_call_id=call-private-with-a-long-identifier; "
+        "chars=1200; bytes=1200; ref=tool-result.json]"
+    )
+    home, database, config, _ = _seed(tmp_path, content=placeholder)
+
+    result = _run_backfill(module, home, database, config, tmp_path / "externalized.json", apply=False)
+
+    assert result["counts"]["skipped_externalized"] == 1
+    assert result["counts"]["eligible"] == 0
+    assert result["items"] == []
+
+
 def test_rollback_dry_run_then_apply_deletes_only_manifest_owned_sidecar(tmp_path):
     module = _load_script()
     home, database, config, _ = _seed(tmp_path)
@@ -127,7 +144,156 @@ def test_rollback_dry_run_then_apply_deletes_only_manifest_owned_sidecar(tmp_pat
     assert dry_run["counts"]["eligible"] == 1
     assert dry_run["counts"]["deleted"] == 0
     assert applied["counts"]["deleted"] == 1
+    assert applied["counts"]["succeeded"] == 1
+    assert applied["counts"]["failed"] == 0
+    assert applied["counts"]["skipped"] == 0
+    assert applied["failed_paths"] == []
     assert not sidecar.exists()
+
+
+def test_rollback_skips_invalid_ref(tmp_path):
+    module = _load_script()
+    home, database, config, _ = _seed(tmp_path)
+    manifest = tmp_path / "apply.json"
+    _run_backfill(module, home, database, config, manifest, apply=True)
+    source = json.loads(manifest.read_text(encoding="utf-8"))
+    source["items"][0]["ref"] = "../outside.json"
+    manifest.write_text(json.dumps(source), encoding="utf-8")
+
+    result = module.run_rollback(
+        database_path=database,
+        hermes_home=home,
+        source_manifest_path=manifest,
+        apply=True,
+        config=config,
+    )
+
+    assert result["counts"]["skipped_invalid_ref"] == 1
+    assert result["counts"]["skipped"] == 1
+
+
+def test_rollback_skips_missing_sidecar(tmp_path):
+    module = _load_script()
+    home, database, config, _ = _seed(tmp_path)
+    manifest = tmp_path / "apply.json"
+    _run_backfill(module, home, database, config, manifest, apply=True)
+    ref = json.loads(manifest.read_text(encoding="utf-8"))["items"][0]["ref"]
+    sidecar = get_large_output_storage_dir(config, hermes_home=str(home), create=False) / ref
+    sidecar.unlink()
+
+    result = module.run_rollback(
+        database_path=database,
+        hermes_home=home,
+        source_manifest_path=manifest,
+        apply=True,
+        config=config,
+    )
+
+    assert result["counts"]["skipped_missing"] == 1
+    assert result["counts"]["skipped"] == 1
+
+
+def test_rollback_skips_symlink(tmp_path):
+    module = _load_script()
+    home, database, config, _ = _seed(tmp_path)
+    manifest = tmp_path / "apply.json"
+    _run_backfill(module, home, database, config, manifest, apply=True)
+    ref = json.loads(manifest.read_text(encoding="utf-8"))["items"][0]["ref"]
+    sidecar = get_large_output_storage_dir(config, hermes_home=str(home), create=False) / ref
+    target = tmp_path / "sidecar-target.json"
+    sidecar.replace(target)
+    sidecar.symlink_to(target)
+
+    result = module.run_rollback(
+        database_path=database,
+        hermes_home=home,
+        source_manifest_path=manifest,
+        apply=True,
+        config=config,
+    )
+
+    assert result["counts"]["skipped_symlink"] == 1
+    assert result["counts"]["skipped"] == 1
+    assert sidecar.is_symlink()
+
+
+def test_rollback_rejects_non_schema_v1_manifest(tmp_path):
+    module = _load_script()
+    home, database, config, _ = _seed(tmp_path)
+    manifest = tmp_path / "invalid-schema.json"
+    manifest.write_text(json.dumps({"schema_version": 2, "applied": True}), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="applied schema-v1"):
+        module.run_rollback(
+            database_path=database,
+            hermes_home=home,
+            source_manifest_path=manifest,
+            apply=True,
+            config=config,
+        )
+
+
+def test_rollback_rejects_non_applied_source_manifest(tmp_path):
+    module = _load_script()
+    home, database, config, _ = _seed(tmp_path)
+    manifest = tmp_path / "dry-run.json"
+    _run_backfill(module, home, database, config, manifest, apply=False)
+
+    with pytest.raises(ValueError, match="applied schema-v1"):
+        module.run_rollback(
+            database_path=database,
+            hermes_home=home,
+            source_manifest_path=manifest,
+            apply=True,
+            config=config,
+        )
+
+
+def test_rollback_reports_partial_failure_and_continues(tmp_path, monkeypatch, capsys):
+    module = _load_script()
+    home, database, config, _ = _seed(tmp_path, content="first historical output " * 100)
+    store = MessageStore(database, ingest_protection_config=config, hermes_home=str(home))
+    store.append(
+        "session-private",
+        {"role": "tool", "tool_call_id": "call-second", "content": "second historical output " * 100},
+    )
+    store.close()
+    manifest = tmp_path / "apply.json"
+    _run_backfill(module, home, database, config, manifest, apply=True)
+    refs = [item["ref"] for item in json.loads(manifest.read_text(encoding="utf-8"))["items"]]
+    storage_dir = get_large_output_storage_dir(config, hermes_home=str(home), create=False)
+    failed_path = storage_dir / refs[0]
+    succeeded_path = storage_dir / refs[1]
+    original_unlink = Path.unlink
+
+    def fail_one_unlink(path, *args, **kwargs):
+        if path == failed_path:
+            raise OSError("simulated unlink failure")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_one_unlink)
+
+    exit_code = module.main(
+        [
+            "--database",
+            str(database),
+            "--hermes-home",
+            str(home),
+            "--rollback",
+            str(manifest),
+            "--apply",
+        ]
+    )
+    result = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 1
+    assert result["counts"]["eligible"] == 2
+    assert result["counts"]["succeeded"] == 1
+    assert result["counts"]["failed"] == 1
+    assert result["counts"]["skipped"] == 0
+    assert result["failed_paths"] == [str(failed_path)]
+    assert failed_path.exists()
+    assert not succeeded_path.exists()
 
 
 def test_rollback_refuses_referenced_sidecar(tmp_path):
