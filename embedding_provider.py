@@ -1131,8 +1131,17 @@ class FastembedProvider(_ResilientProvider):
         return self._embed((str(text),), query=True)[0]
 
 
-def resolve_provider(config: LCMConfig) -> EmbeddingProvider | None:
-    """Resolve inert embedding config without making provider calls."""
+def resolve_provider(
+    config: LCMConfig, *, for_backfill: bool = False
+) -> EmbeddingProvider | None:
+    """Resolve inert embedding config without making provider calls.
+
+    ``for_backfill`` bypasses the interactive per-minute spend guard: bulk
+    ``lcm embed backfill --apply`` embeds thousands of documents (e.g. ~1920
+    docs at batch 32 → ~60 provider calls) and would otherwise trip the 60/min
+    guard mid-run and stall. The backfill worker has its own op budget + lease,
+    so the guard is redundant there; interactive query embedding keeps it.
+    """
     provider = str(getattr(config, "embedding_provider", "") or "").strip().lower()
     model = str(getattr(config, "embedding_model", "") or "").strip()
     if not provider and not model:
@@ -1141,11 +1150,15 @@ def resolve_provider(config: LCMConfig) -> EmbeddingProvider | None:
         raise ProviderUnavailable(
             "LCM_EMBEDDING_PROVIDER and LCM_EMBEDDING_MODEL must both be set"
         )
+    # max_calls=0 disables the sliding-window guard (allows() always True,
+    # record_call() a no-op); the circuit breaker still trips on failures.
+    spend_guard = EmbeddingSpendGuard(max_calls=0) if for_backfill else None
     timeout = float(getattr(config, "embedding_query_timeout_s", 3.0))
     if provider in {"voyage", "voyageai"}:
         return VoyageProvider(
             model,
             timeout=timeout,
+            spend_guard=spend_guard,
             max_batch_items=int(
                 getattr(config, "embedding_max_batch_items", _VOYAGE_MAX_BATCH_ITEMS)
             ),
@@ -1155,9 +1168,12 @@ def resolve_provider(config: LCMConfig) -> EmbeddingProvider | None:
             model,
             base_url=getattr(config, "ollama_base_url", "http://localhost:11434"),
             timeout=timeout,
+            spend_guard=spend_guard,
         )
     if provider in {"fastembed", "fast-embed"}:
-        return FastembedProvider(model, timeout=timeout)
+        return FastembedProvider(
+            model, timeout=timeout, spend_guard=spend_guard
+        )
     raise ProviderUnavailable(
         f"Unsupported embedding provider {provider!r}; use voyage, ollama, or fastembed"
     )

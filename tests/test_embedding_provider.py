@@ -475,6 +475,24 @@ def test_resolve_provider_strings_and_dormant_defaults(monkeypatch):
         resolve_provider(config)
 
 
+def test_resolve_provider_for_backfill_bypasses_spend_guard():
+    config = LCMConfig(embedding_provider="ollama", embedding_model="model-x")
+
+    interactive = resolve_provider(config)
+    assert interactive.spend_guard.max_calls > 0
+
+    backfill = resolve_provider(config, for_backfill=True)
+    # A disabled (max_calls=0) guard never blocks, so a bulk backfill of many
+    # batches cannot trip the interactive per-minute guard mid-run.
+    assert backfill.spend_guard.max_calls == 0
+    for _ in range(interactive.spend_guard.max_calls + 5):
+        backfill.spend_guard.record_call()
+    assert backfill.spend_guard.allows() is True
+
+    # The circuit breaker is untouched — only the spend guard is relaxed.
+    assert backfill.breaker.allows() is True
+
+
 def test_embedding_config_defaults_and_environment(monkeypatch):
     defaults = LCMConfig()
     assert defaults.embedding_provider == ""

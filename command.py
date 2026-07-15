@@ -2302,7 +2302,10 @@ def _embedding_backfill_text(tokens: list[str], engine) -> str:
             for row in rows
         ]
 
-        provider = resolve_provider(engine._config)
+        # Bulk backfill bypasses the interactive per-minute spend guard (it has
+        # its own op budget + lease); otherwise a large --apply run trips the
+        # 60/min guard mid-way and stalls.
+        provider = resolve_provider(engine._config, for_backfill=True)
         if provider is None:
             error = "embedding provider is not configured; run `/lcm embed warmup`"
         elif (
