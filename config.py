@@ -301,6 +301,7 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("rollup_daily_max_tokens", "LCM_ROLLUP_DAILY_MAX_TOKENS", int),
     _EnvFieldSpec("rollup_aggregate_max_tokens", "LCM_ROLLUP_AGGREGATE_MAX_TOKENS", int),
     _EnvFieldSpec("rollup_builds_per_pass", "LCM_ROLLUP_BUILDS_PER_PASS", int),
+    _EnvFieldSpec("rollup_maintenance_budget_ms", "LCM_ROLLUP_MAINTENANCE_BUDGET_MS", int),
 )
 
 _PARSER_BY_TYPE = {
@@ -486,6 +487,9 @@ class LCMConfig:
     rollup_daily_max_tokens: int = 15_000
     rollup_aggregate_max_tokens: int = 20_000
     rollup_builds_per_pass: int = 2
+    # Best-effort wall-clock budget checked between builds. A slow summarizer
+    # may finish its current build and leave later rollups lagging until a future pass.
+    rollup_maintenance_budget_ms: int = 5_000
 
     # -- Diagnostics ---
     # Field-level provenance for values loaded through from_env(). Manual

@@ -9,7 +9,13 @@ import hermes_lcm.rollup_builder as builder_module
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.dag import SummaryDAG, SummaryNode
 from hermes_lcm.engine import LCMEngine
-from hermes_lcm.rollup_builder import build_day, build_month, build_week
+from hermes_lcm.rollup_builder import (
+    _PENDING_ROLLUPS_SQL,
+    build_day,
+    build_month,
+    build_week,
+    run_rollup_maintenance,
+)
 from hermes_lcm.rollup_store import RollupStore
 from hermes_lcm.tokens import count_tokens
 
@@ -315,6 +321,122 @@ def test_ingest_staleness_cascade_and_bounded_bind_maintenance(tmp_path, monkeyp
         engine.shutdown()
 
 
+def test_never_built_stale_day_is_automatically_built(rollup_parts, monkeypatch):
+    store, dag, config = rollup_parts
+    scope = "session-never-built"
+    target_day = date(2026, 7, 15)
+    _add_node(dag, scope, target_day, "source for first automatic build")
+    store.mark_stale_for_day(target_day, scope)
+    config.rollup_builds_per_pass = 1
+    monkeypatch.setattr(
+        builder_module,
+        "summarize_with_escalation",
+        lambda _text, **_kwargs: ("first daily rollup", 1),
+    )
+
+    assert run_rollup_maintenance(dag, config, scope) == 1
+    assert store.get_rollup("day", target_day.isoformat(), scope)["status"] == "ready"
+
+
+def test_failed_rollup_retry_honors_backoff(rollup_parts, monkeypatch):
+    store, dag, config = rollup_parts
+    scope = "session-retry"
+    old_day = date(2026, 7, 14)
+    recent_day = date(2026, 7, 15)
+    _add_node(dag, scope, old_day, "old failed source")
+    _add_node(dag, scope, recent_day, "recent failed source")
+    old_id = store.upsert_building("day", old_day.isoformat(), scope)
+    recent_id = store.upsert_building("day", recent_day.isoformat(), scope)
+    store.mark_failed(old_id, "old failure")
+    store.mark_failed(recent_id, "recent failure")
+    store.connection.execute(
+        "UPDATE lcm_rollups SET built_at = ? WHERE rollup_id = ?",
+        ("2026-07-15T00:00:00+00:00", old_id),
+    )
+    store.connection.commit()
+    config.rollup_builds_per_pass = 5
+    monkeypatch.setattr(
+        builder_module,
+        "summarize_with_escalation",
+        lambda _text, **_kwargs: ("retried daily", 1),
+    )
+
+    assert run_rollup_maintenance(dag, config, scope) == 1
+    assert store.get_rollup("day", old_day.isoformat(), scope)["status"] == "ready"
+    assert store.get_rollup("day", recent_day.isoformat(), scope)["status"] == "failed"
+
+
+def test_maintenance_budget_stops_before_starting_next_build(rollup_parts, monkeypatch):
+    store, dag, config = rollup_parts
+    scope = "session-budget-stop"
+    for offset in range(2):
+        target_day = date(2026, 7, 14) + timedelta(days=offset)
+        _add_node(dag, scope, target_day, f"source {offset}")
+        store.mark_stale_for_day(target_day, scope)
+    config.rollup_builds_per_pass = 2
+    config.rollup_maintenance_budget_ms = 5
+    times = iter((0.0, 0.001, 0.006))
+    monkeypatch.setattr(builder_module, "monotonic", lambda: next(times))
+    monkeypatch.setattr(
+        builder_module,
+        "summarize_with_escalation",
+        lambda _text, **_kwargs: ("budgeted daily", 1),
+    )
+
+    assert run_rollup_maintenance(dag, config, scope) == 1
+    statuses = [
+        store.get_rollup("day", (date(2026, 7, 14) + timedelta(days=offset)).isoformat(), scope)["status"]
+        for offset in range(2)
+    ]
+    assert statuses == ["ready", "stale"]
+
+
+def test_pending_maintenance_query_uses_partial_index(rollup_parts):
+    store, _dag, _config = rollup_parts
+    store.mark_stale_for_day("2026-07-15", "query-plan")
+
+    plan = store.connection.execute(
+        "EXPLAIN QUERY PLAN " + _PENDING_ROLLUPS_SQL,
+        ("query-plan", "2026-07-15T00:00:00+00:00", 2),
+    ).fetchall()
+
+    assert any("idx_lcm_rollups_pending" in str(row[3]) for row in plan)
+
+
+def test_session_reset_stales_rollups_referencing_deleted_nodes(tmp_path):
+    db_path = tmp_path / "reset-rollups.db"
+    config = LCMConfig(
+        database_path=str(db_path),
+        temporal_rollups_enabled=True,
+        new_session_retain_depth=0,
+    )
+    engine = LCMEngine(config=config)
+    scope = "reset-session"
+    try:
+        engine.on_session_start(scope, conversation_id="reset-conversation")
+        node_id = _add_node(engine._dag, scope, date(2026, 7, 15), "deleted source")
+        store = RollupStore(db_path)
+        try:
+            _ready(
+                store,
+                "day",
+                "2026-07-15",
+                scope,
+                summary="summary referencing deleted node",
+                source_ids=[node_id],
+                fingerprint="deleted-node",
+            )
+
+            engine.on_session_reset()
+
+            assert engine._dag.get_session_nodes(scope) == []
+            assert store.get_rollup("day", "2026-07-15", scope)["status"] == "stale"
+        finally:
+            store.close()
+    finally:
+        engine.shutdown()
+
+
 def test_flag_off_skips_both_engine_hook_helpers(tmp_path, monkeypatch):
     config = LCMConfig(
         database_path=str(tmp_path / "flag-off.db"),
@@ -342,7 +464,10 @@ def test_flag_off_skips_both_engine_hook_helpers(tmp_path, monkeypatch):
 
 def test_rollup_builds_per_pass_config_default_and_environment(monkeypatch):
     assert LCMConfig().rollup_builds_per_pass == 2
+    assert LCMConfig().rollup_maintenance_budget_ms == 5_000
 
     monkeypatch.setenv("LCM_ROLLUP_BUILDS_PER_PASS", "5")
+    monkeypatch.setenv("LCM_ROLLUP_MAINTENANCE_BUDGET_MS", "750")
 
     assert LCMConfig.from_env().rollup_builds_per_pass == 5
+    assert LCMConfig.from_env().rollup_maintenance_budget_ms == 750
