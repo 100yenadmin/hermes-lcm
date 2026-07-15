@@ -1,58 +1,70 @@
-# Pack A / PR-1 outcome
+# Pack A / PR-3 outcome
 
 ## Result
 
-Implemented the temporal-rollup storage substrate with no engine, compaction,
-builder, or tool wiring. The new config flag remains off by default, and no
-runtime path constructs or calls `RollupStore`.
+Implemented the agent-facing `lcm_recent` retrieval tool on
+`feat/temporal-lcm-recent`. Natural periods are parsed into UTC `[start, end)`
+windows; ready day/week/month rollups are served newest-first; and missing,
+stale, disabled, or sub-day rollup paths transparently fall back to existing
+depth-0 summary nodes in the same window. Serving is bounded, read-only, and
+makes no LLM calls.
 
 ## File map
 
-- `db_bootstrap.py:30` bumps `SCHEMA_VERSION` from 5 to 6.
-- `db_bootstrap.py:272-306` creates `lcm_rollups`, the partial ready-period
-  index, `lcm_rollup_sources`, and `lcm_rollup_state` idempotently.
-- `db_bootstrap.py:740-745` installs and records `v6_temporal_rollups` through
-  the shared migration runner.
-- `rollup_store.py:27-299` adds connection/bootstrap handling, locked-write
-  diagnostics, transactional CRUD/state transitions, day-to-week/month
-  staleness, window reads, cursor state, source replacement, and app-level
-  source purge integrity.
-- `config.py:299-302` maps the four new `LCM_*` environment variables.
-- `config.py:481-486` adds the inert/default-off `LCMConfig` fields.
-- `tests/test_rollup_store.py:52-333` adds 12 tests for migration idempotency,
-  v5 upgrade, newer-version refusal, CRUD/rebuild, app-level source integrity,
-  inclusive scoped reads, staleness cascade, uniqueness, cursors, purge, and
-  config defaults/environment overrides.
-- `tests/test_lcm_core.py:26-30,1697,1746,2714,3294,3346` replaces five stale
-  schema-version-5 literals with the shared `SCHEMA_VERSION` constant required
-  by the mandated v6 bump.
+- `rollup_periods.py` adds the table-driven natural-time parser for `today`,
+  `yesterday`, `Nd`, `week`, `month`, `date:YYYY-MM-DD`, and `last Nh`, including
+  clean validation for invalid and out-of-range inputs.
+- `tools.py` adds ready-rollup selection through
+  `RollupStore.ready_rollups_for_window`, stale detection, the time-bounded
+  leaf-summary fallback, provenance, stable newest-first sections, limit
+  clamping, per-rollup token lines, and the shared 20,000-character response
+  ceiling.
+- `schemas.py` declares the required `period` argument plus `conversation` and
+  `global` scopes.
+- `engine.py`, `__init__.py`, and `plugin.yaml` add only the public-tool
+  import/list/dispatch/registration plumbing needed to make the new handler
+  agent-facing. No engine lifecycle, compaction, builder, or `/lcm` behavior
+  changed.
+- `README.md` and `docs/retrieval-tools.md` document the tool, three usage
+  examples, UTC semantics, provenance, and transparent degradation behavior.
+- `tests/test_lcm_recent.py` covers every period form, invalid inputs,
+  ready/stale/disabled/sub-day modes, empty windows, scope, limit/order/character
+  bounds, and provenance. Existing registration contract fixtures were updated
+  for the new public tool.
 
 ## Acceptance
 
-- `pytest -q tests/test_rollup_store.py`: **12 passed**.
-- Full pytest through the repository's host-stub harness: **1618 passed, 1
-  skipped, 12 xfailed, 3 failed**. The same three failures reproduce on the
-  untouched `/Volumes/LEXAR/repos/hermes-lcm-upstream-ro` at `31675c6` (**1606
-  passed, 1 skipped, 12 xfailed, 3 failed**):
+- Focused `lcm_recent` plus public registration/packaging contracts: **66
+  passed**.
+- `ruff check .`: **clean**.
+- `git diff --check`: **clean**.
+- Full pytest through the repository host-stub harness: **1652 passed, 1
+  skipped, 12 xfailed, 3 failed**. An isolated-`HOME` run on untouched
+  `/Volumes/LEXAR/repos/hermes-lcm-upstream-ro` at `31675c6` reports **1606
+  passed, 1 skipped, 12 xfailed, 3 failed**, with the exact same failures:
   - `TestEngineABC::test_positive_preflight_clears_prior_noop_status`
   - `test_path_containment_within_allowed_base`
   - `test_configured_externalization_path_inside_allowed_base_accepted`
-- `ruff check .`: **clean**.
 - `PYTHON=python3 scripts/validate_release.sh --full --keep-going --output
-  /tmp/validate-a1.log`: all compile, shell, diff, focused pytest (**409
-  passed**), benchmark, smoke-stress, and release-stress gates passed. Full and
-  low-FD pytest each reported only the same three approved baseline failures
-  (**1618 passed, 1 skipped, 12 xfailed, 3 failed**); the low-FD gate completed
-  normally and did not wedge. The validator exits 1 because it does not encode
-  the dispatch's macOS baseline exception. Checklist:
-  `/tmp/validate-a1.log/validation-checklist.md`.
+  /Volumes/LEXAR/Codex/hermes-lcm-temporal-pr3/validate-release`: compile,
+  shell, diff, focused pytest (**409 passed**), benchmark smoke, stress smoke,
+  and release stress all passed. Full and low-FD pytest each reported only the
+  same three approved baseline failures (**1652 passed, 1 skipped, 12 xfailed,
+  3 failed**). The low-FD gate completed normally and did not wedge. The
+  validator exits 1 only because it does not encode the approved macOS baseline
+  exception. Checklist:
+  `/Volumes/LEXAR/Codex/hermes-lcm-temporal-pr3/validate-release/validation-checklist.md`.
 
-## Convention notes
+## Contract notes
 
-- The required schema bump made five existing `test_lcm_core.py` assertions
-  stale. They were changed only to use the repository's shared version
-  constant; no test behavior beyond version tracking changed.
-- `lcm_rollup_sources` deliberately has no SQL foreign key, matching the
-  existing app-level summary-source convention. Purge and source replacement
-  are transactional in `RollupStore`.
-- No unresolved schema/store convention questions remain.
+- `conversation` resolves rollups and fallback summaries against the active
+  session; `global` uses the global rollup scope and all-session fallback.
+- Calendar day windows use ready daily rollups. `week` and `month` select only
+  the exact calendar aggregate starting at the requested UTC boundary.
+- Any non-ready row in the selected rollup window forces the leaf-summary
+  fallback; sub-day windows never attempt rollup serving.
+- The spec's allowed-file list excluded the repository's hard-coded public tool
+  surfaces. Minimal registration-only edits were required so `lcm_recent` is
+  reachable and the synchronized tool-contract suite remains valid.
+- `SPEC.md` remains the untracked dispatch input and was not committed. No push
+  or GitHub CLI operation was performed.

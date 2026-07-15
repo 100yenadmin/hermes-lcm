@@ -84,6 +84,7 @@ def register(ctx):
     from .engine import LCMEngine, resolve_active_lcm_engine
     from .schemas import (
         LCM_GREP,
+        LCM_RECENT,
         LCM_LOAD_SESSION,
         LCM_DESCRIBE,
         LCM_EXPAND,
@@ -136,6 +137,7 @@ def register(ctx):
     # expected healthy behavior there.
     _TOOLS = [
         ("lcm_grep", LCM_GREP, "🔍"),
+        ("lcm_recent", LCM_RECENT, "🕒"),
         ("lcm_load_session", LCM_LOAD_SESSION, "📋"),
         ("lcm_describe", LCM_DESCRIBE, "📊"),
         ("lcm_expand", LCM_EXPAND, "🔎"),
