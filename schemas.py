@@ -117,10 +117,8 @@ LCM_RECENT = {
             },
             "scope": {
                 "type": "string",
-                "enum": ["conversation", "global"],
-                "description": (
-                    "Use the active conversation (default) or the global rollup/fallback scope."
-                ),
+                "enum": ["conversation"],
+                "description": "Use the active conversation. Cross-session rollups are future work.",
                 "default": "conversation",
             },
             "limit": {
