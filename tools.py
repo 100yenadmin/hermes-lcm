@@ -1270,37 +1270,65 @@ def _lcm_grep_confidence(score: float) -> str:
     return "noise"
 
 
-def _lcm_grep_embed_query(provider: Any, query: str, timeout_s: float) -> list[float]:
-    """Embed one query without letting provider retries exceed the tool budget."""
-    timeout_s = max(0.001, float(timeout_s))
+# A hard-timed semantic operation cannot kill the worker thread it abandons
+# (Python has no thread cancellation), so bound how many can be live at once.
+# A worker releases its slot when it eventually finishes; once every slot is
+# held by a stuck worker, further requests degrade to full-text immediately
+# instead of spawning unbounded threads under repeated timeouts.
+_LCM_SEMANTIC_MAX_WORKERS = 4
+_lcm_semantic_worker_slots = threading.BoundedSemaphore(_LCM_SEMANTIC_MAX_WORKERS)
+
+
+class _WorkerCapacityError(RuntimeError):
+    """Raised when no bounded semantic worker slot is available."""
+
+
+def _run_within_deadline(fn, *, remaining_s: float, name: str):
+    """Run ``fn`` in a bounded daemon worker, raising if the deadline lapses.
+
+    ``remaining_s`` is the time left in the operation's single absolute
+    deadline. On timeout the worker is abandoned but keeps its slot until it
+    finishes, so stuck workers cannot accumulate without bound.
+    """
+    remaining_s = float(remaining_s)
+    if remaining_s <= 0:
+        raise TimeoutError("semantic latency budget exhausted")
+    if not _lcm_semantic_worker_slots.acquire(blocking=False):
+        raise _WorkerCapacityError("semantic worker capacity is exhausted")
     outcome: list[tuple[bool, Any]] = []
 
     def invoke() -> None:
         try:
-            interactive = getattr(provider, "embed_query_interactive", None)
-            if callable(interactive):
-                vector = interactive(query, timeout=timeout_s)
-            else:
-                vector = provider.embed_query(query)
-            outcome.append((True, vector))
-        except BaseException as exc:
+            outcome.append((True, fn()))
+        except BaseException as exc:  # noqa: BLE001 - forwarded to caller
             outcome.append((False, exc))
+        finally:
+            _lcm_semantic_worker_slots.release()
 
-    worker = threading.Thread(
-        target=invoke,
-        name="lcm-query-embed",
-        daemon=True,
-    )
+    worker = threading.Thread(target=invoke, name=name, daemon=True)
     worker.start()
-    worker.join(timeout_s)
+    worker.join(remaining_s)
     if worker.is_alive():
-        raise TimeoutError(
-            f"query embedding exceeded the {timeout_s:g}s latency budget"
-        )
+        raise TimeoutError(f"{name} exceeded the semantic latency budget")
     succeeded, value = outcome[0]
     if not succeeded:
         raise value
-    vector = value
+    return value
+
+
+def _lcm_grep_embed_query(
+    provider: Any, query: str, *, remaining_s: float
+) -> list[float]:
+    """Embed one query within the operation's remaining absolute budget."""
+    def invoke() -> list[float]:
+        interactive = getattr(provider, "embed_query_interactive", None)
+        if callable(interactive):
+            return interactive(query, timeout=max(0.001, remaining_s))
+        return provider.embed_query(query)
+
+    vector = _run_within_deadline(
+        invoke, remaining_s=remaining_s, name="lcm-query-embed"
+    )
     return [float(value) for value in vector]
 
 
@@ -1316,6 +1344,34 @@ def _lcm_grep_resolve_provider(engine: "LCMEngine") -> Any:
     provider = resolve_provider(config)
     engine._lcm_embedding_provider_cache = (cache_key, provider)
     return provider
+
+
+def _resolve_semantic_conversation_scope(
+    engine: "LCMEngine",
+    *,
+    search_session_id: str | None,
+    conversation_id: str | None,
+) -> list[str] | None:
+    """Resolve the conversation filter to the session_ids KNN should allow.
+
+    Summaries are keyed by session_id, so a message-level ``conversation_id`` is
+    enforced by resolving it to the sessions that carry it (intersected with the
+    active scope). Returns ``None`` for "no session constraint", or a possibly
+    empty list when a conversation matches no sessions (which then degrades).
+    """
+    if not conversation_id:
+        return [search_session_id] if search_session_id is not None else None
+    try:
+        rows = engine._store.connection.execute(
+            "SELECT DISTINCT session_id FROM messages WHERE conversation_id = ?",
+            (conversation_id,),
+        ).fetchall()
+        conv_sessions = {str(row[0]) for row in rows if row and row[0] is not None}
+    except Exception:  # pragma: no cover - defensive; degrade on any store error
+        conv_sessions = set()
+    if search_session_id is not None:
+        return sorted(conv_sessions & {search_session_id})
+    return sorted(conv_sessions)
 
 
 def _lcm_grep_semantic(
@@ -1392,6 +1448,21 @@ def _lcm_grep_semantic(
     if not bool(getattr(engine._config, "embeddings_enabled", False)):
         return degraded("semantic retrieval is disabled")
 
+    # role is a raw-message dimension; a summary vector has no single role, so
+    # it cannot be enforced over embedded summaries. Rather than silently
+    # ignoring it, degrade to full_text — which does enforce role — so a
+    # role=user query never returns assistant/tool summaries.
+    if role is not None:
+        return degraded("role filtering is only supported by full_text retrieval")
+
+    # Enforce the conversation filter at the store layer by resolving it to the
+    # set of session_ids that carry that conversation, intersected with the
+    # active scope. An empty resolution yields no candidates (which then
+    # degrades), never a silently unfiltered result.
+    knn_conversation_ids = _resolve_semantic_conversation_scope(
+        engine, search_session_id=search_session_id, conversation_id=conversation_id
+    )
+
     try:
         provider = _lcm_grep_resolve_provider(engine)
     except Exception as exc:
@@ -1399,9 +1470,26 @@ def _lcm_grep_semantic(
     if provider is None:
         return degraded("embedding provider is not configured")
 
-    timeout_s = float(getattr(engine._config, "embedding_query_timeout_s", 3.0))
+    # Warm the optional NumPy import BEFORE arming the deadline: its one-time
+    # ~0.5s module load must not be charged to a tight per-query budget. The
+    # deadline is meant to bound the actual embed + KNN compute, not a process's
+    # first import. NumPy stays optional — a missing import is ignored and KNN
+    # falls back to its bounded pure-Python scan.
+    try:  # pragma: no cover - import cost varies by environment
+        import numpy  # noqa: F401
+    except Exception:
+        pass
+
+    # ONE absolute deadline across query-embed + vector-store construction + KNN,
+    # not just the embed call. Exceeding it (or exhausting worker capacity)
+    # degrades to full_text within budget.
+    timeout_s = max(0.001, float(getattr(engine._config, "embedding_query_timeout_s", 3.0)))
+    deadline = time.monotonic() + timeout_s
+
     try:
-        query_vector = _lcm_grep_embed_query(provider, query, timeout_s)
+        query_vector = _lcm_grep_embed_query(
+            provider, query, remaining_s=deadline - time.monotonic()
+        )
     except VoyageError as exc:
         if exc.kind == "auth":
             return {
@@ -1409,25 +1497,40 @@ def _lcm_grep_semantic(
                 "mode": str(args.get("mode") or "semantic").lower(),
             }
         return degraded(f"query embedding failed: {exc}")
-    except Exception as exc:
+    except _WorkerCapacityError as exc:
+        return degraded(f"semantic capacity exhausted: {exc}")
+    except (TimeoutError, Exception) as exc:
         return degraded(f"query embedding failed: {exc}")
 
-    try:
+    def _run_knn() -> Any:
         vector_store = VectorStore(engine._store.db_path, config=engine._config)
-        knn_results = vector_store.knn(
-            query_vector,
-            k=knn_limit,
-            model=provider.model_id,
-            since=time_from,
-            conversation_ids=[search_session_id] if search_session_id is not None else None,
+        try:
+            return vector_store.knn(
+                query_vector,
+                k=knn_limit,
+                model=provider.model_id,
+                since=time_from,
+                until=time_to,
+                conversation_ids=knn_conversation_ids,
+                source=source,
+            )
+        finally:
+            vector_store.close()
+
+    try:
+        knn_results = _run_within_deadline(
+            _run_knn,
+            remaining_s=deadline - time.monotonic(),
+            name="lcm-knn",
         )
         coverage = knn_results.coverage
         ranked_rows = list(knn_results)
+    except _WorkerCapacityError as exc:
+        return degraded(f"semantic capacity exhausted: {exc}")
+    except TimeoutError as exc:
+        return degraded(f"semantic vector search exceeded the latency budget: {exc}")
     except Exception as exc:
         return degraded(f"semantic vector search failed: {exc}")
-    finally:
-        if "vector_store" in locals():
-            vector_store.close()
 
     if coverage == "none":
         return degraded("semantic vectors are unavailable (coverage=none)")
@@ -1447,10 +1550,9 @@ def _lcm_grep_semantic(
         node = engine._dag.get_node(node_id)
         if node is None:
             continue
-        if time_to is not None and float(node.latest_at or node.created_at or 0.0) > time_to:
-            continue
-        if source and not engine._dag._node_matches_source(node.node_id, source):
-            continue
+        # conversation/role/source/time filters are enforced inside knn() before
+        # the top-k cap, so no eligible lower-ranked vector was dropped for an
+        # ineligible top hit; nothing further to post-filter here.
         confidence = _lcm_grep_confidence(float(score))
         result = {
             "type": "summary",
