@@ -76,7 +76,11 @@ from .runtime_identity import (
     _git_runtime_identity,
     _plugin_metadata,
 )
-from .rollup_builder import mark_stale_after_ingest, run_rollup_maintenance
+from .rollup_builder import (
+    mark_stale_after_ingest,
+    mark_stale_for_deleted_nodes,
+    run_rollup_maintenance,
+)
 from .schemas import (
     LCM_DESCRIBE,
     LCM_DOCTOR,
@@ -2982,10 +2986,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         #    N  → keep nodes at depth >= N (e.g. 2 keeps d2+)
         retain = self._config.new_session_retain_depth
         if self._session_id and retain != -1:
+            deleted_node_ids = [
+                node.node_id for node in self._dag.get_session_nodes(self._session_id)
+                if node.node_id is not None and (retain == 0 or node.depth < retain)
+            ]
             if retain == 0:
                 self._dag.delete_session_nodes(self._session_id)
             else:
                 self._dag.delete_below_depth(self._session_id, retain)
+            if self._config.temporal_rollups_enabled:
+                mark_stale_for_deleted_nodes(self._dag, deleted_node_ids)
 
     def carry_over_new_session_context(self, old_session_id: str, new_session_id: str) -> int:
         """Move retained summaries from the old session into the new one.

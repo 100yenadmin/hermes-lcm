@@ -7,6 +7,7 @@ import json
 import logging
 from calendar import monthrange
 from datetime import date, datetime, time as datetime_time, timedelta, timezone
+from time import monotonic
 from typing import Callable, Sequence
 
 from .config import LCMConfig
@@ -18,6 +19,23 @@ from .tokens import count_tokens
 logger = logging.getLogger(__name__)
 
 Summarizer = Callable[..., tuple[str, int]]
+_FAILED_ROLLUP_BACKOFF = timedelta(seconds=30)
+
+_PENDING_ROLLUPS_SQL = """
+    SELECT period_kind, period_start
+    FROM lcm_rollups
+    WHERE scope = ?
+      AND status IN ('stale', 'failed')
+      AND (
+        status = 'stale'
+        OR built_at IS NULL
+        OR built_at <= ?
+      )
+    ORDER BY CASE WHEN period_kind = 'day' THEN 0 ELSE 1 END,
+             period_start,
+             period_kind
+    LIMIT ?
+"""
 
 
 def _as_date(value: date | str) -> date:
@@ -355,6 +373,38 @@ def mark_stale_after_ingest(
             store.close()
 
 
+def mark_stale_for_deleted_nodes(dag: SummaryDAG, node_ids: Sequence[int]) -> int:
+    """Mark rollups that reference deleted summary nodes stale for rebuilding."""
+    store: RollupStore | None = None
+    try:
+        unique_node_ids = list(dict.fromkeys(int(node_id) for node_id in node_ids))
+        if not unique_node_ids:
+            return 0
+        placeholders = ",".join("?" for _ in unique_node_ids)
+        store = RollupStore(dag.db_path)
+        with store.connection:
+            cur = store.connection.execute(
+                f"""
+                UPDATE lcm_rollups
+                SET status = 'stale'
+                WHERE status != 'stale'
+                  AND rollup_id IN (
+                    SELECT rollup_id
+                    FROM lcm_rollup_sources
+                    WHERE node_id IN ({placeholders})
+                  )
+                """,
+                unique_node_ids,
+            )
+        return int(cur.rowcount or 0)
+    except Exception:
+        logger.debug("LCM temporal rollup deletion staleness update failed", exc_info=True)
+        return 0
+    finally:
+        if store is not None:
+            store.close()
+
+
 def run_rollup_maintenance(
     dag: SummaryDAG,
     config: LCMConfig,
@@ -363,36 +413,19 @@ def run_rollup_maintenance(
     circuit_breaker: object | None = None,
     spend_guard: object | None = None,
 ) -> int:
-    """Rebuild a bounded stale batch: all dailies before any aggregates."""
+    """Best-effort bounded maintenance; slow summarizers may leave rollups lagging."""
     store: RollupStore | None = None
+    started_at = monotonic()
     try:
         limit = max(0, int(config.rollup_builds_per_pass))
+        budget_ms = max(0, int(config.rollup_maintenance_budget_ms))
         connection = dag.connection
-        if limit <= 0 or connection is None:
+        if limit <= 0 or budget_ms <= 0 or connection is None:
             return 0
+        retry_before = (datetime.now(timezone.utc) - _FAILED_ROLLUP_BACKOFF).isoformat()
         rows = connection.execute(
-            """
-            WITH stale AS (
-                SELECT period_kind, period_start
-                FROM lcm_rollups INDEXED BY sqlite_autoindex_lcm_rollups_1
-                WHERE period_kind = 'day' AND scope = ? AND status = 'stale'
-                UNION ALL
-                SELECT period_kind, period_start
-                FROM lcm_rollups INDEXED BY sqlite_autoindex_lcm_rollups_1
-                WHERE period_kind = 'week' AND scope = ? AND status = 'stale'
-                UNION ALL
-                SELECT period_kind, period_start
-                FROM lcm_rollups INDEXED BY sqlite_autoindex_lcm_rollups_1
-                WHERE period_kind = 'month' AND scope = ? AND status = 'stale'
-            )
-            SELECT period_kind, period_start
-            FROM stale
-            ORDER BY CASE WHEN period_kind = 'day' THEN 0 ELSE 1 END,
-                     period_start,
-                     period_kind
-            LIMIT ?
-            """,
-            (scope, scope, scope, limit),
+            _PENDING_ROLLUPS_SQL,
+            (scope, retry_before, limit),
         ).fetchall()
         if not rows:
             return 0
@@ -402,7 +435,10 @@ def run_rollup_maintenance(
             "week": build_week,
             "month": build_month,
         }
+        builds_started = 0
         for row in rows:
+            if (monotonic() - started_at) * 1000 >= budget_ms:
+                break
             builder = builders[str(row[0])]
             builder(
                 store,
@@ -413,7 +449,8 @@ def run_rollup_maintenance(
                 circuit_breaker=circuit_breaker,
                 spend_guard=spend_guard,
             )
-        return len(rows)
+            builds_started += 1
+        return builds_started
     except Exception:
         logger.debug("LCM temporal rollup maintenance failed", exc_info=True)
         return 0
