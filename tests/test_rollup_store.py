@@ -6,7 +6,7 @@ import pytest
 
 from hermes_lcm import db_bootstrap
 from hermes_lcm.config import LCMConfig
-from hermes_lcm.rollup_store import RollupStore
+from hermes_lcm.rollup_store import RollupBuildToken, RollupStore
 
 
 ROLLUP_TABLES = {"lcm_rollups", "lcm_rollup_sources", "lcm_rollup_state"}
@@ -38,76 +38,85 @@ def _ready_rollup(
     *,
     source_node_ids: list[int] | None = None,
 ) -> int:
-    rollup_id = store.upsert_building(period_kind, period_start, scope)
+    token = store.upsert_building(period_kind, period_start, scope)
     store.mark_ready(
-        rollup_id,
+        token,
         f"{period_kind} summary for {period_start}",
         42,
         source_node_ids or [],
         f"fingerprint-{period_kind}-{period_start}-{scope}",
     )
-    return rollup_id
+    return token.rollup_id
 
 
-def test_temporal_rollup_migration_is_idempotent(tmp_path):
-    conn = sqlite3.connect(tmp_path / "idempotent.db")
+def test_core_migrations_do_not_create_rollup_tables_or_bump_schema(tmp_path):
+    # The opt-in rollup tables are NOT part of the core numeric schema: a base
+    # (feature-off) startup must leave schema_version at SCHEMA_VERSION and create
+    # no lcm_rollups* tables, so a base build keeps opening the DB.
+    conn = sqlite3.connect(tmp_path / "core.db")
     try:
         db_bootstrap.run_versioned_migrations(conn)
         db_bootstrap.run_versioned_migrations(conn)
         conn.commit()
 
-        assert ROLLUP_TABLES <= _table_names(conn)
         assert db_bootstrap.get_schema_version(conn) == db_bootstrap.SCHEMA_VERSION
+        assert db_bootstrap.SCHEMA_VERSION == 5
+        assert ROLLUP_TABLES.isdisjoint(_table_names(conn))
+        # No numeric v6 step is recorded; the rollup tables use a named step.
         steps = conn.execute(
-            """
-            SELECT step_name
-            FROM lcm_migration_state
-            WHERE step_name = 'v6_temporal_rollups'
-            """
+            "SELECT step_name FROM lcm_migration_state WHERE step_name LIKE 'v6%' OR step_name = 'temporal_rollups_v1'"
         ).fetchall()
-        assert steps == [("v6_temporal_rollups",)]
-        index_sql = conn.execute(
-            """
-            SELECT sql
-            FROM sqlite_master
-            WHERE type = 'index' AND name = 'idx_lcm_rollups_ready_period'
-            """
-        ).fetchone()[0]
-        assert "WHERE status = 'ready'" in index_sql
-        pending_index_sql = conn.execute(
-            """
-            SELECT sql
-            FROM sqlite_master
-            WHERE type = 'index' AND name = 'idx_lcm_rollups_pending'
-            """
-        ).fetchone()[0]
-        assert "WHERE status IN ('stale', 'failed')" in pending_index_sql
+        assert steps == []
     finally:
         conn.close()
 
 
-def test_rollup_store_upgrades_previous_schema_version(tmp_path):
-    db_path = tmp_path / "previous.db"
+def test_rollup_store_lazily_creates_tables_without_bumping_schema(tmp_path):
+    # A DB already at the core schema version (feature previously off) gains the
+    # rollup tables + the NAMED migration step when RollupStore opens it, while
+    # schema_version stays put so a base build still opens it.
+    db_path = tmp_path / "enable.db"
     conn = sqlite3.connect(db_path)
-    conn.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT)")
-    conn.execute(
-        "INSERT INTO metadata(key, value) VALUES('schema_version', ?)",
-        (str(db_bootstrap.SCHEMA_VERSION - 1),),
-    )
+    db_bootstrap.run_versioned_migrations(conn)
     conn.commit()
     conn.close()
+    assert db_bootstrap.get_schema_version(sqlite3.connect(db_path)) == db_bootstrap.SCHEMA_VERSION
 
     store = RollupStore(db_path)
     try:
         assert ROLLUP_TABLES <= _table_names(store.connection)
         assert db_bootstrap.get_schema_version(store.connection) == db_bootstrap.SCHEMA_VERSION
         completed = store.connection.execute(
-            "SELECT completed_at FROM lcm_migration_state WHERE step_name = ?",
-            ("v6_temporal_rollups",),
+            "SELECT completed_at FROM lcm_migration_state WHERE step_name = 'temporal_rollups_v1'"
         ).fetchone()
         assert completed is not None
+        index_sql = store.connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_lcm_rollups_ready_period'"
+        ).fetchone()[0]
+        assert "WHERE status = 'ready'" in index_sql
+        pending_index_sql = store.connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_lcm_rollups_pending'"
+        ).fetchone()[0]
+        assert "WHERE status IN ('stale', 'failed')" in pending_index_sql
     finally:
         store.close()
+
+
+def test_base_build_opens_enabled_rollup_db_without_raising(tmp_path, monkeypatch):
+    # After the feature is enabled (rollup tables present, schema still at base),
+    # a simulated base build (SCHEMA_VERSION unchanged) must open the DB and its
+    # own migrations must not raise SchemaVersionTooNewError.
+    db_path = tmp_path / "enabled.db"
+    store = RollupStore(db_path)
+    store.close()
+
+    reopen = sqlite3.connect(db_path)
+    try:
+        db_bootstrap.refuse_schema_version_too_new(reopen)
+        db_bootstrap.run_versioned_migrations(reopen)
+        assert db_bootstrap.get_schema_version(reopen) == db_bootstrap.SCHEMA_VERSION
+    finally:
+        reopen.close()
 
 
 def test_rollup_store_refuses_newer_schema_before_configuring_connection(
@@ -145,9 +154,10 @@ def test_rollup_store_refuses_newer_schema_before_configuring_connection(
 
 
 def test_rollup_crud_round_trip_and_rebuild(rollup_store):
-    rollup_id = rollup_store.upsert_building(
+    token = rollup_store.upsert_building(
         "day", "2026-07-15", "conversation:conv-1"
     )
+    rollup_id = token.rollup_id
     initial = rollup_store.get_rollup(
         "day", "2026-07-15", "conversation:conv-1"
     )
@@ -162,16 +172,17 @@ def test_rollup_crud_round_trip_and_rebuild(rollup_store):
         "status": "building",
         "source_fingerprint": None,
         "error": None,
+        "generation": 0,
         "source_node_ids": [],
     }
 
-    rollup_store.mark_ready(
-        rollup_id,
+    assert rollup_store.mark_ready(
+        token,
         "Daily summary",
         123,
         [9, 3, 9],
         "fingerprint-1",
-    )
+    ) is True
     ready = rollup_store.get_rollup(
         "day", "2026-07-15", "conversation:conv-1"
     )
@@ -182,10 +193,10 @@ def test_rollup_crud_round_trip_and_rebuild(rollup_store):
     assert ready["source_fingerprint"] == "fingerprint-1"
     assert ready["source_node_ids"] == [3, 9]
 
-    rebuilt_id = rollup_store.upsert_building(
+    rebuilt = rollup_store.upsert_building(
         "day", "2026-07-15", "conversation:conv-1"
     )
-    assert rebuilt_id == rollup_id
+    assert rebuilt.rollup_id == rollup_id
     rebuilding = rollup_store.get_rollup(
         "day", "2026-07-15", "conversation:conv-1"
     )
@@ -207,7 +218,7 @@ def test_rollup_crud_round_trip_and_rebuild(rollup_store):
 
 def test_mark_ready_rejects_unknown_rollup_without_orphan_sources(rollup_store):
     with pytest.raises(ValueError, match="unknown rollup_id"):
-        rollup_store.mark_ready(999, "missing", 1, [10], "fingerprint")
+        rollup_store.mark_ready(RollupBuildToken(999, 0), "missing", 1, [10], "fingerprint")
 
     count = rollup_store.connection.execute(
         "SELECT COUNT(*) FROM lcm_rollup_sources"
@@ -221,7 +232,7 @@ def test_ready_rollups_for_window_is_inclusive_and_scoped(rollup_store):
     third = _ready_rollup(rollup_store, "day", "2026-07-31", "global")
     _ready_rollup(rollup_store, "day", "2026-07-15", "conversation:other")
     failed = rollup_store.upsert_building("day", "2026-07-20", "global")
-    rollup_store.mark_failed(failed, "failed")
+    rollup_store.mark_failed(failed.rollup_id, "failed")
 
     rows = rollup_store.ready_rollups_for_window(
         "day", "2026-07-15", "2026-07-31", "global"
@@ -342,6 +353,81 @@ def test_purge_rollups_for_sources_removes_rollups_and_source_rows(rollup_store)
     assert {first, second}.isdisjoint({kept})
     assert rollup_store.purge_rollups_for_sources([]) == 0
     assert rollup_store.purge_rollups_for_sources([999]) == 0
+
+
+def test_invalidation_mid_build_supersedes_old_mark_ready(rollup_store):
+    scope = "conversation:conv-1"
+    token = rollup_store.upsert_building("day", "2026-07-15", scope)
+
+    # An invalidation arrives while the build is in flight, advancing generation.
+    rollup_store.mark_stale_for_day("2026-07-15", scope)
+
+    # The stale builder's late publish is a no-op; the newer stale state stands.
+    assert rollup_store.mark_ready(token, "stale build", 5, [1], "fp") is False
+    row = rollup_store.get_rollup("day", "2026-07-15", scope)
+    assert row["status"] == "stale"
+    assert row["summary"] is None
+    assert row["generation"] == 1
+
+
+def test_reclaim_stale_building_reclaims_expired_lease_and_blocks_publish(rollup_store):
+    scope = "conversation:conv-1"
+    token = rollup_store.upsert_building("day", "2026-07-15", scope)
+
+    # Nothing is reclaimed while the lease is valid.
+    assert rollup_store.reclaim_stale_building(now="1999-01-01T00:00:00+00:00") == 0
+    assert rollup_store.get_rollup("day", "2026-07-15", scope)["status"] == "building"
+
+    # A far-future 'now' makes the lease expired: the crashed build is reclaimed.
+    assert rollup_store.reclaim_stale_building(now="2999-01-01T00:00:00+00:00") == 1
+    reclaimed = rollup_store.get_rollup("day", "2026-07-15", scope)
+    assert reclaimed["status"] == "stale"
+    assert reclaimed["generation"] == 1
+
+    # The original (crashed) builder returning late cannot publish over it.
+    assert rollup_store.mark_ready(token, "zombie", 5, [1], "fp") is False
+    assert rollup_store.get_rollup("day", "2026-07-15", scope)["status"] == "stale"
+
+
+def test_upsert_stale_seeds_missing_rows_and_leaves_building_alone(rollup_store):
+    scope = "conversation:conv-1"
+
+    assert rollup_store.upsert_stale("month", "2026-07-01", scope) == 1
+    seeded = rollup_store.get_rollup("month", "2026-07-01", scope)
+    assert seeded["status"] == "stale"
+    assert seeded["summary"] is None
+
+    # A currently-building row is not disturbed by an upsert_stale.
+    rollup_store.upsert_building("day", "2026-07-15", scope)
+    rollup_store.upsert_stale("day", "2026-07-15", scope)
+    assert rollup_store.get_rollup("day", "2026-07-15", scope)["status"] == "building"
+
+
+def test_stale_aggregates_for_day_targets_week_and_month_only(rollup_store):
+    scope = "conversation:conv-1"
+    day_id = _ready_rollup(rollup_store, "day", "2026-07-15", scope)
+    week_id = _ready_rollup(rollup_store, "week", "2026-07-13", scope)
+    month_id = _ready_rollup(rollup_store, "month", "2026-07-01", scope)
+
+    assert rollup_store.stale_aggregates_for_day("2026-07-15", scope) == 2
+
+    statuses = dict(
+        rollup_store.connection.execute(
+            "SELECT rollup_id, status FROM lcm_rollups"
+        ).fetchall()
+    )
+    assert statuses[day_id] == "ready"
+    assert statuses[week_id] == "stale"
+    assert statuses[month_id] == "stale"
+
+
+def test_cursor_state_is_per_scope(rollup_store):
+    rollup_store.set_cursor("day", "cursor-a", "scope-a")
+    rollup_store.set_cursor("day", "cursor-b", "scope-b")
+
+    assert rollup_store.get_cursor("day", "scope-a") == "cursor-a"
+    assert rollup_store.get_cursor("day", "scope-b") == "cursor-b"
+    assert rollup_store.get_cursor("day", "scope-missing") is None
 
 
 def test_temporal_rollup_config_defaults_are_inert():

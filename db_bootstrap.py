@@ -27,7 +27,7 @@ class SchemaVersionTooNewError(RuntimeError):
     """
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 5
 SQLITE_BUSY_TIMEOUT_MS = 30_000
 _MIN_DISK_SPACE_BYTES = 50 * 1024 * 1024
 REQUIRED_CORE_TABLES = (
@@ -270,6 +270,19 @@ def ensure_message_origin_columns(conn: sqlite3.Connection) -> None:
 
 
 def ensure_temporal_rollup_tables(conn: sqlite3.Connection) -> None:
+    """Lazily create the opt-in temporal-rollup feature tables.
+
+    These tables are NOT part of the core numeric ``schema_version`` migration:
+    they are created idempotently from :class:`RollupStore`'s own init on the
+    enabled path (recorded as the named ``temporal_rollups_v1`` migration step),
+    so a disabled install leaves ``schema_version`` untouched and stays readable
+    by a base build. Keep every statement ``IF NOT EXISTS`` / additive so a
+    concurrent enabled process can run this at the same time without racing.
+
+    ``generation`` is an optimistic-concurrency counter bumped on every
+    invalidation; ``lease_expires_at`` bounds a ``building`` row so a crashed
+    build can be reclaimed. See :mod:`hermes_lcm.rollup_store`.
+    """
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS lcm_rollups (
@@ -284,6 +297,8 @@ def ensure_temporal_rollup_tables(conn: sqlite3.Connection) -> None:
             built_at TEXT,
             source_fingerprint TEXT,
             error TEXT,
+            generation INTEGER NOT NULL DEFAULT 0,
+            lease_expires_at TEXT,
             UNIQUE(period_kind, period_start, scope)
         );
 
@@ -300,12 +315,43 @@ def ensure_temporal_rollup_tables(conn: sqlite3.Connection) -> None:
             node_id INTEGER NOT NULL,
             PRIMARY KEY(rollup_id, node_id)
         );
-
+        """
+    )
+    # Backfill the generation/lease columns for a table created by an earlier
+    # lazy revision that predates optimistic concurrency.
+    rollup_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(lcm_rollups)").fetchall()
+    }
+    add_column_if_missing(
+        conn, rollup_columns, "generation",
+        "ALTER TABLE lcm_rollups ADD COLUMN generation INTEGER NOT NULL DEFAULT 0",
+    )
+    add_column_if_missing(
+        conn, rollup_columns, "lease_expires_at",
+        "ALTER TABLE lcm_rollups ADD COLUMN lease_expires_at TEXT",
+    )
+    # Cursor state is keyed per (period_kind, scope) so multiple scopes sharing a
+    # database do not clobber one another's build cursor. A pre-scope table (from
+    # an earlier revision) only cached vestigial introspection data, so recreate
+    # it rather than attempt an unsupported PRIMARY KEY migration.
+    state_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='lcm_rollup_state'"
+    ).fetchone()
+    if state_exists:
+        state_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(lcm_rollup_state)").fetchall()
+        }
+        if "scope" not in state_columns:
+            conn.execute("DROP TABLE lcm_rollup_state")
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS lcm_rollup_state (
-            period_kind TEXT PRIMARY KEY,
+            period_kind TEXT NOT NULL,
+            scope TEXT NOT NULL DEFAULT '',
             last_build_cursor TEXT,
-            last_built_at TEXT
-        );
+            last_built_at TEXT,
+            PRIMARY KEY(period_kind, scope)
+        )
         """
     )
 
@@ -741,9 +787,9 @@ def run_versioned_migrations(conn: sqlite3.Connection) -> None:
         mark_migration_step_complete(conn, "v5_message_conversation_id")
         current_version = 5
 
-    ensure_temporal_rollup_tables(conn)
-    if current_version < 6:
-        mark_migration_step_complete(conn, "v6_temporal_rollups")
-        current_version = 6
-
+    # NOTE: the opt-in temporal-rollup tables are deliberately NOT created here.
+    # Creating them would advance the core schema for every install (even with
+    # the feature off) and make the DB unreadable by a base build. They are
+    # created lazily by RollupStore on the enabled path via a NAMED migration
+    # step (``temporal_rollups_v1``), independent of this numeric counter.
     set_schema_version(conn, current_version)
