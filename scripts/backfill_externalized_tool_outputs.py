@@ -242,12 +242,16 @@ def run_rollback(
         "manifest_items": 0,
         "eligible": 0,
         "deleted": 0,
+        "succeeded": 0,
+        "failed": 0,
+        "skipped": 0,
         "skipped_invalid_ref": 0,
         "skipped_missing": 0,
         "skipped_symlink": 0,
         "skipped_digest_mismatch": 0,
         "skipped_referenced": 0,
     }
+    failed_paths: list[str] = []
 
     with _read_only_connection(database_path) as connection:
         for item in source.get("items") or []:
@@ -279,14 +283,32 @@ def run_rollback(
                 continue
             counts["eligible"] += 1
             if apply:
-                path.unlink()
+                try:
+                    path.unlink()
+                except OSError:
+                    counts["failed"] += 1
+                    failed_paths.append(str(path))
+                    continue
                 counts["deleted"] += 1
+                counts["succeeded"] += 1
+
+    counts["skipped"] = sum(
+        counts[key]
+        for key in (
+            "skipped_invalid_ref",
+            "skipped_missing",
+            "skipped_symlink",
+            "skipped_digest_mismatch",
+            "skipped_referenced",
+        )
+    )
 
     return {
         "schema_version": 1,
         "operation": "historical_tool_output_externalization_rollback",
         "applied": apply,
         "counts": counts,
+        "failed_paths": failed_paths,
     }
 
 
@@ -332,6 +354,8 @@ def main(argv: list[str] | None = None) -> int:
             config=config,
         )
     print(json.dumps(result, indent=2, sort_keys=True))
+    if args.rollback and result["counts"]["failed"]:
+        return 1
     return 0
 
 
