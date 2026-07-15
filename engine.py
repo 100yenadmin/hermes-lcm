@@ -77,7 +77,6 @@ from .runtime_identity import (
     _plugin_metadata,
 )
 from .rollup_builder import (
-    mark_stale_after_ingest,
     mark_stale_for_deleted_nodes,
     mark_stale_for_published_summary,
     run_rollup_maintenance,
@@ -1345,7 +1344,15 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     deleted,
                     self._config.empty_lifecycle_gc_threshold,
                 )
-        if self._config.temporal_rollups_enabled:
+        # Bypassed/stateless sessions skip every LCM write, so they must also skip
+        # rollup maintenance — otherwise the bind-time hook would build rollups for
+        # a session whose ingest is suppressed (maintainer #388: gate on the same
+        # not-bypassed condition the ingest write uses).
+        if (
+            self._config.temporal_rollups_enabled
+            and not self._session_ignored
+            and not self._session_stateless
+        ):
             run_rollup_maintenance(
                 self._dag, self._config, session_id,
                 circuit_breaker=self._summary_circuit_breaker,
@@ -3001,10 +3008,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         #    N  → keep nodes at depth >= N (e.g. 2 keeps d2+)
         retain = self._config.new_session_retain_depth
         if self._session_id and retain != -1:
-            deleted_node_ids = [
-                node.node_id for node in self._dag.get_session_nodes(self._session_id)
-                if node.node_id is not None and (retain == 0 or node.depth < retain)
-            ]
+            # Capture the COMPLETE deleted-id set (unbounded), not the first 1000
+            # get_session_nodes would return, so rollups referencing any deleted
+            # node past that cap are still staled (maintainer #388 blocker).
+            deleted_node_ids = self._dag.get_session_node_ids_below_depth(
+                self._session_id, None if retain == 0 else retain
+            )
             if retain == 0:
                 self._dag.delete_session_nodes(self._session_id)
             else:
@@ -3020,6 +3029,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         ``session_scope='current'`` may therefore include a carried-over node in
         the new session, while ``source`` filtering still evaluates against the
         node's original descendant message sources.
+
+        Temporal rollups are deliberately NOT re-scoped here: they are keyed by
+        (period_kind, period_start, scope=session_id) with a UNIQUE constraint, so
+        rewriting scope on rollover could collide with the new session's own
+        rollups and would need a core-schema change to do safely. Rotation is the
+        documented rollup scope boundary; ``lcm_recent`` compensates at read time
+        by spanning the same current + last-finalized sessions its leaf fallback
+        uses (see ``_recent_ready_rollups``), so no window content is dropped.
         """
         if not old_session_id or not new_session_id or old_session_id == new_session_id:
             return 0
@@ -4152,15 +4169,18 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 active_replay_messages[absolute_idx] = active_message
 
         estimates = [count_message_tokens(m) for m in protected_messages]
-        stored_ids = self._store._append_protected_batch(
+        self._store._append_protected_batch(
             self._session_id,
             protected_messages,
             estimates,
             source=self._session_platform,
             conversation_id=self._conversation_id,
         )
-        if self._config.temporal_rollups_enabled:
-            mark_stale_after_ingest(self._dag, self._session_id, stored_ids)
+        # Rollup staleness is driven by summary-node PUBLICATION
+        # (_invalidate_rollups_for_published_node at every add_node site), not by
+        # raw ingest: marking a period stale before its covering summary exists
+        # would let a rebuild publish 'ready' from old sources and omit the leaf
+        # (maintainer #388 P1).
         self._ingest_cursor = n
         self._compression_boundary_ingest_pending = False
         self._compression_boundary_active_placeholder_digest_budget = {}
