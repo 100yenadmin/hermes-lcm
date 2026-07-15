@@ -1058,29 +1058,55 @@ def _recent_rollup_bounds(window: RecentPeriodWindow) -> tuple[str, str]:
     return start, start
 
 
+def _recent_expected_period_starts(window: RecentPeriodWindow) -> list[str]:
+    """Every rollup ``period_start`` the window requires to be served in rollup
+    mode. For a day window this is every calendar day in ``[start, end)``; for a
+    week/month window it is the single containing aggregate's start.
+    """
+    if window.rollup_kind == "day":
+        first = window.start.date()
+        last = (window.end - timedelta(microseconds=1)).date()
+        days: list[str] = []
+        current = first
+        while current <= last:
+            days.append(current.isoformat())
+            current += timedelta(days=1)
+        return days
+    return [window.start.date().isoformat()]
+
+
 def _recent_has_unready_rollups(
     store: RollupStore,
     window: RecentPeriodWindow,
     scope: str,
 ) -> bool:
+    """True when the window is not fully covered by ``ready`` rollups.
+
+    Detects MISSING days (no row at all), not only existing non-ready rows: every
+    period the window requires must have a ``ready`` rollup, otherwise the whole
+    window falls back (maintainer #389 blocker 1).
+    """
     connection = store.connection
     if connection is None:
         return True
+    expected = _recent_expected_period_starts(window)
+    if not expected:
+        return True
     start, end = _recent_rollup_bounds(window)
-    row = connection.execute(
+    ready_rows = connection.execute(
         """
-        SELECT 1
+        SELECT period_start
         FROM lcm_rollups
         WHERE period_kind = ?
           AND period_start >= ?
           AND period_start <= ?
           AND scope = ?
-          AND status != 'ready'
-        LIMIT 1
+          AND status = 'ready'
         """,
         (window.rollup_kind, start, end, scope),
-    ).fetchone()
-    return row is not None
+    ).fetchall()
+    ready_starts = {str(row[0]) for row in ready_rows}
+    return not set(expected).issubset(ready_starts)
 
 
 def _recent_ready_rollups(
@@ -1114,6 +1140,33 @@ def _recent_ready_rollups(
             store.close()
 
 
+def _recent_conversation_scope_session_ids(engine: "LCMEngine") -> list[str]:
+    """Session ids that make up the current conversation family for fallback.
+
+    Rotation reassigns retained higher-depth/carry-forward summaries into the
+    new session, but a just-finalized session may still hold retained lineage, so
+    the fallback spans the current session plus the conversation's finalized
+    session (maintainer #389 blocker 2). Scope identity is otherwise session-based
+    (see the operator guide) because summary nodes carry no conversation key.
+    """
+    ids: list[str] = []
+    current = str(engine.current_session_id or "")
+    if current:
+        ids.append(current)
+    lifecycle = getattr(engine, "_lifecycle", None)
+    conversation_id = getattr(engine, "current_conversation_id", None)
+    if lifecycle is not None and conversation_id:
+        try:
+            state = lifecycle.get_by_conversation(conversation_id)
+        except Exception:  # pragma: no cover - defensive read-only degradation
+            state = None
+        if state is not None:
+            for sid in (state.current_session_id, state.last_finalized_session_id):
+                if sid and str(sid) not in ids:
+                    ids.append(str(sid))
+    return ids or [current]
+
+
 def _recent_leaf_sections(
     engine: "LCMEngine",
     window: RecentPeriodWindow,
@@ -1123,15 +1176,19 @@ def _recent_leaf_sections(
     connection = engine._dag.connection
     if connection is None:
         return []
+    # Include retained higher-depth/carry-forward summaries, not just depth-0
+    # current-session leaves, mirroring how lcm_grep/describe select across
+    # depths and retained lineage (maintainer #389 blocker 2).
     where = [
-        "depth = 0",
         "COALESCE(latest_at, created_at) >= ?",
         "COALESCE(latest_at, created_at) < ?",
     ]
     params: list[object] = [window.start.timestamp(), window.end.timestamp()]
     if requested_scope == "conversation":
-        where.append("session_id = ?")
-        params.append(engine.current_session_id)
+        session_ids = _recent_conversation_scope_session_ids(engine)
+        placeholders = ",".join("?" for _ in session_ids)
+        where.append(f"session_id IN ({placeholders})")
+        params.extend(session_ids)
     params.append(limit)
     try:
         with engine._dag._db_lock:
