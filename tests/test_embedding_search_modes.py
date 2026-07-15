@@ -197,7 +197,9 @@ def test_timeout_worker_is_daemon_and_provider_call_is_bounded(
             if thread.name == "lcm-query-embed" and thread.is_alive()
         ]
         assert payload["degraded_to_fts"] is True
-        assert observed_timeouts == [pytest.approx(0.02)]
+        # The interactive timeout is the remaining absolute budget (~0.02s),
+        # computed from a monotonic clock so a few microseconds may have elapsed.
+        assert observed_timeouts and observed_timeouts[0] == pytest.approx(0.02, abs=0.01)
         assert live_workers
         assert all(thread.daemon for thread in live_workers)
     finally:
@@ -419,6 +421,148 @@ def test_full_text_modes_remain_byte_identical_with_embeddings_on_or_off(semanti
         semantic_engine._config.embeddings_enabled = True
         enabled = lcm_tools.lcm_grep(args, engine=semantic_engine)
         assert disabled == explicit == enabled
+
+
+def _add_summary_in(engine, summary, *, session_id, created_at, source_ids=None):
+    return engine._dag.add_node(
+        SummaryNode(
+            session_id=session_id,
+            depth=0,
+            summary=summary,
+            token_count=20,
+            source_token_count=40,
+            source_ids=list(source_ids or []),
+            source_type="messages",
+            created_at=created_at,
+            earliest_at=created_at,
+            latest_at=created_at,
+            expand_hint="",
+        )
+    )
+
+
+def test_semantic_role_filter_degrades_to_full_text(semantic_engine, monkeypatch):
+    semantic_engine._store.append("session-a", {"role": "user", "content": "role marker"})
+    node = _add_summary(semantic_engine, "an embedded summary", created_at=1.0)
+    _seed_vectors(semantic_engine, [(node, [1.0, 0.0])])
+    monkeypatch.setattr(lcm_tools, "resolve_provider", lambda _config: MockProvider())
+
+    payload = json.loads(
+        lcm_tools.lcm_grep(
+            {"query": "marker", "mode": "semantic", "role": "user"},
+            engine=semantic_engine,
+        )
+    )
+
+    # role is not enforceable over role-less summaries, so it degrades to
+    # full_text (which does enforce role) rather than silently ignoring it.
+    assert payload["degraded_to_fts"] is True
+    assert "role" in payload["degraded_reason"].lower()
+    assert all(hit.get("type") == "message" for hit in payload["results"])
+
+
+def test_semantic_time_to_excludes_ineligible_before_top_k(semantic_engine, monkeypatch):
+    newer = _add_summary(semantic_engine, "newer high score", created_at=100.0)
+    older = _add_summary(semantic_engine, "older lower score", created_at=1.0)
+    # newer scores highest for the query vector but is outside time_to.
+    _seed_vectors(semantic_engine, [(newer, [1.0, 0.0]), (older, [0.0, 1.0])])
+    monkeypatch.setattr(lcm_tools, "resolve_provider", lambda _config: MockProvider())
+
+    payload = json.loads(
+        lcm_tools.lcm_grep(
+            {"query": "q", "mode": "semantic", "time_to": 50, "limit": 1},
+            engine=semantic_engine,
+        )
+    )
+
+    ids = [hit["node_id"] for hit in payload["results"]]
+    assert newer not in ids
+    assert ids == [older]
+
+
+def test_semantic_source_filter_excludes_ineligible_before_top_k(semantic_engine, monkeypatch):
+    keep_msg = semantic_engine._store.append(
+        "session-a", {"role": "user", "content": "k"}, source="keep-src"
+    )
+    drop_msg = semantic_engine._store.append(
+        "session-a", {"role": "user", "content": "d"}, source="drop-src"
+    )
+    keep = _add_summary(semantic_engine, "keep summary", created_at=1.0, source_ids=[keep_msg])
+    drop = _add_summary(semantic_engine, "drop summary", created_at=2.0, source_ids=[drop_msg])
+    # drop scores highest but its source is excluded, so it must not take the slot.
+    _seed_vectors(semantic_engine, [(keep, [0.0, 1.0]), (drop, [1.0, 0.0])])
+    monkeypatch.setattr(lcm_tools, "resolve_provider", lambda _config: MockProvider())
+
+    payload = json.loads(
+        lcm_tools.lcm_grep(
+            {"query": "q", "mode": "semantic", "source": "keep-src", "limit": 1},
+            engine=semantic_engine,
+        )
+    )
+
+    assert [hit["node_id"] for hit in payload["results"]] == [keep]
+
+
+def test_semantic_conversation_filter_resolves_to_sessions(semantic_engine, monkeypatch):
+    semantic_engine._store.append(
+        "session-a", {"role": "user", "content": "c"}, conversation_id="conv-1"
+    )
+    in_conv = _add_summary(semantic_engine, "in conversation", created_at=1.0)
+    other = _add_summary_in(
+        semantic_engine, "other session", session_id="session-b", created_at=2.0
+    )
+    # other scores highest but lives in a session outside the conversation.
+    _seed_vectors(semantic_engine, [(in_conv, [0.0, 1.0]), (other, [1.0, 0.0])])
+    monkeypatch.setattr(lcm_tools, "resolve_provider", lambda _config: MockProvider())
+
+    payload = json.loads(
+        lcm_tools.lcm_grep(
+            {
+                "query": "q",
+                "mode": "semantic",
+                "session_scope": "all",
+                "conversation_id": "conv-1",
+                "limit": 1,
+            },
+            engine=semantic_engine,
+        )
+    )
+
+    assert [hit["node_id"] for hit in payload["results"]] == [in_conv]
+
+
+def test_slow_knn_degrades_within_total_budget(semantic_engine, monkeypatch):
+    semantic_engine._config.embedding_query_timeout_s = 0.05
+    semantic_engine._store.append(
+        "session-a", {"role": "user", "content": "needle for fallback"}
+    )
+
+    class SlowVectorStore:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def knn(self, *_args, **_kwargs):
+            time.sleep(0.3)
+            return KNNResult(coverage="full")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(lcm_tools, "VectorStore", SlowVectorStore)
+    monkeypatch.setattr(lcm_tools, "resolve_provider", lambda _config: MockProvider())
+
+    started = time.monotonic()
+    payload = json.loads(
+        lcm_tools.lcm_grep({"query": "needle", "mode": "semantic"}, engine=semantic_engine)
+    )
+    elapsed = time.monotonic() - started
+
+    # The whole operation degrades within the tiny budget, well under the 0.3s
+    # the KNN would otherwise take.
+    assert elapsed < 0.2
+    assert payload["degraded_to_fts"] is True
+    assert "latency budget" in payload["degraded_reason"]
+    assert payload["results"][0]["type"] == "message"
 
 
 def test_recall_eval_is_deterministic_and_hybrid_beats_fts_on_paraphrases():
