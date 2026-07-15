@@ -153,6 +153,8 @@ This is a local archive migration path. It does not make LCM a general memory pr
 
 ## Related references
 
+- [Embeddings setup — free and local options](./embeddings-setup.md) — provider configuration for the `semantic` / `hybrid` modes
+
 - [Operator guide](operator-guide.md)
 - [Architecture notes](architecture.md)
 - [Benchmarking and stress checks](../benchmarks/README.md)
