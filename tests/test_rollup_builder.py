@@ -278,7 +278,11 @@ def test_empty_builds_have_zero_store_side_effects(rollup_parts):
     assert store.connection.execute("SELECT COUNT(*) FROM lcm_rollups").fetchone()[0] == 0
 
 
-def test_ingest_staleness_cascade_and_bounded_bind_maintenance(tmp_path, monkeypatch):
+def test_publication_staleness_and_bounded_bind_maintenance(tmp_path, monkeypatch):
+    # Raw ingest ALONE must not stale rollups (maintainer #388 P1): a period is
+    # staled only when a covering summary node is PUBLISHED. Then bind-time
+    # maintenance rebuilds up to rollup_builds_per_pass targets, leaving the rest
+    # durably stale for the next pass.
     db_path = tmp_path / "engine-rollups.db"
     config = LCMConfig(
         database_path=str(db_path),
@@ -310,7 +314,15 @@ def test_ingest_staleness_cascade_and_bounded_bind_maintenance(tmp_path, monkeyp
                     fingerprint=f"old-{kind}",
                 )
 
-            engine.ingest([{"role": "user", "content": "new message makes rollups stale"}])
+            # Raw ingest does not stale rollups: no covering summary was published.
+            engine.ingest([{"role": "user", "content": "raw ingest alone must not stale"}])
+            assert [
+                store.get_rollup(kind, start.isoformat(), scope)["status"]
+                for kind, start in (("day", today), ("week", week_start), ("month", month_start))
+            ] == ["ready", "ready", "ready"]
+
+            # Publishing a summary covering today is the staleness signal.
+            engine._invalidate_rollups_for_published_node(engine._dag.get_node(node_id))
             assert [
                 store.get_rollup(kind, start.isoformat(), scope)["status"]
                 for kind, start in (("day", today), ("week", week_start), ("month", month_start))
@@ -452,17 +464,12 @@ def test_session_reset_stales_rollups_referencing_deleted_nodes(tmp_path):
         engine.shutdown()
 
 
-def test_flag_off_skips_both_engine_hook_helpers(tmp_path, monkeypatch):
+def test_flag_off_skips_rollup_maintenance(tmp_path, monkeypatch):
     config = LCMConfig(
         database_path=str(tmp_path / "flag-off.db"),
         temporal_rollups_enabled=False,
     )
     calls = []
-    monkeypatch.setattr(
-        engine_module,
-        "mark_stale_after_ingest",
-        lambda *_args, **_kwargs: calls.append("ingest"),
-    )
     monkeypatch.setattr(
         engine_module,
         "run_rollup_maintenance",
@@ -472,6 +479,7 @@ def test_flag_off_skips_both_engine_hook_helpers(tmp_path, monkeypatch):
     try:
         engine.on_session_start("flag-off-session", conversation_id="flag-off-conversation")
         engine.ingest([{"role": "user", "content": "stored without rollup queries"}])
+        engine._bind_lifecycle_state("flag-off-session", conversation_id="flag-off-conversation")
         assert calls == []
     finally:
         engine.shutdown()
@@ -559,3 +567,200 @@ def test_rollup_builds_per_pass_config_default_and_environment(monkeypatch):
 
     assert LCMConfig.from_env().rollup_builds_per_pass == 5
     assert LCMConfig.from_env().rollup_maintenance_budget_ms == 750
+
+
+# --- FIXSPEC3 generation-model + staleness + dedup + scope additions -----------
+
+
+def test_build_day_captures_token_before_reading_sources(rollup_parts, monkeypatch):
+    # The build lease must be claimed BEFORE the source snapshot is read, so an
+    # invalidation between snapshot and claim cannot escape the generation CAS
+    # (maintainer #388 capture-token-first).
+    store, dag, config = rollup_parts
+    scope = "session-order"
+    day = date(2026, 7, 15)
+    _add_node(dag, scope, day, "ordered content")
+    order: list[str] = []
+    real_claim = store.upsert_building
+    real_sources = builder_module._daily_sources
+
+    def spy_claim(*args, **kwargs):
+        order.append("claim")
+        return real_claim(*args, **kwargs)
+
+    def spy_sources(*args, **kwargs):
+        order.append("sources")
+        return real_sources(*args, **kwargs)
+
+    monkeypatch.setattr(store, "upsert_building", spy_claim)
+    monkeypatch.setattr(builder_module, "_daily_sources", spy_sources)
+
+    build_day(store, dag, config, scope, day, summarizer=lambda _t, **_k: ("daily", 1))
+    assert order[:2] == ["claim", "sources"]
+
+
+def test_build_day_supersedes_invalidation_arriving_during_summarize(rollup_parts):
+    store, dag, config = rollup_parts
+    scope = "session-race"
+    day = date(2026, 7, 15)
+    _add_node(dag, scope, day, "racy content")
+
+    def summarize(_text, **_kwargs):
+        # An invalidation lands mid-build; the pre-invalidation token must not
+        # publish stale content over it.
+        store.mark_stale_for_day(day, scope)
+        return "would-be daily", 1
+
+    build_day(store, dag, config, scope, day, summarizer=summarize)
+    row = store.get_rollup("day", day.isoformat(), scope)
+    assert row["status"] == "stale"
+    assert row["summary"] is None
+
+
+def test_deletion_staleness_bumps_generation_and_supersedes_inflight(rollup_parts):
+    store, dag, config = rollup_parts
+    scope = "session-del"
+    day = date(2026, 7, 15)
+    node_id = _add_node(dag, scope, day, "to be deleted")
+    token = store.upsert_building("day", day.isoformat(), scope)
+    store.connection.execute(
+        "INSERT INTO lcm_rollup_sources(rollup_id, node_id) VALUES(?, ?)",
+        (token.rollup_id, node_id),
+    )
+    store.connection.commit()
+
+    assert builder_module.mark_stale_for_deleted_nodes(dag, [node_id]) == 1
+    # The in-flight build cannot publish deleted-node content over the stale row.
+    assert store.mark_ready(token, "deleted content", 1, [node_id], "fp") is False
+    row = store.get_rollup("day", day.isoformat(), scope)
+    assert row["status"] == "stale"
+    assert row["generation"] == token.generation + 1
+
+
+def test_no_source_stale_day_is_resolved_not_left_lingering(rollup_parts):
+    store, dag, config = rollup_parts
+    scope = "session-nosource"
+    day = date(2026, 7, 15)
+    # A stale day whose only sources were deleted: no summary node remains.
+    store.mark_stale_for_day(day, scope)
+
+    assert build_day(store, dag, config, scope, day) is None
+    # The day row is cleared, not left stale forever consuming a build slot.
+    assert store.get_rollup("day", day.isoformat(), scope) is None
+
+
+def test_daily_sources_excludes_condensed_children_present_same_day(rollup_parts):
+    store, dag, config = rollup_parts
+    scope = "session-dedup"
+    day = date(2026, 7, 15)
+    child = _add_node(dag, scope, day, "child leaf summary")
+    parent = dag.add_node(
+        SummaryNode(
+            session_id=scope,
+            depth=1,
+            summary="parent condensed summary",
+            token_count=count_tokens("parent condensed summary"),
+            source_token_count=10,
+            source_ids=[child],
+            source_type="nodes",
+            created_at=_timestamp(day, 18),
+            earliest_at=_timestamp(day, 8),
+            latest_at=_timestamp(day, 22),
+        )
+    )
+    captured: dict[str, str] = {}
+
+    def summarize(text, **_kwargs):
+        captured["text"] = text
+        return "daily", 1
+
+    result = build_day(store, dag, config, scope, day, summarizer=summarize)
+    assert result["source_node_ids"] == [parent]
+    assert "parent condensed summary" in captured["text"]
+    assert "child leaf summary" not in captured["text"]
+
+
+def test_raw_ingest_does_not_prebuild_then_publication_drives_stale(tmp_path, monkeypatch):
+    # Item 6 P1: raw ingest must not build/omit a rollup before its summary
+    # exists; publication of the covering leaf is the sole staleness signal.
+    db_path = tmp_path / "p1.db"
+    config = LCMConfig(
+        database_path=str(db_path),
+        temporal_rollups_enabled=True,
+        rollup_builds_per_pass=4,
+    )
+    engine = LCMEngine(config=config)
+    scope = "p1-session"
+    day = datetime.now(timezone.utc).date()
+    try:
+        engine.on_session_start(scope, conversation_id="p1-conv")
+        store = RollupStore(db_path)
+        try:
+            engine.ingest([{"role": "user", "content": "raw only, no summary yet"}])
+            engine._bind_lifecycle_state(scope, conversation_id="p1-conv")
+            assert store.get_rollup("day", day.isoformat(), scope) is None
+
+            node_id = _add_node(engine._dag, scope, day, "published leaf summary")
+            monkeypatch.setattr(
+                builder_module,
+                "summarize_with_escalation",
+                lambda _t, **_k: ("rebuilt with leaf", 1),
+            )
+            engine._invalidate_rollups_for_published_node(engine._dag.get_node(node_id))
+            assert store.get_rollup("day", day.isoformat(), scope)["status"] == "stale"
+
+            engine._bind_lifecycle_state(scope, conversation_id="p1-conv")
+            built = store.get_rollup("day", day.isoformat(), scope)
+            assert built["status"] == "ready"
+            assert node_id in built["source_node_ids"]
+        finally:
+            store.close()
+    finally:
+        engine.shutdown()
+
+
+def test_bypassed_session_skips_rollup_maintenance(tmp_path, monkeypatch):
+    config = LCMConfig(
+        database_path=str(tmp_path / "bypass.db"),
+        temporal_rollups_enabled=True,
+    )
+    calls: list[str] = []
+    monkeypatch.setattr(
+        engine_module,
+        "run_rollup_maintenance",
+        lambda *_args, **_kwargs: calls.append("maintenance"),
+    )
+    engine = LCMEngine(config=config)
+    try:
+        engine.on_session_start("bypass-session", conversation_id="bypass-conv")
+        calls.clear()
+
+        engine._session_stateless = True
+        engine._bind_lifecycle_state("bypass-session", conversation_id="bypass-conv")
+        assert calls == []
+
+        engine._session_stateless = False
+        engine._session_ignored = True
+        engine._bind_lifecycle_state("bypass-session", conversation_id="bypass-conv")
+        assert calls == []
+
+        engine._session_ignored = False
+        engine._bind_lifecycle_state("bypass-session", conversation_id="bypass-conv")
+        assert calls == ["maintenance"]
+    finally:
+        engine.shutdown()
+
+
+def test_deleted_node_staleness_covers_more_than_get_session_nodes_limit(rollup_parts):
+    # get_session_nodes caps at 1000; the unbounded id capture must return every
+    # deleted node so rollups past the cap are still staled (maintainer #388).
+    store, dag, _config = rollup_parts
+    scope = "session-over-1000"
+    for i in range(1001):
+        _add_node(dag, scope, date(2026, 7, 15), f"node {i}")
+
+    assert len(dag.get_session_nodes(scope)) == 1000
+    all_ids = dag.get_session_node_ids_below_depth(scope, None)
+    assert len(all_ids) == 1001
+    # Depth filtering also returns the complete set unbounded (all are depth 0).
+    assert len(dag.get_session_node_ids_below_depth(scope, 1)) == 1001

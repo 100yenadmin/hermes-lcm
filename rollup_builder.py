@@ -13,7 +13,7 @@ from typing import Callable, Sequence
 from .config import LCMConfig
 from .dag import SummaryDAG
 from .escalation import _deterministic_truncate, summarize_with_escalation
-from .rollup_store import RollupStore
+from .rollup_store import RollupBuildToken, RollupStore
 from .tokens import count_tokens
 
 logger = logging.getLogger(__name__)
@@ -57,21 +57,37 @@ def _stable_hash(value: object) -> str:
 
 
 def _daily_sources(dag: SummaryDAG, scope: str, day: date) -> list[dict[str, object]]:
-    """Return summaries whose newest covered source message falls on ``day``."""
+    """Return summaries whose newest covered source message falls on ``day``.
+
+    A condensed child and its condensing parent can both land on the same day
+    (a parent's ``latest_at`` equals its newest child's), which would double-count
+    that content in the rollup. Exclude any node that is referenced as a source by
+    a higher-depth node also present in the day's set, so the parent stands in for
+    the children it covers (maintainer #389 source-dedup blocker).
+    """
     connection = dag.connection
     if connection is None:
         return []
     start, end = _utc_bounds(day)
     rows = connection.execute(
         """
-        SELECT node_id, summary
-        FROM summary_nodes
-        WHERE session_id = ?
-          AND COALESCE(latest_at, created_at) >= ?
-          AND COALESCE(latest_at, created_at) < ?
-        ORDER BY COALESCE(latest_at, created_at), node_id
+        SELECT n.node_id, n.summary
+        FROM summary_nodes n
+        WHERE n.session_id = ?
+          AND COALESCE(n.latest_at, n.created_at) >= ?
+          AND COALESCE(n.latest_at, n.created_at) < ?
+          AND n.node_id NOT IN (
+              SELECT je.value
+              FROM summary_nodes p, json_each(p.source_ids) je
+              WHERE p.session_id = n.session_id
+                AND p.source_type = 'nodes'
+                AND p.depth > n.depth
+                AND COALESCE(p.latest_at, p.created_at) >= ?
+                AND COALESCE(p.latest_at, p.created_at) < ?
+          )
+        ORDER BY COALESCE(n.latest_at, n.created_at), n.node_id
         """,
-        (scope, start, end),
+        (scope, start, end, start, end),
     ).fetchall()
     return [
         {"node_id": int(row[0]), "summary": str(row[1] or "")}
@@ -126,10 +142,18 @@ def _summarize_capped(
         previous_tokens = summary_tokens
 
 
-def _mark_failed(store: RollupStore, rollup_id: int | None, exc: Exception) -> None:
-    if rollup_id is not None:
+def _mark_failed(
+    store: RollupStore, token: "RollupBuildToken | None", exc: Exception
+) -> None:
+    if token is not None:
         try:
-            store.mark_failed(rollup_id, f"{type(exc).__name__}: {exc}")
+            # Generation-guarded: a superseded builder's late exception must not
+            # flip a newer ready/stale row to failed (maintainer #387 blocker 2).
+            store.mark_failed(
+                token.rollup_id,
+                f"{type(exc).__name__}: {exc}",
+                generation=token.generation,
+            )
         except Exception:
             logger.debug("LCM temporal rollup failure state could not be persisted", exc_info=True)
     logger.debug("LCM temporal rollup build failed", exc_info=True)
@@ -147,12 +171,22 @@ def build_day(
     spend_guard: object | None = None,
 ) -> dict[str, object] | None:
     """Build one UTC daily rollup without allowing failures into the caller."""
-    rollup_id: int | None = None
+    token: RollupBuildToken | None = None
     try:
         summarizer = summarizer or summarize_with_escalation
         day = _as_date(period_date)
+        # Capture the build token (advancing the generation) BEFORE reading the
+        # source snapshot, so an invalidation that arrives while we build is
+        # guaranteed to supersede this token's mark_ready — a snapshot read
+        # before the claim could otherwise be published stale (maintainer #388
+        # blocker: capture-token-first).
+        token = store.upsert_building("day", day.isoformat(), scope)
         sources = _daily_sources(dag, scope, day)
         if not sources:
+            # A stale day with no summary node to build from must resolve, not
+            # linger stale forever consuming a per-pass build slot (maintainer
+            # #388 blocker: no-source jobs).
+            store.resolve_no_source(token)
             return None
 
         source_ids = sorted(int(source["node_id"]) for source in sources)
@@ -166,8 +200,6 @@ def build_day(
             f"[Summary node {source['node_id']}]\n{source['summary']}"
             for source in sources
         )
-        token = store.upsert_building("day", day.isoformat(), scope)
-        rollup_id = token.rollup_id
         summary, token_count = _summarize_capped(
             text,
             target_tokens=config.rollup_daily_target_tokens,
@@ -185,7 +217,7 @@ def build_day(
             store.stale_aggregates_for_day(day, scope)
         return store.get_rollup("day", day.isoformat(), scope)
     except Exception as exc:
-        _mark_failed(store, rollup_id, exc)
+        _mark_failed(store, token, exc)
         return None
 
 
@@ -294,17 +326,24 @@ def _build_aggregate(
     circuit_breaker: object | None,
     spend_guard: object | None,
 ) -> dict[str, object] | None:
-    rollup_id: int | None = None
+    token: RollupBuildToken | None = None
     try:
         summarizer = summarizer or summarize_with_escalation
         start, end = _period_window(period_kind, period_start)
+        # Capture the build token (advancing the generation) BEFORE reading the
+        # daily-status snapshot, so a daily (re)build that stales this aggregate
+        # while we build supersedes this token's mark_ready — reading dailies
+        # before the claim could otherwise publish an aggregate that omits a
+        # just-rebuilt daily (maintainer #388 blocker: capture-token-first).
+        token = store.upsert_building(period_kind, start.isoformat(), scope)
         statuses = _daily_statuses(store, start, end, scope)
 
         # Completeness gate (maintainer #388 blocker 5): only publish a ready
         # aggregate when every day that HAS content in the window has a ready
         # daily rollup. A content day that is missing/stale/building blocks the
-        # aggregate, which is left stale with a recorded reason so it rebuilds
-        # once the daily catches up. Days with no content do not block.
+        # aggregate, which is released back to stale (token-guarded) with a
+        # recorded reason so it rebuilds once the daily catches up. Days with no
+        # content do not block.
         content_days = _days_with_content(dag, scope, start, end)
         pending_days = sorted(
             day_key
@@ -313,10 +352,8 @@ def _build_aggregate(
         )
         if pending_days:
             preview = ", ".join(pending_days[:5])
-            store.record_incomplete_aggregate(
-                period_kind,
-                start.isoformat(),
-                scope,
+            store.defer_incomplete(
+                token,
                 f"incomplete: {len(pending_days)} daily rollup(s) not ready ({preview})",
             )
             return None
@@ -336,6 +373,10 @@ def _build_aggregate(
             current += timedelta(days=1)
 
         if not ready:
+            # No ready constituent daily to aggregate: clear the claimed row so
+            # it does not linger stale consuming a build slot (a later daily
+            # (re)build re-stales the aggregate via stale_aggregates_for_day).
+            store.resolve_no_source(token)
             return None
 
         fingerprint = _stable_hash(days)
@@ -347,8 +388,6 @@ def _build_aggregate(
             store,
             [int(row["rollup_id"]) for _day_key, row in ready],
         )
-        token = store.upsert_building(period_kind, start.isoformat(), scope)
-        rollup_id = token.rollup_id
         summary, token_count = _summarize_capped(
             text,
             target_tokens=config.rollup_aggregate_max_tokens,
@@ -361,7 +400,7 @@ def _build_aggregate(
         store.mark_ready(token, summary, token_count, source_ids, fingerprint)
         return store.get_rollup(period_kind, start.isoformat(), scope)
     except Exception as exc:
-        _mark_failed(store, rollup_id, exc)
+        _mark_failed(store, token, exc)
         return None
 
 
@@ -403,35 +442,13 @@ def build_month(
     )
 
 
-def mark_stale_after_ingest(
-    dag: SummaryDAG,
-    scope: str,
-    store_ids: Sequence[int],
-) -> int:
-    """Mark rollups stale for the UTC days of newly persisted messages."""
-    store: RollupStore | None = None
-    try:
-        connection = dag.connection
-        if not store_ids or connection is None:
-            return 0
-        placeholders = ",".join("?" for _ in store_ids)
-        rows = connection.execute(
-            f"""
-            SELECT DISTINCT date(timestamp, 'unixepoch')
-            FROM messages
-            WHERE store_id IN ({placeholders})
-            ORDER BY 1
-            """,
-            [int(store_id) for store_id in store_ids],
-        ).fetchall()
-        store = RollupStore(dag.db_path)
-        return sum(store.mark_stale_for_day(str(row[0]), scope) for row in rows if row[0])
-    except Exception:
-        logger.debug("LCM temporal rollup staleness update failed", exc_info=True)
-        return 0
-    finally:
-        if store is not None:
-            store.close()
+# NOTE: there is deliberately no ``mark_stale_after_ingest`` raw-ingest hook.
+# Staleness is driven SOLELY by summary-node publication
+# (:func:`mark_stale_for_published_summary`, wired at every ``_dag.add_node``
+# site). A raw-ingest bind-time mark would stale a period before its covering
+# summary exists, letting a rebuild publish ``ready`` from the OLD sources and
+# omit the not-yet-published leaf (maintainer #388 P1). Rollups consume
+# published summary nodes, so publication is the only correct trigger.
 
 
 def mark_stale_for_published_summary(
@@ -475,10 +492,16 @@ def mark_stale_for_deleted_nodes(dag: SummaryDAG, node_ids: Sequence[int]) -> in
         placeholders = ",".join("?" for _ in unique_node_ids)
         store = RollupStore(dag.db_path)
         with store.connection:
+            # Advance generation on the invalidation so an in-flight build for
+            # any affected rollup is superseded and cannot publish deleted-node
+            # content over the stale row (maintainer #388 blocker: deletion must
+            # bump generation, mirroring mark_stale_for_day).
             cur = store.connection.execute(
                 f"""
                 UPDATE lcm_rollups
-                SET status = 'stale'
+                SET status = 'stale',
+                    generation = generation + 1,
+                    lease_expires_at = NULL
                 WHERE status != 'stale'
                   AND rollup_id IN (
                     SELECT rollup_id
