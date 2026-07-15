@@ -27,6 +27,13 @@ logger = logging.getLogger(__name__)
 _VOYAGE_URL = "https://api.voyageai.com/v1/embeddings"
 _VOYAGE_MAX_BATCH_TOKENS = 80_000
 _VOYAGE_MAX_DOCUMENT_TOKENS = 27_000
+_VOYAGE_TOKEN_SAFETY_FACTOR = 0.9
+_VOYAGE_BATCH_TOKEN_BUDGET = int(
+    _VOYAGE_MAX_BATCH_TOKENS * _VOYAGE_TOKEN_SAFETY_FACTOR
+)
+_VOYAGE_DOCUMENT_TOKEN_BUDGET = int(
+    _VOYAGE_MAX_DOCUMENT_TOKENS * _VOYAGE_TOKEN_SAFETY_FACTOR
+)
 _MAX_ATTEMPTS = 3
 _RETRY_AFTER_BUDGET_S = 60.0
 _DEFAULT_FASTEMBED_CACHE = Path.home() / ".cache" / "fastembed"
@@ -262,6 +269,8 @@ def _scrub_response_body(body: bytes) -> str:
             }
         if isinstance(value, list):
             return [scrub(item) for item in value]
+        if isinstance(value, str):
+            return "[REDACTED]"
         return value
 
     return json.dumps(scrub(payload), ensure_ascii=True, sort_keys=True)
@@ -336,7 +345,15 @@ class VoyageProvider(_ResilientProvider):
         logger.warning("Voyage embedding error status=%s body=%s", status, scrubbed)
         return VoyageError(kind, f"Voyage embedding request failed ({status})", status_code=status)
 
-    def _request(self, texts: Sequence[str], *, input_type: str) -> list[list[float]]:
+    def _request(
+        self,
+        texts: Sequence[str],
+        *,
+        input_type: str,
+        timeout: float | None = None,
+        max_attempts: int = _MAX_ATTEMPTS,
+        retry_after_budget_s: float = _RETRY_AFTER_BUDGET_S,
+    ) -> list[list[float]]:
         api_key = os.environ.get("VOYAGE_API_KEY", "").strip()
         if not api_key:
             raise VoyageError("auth", "VOYAGE_API_KEY is not set")
@@ -346,9 +363,11 @@ class VoyageProvider(_ResilientProvider):
             "input_type": input_type,
             "truncation": False,
         }
+        request_timeout = self.timeout if timeout is None else max(0.001, float(timeout))
+        attempts = max(1, int(max_attempts))
         retry_after_spent = 0.0
         last_error: VoyageError | None = None
-        for attempt in range(_MAX_ATTEMPTS):
+        for attempt in range(attempts):
             try:
                 response = self._transport(
                     url=_VOYAGE_URL,
@@ -357,11 +376,11 @@ class VoyageProvider(_ResilientProvider):
                         "Authorization": f"Bearer {api_key}",
                         "Content-Type": "application/json",
                     },
-                    timeout=self.timeout,
+                    timeout=request_timeout,
                 )
             except (OSError, TimeoutError, urllib.error.URLError) as exc:
                 last_error = VoyageError("network", f"Voyage network error: {exc}")
-                if attempt + 1 >= _MAX_ATTEMPTS:
+                if attempt + 1 >= attempts:
                     raise last_error from exc
                 self._sleep(min(25.0, 0.5 * (2 ** attempt)))
                 continue
@@ -384,11 +403,11 @@ class VoyageProvider(_ResilientProvider):
 
             last_error = self._error(response)
             retryable = response.status == 429 or response.status >= 500
-            if not retryable or attempt + 1 >= _MAX_ATTEMPTS:
+            if not retryable or attempt + 1 >= attempts:
                 raise last_error
             if response.status == 429:
                 delay = _retry_after_seconds(_header(response.headers, "Retry-After"))
-                remaining = _RETRY_AFTER_BUDGET_S - retry_after_spent
+                remaining = retry_after_budget_s - retry_after_spent
                 if delay > remaining:
                     raise last_error
                 retry_after_spent += delay
@@ -411,13 +430,13 @@ class VoyageProvider(_ResilientProvider):
         for index, text in enumerate(texts):
             text = str(text)
             tokens = count_tokens(text)
-            if tokens > _VOYAGE_MAX_DOCUMENT_TOKENS:
+            if tokens > _VOYAGE_DOCUMENT_TOKEN_BUDGET:
                 self.last_skipped_documents.append(index)
                 logger.warning(
                     "Skipping Voyage document index=%d tokens=%d limit=%d",
                     index,
                     tokens,
-                    _VOYAGE_MAX_DOCUMENT_TOKENS,
+                    _VOYAGE_DOCUMENT_TOKEN_BUDGET,
                 )
                 continue
             accepted.append((text, tokens))
@@ -426,7 +445,7 @@ class VoyageProvider(_ResilientProvider):
         batch: list[str] = []
         batch_tokens = 0
         for text, tokens in accepted:
-            if batch and batch_tokens + tokens > _VOYAGE_MAX_BATCH_TOKENS:
+            if batch and batch_tokens + tokens > _VOYAGE_BATCH_TOKEN_BUDGET:
                 vectors.extend(
                     self._guarded(lambda current=tuple(batch): self._request(current, input_type="document"))
                 )
@@ -444,6 +463,20 @@ class VoyageProvider(_ResilientProvider):
     def embed_query(self, text: str) -> list[float]:
         vectors = self._guarded(
             lambda: self._request((str(text),), input_type="query")
+        )
+        self._remember_dim(vectors)
+        return vectors[0]
+
+    def embed_query_interactive(self, text: str, *, timeout: float) -> list[float]:
+        """Embed a latency-sensitive query with one bounded HTTP attempt."""
+        vectors = self._guarded(
+            lambda: self._request(
+                (str(text),),
+                input_type="query",
+                timeout=timeout,
+                max_attempts=1,
+                retry_after_budget_s=0.0,
+            )
         )
         self._remember_dim(vectors)
         return vectors[0]
@@ -481,17 +514,25 @@ class OllamaProvider(_ResilientProvider):
     def dim(self) -> int:
         return self._dim
 
-    def _request(self, texts: Sequence[str]) -> list[list[float]]:
-        for attempt in range(_MAX_ATTEMPTS):
+    def _request(
+        self,
+        texts: Sequence[str],
+        *,
+        timeout: float | None = None,
+        max_attempts: int = _MAX_ATTEMPTS,
+    ) -> list[list[float]]:
+        request_timeout = self.timeout if timeout is None else max(0.001, float(timeout))
+        attempts = max(1, int(max_attempts))
+        for attempt in range(attempts):
             try:
                 response = self._transport(
                     url=f"{self.base_url}/api/embed",
                     payload={"model": self.model_id, "input": list(texts)},
                     headers={"Content-Type": "application/json"},
-                    timeout=self.timeout,
+                    timeout=request_timeout,
                 )
             except (OSError, TimeoutError, urllib.error.URLError) as exc:
-                if attempt + 1 >= _MAX_ATTEMPTS:
+                if attempt + 1 >= attempts:
                     raise EmbeddingProviderError(f"Ollama network error: {exc}") from exc
                 self._sleep(min(25.0, 0.5 * (2 ** attempt)))
                 continue
@@ -511,10 +552,22 @@ class OllamaProvider(_ResilientProvider):
             return vectors
         raise EmbeddingProviderError("Ollama embedding request failed")
 
-    def _embed(self, texts: Sequence[str]) -> list[list[float]]:
+    def _embed(
+        self,
+        texts: Sequence[str],
+        *,
+        timeout: float | None = None,
+        max_attempts: int = _MAX_ATTEMPTS,
+    ) -> list[list[float]]:
         if not texts:
             return []
-        vectors = self._guarded(lambda: self._request(tuple(str(text) for text in texts)))
+        vectors = self._guarded(
+            lambda: self._request(
+                tuple(str(text) for text in texts),
+                timeout=timeout,
+                max_attempts=max_attempts,
+            )
+        )
         for vector in vectors:
             if not vector:
                 raise EmbeddingProviderError("Ollama returned an empty embedding")
@@ -528,6 +581,10 @@ class OllamaProvider(_ResilientProvider):
 
     def embed_query(self, text: str) -> list[float]:
         return self._embed((text,))[0]
+
+    def embed_query_interactive(self, text: str, *, timeout: float) -> list[float]:
+        """Embed a latency-sensitive query with one bounded HTTP attempt."""
+        return self._embed((text,), timeout=timeout, max_attempts=1)[0]
 
 
 def _load_fastembed():
