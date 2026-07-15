@@ -159,10 +159,10 @@ class CompactionMixin:
             if self._should_run_deferred_maintenance(replay_messages, observed_tokens=replay_rough):
                 return self._mark_preflight_compression_requested()
             return False
-        if self._should_force_overflow_recovery(observed_tokens=rough):
-            return self._mark_preflight_compression_requested()
         if self._compression_boundary_cooldown_active():
             return False
+        if self._should_force_overflow_recovery(observed_tokens=rough):
+            return self._mark_preflight_compression_requested()
         if self.threshold_tokens > 0 and rough >= self.threshold_tokens:
             if pre_ingest_placeholder_ambiguous_noop:
                 self._last_compression_status = "noop"
