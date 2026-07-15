@@ -1739,20 +1739,15 @@ def _rollups_rebuild_text(tokens: list[str], engine) -> str:
     store = RollupStore(engine._dag.db_path)
     outcomes: list[tuple[str, str, str]] = []
     try:
-        conn = store.connection
-        if conn is None:  # pragma: no cover - RollupStore initialization contract
+        if store.connection is None:  # pragma: no cover - RollupStore initialization contract
             raise RuntimeError("temporal rollup store is unavailable")
+        # Durably seed a stale row for EVERY requested target BEFORE applying the
+        # per-pass build budget, so targets beyond the budget remain durably
+        # 'stale' (not absent) and are built by later maintenance (maintainer #391
+        # blocker). upsert_stale reuses the COMMIT-A store upsert and leaves a
+        # currently-'building' row untouched.
         for period_kind, period_start in targets:
-            conn.execute(
-                """
-                UPDATE lcm_rollups
-                SET status = 'stale'
-                WHERE period_kind = ? AND period_start = ? AND scope = ?
-                  AND status != 'building'
-                """,
-                (period_kind, period_start.isoformat(), scope),
-            )
-        conn.commit()
+            store.upsert_stale(period_kind, period_start.isoformat(), scope)
 
         builders = {
             "day": rollup_builder.build_day,

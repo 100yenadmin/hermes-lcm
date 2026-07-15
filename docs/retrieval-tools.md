@@ -61,13 +61,15 @@ the same 20,000-character response ceiling used by the retrieval tools.
 {"period": "date:2026-07-15", "scope": "global"}
 ```
 
-When temporal rollups are enabled and a ready rollup covers the requested
-window, the response includes its id and `ready` status in `provenance.rollups`.
-If rollups are missing or stale, the feature flag is off, or the request uses a
-sub-day `last Nh` window, the tool performs the existing read-only leaf-summary
-retrieval over the same time bounds. This fallback is a successful retrieval,
-including for an empty window; `provenance.fallback` is `true` and no LLM call
-is made while serving either path. See the
+When temporal rollups are enabled and `ready` rollups cover the **entire**
+requested window, the response includes their ids and `ready` status in
+`provenance.rollups`. If any day in the window lacks a ready rollup (missing or
+stale), the feature flag is off, or the request uses a sub-day `last Nh` window,
+the tool falls back for the whole window to the existing read-only leaf-summary
+retrieval over the same time bounds — including retained higher-depth and
+carry-forward summaries, not only current-session depth-0 leaves. This fallback
+is a successful retrieval, including for an empty window; `provenance.fallback`
+is `true` and no LLM call is made while serving either path. See the
 [operator guide's temporal rollup operations](operator-guide.md#temporal-rollup-operations)
 for enablement, tuning, status inspection, and bounded rebuild commands.
 
