@@ -208,3 +208,110 @@ untouched.
   the engine-integration test files are not runnable in this standalone
   checkout. The `validate_release.sh` pytest gates therefore report red on this
   standalone checkout for reasons unrelated to the embeddings surface.
+
+---
+
+# FIXSPEC3 — codex-bot round-2 findings (branch docs/embeddings-setup-guide)
+
+Per-item disposition against the CURRENT re-stacked heads. Baseline for the
+"0 new failures" rule is upstream-ro @ `31675c6`: raw pytest is **38 failed /
+636 passed / 13 collection errors**, every failure/error rooted in the missing
+`agent` monorepo (engine-integration + packaging/host/path/benchmarking). After
+this work: **38 failed / 647 passed / 13 errors** — the failed-test set and the
+collection-error-file set are **byte-identical** to baseline (0 new; +11 passing
+from the new tests). `_lcm_grep_full_text` byte-identity preserved:
+sha256 `fbf5ece961667d5bbf5673e85f2428d7948d66bd4f1c537976226232a47d8bad`.
+
+## Dispositions
+
+1. **latest_at / messages.source legacy-DB crash — FIXED (A).** `vector_store._filtered_candidate_indexes`
+   used `COALESCE(sn.latest_at, sn.created_at)` unconditionally (only `suppressed_at`
+   was PRAGMA-guarded); `_source_allowed_ids` referenced `m.source` unconditionally.
+   A VectorStore-only worker DB predating the DAG `latest_at` / MessageStore
+   `source` migrations crashed time-/source-scoped KNN. Now: `recency_expr`
+   falls back to `created_at` when `latest_at` is absent; `_source_allowed_ids`
+   PRAGMA-detects `messages.source` and skips the source filter when absent.
+2. **node_id CAST defeats the INTEGER PK index — FIXED (A).** `record_embedding`
+   (`WHERE CAST(node_id AS TEXT) = ?`) and both candidate JOINs (`_filtered_candidate_indexes`,
+   `_source_allowed_ids`) now bind/cast the *param* (`node_id = ?` / `sn.node_id = CAST(t.id AS INTEGER)`),
+   so the `INTEGER PRIMARY KEY` index is used. `_as_node_id` coerces non-integer
+   ids to None (never a match) instead of scanning.
+3. **Bounded scan sorted every vector — FIXED (A).** Replaced `_bounded_rows`
+   (`ORDER BY m.embedded_at DESC, v.rowid DESC LIMIT ?` → `USE TEMP B-TREE FOR
+   LAST TERM`) with `_candidate_ids_by_recency` (`ORDER BY m.embedded_at DESC`
+   served directly by `idx_lcm_embedding_meta_identity_embedded_at`, EXPLAIN
+   confirms no temp B-tree) + `_load_vectors_for_ids`.
+4. **Per-call scratch temp tables — FIXED (A).** `_temp_id_table` now uses a
+   `uuid4`-suffixed name and `DROP`s in `finally`; two overlapping candidate
+   sets no longer clobber (the old fixed name + `DELETE` wiped the sibling set).
+5. **Resolve active profile under the write lock — FIXED (A).** `record_embedding`
+   now resolves the profile + normalizes the vector INSIDE `_write_transaction`,
+   so a concurrent active-provider switch cannot let it read identity A and
+   write under B.
+6. **Bounded path applied the limit before the filter — FIXED (A).** The
+   no-numpy `knn` branch now enumerates all candidate ids in recency order,
+   filters (`_filtered_candidate_indexes`), THEN takes the most-recent
+   `bounded_scan_rows` survivors and loads only their vectors — a filtered match
+   outside the recent window is no longer lost. (numpy path was already correct.)
+7. **KNN resolved by model_id alone — FIXED (A + D).** `knn(..., provider=...)`
+   + `_resolve_profile(model, provider=...)` resolve by the full configured
+   identity; `tools._run_knn` passes `provider=provider.provider_id`. Switching
+   provider A→B for one model name now scores against B's vectors (or degrades
+   to FTS when B is unbackfilled: coverage `none`).
+8. **purge_embeddings_for_nodes unwired — FIXED wiring (A); orphan-filter ALREADY-PRESENT.**
+   The orphan defense (a filtered match must exist in `summary_nodes`) is already
+   enforced by the inner JOIN in `_filtered_candidate_indexes`/`_source_allowed_ids`,
+   which runs on every knn — proven by `test_orphaned_embeddings_are_not_ranked_and_purge_reclaims`.
+   The purge is now wired: `engine.on_session_reset` collects the to-be-deleted
+   node_ids (`dag.session_node_ids{,_below_depth}`) and calls the new guarded
+   `engine._purge_embeddings_for_nodes` (no-op unless `embeddings_enabled`);
+   `command._delete_clean_candidates_atomically` (doctor clean apply) captures
+   deleted node_ids and calls the same helper after commit.
+9. **Redact scalar error strings — ALREADY-FIXED (no change).** `embedding_provider._scrub_response_body`
+   already maps EVERY string value to `[REDACTED]` (lines 276-277), so a scalar
+   `error`/`message`/nested detail echoing input is never logged raw; status is
+   logged separately as a formatted int.
+10. **Backfill tripped the per-minute spend guard — FIXED (B).** `resolve_provider(config, for_backfill=True)`
+    builds the provider with `EmbeddingSpendGuard(max_calls=0)` (guard disabled,
+    circuit breaker retained); `command._embedding_backfill_apply` passes
+    `for_backfill=True`. Interactive query embedding keeps the 60/min guard.
+11. **Enforce role in semantic — ALREADY-FIXED (no change).** `tools._lcm_grep_semantic`
+    already degrades to full_text when `role` is set (line ~1455). Reinforced by
+    the item-12/13 contract guards below.
+12 & 13. **Conversation-lane + raw-only contract — FIXED together (D).** The
+    advertised `schemas.LCM_GREP` contract returns raw-message hits only for
+    broader scopes (`all`/`session`) and for `role`/`time_from`/`time_to`, and
+    `conversation_id` is a message-lane filter that `full_text` treats as
+    raw-only. A summary node has no single lane and is cross-session, so the
+    semantic arm now **degrades to the raw full_text path** (which filters at the
+    message-row level — the correct lane filter) whenever `session_scope != current`,
+    a time bound is set, or `conversation_id` is set — instead of the round-2
+    behavior of resolving conversation→sessions and returning cross-session /
+    wrong-lane summary hits. This aligns the semantic contract with full_text +
+    the maintainer (Tosko4 #394) review. Round-2 tests that asserted the old
+    (contract-violating) behavior were updated to assert the degradation.
+
+## Per-commit file:line manifest
+
+- **A (#390 vector_store/purge):** `vector_store.py` (`_resolve_profile`+provider ~215;
+  `_as_node_id` ~257; `record_embedding` resolve-under-lock + int lookup ~330-370;
+  `_temp_id_table` uuid+drop ~426; `_candidate_ids_by_recency`/`_load_vectors_for_ids`
+  ~540-600; `_source_allowed_ids` source-guard + int join ~600-640; `_filtered_candidate_indexes`
+  latest_at-guard + int join ~660-720; `knn` provider + filter-before-bound ~780-860);
+  `dag.py` (`session_node_ids`/`session_node_ids_below_depth` ~255); `engine.py`
+  (`on_session_reset` purge ~2977; `_purge_embeddings_for_nodes` ~2983);
+  `command.py` (`_delete_clean_candidates_atomically` purge ~1440); `tests/test_vector_store.py` (+9 tests).
+- **B (#392 provider/backfill):** `embedding_provider.py` (`resolve_provider(for_backfill=)` ~772);
+  `command.py` (`resolve_provider(..., for_backfill=True)` ~2257); `tests/test_embedding_provider.py`
+  (+1 test); `tests/test_embedding_backfill.py` (stubs accept `**_kw`).
+- **D (#394 tools search):** `tools.py` (`_lcm_grep_semantic` raw-only degrade guards ~1455;
+  `_run_knn` provider ~1511); `tests/test_embedding_search_modes.py` (2 rewritten + 1 new).
+- **E (#395 docs):** `docs/retrieval-tools.md` (semantic filter contract ~75); `FIX-OUTCOME.md`.
+
+## Counts
+
+13 items: **10 fixed** (1-8, 10, 12&13 counted as the 11th/12th sub-fix under one
+change), **3 already-fixed** (9, 11, and the orphan-filter half of 8). 13 new/updated
+tests. ruff clean. 0 new pytest failures vs baseline; validate_release fails only
+on the 14 pre-existing `test_packaging_install` agent-monorepo wedge tests (all in
+the baseline failed set), every other gate green.

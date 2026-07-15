@@ -72,12 +72,18 @@ and `coverage: 'none'`. Provider authentication failures do not degrade: they
 return an operator-readable error so a missing or invalid credential is repaired
 instead of silently hidden.
 
-`conversation_id`, `source`, `time_from`, and `time_to` are enforced inside the
-KNN eligibility step **before** the top-k cap, so an ineligible high-scoring
-vector cannot displace an eligible lower-scoring one. `conversation_id` resolves
-to the sessions that carry it; `role` is a raw-message dimension summaries do not
-have, so a `role` filter degrades the semantic arm to full-text (which enforces
-role) rather than being ignored.
+`source` is enforced inside the KNN eligibility step **before** the top-k cap
+(by descendant source lineage), so an ineligible high-scoring vector cannot
+displace an eligible lower-scoring one. The remaining raw-message filters are
+governed by the advertised contract: `role`, `time_from`, `time_to`,
+`conversation_id`, and broader `session_scope` values (`all`/`session`) all
+return raw-message hits only. Because a summary node has no single role/lane and
+is cross-session, the semantic arm degrades to the raw full-text path (which
+enforces those filters at the message-row level and reports `degraded_to_fts`)
+whenever any of them is supplied, rather than emitting summary hits that would
+violate the contract. The semantic arm therefore produces summary hits only for
+a current-session query with no role/time/conversation filter (`source` still
+allowed).
 
 `mode='hybrid'` runs both arms and deduplicates shared summary nodes by
 `node_id`. It fuses ranks with reciprocal-rank fusion only:
