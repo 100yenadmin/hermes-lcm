@@ -461,13 +461,16 @@ def test_semantic_role_filter_degrades_to_full_text(semantic_engine, monkeypatch
     assert all(hit.get("type") == "message" for hit in payload["results"])
 
 
-def test_semantic_time_to_excludes_ineligible_before_top_k(semantic_engine, monkeypatch):
+def test_semantic_time_scoped_query_degrades_to_raw_full_text(semantic_engine, monkeypatch):
     newer = _add_summary(semantic_engine, "newer high score", created_at=100.0)
     older = _add_summary(semantic_engine, "older lower score", created_at=1.0)
-    # newer scores highest for the query vector but is outside time_to.
     _seed_vectors(semantic_engine, [(newer, [1.0, 0.0]), (older, [0.0, 1.0])])
     monkeypatch.setattr(lcm_tools, "resolve_provider", lambda _config: MockProvider())
 
+    # time_from/time_to advertise raw-message hits only (schemas.LCM_GREP), and
+    # full_text omits summaries when a time filter is set. The semantic arm,
+    # which produces only summary hits, must therefore degrade to the raw
+    # full_text path instead of returning time-scoped summary hits.
     payload = json.loads(
         lcm_tools.lcm_grep(
             {"query": "q", "mode": "semantic", "time_to": 50, "limit": 1},
@@ -475,9 +478,9 @@ def test_semantic_time_to_excludes_ineligible_before_top_k(semantic_engine, monk
         )
     )
 
-    ids = [hit["node_id"] for hit in payload["results"]]
-    assert newer not in ids
-    assert ids == [older]
+    assert payload["degraded_to_fts"] is True
+    assert "time" in payload["degraded_reason"].lower()
+    assert all(hit.get("type") != "summary" for hit in payload.get("results", []))
 
 
 def test_semantic_source_filter_excludes_ineligible_before_top_k(semantic_engine, monkeypatch):
@@ -503,7 +506,7 @@ def test_semantic_source_filter_excludes_ineligible_before_top_k(semantic_engine
     assert [hit["node_id"] for hit in payload["results"]] == [keep]
 
 
-def test_semantic_conversation_filter_resolves_to_sessions(semantic_engine, monkeypatch):
+def test_semantic_broad_scope_degrades_to_raw_full_text(semantic_engine, monkeypatch):
     semantic_engine._store.append(
         "session-a", {"role": "user", "content": "c"}, conversation_id="conv-1"
     )
@@ -511,10 +514,12 @@ def test_semantic_conversation_filter_resolves_to_sessions(semantic_engine, monk
     other = _add_summary_in(
         semantic_engine, "other session", session_id="session-b", created_at=2.0
     )
-    # other scores highest but lives in a session outside the conversation.
     _seed_vectors(semantic_engine, [(in_conv, [0.0, 1.0]), (other, [1.0, 0.0])])
     monkeypatch.setattr(lcm_tools, "resolve_provider", lambda _config: MockProvider())
 
+    # Broader scopes ('all'/'session') return raw-message hits only. A summary
+    # is cross-session/unexpandable, so semantic degrades to full_text rather
+    # than emit cross-session summary hits.
     payload = json.loads(
         lcm_tools.lcm_grep(
             {
@@ -528,7 +533,38 @@ def test_semantic_conversation_filter_resolves_to_sessions(semantic_engine, monk
         )
     )
 
-    assert [hit["node_id"] for hit in payload["results"]] == [in_conv]
+    assert payload["degraded_to_fts"] is True
+    assert "broader scopes" in payload["degraded_reason"]
+    assert all(hit.get("type") != "summary" for hit in payload.get("results", []))
+
+
+def test_semantic_conversation_filter_degrades_to_raw_full_text(semantic_engine, monkeypatch):
+    semantic_engine._store.append(
+        "session-a", {"role": "user", "content": "c"}, conversation_id="conv-1"
+    )
+    in_conv = _add_summary(semantic_engine, "in conversation", created_at=1.0)
+    _seed_vectors(semantic_engine, [(in_conv, [0.0, 1.0])])
+    monkeypatch.setattr(lcm_tools, "resolve_provider", lambda _config: MockProvider())
+
+    # A conversation lane maps to raw messages; a summary can aggregate multiple
+    # lanes within one session, so semantic degrades to the raw full_text path
+    # (which filters messages by conversation_id at the row level) rather than
+    # leak wrong-lane summary hits.
+    payload = json.loads(
+        lcm_tools.lcm_grep(
+            {
+                "query": "q",
+                "mode": "semantic",
+                "conversation_id": "conv-1",
+                "limit": 1,
+            },
+            engine=semantic_engine,
+        )
+    )
+
+    assert payload["degraded_to_fts"] is True
+    assert "conversation" in payload["degraded_reason"].lower()
+    assert all(hit.get("type") != "summary" for hit in payload.get("results", []))
 
 
 def test_slow_knn_degrades_within_total_budget(semantic_engine, monkeypatch):

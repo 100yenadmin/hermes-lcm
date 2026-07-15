@@ -1455,10 +1455,23 @@ def _lcm_grep_semantic(
     if role is not None:
         return degraded("role filtering is only supported by full_text retrieval")
 
-    # Enforce the conversation filter at the store layer by resolving it to the
-    # set of session_ids that carry that conversation, intersected with the
-    # active scope. An empty resolution yields no candidates (which then
-    # degrades), never a silently unfiltered result.
+    # The advertised lcm_grep contract (schemas.LCM_GREP) returns RAW message
+    # hits only for broader scopes and for time/conversation filters; full_text
+    # honors this by omitting summary hits in exactly these cases. Embedded
+    # summaries have no single lane and are cross-session/unexpandable, so the
+    # semantic arm degrades to the raw full_text path rather than emit summary
+    # hits that violate the contract (and, for conversation_id, leak
+    # wrong-lane summaries from a session that carries multiple conversations).
+    if session_scope != "current":
+        return degraded("broader scopes return raw-message hits only")
+    if time_from is not None or time_to is not None:
+        return degraded("time-scoped queries return raw-message hits only")
+    if conversation_id is not None:
+        return degraded("conversation-scoped queries return raw-message hits only")
+
+    # Scope the (current-session) summaries to the active session id. With the
+    # raw-only degradations above, conversation_id is always None here, so this
+    # resolves to the current session set.
     knn_conversation_ids = _resolve_semantic_conversation_scope(
         engine, search_session_id=search_session_id, conversation_id=conversation_id
     )
@@ -1509,6 +1522,7 @@ def _lcm_grep_semantic(
                 query_vector,
                 k=knn_limit,
                 model=provider.model_id,
+                provider=provider.provider_id,
                 since=time_from,
                 until=time_to,
                 conversation_ids=knn_conversation_ids,
