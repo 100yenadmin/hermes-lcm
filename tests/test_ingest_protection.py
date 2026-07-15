@@ -25,6 +25,7 @@ from hermes_lcm.externalize import (
     externalize_ingest_payload,
     extract_externalized_ref,
     extract_externalized_refs,
+    read_externalized_payload_search_prefix,
     reassign_externalized_payloads,
 )
 from hermes_lcm.ingest_protection import (
@@ -495,6 +496,50 @@ def test_externalized_payload_write_fsyncs_file_and_parent_directory(tmp_path, m
     assert result["path"].exists()
     assert file_fsync_calls
     assert result["path"].parent in fsynced_dirs
+
+
+def test_externalized_search_prefix_rejects_path_replaced_during_open(tmp_path, monkeypatch):
+    engine = _engine(tmp_path)
+    target = externalize_ingest_payload(
+        "original searchable payload",
+        role="user",
+        session_id=engine.current_session_id,
+        field_path="content",
+        config=engine._config,
+        hermes_home=str(tmp_path),
+    )
+    replacement = externalize_ingest_payload(
+        "replacement searchable payload",
+        role="user",
+        session_id=engine.current_session_id,
+        field_path="content",
+        config=engine._config,
+        hermes_home=str(tmp_path),
+    )
+    assert target is not None
+    assert replacement is not None
+    target_path = target["path"]
+    replacement_path = replacement["path"]
+    real_open = externalize_module.os.open
+    replaced = False
+
+    def replace_before_open(path, flags, *args, **kwargs):
+        nonlocal replaced
+        if not replaced and Path(path) == target_path:
+            replacement_path.replace(target_path)
+            replaced = True
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(externalize_module.os, "open", replace_before_open)
+
+    result = read_externalized_payload_search_prefix(
+        target_path.name,
+        config=engine._config,
+        hermes_home=str(tmp_path),
+    )
+
+    assert replaced is True
+    assert result["status"] == "unreadable"
 
 
 def test_first_externalized_payload_fsyncs_new_storage_directory_parent(tmp_path, monkeypatch):

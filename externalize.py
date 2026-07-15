@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import re
+import stat
 import time
 from pathlib import Path
 from typing import Any, Dict
@@ -667,15 +668,33 @@ def read_externalized_payload_search_prefix(
         return {"status": "invalid_ref", "ref": ref}
     storage_dir = get_large_output_storage_dir(config, hermes_home=hermes_home, create=False)
     path = storage_dir / ref
-    if path.is_symlink():
+    try:
+        expected_stat = os.lstat(path)
+    except FileNotFoundError:
+        return {"status": "missing", "ref": ref}
+    except OSError:
+        return {"status": "unreadable", "ref": ref}
+    if stat.S_ISLNK(expected_stat.st_mode):
         return {"status": "symlink", "ref": ref}
-    if not path.exists() or not path.is_file():
+    if not stat.S_ISREG(expected_stat.st_mode):
         return {"status": "missing", "ref": ref}
 
     content_limit = max(1, min(int(max_content_bytes), 512_000))
+    fd = -1
     try:
-        file_size = path.stat().st_size
-        with path.open("rb") as handle:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        flags |= getattr(os, "O_BINARY", 0)
+        fd = os.open(path, flags)
+        opened_stat = os.fstat(fd)
+        if (
+            not stat.S_ISREG(opened_stat.st_mode)
+            or (opened_stat.st_dev, opened_stat.st_ino)
+            != (expected_stat.st_dev, expected_stat.st_ino)
+        ):
+            return {"status": "unreadable", "ref": ref}
+        file_size = opened_stat.st_size
+        with os.fdopen(fd, "rb") as handle:
+            fd = -1
             header = handle.read(_EXTERNALIZED_SEARCH_HEADER_BYTES)
             marker = re.search(rb'"content"\s*:\s*"', header)
             if marker is None:
@@ -703,6 +722,9 @@ def read_externalized_payload_search_prefix(
             tail = handle.read(_EXTERNALIZED_SEARCH_TAIL_BYTES)
     except OSError:
         return {"status": "unreadable", "ref": ref}
+    finally:
+        if fd >= 0:
+            os.close(fd)
 
     metadata = header[: marker.start()]
     content = _decode_json_string_fragment(bytes(raw))

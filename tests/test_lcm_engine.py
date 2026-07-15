@@ -25723,6 +25723,101 @@ class TestHandleGrepExternalizedPayloads:
 
         assert {item["type"] for item in result["results"]} == {"message", "externalized"}
 
+    @pytest.mark.parametrize("sort", ["relevance", "hybrid"])
+    def test_both_scope_preserves_message_only_ordering(self, externalized_search_engine, sort):
+        for role, content in (
+            ("user", "needle alpha"),
+            ("assistant", "needle needle beta"),
+            ("tool", "needle gamma"),
+        ):
+            externalized_search_engine._store.append(
+                "test-session",
+                {"role": role, "content": content},
+            )
+
+        history = json.loads(
+            externalized_search_engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "needle", "content_scope": "history", "sort": sort},
+            )
+        )
+        self._externalize(externalized_search_engine, "needle in payload " * 20)
+        combined = json.loads(
+            externalized_search_engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "needle", "content_scope": "both", "sort": sort},
+            )
+        )
+
+        combined_messages = [item for item in combined["results"] if item["type"] == "message"]
+        assert json.dumps(combined_messages, ensure_ascii=False) == json.dumps(
+            history["results"],
+            ensure_ascii=False,
+        )
+
+    @pytest.mark.parametrize("sort", ["relevance", "hybrid"])
+    def test_combined_sort_tiers_externalized_native_rank(self, sort):
+        message = {
+            "type": "message",
+            "role": "user",
+            "_sort_rank": 50.0,
+            "_sort_ts": 1.0,
+        }
+        externalized = {
+            "type": "externalized",
+            "_sort_rank": 0,
+            "_sort_ts": 1.0,
+        }
+
+        ordered = sorted(
+            [externalized, message],
+            key=lambda item: lcm_tools._combined_result_sort_key(item, sort),
+        )
+
+        assert ordered == [message, externalized]
+
+    def test_auto_discovery_filters_session_before_candidate_cap(self, externalized_search_engine):
+        owned_refs = {
+            self._externalize(
+                externalized_search_engine,
+                f"owned needle {index} " * 20,
+                f"call-owned-{index}",
+            )
+            for index in range(2)
+        }
+        storage = Path(externalized_search_engine._hermes_home, "lcm-large-outputs")
+        foreign_payload = {
+            "kind": "tool_result",
+            "role": "tool",
+            "session_id": "foreign-session",
+            "tool_call_id": "call-foreign",
+            "content": "foreign needle",
+            "content_chars": len("foreign needle"),
+            "content_bytes": len("foreign needle".encode()),
+            "created_at": 1.0,
+        }
+        for index in range(257):
+            (storage / f"zzzz-foreign-{index:03d}.json").write_text(
+                json.dumps(foreign_payload),
+                encoding="utf-8",
+            )
+        first_256 = sorted(
+            (path.name for path in storage.glob("*.json")),
+            reverse=True,
+        )[:256]
+        assert owned_refs.isdisjoint(first_256)
+
+        result = json.loads(
+            externalized_search_engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "needle", "content_scope": "externalized"},
+            )
+        )
+
+        assert {item["ref"] for item in result["results"]} == owned_refs
+        assert result["externalized_scan"]["candidate_files"] == len(owned_refs)
+        assert result["externalized_scan"]["rejected_session_mismatch"] == 257
+
     def test_explicit_refs_filter_and_rejects_cross_session_payload(self, externalized_search_engine):
         current_ref = self._externalize(externalized_search_engine, "current needle " * 20, "call-current")
         externalized_search_engine._session_id = "other-session"
