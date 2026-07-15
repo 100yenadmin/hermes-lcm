@@ -107,17 +107,15 @@ class RollupStore:
         with self._write_transaction():
             self._conn.execute(
                 """
-                INSERT INTO lcm_rollups(period_kind, period_start, scope, status)
-                VALUES(?, ?, ?, 'building')
+                INSERT INTO lcm_rollups(period_kind, period_start, scope, status, built_at)
+                VALUES(?, ?, ?, 'building', ?)
                 ON CONFLICT(period_kind, period_start, scope) DO UPDATE SET
-                    summary = NULL,
-                    token_count = NULL,
                     status = 'building',
-                    built_at = NULL,
+                    built_at = excluded.built_at,
                     source_fingerprint = NULL,
                     error = NULL
                 """,
-                (period_kind, period_start, scope),
+                (period_kind, period_start, scope, self._now()),
             )
             row = self._conn.execute(
                 """
@@ -192,17 +190,16 @@ class RollupStore:
         with self._write_transaction():
             cur = self._conn.execute(
                 """
-                UPDATE lcm_rollups
-                SET status = 'stale'
-                WHERE status = 'ready'
-                  AND scope = ?
-                  AND (
-                    (period_kind = 'day' AND period_start = ?)
-                    OR (period_kind = 'week' AND period_start = ?)
-                    OR (period_kind = 'month' AND period_start = ?)
-                  )
+                INSERT INTO lcm_rollups(period_kind, period_start, scope, status)
+                VALUES
+                    ('day', ?, ?, 'stale'),
+                    ('week', ?, ?, 'stale'),
+                    ('month', ?, ?, 'stale')
+                ON CONFLICT(period_kind, period_start, scope) DO UPDATE SET
+                    status = 'stale'
+                WHERE lcm_rollups.status = 'ready'
                 """,
-                (scope, day_start, week_start, month_start),
+                (day_start, scope, week_start, scope, month_start, scope),
             )
         return int(cur.rowcount or 0)
 

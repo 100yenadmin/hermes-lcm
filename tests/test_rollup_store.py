@@ -74,6 +74,14 @@ def test_temporal_rollup_migration_is_idempotent(tmp_path):
             """
         ).fetchone()[0]
         assert "WHERE status = 'ready'" in index_sql
+        pending_index_sql = conn.execute(
+            """
+            SELECT sql
+            FROM sqlite_master
+            WHERE type = 'index' AND name = 'idx_lcm_rollups_pending'
+            """
+        ).fetchone()[0]
+        assert "WHERE status IN ('stale', 'failed')" in pending_index_sql
     finally:
         conn.close()
 
@@ -140,9 +148,11 @@ def test_rollup_crud_round_trip_and_rebuild(rollup_store):
     rollup_id = rollup_store.upsert_building(
         "day", "2026-07-15", "conversation:conv-1"
     )
-    assert rollup_store.get_rollup(
+    initial = rollup_store.get_rollup(
         "day", "2026-07-15", "conversation:conv-1"
-    ) == {
+    )
+    assert initial.pop("built_at") is not None
+    assert initial == {
         "rollup_id": rollup_id,
         "period_kind": "day",
         "period_start": "2026-07-15",
@@ -150,7 +160,6 @@ def test_rollup_crud_round_trip_and_rebuild(rollup_store):
         "summary": None,
         "token_count": None,
         "status": "building",
-        "built_at": None,
         "source_fingerprint": None,
         "error": None,
         "source_node_ids": [],
@@ -181,7 +190,9 @@ def test_rollup_crud_round_trip_and_rebuild(rollup_store):
         "day", "2026-07-15", "conversation:conv-1"
     )
     assert rebuilding["status"] == "building"
-    assert rebuilding["summary"] is None
+    assert rebuilding["summary"] == "Daily summary"
+    assert rebuilding["token_count"] == 123
+    assert rebuilding["built_at"] is not None
     assert rebuilding["source_node_ids"] == []
 
     rollup_store.mark_failed(rollup_id, "summarizer unavailable")
@@ -190,6 +201,8 @@ def test_rollup_crud_round_trip_and_rebuild(rollup_store):
     )
     assert failed["status"] == "failed"
     assert failed["error"] == "summarizer unavailable"
+    assert failed["summary"] == "Daily summary"
+    assert failed["token_count"] == 123
 
 
 def test_mark_ready_rejects_unknown_rollup_without_orphan_sources(rollup_store):
@@ -240,6 +253,27 @@ def test_mark_stale_for_day_cascades_to_containing_week_and_month(rollup_store):
     )
     assert {statuses[rollup_id] for rollup_id in affected_ids} == {"stale"}
     assert {statuses[rollup_id] for rollup_id in untouched_ids} == {"ready"}
+
+
+def test_mark_stale_for_day_creates_missing_maintenance_rows(rollup_store):
+    scope = "conversation:never-built"
+
+    assert rollup_store.mark_stale_for_day("2026-07-15", scope) == 3
+
+    rows = rollup_store.connection.execute(
+        """
+        SELECT period_kind, period_start, status, summary
+        FROM lcm_rollups
+        WHERE scope = ?
+        ORDER BY period_kind
+        """,
+        (scope,),
+    ).fetchall()
+    assert [tuple(row) for row in rows] == [
+        ("day", "2026-07-15", "stale", None),
+        ("month", "2026-07-01", "stale", None),
+        ("week", "2026-07-13", "stale", None),
+    ]
 
 
 def test_rollup_unique_constraint_is_kind_start_scope(rollup_store):
