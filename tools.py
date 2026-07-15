@@ -1109,6 +1109,36 @@ def _recent_has_unready_rollups(
     return not set(expected).issubset(ready_starts)
 
 
+def _session_has_window_content(
+    engine: "LCMEngine",
+    window: RecentPeriodWindow,
+    session_id: str,
+) -> bool:
+    """True when ``session_id`` has a summary node whose covered span overlaps
+    the window (earliest < end AND latest >= start), matching the leaf-fallback's
+    overlap semantics rather than newest-timestamp-only.
+    """
+    connection = engine._dag.connection
+    if connection is None or not session_id:
+        return False
+    try:
+        with engine._dag._db_lock:
+            row = connection.execute(
+                """
+                SELECT 1
+                FROM summary_nodes
+                WHERE session_id = ?
+                  AND COALESCE(earliest_at, created_at) < ?
+                  AND COALESCE(latest_at, created_at) >= ?
+                LIMIT 1
+                """,
+                (session_id, window.end.timestamp(), window.start.timestamp()),
+            ).fetchone()
+    except Exception:  # pragma: no cover - defensive read-only degradation
+        return False
+    return row is not None
+
+
 def _recent_ready_rollups(
     engine: "LCMEngine",
     window: RecentPeriodWindow,
@@ -1118,6 +1148,16 @@ def _recent_ready_rollups(
         return [], "subday_window"
     if not engine._config.temporal_rollups_enabled:
         return [], "temporal_rollups_disabled"
+
+    # Rollups are session-scoped, but the leaf fallback spans the whole
+    # conversation family (current + last-finalized session). Only serve rollups
+    # when the rollup scope solely covers the window: if another session in that
+    # span holds overlapping content (post-rotation retained lineage), fall back
+    # to leaf sections, which span the same sessions — so rollup mode never drops
+    # a finalized session's content (maintainer #389: match the fallback span).
+    for other in _recent_conversation_scope_session_ids(engine):
+        if other != scope and _session_has_window_content(engine, window, other):
+            return [], "rollups_span_multiple_sessions"
 
     store: RollupStore | None = None
     try:
@@ -1179,11 +1219,16 @@ def _recent_leaf_sections(
     # Include retained higher-depth/carry-forward summaries, not just depth-0
     # current-session leaves, mirroring how lcm_grep/describe select across
     # depths and retained lineage (maintainer #389 blocker 2).
+    # Include any summary whose covered span INTERSECTS the window, not only
+    # those whose newest timestamp lands inside it: a summary spanning several
+    # days (earliest before the window, latest inside, or vice versa) still holds
+    # window content and must be returned (maintainer #389: overlap, not
+    # latest_at). Overlap = earliest < window.end AND latest >= window.start.
     where = [
+        "COALESCE(earliest_at, created_at) < ?",
         "COALESCE(latest_at, created_at) >= ?",
-        "COALESCE(latest_at, created_at) < ?",
     ]
-    params: list[object] = [window.start.timestamp(), window.end.timestamp()]
+    params: list[object] = [window.end.timestamp(), window.start.timestamp()]
     if requested_scope == "conversation":
         session_ids = _recent_conversation_scope_session_ids(engine)
         placeholders = ",".join("?" for _ in session_ids)

@@ -290,3 +290,61 @@ def test_lcm_recent_argument_validation(recent_parts, args, message):
     engine, _store = recent_parts
     result = json.loads(lcm_recent(args, engine=engine))
     assert message in result["error"]
+
+
+def test_recent_rollup_falls_back_when_finalized_session_has_window_content(recent_parts):
+    # Rollups are session-scoped, but the leaf fallback spans current +
+    # last-finalized session. Rollup mode must not serve current-session-only
+    # rollups while the finalized session still holds overlapping window content,
+    # or that content would be silently dropped (maintainer #389 blocker 3).
+    engine, store = recent_parts
+    current = engine.current_session_id
+    finalized = "conversation-a-prev"
+    engine.current_conversation_id = "conv"
+    engine._lifecycle = SimpleNamespace(
+        get_by_conversation=lambda _cid: SimpleNamespace(
+            current_session_id=current,
+            last_finalized_session_id=finalized,
+        )
+    )
+    day = date(2026, 7, 15)
+    _ready(store, "day", day.isoformat(), current)  # current fully covers window
+    _add_leaf(engine._dag, finalized, day, "finalized session leaf")
+
+    window = parse_recent_period("date:2026-07-15", now=NOW)
+    served, reason = _recent_ready_rollups(engine, window, current)
+    assert served == []
+    assert reason == "rollups_span_multiple_sessions"
+
+    result = json.loads(lcm_recent({"period": "date:2026-07-15"}, engine=engine))
+    assert result["mode"] == "leaf_summary_fallback"
+    assert result["fallback_reason"] == "rollups_span_multiple_sessions"
+    assert "finalized session leaf" in {section["content"] for section in result["sections"]}
+
+
+def test_recent_fallback_includes_summary_overlapping_window_edge(recent_parts):
+    # A summary spanning past midnight (latest_at in the NEXT day) still holds
+    # this day's content; overlap-based filtering must return it where the old
+    # latest_at-only filter dropped it (maintainer #389 blocker: overlap).
+    engine, _store = recent_parts
+    engine._config.temporal_rollups_enabled = False  # force the leaf fallback
+    scope = engine.current_session_id
+    day = date(2026, 7, 15)
+    spanning_id = engine._dag.add_node(
+        SummaryNode(
+            session_id=scope,
+            depth=0,
+            summary="spanning across midnight",
+            token_count=count_tokens("spanning across midnight"),
+            source_token_count=5,
+            source_ids=[1],
+            source_type="messages",
+            created_at=_timestamp(day, 23),
+            earliest_at=_timestamp(day, 23),
+            latest_at=_timestamp(date(2026, 7, 16), 1),
+        )
+    )
+
+    result = json.loads(lcm_recent({"period": "date:2026-07-15"}, engine=engine))
+    assert result["mode"] == "leaf_summary_fallback"
+    assert spanning_id in {section["node_id"] for section in result["sections"]}
