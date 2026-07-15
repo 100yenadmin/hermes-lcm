@@ -7,7 +7,7 @@ import json
 import logging
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, TYPE_CHECKING
 
@@ -36,6 +36,8 @@ from .ingest_protection import (
 )
 from .model_routing import apply_lcm_model_route
 from .presets import preset_status_payload
+from .rollup_periods import RecentPeriodWindow, parse_recent_period
+from .rollup_store import RollupStore
 from .search_query import AGE_DECAY_RATE, normalize_search_sort
 from .session_patterns import build_session_match_keys, compile_session_pattern
 from .store import build_message_fts_spec
@@ -201,10 +203,13 @@ def _parse_strict_int(value: Any, name: str) -> tuple[int | None, str | None]:
 
 _LCM_GREP_VALID_SCOPES = frozenset({"current", "all", "session"})
 _LCM_GREP_HARD_LIMIT_CAP = 200
+_LCM_RECENT_DEFAULT_LIMIT = 10
+_LCM_RECENT_HARD_LIMIT_CAP = 200
 _LCM_LOAD_SESSION_DEFAULT_LIMIT = 100
 _LCM_LOAD_SESSION_HARD_LIMIT_CAP = 200
 _LCM_LOAD_SESSION_DEFAULT_MAX_CONTENT_CHARS = 4000
 _LCM_LOAD_SESSION_HARD_MAX_CONTENT_CHARS = 20_000
+_LCM_RECENT_MAX_RESPONSE_CHARS = _LCM_LOAD_SESSION_HARD_MAX_CONTENT_CHARS
 _LCM_INSPECT_DEFAULT_LIMIT = 20
 _LCM_INSPECT_HARD_LIMIT_CAP = 200
 _LCM_INSPECT_REF_SCAN_MESSAGE_LIMIT = 10_000
@@ -1039,6 +1044,252 @@ def lcm_load_session(args: Dict[str, Any], **kwargs) -> str:
     if requested_max_content_chars > _LCM_LOAD_SESSION_HARD_MAX_CONTENT_CHARS:
         response["max_content_chars_clamped_from"] = requested_max_content_chars
     return json.dumps(response)
+
+
+def _recent_iso(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _recent_rollup_bounds(window: RecentPeriodWindow) -> tuple[str, str]:
+    start = window.start.date().isoformat()
+    if window.rollup_kind == "day":
+        end = (window.end - timedelta(microseconds=1)).date().isoformat()
+        return start, end
+    return start, start
+
+
+def _recent_has_unready_rollups(
+    store: RollupStore,
+    window: RecentPeriodWindow,
+    scope: str,
+) -> bool:
+    connection = store.connection
+    if connection is None:
+        return True
+    start, end = _recent_rollup_bounds(window)
+    row = connection.execute(
+        """
+        SELECT 1
+        FROM lcm_rollups
+        WHERE period_kind = ?
+          AND period_start >= ?
+          AND period_start <= ?
+          AND scope = ?
+          AND status != 'ready'
+        LIMIT 1
+        """,
+        (window.rollup_kind, start, end, scope),
+    ).fetchone()
+    return row is not None
+
+
+def _recent_ready_rollups(
+    engine: "LCMEngine",
+    window: RecentPeriodWindow,
+    scope: str,
+) -> tuple[list[dict[str, object]], str | None]:
+    if window.subday:
+        return [], "subday_window"
+    if not engine._config.temporal_rollups_enabled:
+        return [], "temporal_rollups_disabled"
+
+    store: RollupStore | None = None
+    try:
+        store = RollupStore(engine._dag.db_path)
+        start, end = _recent_rollup_bounds(window)
+        rollups = store.ready_rollups_for_window(
+            window.rollup_kind,
+            start,
+            end,
+            scope,
+        )
+        if not rollups or _recent_has_unready_rollups(store, window, scope):
+            return [], "rollups_unavailable"
+        return rollups, None
+    except Exception:
+        logger.debug("LCM recent rollup read failed; using leaf summaries", exc_info=True)
+        return [], "rollups_unavailable"
+    finally:
+        if store is not None:
+            store.close()
+
+
+def _recent_leaf_sections(
+    engine: "LCMEngine",
+    window: RecentPeriodWindow,
+    requested_scope: str,
+    limit: int,
+) -> list[dict[str, Any]]:
+    connection = engine._dag.connection
+    if connection is None:
+        return []
+    where = [
+        "depth = 0",
+        "COALESCE(latest_at, created_at) >= ?",
+        "COALESCE(latest_at, created_at) < ?",
+    ]
+    params: list[object] = [window.start.timestamp(), window.end.timestamp()]
+    if requested_scope == "conversation":
+        where.append("session_id = ?")
+        params.append(engine.current_session_id)
+    params.append(limit)
+    try:
+        with engine._dag._db_lock:
+            rows = connection.execute(
+                f"""
+                SELECT node_id, session_id, summary, token_count,
+                       COALESCE(earliest_at, created_at) AS earliest_at,
+                       COALESCE(latest_at, created_at) AS latest_at
+                FROM summary_nodes
+                WHERE {' AND '.join(where)}
+                ORDER BY COALESCE(latest_at, created_at) DESC, node_id DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+    except Exception:
+        logger.debug("LCM recent leaf-summary fallback failed", exc_info=True)
+        return []
+    return [
+        {
+            "kind": "leaf_summary",
+            "node_id": int(row[0]),
+            "session_id": str(row[1]),
+            "token_count": int(row[3] or 0),
+            "earliest_at": row[4],
+            "latest_at": row[5],
+            "content": str(row[2] or ""),
+            "content_truncated": False,
+        }
+        for row in rows
+    ]
+
+
+def _recent_rollup_sections(rollups: list[dict[str, object]]) -> list[dict[str, Any]]:
+    sections: list[dict[str, Any]] = []
+    for rollup in sorted(rollups, key=lambda row: str(row["period_start"]), reverse=True):
+        token_count = int(rollup.get("token_count") or 0)
+        sections.append(
+            {
+                "kind": "rollup",
+                "rollup_id": int(rollup["rollup_id"]),
+                "period_kind": str(rollup["period_kind"]),
+                "period_start": str(rollup["period_start"]),
+                "status": str(rollup["status"]),
+                "token_count": token_count,
+                "content": f"Tokens: {token_count}\n{rollup.get('summary') or ''}",
+                "content_truncated": False,
+            }
+        )
+    return sections
+
+
+def _bounded_recent_json(response: dict[str, Any], sections: list[dict[str, Any]]) -> str:
+    response["sections"] = []
+    response["total_sections"] = len(sections)
+    response["returned_sections"] = 0
+    response["truncated"] = False
+
+    def encode() -> str:
+        return json.dumps(response, ensure_ascii=False)
+
+    for section in sections:
+        response["sections"].append(section)
+        response["returned_sections"] = len(response["sections"])
+        if len(encode()) <= _LCM_RECENT_MAX_RESPONSE_CHARS:
+            continue
+
+        response["sections"].pop()
+        response["returned_sections"] = len(response["sections"])
+        content = str(section.get("content") or "")
+        low, high = 0, len(content)
+        best: dict[str, Any] | None = None
+        while low <= high:
+            midpoint = (low + high) // 2
+            candidate = dict(section)
+            candidate["content"] = content[:midpoint]
+            candidate["content_truncated"] = midpoint < len(content)
+            response["sections"].append(candidate)
+            response["returned_sections"] = len(response["sections"])
+            fits = len(encode()) <= _LCM_RECENT_MAX_RESPONSE_CHARS
+            response["sections"].pop()
+            response["returned_sections"] = len(response["sections"])
+            if fits:
+                best = candidate
+                low = midpoint + 1
+            else:
+                high = midpoint - 1
+        if best is not None:
+            response["sections"].append(best)
+            response["returned_sections"] = len(response["sections"])
+        response["truncated"] = True
+        break
+
+    if response["returned_sections"] < response["total_sections"]:
+        response["truncated"] = True
+    return encode()
+
+
+def lcm_recent(args: Dict[str, Any], **kwargs) -> str:
+    """Serve ready temporal rollups or transparently fall back to leaf summaries."""
+    engine = _require_engine(kwargs)
+    if engine is None:
+        return json.dumps({"error": "LCM engine not initialized"})
+
+    try:
+        window = parse_recent_period(args.get("period"))
+    except ValueError as exc:
+        return json.dumps({"error": str(exc)})
+
+    requested_scope = str(args.get("scope", "conversation")).strip().lower()
+    if requested_scope not in {"conversation", "global"}:
+        return json.dumps({"error": "scope must be one of: conversation, global"})
+
+    parsed_limit, limit_error = _parse_strict_int(
+        args.get("limit", _LCM_RECENT_DEFAULT_LIMIT),
+        "limit",
+    )
+    if limit_error:
+        return json.dumps({"error": limit_error})
+    if parsed_limit is None or parsed_limit <= 0:
+        return json.dumps({"error": "limit must be a positive integer"})
+    requested_limit = parsed_limit
+    limit = min(requested_limit, _LCM_RECENT_HARD_LIMIT_CAP)
+
+    rollup_scope = engine.current_session_id if requested_scope == "conversation" else "global"
+    rollups, fallback_reason = _recent_ready_rollups(engine, window, rollup_scope)
+    fallback = not rollups
+    if fallback:
+        sections = _recent_leaf_sections(engine, window, requested_scope, limit)
+    else:
+        sections = _recent_rollup_sections(rollups)[:limit]
+
+    response: dict[str, Any] = {
+        "period": window.period,
+        "scope": requested_scope,
+        "window": {
+            "start": _recent_iso(window.start),
+            "end": _recent_iso(window.end),
+        },
+        "limit": limit,
+        "char_limit": _LCM_RECENT_MAX_RESPONSE_CHARS,
+        "mode": "leaf_summary_fallback" if fallback else "rollup",
+        "provenance": {
+            "fallback": fallback,
+            "rollups": [
+                {
+                    "rollup_id": int(rollup["rollup_id"]),
+                    "status": str(rollup["status"]),
+                }
+                for rollup in rollups
+            ],
+        },
+    }
+    if fallback_reason is not None:
+        response["fallback_reason"] = fallback_reason
+    if requested_limit > _LCM_RECENT_HARD_LIMIT_CAP:
+        response["limit_clamped_from"] = requested_limit
+    return _bounded_recent_json(response, sections)
 
 
 def lcm_grep(args: Dict[str, Any], **kwargs) -> str:

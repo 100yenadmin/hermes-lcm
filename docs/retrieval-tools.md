@@ -10,6 +10,7 @@ for earlier separate sessions or broad cross-session history.
 | Tool | Use |
 |------|-----|
 | `lcm_grep` | Search current-session raw messages and summaries. Opt into `session_scope='all'` or `session_scope='session'` (with `session_id`) for bounded archive recovery over rows already present in `lcm.db`, including externally backfilled rows that may carry source strings such as `openclaw-lcm:*`; broader scopes return raw-message hits only. Raw-message filters `role`, `time_from`, and `time_to` are pushed into the search query; when any of them is supplied, summary hits are omitted so the filter contract stays exact. Use `session_search` for earlier separate sessions or broad cross-session recall. |
+| `lcm_recent` | Retrieve recent summaries with natural UTC periods. Ready temporal rollups are preferred; missing, stale, disabled, and sub-day windows transparently use leaf summaries instead. |
 | `lcm_load_session` | Load one ordered raw-message transcript page for an explicit `session_id`. This is not search: it returns raw rows in `store_id` order, bounded by `limit`, with per-message content bounded by `max_content_chars`, and continues with `after_store_id` from `next_cursor`. |
 | `lcm_describe` | Inspect the current-session DAG or preview an `externalized_ref` without loading full content. |
 | `lcm_expand` | Recover source messages, child summaries, or externalized payloads with pagination. Use `store_id` to fetch a single raw message regardless of session, suitable for drilling into a cross-session `lcm_grep` result. |
@@ -40,6 +41,33 @@ Carried-over summary nodes can become current-session content after `/new`, but
 their source eligibility still comes from the descendant raw messages. Expanding
 a carried-over current-session node recovers those original raw message sources
 even when the sources still belong to the previous session.
+
+### Natural-time retrieval
+
+`lcm_recent` accepts `today`, `yesterday`, `Nd`, `week`, `month`,
+`date:YYYY-MM-DD`, and `last Nh`. All periods are normalized to UTC `[start,
+end)` windows. Results are newest-first, limited to 200 sections, and bounded to
+the same 20,000-character response ceiling used by the retrieval tools.
+
+```json
+{"period": "today"}
+```
+
+```json
+{"period": "7d", "limit": 20}
+```
+
+```json
+{"period": "date:2026-07-15", "scope": "global"}
+```
+
+When temporal rollups are enabled and a ready rollup covers the requested
+window, the response includes its id and `ready` status in `provenance.rollups`.
+If rollups are missing or stale, the feature flag is off, or the request uses a
+sub-day `last Nh` window, the tool performs the existing read-only leaf-summary
+retrieval over the same time bounds. This fallback is a successful retrieval,
+including for an empty window; `provenance.fallback` is `true` and no LLM call
+is made while serving either path.
 
 ### Lossless raw recovery contract
 

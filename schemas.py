@@ -98,6 +98,44 @@ LCM_GREP = {
     },
 }
 
+LCM_RECENT = {
+    "name": "lcm_recent",
+    "description": (
+        "Retrieve recent conversation summaries by a natural UTC time period. "
+        "Ready temporal rollups are served when available; otherwise the tool "
+        "transparently falls back to existing leaf summaries in the same window."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "period": {
+                "type": "string",
+                "description": (
+                    "UTC period: today, yesterday, Nd (for example 7d), week, "
+                    "month, date:YYYY-MM-DD, or last Nh (for example last 6h)."
+                ),
+            },
+            "scope": {
+                "type": "string",
+                "enum": ["conversation", "global"],
+                "description": (
+                    "Use the active conversation (default) or the global rollup/fallback scope."
+                ),
+                "default": "conversation",
+            },
+            "limit": {
+                "type": "integer",
+                "description": (
+                    "Maximum sections to return (default 10, hard upper bound 200). "
+                    "Values above the cap are clamped and reported."
+                ),
+                "default": 10,
+            },
+        },
+        "required": ["period"],
+    },
+}
+
 LCM_LOAD_SESSION = {
     "name": "lcm_load_session",
     "description": (
