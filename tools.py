@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import codecs
+import concurrent.futures
 import json
 import logging
 import re
@@ -18,6 +19,7 @@ from .externalize import (
     get_large_output_storage_dir,
     load_externalized_payload,
 )
+from .embedding_provider import VoyageError, resolve_provider
 from .diagnostics import (
     _has_lifecycle_fragmentation,
     _state_db_path_for_engine,
@@ -39,6 +41,7 @@ from .presets import preset_status_payload
 from .search_query import AGE_DECAY_RATE, normalize_search_sort
 from .session_patterns import build_session_match_keys, compile_session_pattern
 from .store import build_message_fts_spec
+from .vector_store import VectorStore
 
 if TYPE_CHECKING:
     from .engine import LCMEngine
@@ -201,6 +204,9 @@ def _parse_strict_int(value: Any, name: str) -> tuple[int | None, str | None]:
 
 _LCM_GREP_VALID_SCOPES = frozenset({"current", "all", "session"})
 _LCM_GREP_HARD_LIMIT_CAP = 200
+_LCM_GREP_HYBRID_CANDIDATE_CAP = 500
+_LCM_GREP_SEMANTIC_SNIPPET_CHARS = 300
+_LCM_GREP_RRF_K = 60
 _LCM_LOAD_SESSION_DEFAULT_LIMIT = 100
 _LCM_LOAD_SESSION_HARD_LIMIT_CAP = 200
 _LCM_LOAD_SESSION_DEFAULT_MAX_CONTENT_CHARS = 4000
@@ -1041,7 +1047,7 @@ def lcm_load_session(args: Dict[str, Any], **kwargs) -> str:
     return json.dumps(response)
 
 
-def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
+def _lcm_grep_full_text(args: Dict[str, Any], **kwargs) -> str:
     """Search raw messages + summaries with optional cross-session scoping.
 
     Default scope is the current session, preserving historical behavior and returning
@@ -1065,7 +1071,8 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
     if parsed_limit <= 0:
         return json.dumps({"error": "limit must be a positive integer"})
     requested_limit = parsed_limit
-    limit = min(requested_limit, _LCM_GREP_HARD_LIMIT_CAP)
+    limit_cap = int(kwargs.get("_limit_cap", _LCM_GREP_HARD_LIMIT_CAP))
+    limit = min(requested_limit, limit_cap)
     sort = normalize_search_sort(args.get("sort"))
     source_limit = max(limit * 4, limit, 20)
 
@@ -1242,7 +1249,7 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
         response["summary_results_omitted"] = True
     if session_scope == "session":
         response["session_id"] = explicit_session_id
-    if requested_limit > _LCM_GREP_HARD_LIMIT_CAP:
+    if requested_limit > limit_cap:
         response["limit_clamped_from"] = requested_limit
     if requested_session_scope not in _LCM_GREP_VALID_SCOPES:
         response["ignored_session_scope"] = requested_session_scope
@@ -1251,6 +1258,349 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
             "Valid values: current, all, session."
         )
     return json.dumps(response)
+
+
+def _lcm_grep_confidence(score: float) -> str:
+    if score >= 0.65:
+        return "high"
+    if score >= 0.5:
+        return "medium"
+    if score >= 0.35:
+        return "low"
+    return "noise"
+
+
+def _lcm_grep_embed_query(provider: Any, query: str, timeout_s: float) -> list[float]:
+    """Embed one query without letting provider retries exceed the tool budget."""
+    executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix="lcm-query-embed",
+    )
+    future = executor.submit(provider.embed_query, query)
+    try:
+        vector = future.result(timeout=max(0.001, float(timeout_s)))
+    except concurrent.futures.TimeoutError as exc:
+        future.cancel()
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise TimeoutError(
+            f"query embedding exceeded the {float(timeout_s):g}s latency budget"
+        ) from exc
+    except BaseException:
+        executor.shutdown(wait=True, cancel_futures=True)
+        raise
+    executor.shutdown(wait=True, cancel_futures=True)
+    return [float(value) for value in vector]
+
+
+def _lcm_grep_semantic(
+    args: Dict[str, Any],
+    *,
+    engine: "LCMEngine",
+    candidate_limit: int | None = None,
+) -> dict[str, Any]:
+    query = str(args.get("query", "")).strip()
+    if not query:
+        return {"error": "No query provided"}
+
+    raw_limit_arg = args.get("limit", 10)
+    parsed_limit = _parse_int_value(raw_limit_arg, 10)
+    if parsed_limit <= 0:
+        return {"error": "limit must be a positive integer"}
+    requested_limit = parsed_limit
+    limit = min(requested_limit, _LCM_GREP_HARD_LIMIT_CAP)
+    knn_limit = candidate_limit if candidate_limit is not None else limit
+
+    requested_session_scope = str(args.get("session_scope", "current")).lower()
+    raw_session_id_arg = args.get("session_id")
+    explicit_session_id = (
+        str(raw_session_id_arg).strip() if raw_session_id_arg is not None else ""
+    )
+    if requested_session_scope == "current":
+        if explicit_session_id:
+            return {"error": "session_id is only valid with session_scope=session"}
+        session_scope = "current"
+        search_session_id: str | None = engine.current_session_id
+    elif requested_session_scope == "all":
+        if explicit_session_id:
+            return {"error": "session_id is not used with session_scope=all"}
+        session_scope = "all"
+        search_session_id = None
+    elif requested_session_scope == "session":
+        if not explicit_session_id:
+            return {"error": "session_scope=session requires session_id"}
+        session_scope = "session"
+        search_session_id = explicit_session_id
+    else:
+        session_scope = "current"
+        search_session_id = engine.current_session_id
+        logger.warning(
+            "Ignoring unsupported session_scope=%s for semantic lcm_grep",
+            requested_session_scope,
+        )
+
+    source = str(args.get("source") or "").strip() or None
+    conversation_id = str(args.get("conversation_id") or "").strip() or None
+    role, role_error = _parse_grep_role(args.get("role"))
+    if role_error:
+        return {"error": role_error}
+    time_from, time_from_error = _parse_optional_timestamp(args.get("time_from"), "time_from")
+    if time_from_error:
+        return {"error": time_from_error}
+    time_to, time_to_error = _parse_optional_timestamp(args.get("time_to"), "time_to")
+    if time_to_error:
+        return {"error": time_to_error}
+    if time_from is not None and time_to is not None and time_to < time_from:
+        return {"error": "time_to must be greater than or equal to time_from"}
+
+    def degraded(reason: str) -> dict[str, Any]:
+        fts_args = dict(args)
+        fts_args.pop("mode", None)
+        payload = json.loads(_lcm_grep_full_text(fts_args, engine=engine))
+        if "error" not in payload:
+            payload["mode"] = str(args.get("mode") or "semantic").lower()
+            payload["degraded_to_fts"] = True
+            payload["degraded_reason"] = reason
+            payload["coverage"] = "none"
+        return payload
+
+    if not bool(getattr(engine._config, "embeddings_enabled", False)):
+        return degraded("semantic retrieval is disabled")
+
+    try:
+        provider = resolve_provider(engine._config)
+    except Exception as exc:
+        return degraded(f"embedding provider unavailable: {exc}")
+    if provider is None:
+        return degraded("embedding provider is not configured")
+
+    timeout_s = float(getattr(engine._config, "embedding_query_timeout_s", 3.0))
+    try:
+        query_vector = _lcm_grep_embed_query(provider, query, timeout_s)
+    except VoyageError as exc:
+        if exc.kind == "auth":
+            return {
+                "error": f"Embedding provider authentication failed; {exc}",
+                "mode": str(args.get("mode") or "semantic").lower(),
+            }
+        return degraded(f"query embedding failed: {exc}")
+    except Exception as exc:
+        return degraded(f"query embedding failed: {exc}")
+
+    try:
+        vector_store = VectorStore(engine._store.db_path, config=engine._config)
+        knn_results = vector_store.knn(
+            query_vector,
+            k=knn_limit,
+            model=provider.model_id,
+            since=time_from,
+            conversation_ids=[search_session_id] if search_session_id is not None else None,
+        )
+        coverage = knn_results.coverage
+        ranked_rows = list(knn_results)
+    except Exception as exc:
+        return degraded(f"semantic vector search failed: {exc}")
+    finally:
+        if "vector_store" in locals():
+            vector_store.close()
+
+    current_session_id = engine.current_session_id
+    has_current_session = bool(current_session_id)
+    results: list[dict[str, Any]] = []
+    for embedded_id, score, kind in ranked_rows:
+        if kind != "summary":
+            continue
+        try:
+            node_id = int(embedded_id)
+        except (TypeError, ValueError):
+            continue
+        node = engine._dag.get_node(node_id)
+        if node is None:
+            continue
+        if time_to is not None and float(node.latest_at or node.created_at or 0.0) > time_to:
+            continue
+        if source and not engine._dag._node_matches_source(node.node_id, source):
+            continue
+        confidence = _lcm_grep_confidence(float(score))
+        result = {
+            "type": "summary",
+            "depth": f"d{node.depth}",
+            "node_id": node.node_id,
+            "session_id": node.session_id,
+            "snippet": node.summary[:_LCM_GREP_SEMANTIC_SNIPPET_CHARS],
+            "token_count": node.token_count,
+            "expand_hint": node.expand_hint,
+            "earliest_at": node.earliest_at,
+            "latest_at": node.latest_at,
+            "from_current_session": has_current_session and node.session_id == current_session_id,
+            "score": float(score),
+            "cosine_score": float(score),
+            "confidence": confidence,
+            "confidence_band": confidence,
+        }
+        results.append(result)
+        if len(results) >= knn_limit:
+            break
+
+    response: dict[str, Any] = {
+        "query": query,
+        "mode": "semantic",
+        "sort": normalize_search_sort(args.get("sort")),
+        "session_scope": session_scope,
+        "source": source,
+        "conversation_id": conversation_id,
+        "limit": limit,
+        "total_results": len(results),
+        "results": results[:limit] if candidate_limit is None else results,
+        "coverage": coverage,
+        "degraded_to_fts": False,
+    }
+    if role is not None:
+        response["role"] = role
+    if time_from is not None:
+        response["time_from"] = time_from
+    if time_to is not None:
+        response["time_to"] = time_to
+    if session_scope == "session":
+        response["session_id"] = explicit_session_id
+    if requested_limit > _LCM_GREP_HARD_LIMIT_CAP:
+        response["limit_clamped_from"] = requested_limit
+    if requested_session_scope not in _LCM_GREP_VALID_SCOPES:
+        response["ignored_session_scope"] = requested_session_scope
+        response["scope_note"] = (
+            "Unsupported session_scope; stayed on current. "
+            "Valid values: current, all, session."
+        )
+    return response
+
+
+def _lcm_grep_hybrid(args: Dict[str, Any], *, engine: "LCMEngine") -> dict[str, Any]:
+    requested_limit = _parse_int_value(args.get("limit", 10), 10)
+    if requested_limit <= 0:
+        return {"error": "limit must be a positive integer"}
+    limit = min(requested_limit, _LCM_GREP_HARD_LIMIT_CAP)
+    candidate_limit = min(
+        _LCM_GREP_HYBRID_CANDIDATE_CAP,
+        max(50, limit * 3),
+    )
+
+    fts_args = dict(args)
+    fts_args.pop("mode", None)
+    fts_args["limit"] = candidate_limit
+    fts = json.loads(
+        _lcm_grep_full_text(
+            fts_args,
+            engine=engine,
+            _limit_cap=_LCM_GREP_HYBRID_CANDIDATE_CAP,
+        )
+    )
+    if "error" in fts:
+        return fts
+
+    semantic_args = dict(args)
+    semantic_args["limit"] = candidate_limit
+    semantic = _lcm_grep_semantic(
+        semantic_args,
+        engine=engine,
+        candidate_limit=candidate_limit,
+    )
+    if "error" in semantic:
+        return semantic
+    if semantic.get("degraded_to_fts"):
+        response = dict(fts)
+        response["mode"] = "hybrid"
+        response["limit"] = limit
+        response["total_results"] = len(fts.get("results", []))
+        response["results"] = list(fts.get("results", []))[:limit]
+        response["degraded_to_fts"] = True
+        response["degraded_reason"] = semantic.get("degraded_reason", "semantic arm unavailable")
+        response["coverage"] = semantic.get("coverage", "none")
+        if requested_limit > _LCM_GREP_HARD_LIMIT_CAP:
+            response["limit_clamped_from"] = requested_limit
+        else:
+            response.pop("limit_clamped_from", None)
+        return response
+
+    fused: dict[tuple[str, Any], dict[str, Any]] = {}
+
+    def identity(hit: dict[str, Any]) -> tuple[str, Any]:
+        if hit.get("node_id") is not None:
+            return ("node", hit.get("node_id"))
+        return ("message", hit.get("store_id"))
+
+    for rank, hit in enumerate(fts.get("results", []), start=1):
+        key = identity(hit)
+        entry = fused.setdefault(key, {"hit": dict(hit), "rrf_score": 0.0})
+        entry["fts_rank"] = rank
+        entry["rrf_score"] += 1.0 / (_LCM_GREP_RRF_K + rank)
+
+    for rank, hit in enumerate(semantic.get("results", []), start=1):
+        key = identity(hit)
+        entry = fused.setdefault(key, {"hit": dict(hit), "rrf_score": 0.0})
+        entry["semantic_rank"] = rank
+        entry["rrf_score"] += 1.0 / (_LCM_GREP_RRF_K + rank)
+        entry["semantic_score"] = hit.get("score")
+        entry["confidence"] = hit.get("confidence")
+        entry["confidence_band"] = hit.get("confidence_band")
+        if "fts_rank" in entry:
+            # The semantic form carries score/confidence while the FTS form carries
+            # its exact house snippet/provenance. Preserve the latter as the base.
+            entry["hit"].setdefault("semantic_snippet", hit.get("snippet", ""))
+
+    ordered = sorted(
+        fused.values(),
+        key=lambda entry: (
+            -float(entry["rrf_score"]),
+            int(entry.get("fts_rank", 10**9)),
+            int(entry.get("semantic_rank", 10**9)),
+            identity(entry["hit"]),
+        ),
+    )
+    results: list[dict[str, Any]] = []
+    for entry in ordered[:limit]:
+        hit = dict(entry["hit"])
+        hit["score"] = float(entry["rrf_score"])
+        hit["rrf_score"] = float(entry["rrf_score"])
+        if "fts_rank" in entry:
+            hit["fts_rank"] = entry["fts_rank"]
+        if "semantic_rank" in entry:
+            hit["semantic_rank"] = entry["semantic_rank"]
+            hit["semantic_score"] = entry["semantic_score"]
+            hit["confidence"] = entry["confidence"]
+            hit["confidence_band"] = entry["confidence_band"]
+        results.append(hit)
+
+    response = dict(fts)
+    response["mode"] = "hybrid"
+    response["limit"] = limit
+    response["total_results"] = len(fused)
+    response["results"] = results
+    response["coverage"] = semantic.get("coverage", "none")
+    response["degraded_to_fts"] = False
+    response["fusion"] = "rrf"
+    response["rrf_k"] = _LCM_GREP_RRF_K
+    if requested_limit > _LCM_GREP_HARD_LIMIT_CAP:
+        response["limit_clamped_from"] = requested_limit
+    else:
+        response.pop("limit_clamped_from", None)
+    return response
+
+
+def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
+    """Search LCM history using full-text, semantic, or RRF hybrid retrieval."""
+    mode = str(args.get("mode") or "full_text").strip().lower()
+    if mode == "full_text":
+        return _lcm_grep_full_text(args, **kwargs)
+
+    engine = _require_engine(kwargs)
+    if engine is None:
+        return json.dumps({"error": "LCM engine not initialized"})
+    if mode == "semantic":
+        return json.dumps(_lcm_grep_semantic(args, engine=engine))
+    if mode == "hybrid":
+        return json.dumps(_lcm_grep_hybrid(args, engine=engine))
+    return json.dumps({
+        "error": "mode must be one of: full_text, semantic, hybrid",
+    })
 
 
 def lcm_describe(args: Dict[str, Any], **kwargs) -> str:

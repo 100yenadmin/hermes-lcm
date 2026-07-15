@@ -9,7 +9,7 @@ for earlier separate sessions or broad cross-session history.
 
 | Tool | Use |
 |------|-----|
-| `lcm_grep` | Search current-session raw messages and summaries. Opt into `session_scope='all'` or `session_scope='session'` (with `session_id`) for bounded archive recovery over rows already present in `lcm.db`, including externally backfilled rows that may carry source strings such as `openclaw-lcm:*`; broader scopes return raw-message hits only. Raw-message filters `role`, `time_from`, and `time_to` are pushed into the search query; when any of them is supplied, summary hits are omitted so the filter contract stays exact. Use `session_search` for earlier separate sessions or broad cross-session recall. |
+| `lcm_grep` | Search current-session raw messages and summaries. `mode='full_text'` is the byte-compatible default; `mode='semantic'` searches embedded summaries; `mode='hybrid'` combines full-text and semantic ranks with RRF. Opt into `session_scope='all'` or `session_scope='session'` (with `session_id`) for bounded archive recovery over rows already present in `lcm.db`, including externally backfilled rows that may carry source strings such as `openclaw-lcm:*`; broader scopes return raw-message hits only in full-text mode. Raw-message filters `role`, `time_from`, and `time_to` are pushed into the full-text query; when any of them is supplied, full-text summary hits are omitted so the filter contract stays exact. Use `session_search` for earlier separate sessions or broad cross-session recall. |
 | `lcm_load_session` | Load one ordered raw-message transcript page for an explicit `session_id`. This is not search: it returns raw rows in `store_id` order, bounded by `limit`, with per-message content bounded by `max_content_chars`, and continues with `after_store_id` from `next_cursor`. |
 | `lcm_describe` | Inspect the current-session DAG or preview an `externalized_ref` without loading full content. |
 | `lcm_expand` | Recover source messages, child summaries, or externalized payloads with pagination. Use `store_id` to fetch a single raw message regardless of session, suitable for drilling into a cross-session `lcm_grep` result. |
@@ -35,6 +35,78 @@ message search query before result limiting. `time_from` and `time_to` accept Un
 seconds or timezone-aware ISO 8601 strings; naive ISO strings are rejected so the
 same query means the same thing across machines. When a raw-message filter is
 active, `lcm_grep` returns raw rows only and reports `summary_results_omitted`.
+
+### Full-text, semantic, and hybrid modes
+
+`lcm_grep` defaults to `mode='full_text'`. Omitting `mode` or setting it to
+`full_text` uses the historical FTS path without changing its serialized result.
+The existing `sort` argument still controls ordering inside that full-text arm;
+it is separate from the retrieval `mode`.
+
+`mode='semantic'` embeds the query with the configured provider's query path
+(preserving query/document input asymmetry), then searches the current embedding
+profile with cosine KNN. Semantic hits are summary nodes and retain the normal
+`node_id`, depth, session, time-window, `expand_hint`, and bounded 300-character
+snippet provenance. Each hit adds `score`/`cosine_score` and a
+`confidence`/`confidence_band` value:
+
+| Cosine score | Confidence |
+|---:|---|
+| `>= 0.65` | `high` |
+| `>= 0.50` | `medium` |
+| `>= 0.35` | `low` |
+| `< 0.35` | `noise` |
+
+The response-level `coverage` value comes directly from the vector store:
+`full` means the complete current profile was scanned, `bounded` means the
+dependency-free bounded-scan fallback was used, and `none` means no usable
+profile/vector coverage was available.
+
+Query embedding has a hard wall-clock budget from
+`embedding_query_timeout_s` (3 seconds by default). Disabled embeddings, a
+missing/unavailable provider, timeouts, transient provider failures, or vector
+search failures fall back to the existing full-text result and add
+`degraded_to_fts: true`, `degraded_reason`, and `coverage: 'none'`. Provider
+authentication failures do not degrade: they return an operator-readable error
+so a missing or invalid credential is repaired instead of silently hidden.
+
+`mode='hybrid'` runs both arms and deduplicates shared summary nodes by
+`node_id`. It fuses ranks with reciprocal-rank fusion only:
+
+```text
+rrf_score = sum(1 / (60 + rank))
+```
+
+Hybrid hits surface `fts_rank` and/or `semantic_rank`, plus `rrf_score`.
+Semantic hits also retain `semantic_score` and `confidence`. Both arms inspect
+`min(500, max(50, limit * 3))` candidates before the public result limit is
+applied. If the semantic arm fails or times out, hybrid returns FTS-only results
+with the same degradation fields. No external reranker is called.
+
+### Deterministic recall smoke evaluation
+
+The committed offline harness builds a fixed-seed, 60-summary synthetic corpus
+and evaluates 30 labeled queries across exact-term, paraphrase, and
+multi-hop-ish strata. Its mock embedder produces hash-based unit vectors with
+topic clustering, so it requires no network, model download, or credential:
+
+```bash
+python3 scripts/eval_retrieval_recall.py
+```
+
+The command prints recall@5 and recall@10 per mode and stratum as a Markdown
+table. `--json` emits stable machine-readable output. These values are a
+deterministic smoke proof, not a claim about production-provider quality.
+
+Real-provider numbers will differ. A live rerun is deliberately double-gated
+because it can make network calls and incur provider cost: configure
+`LCM_EMBEDDING_PROVIDER` and `LCM_EMBEDDING_MODEL` (plus the provider credential
+or local endpoint), then run:
+
+```bash
+LCM_RECALL_EVAL_ALLOW_LIVE_PROVIDER=1 \
+  python3 scripts/eval_retrieval_recall.py --live-provider
+```
 
 Carried-over summary nodes can become current-session content after `/new`, but
 their source eligibility still comes from the descendant raw messages. Expanding

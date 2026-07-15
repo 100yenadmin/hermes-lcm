@@ -1,61 +1,82 @@
-# Pack B / PR-3 outcome
+# Pack B / PR-4 outcome
 
 ## Result
 
-Implemented the dry-run-first `/lcm embed backfill` command for hermes-lcm
-#386 on `feat/embedding-backfill`, stacked on provider head `9a45932`. The
-command discovers missing current-profile depth-0 summaries, previews bounded
-work without provider calls or database writes, and applies resumable embedding
-batches behind an expiring single-flight claim.
+Implemented semantic and hybrid `lcm_grep` retrieval for hermes-lcm #386 on
+`feat/embedding-search-modes`, stacked on embedding-backfill head `44326e6`.
+The default and explicit `full_text` paths retain the historical serialized
+payload byte-for-byte; semantic and hybrid behavior is opt-in through the new
+`mode` enum.
 
-No provider, vector-store, engine, tool, schema, migration, push, or GitHub
-operation was included. The supplied untracked `SPEC.md` remains untracked and
-is not part of the implementation commit.
+No engine, vector-store, provider, config, migration, push, or GitHub operation
+was included. The supplied untracked `SPEC.md` remains untracked and is not part
+of the implementation commit.
 
 ## File map
 
-- `command.py:58-74` defines the 10-minute metadata-table claim, bounded
-  command batch size, Voyage token caps used for estimates, and cost rates.
-- `command.py:1742-1823` opens dry-run discovery read-only, selects newest
-  depth-0 rows through a current-profile correlated `NOT EXISTS`, and computes
-  provider-aware batch and cost estimates.
-- `command.py:1826-1875` atomically acquires the single-flight claim with
-  `BEGIN IMMEDIATE`, permits stale takeover, and releases only the matching
-  owner value.
-- `command.py:1878-2141` parses `--apply` / `--limit`, emits the shared report,
-  calls providers outside write transactions, maps provider over-cap skips,
-  commits each vector row independently, aborts on Voyage auth errors, and
-  continues after transient batch errors.
-- `command.py:2195-2200` routes `/lcm embed backfill` and advertises it in help.
-- `docs/operator-guide.md:167-169,525-527,572-612` documents configuration,
-  dry-run/apply workflow, estimates, single-flight behavior, and safe resume.
-- `tests/test_embedding_backfill.py:1-353` adds nine mocked-provider tests for
-  dry-run purity and local/Voyage cost math, batching/meta, idempotence,
-  limit/newest ordering, per-row
-  isolation, auth abort and claim cleanup, transient continuation, over-cap
-  reporting, fresh/stale claims, and refusal messages.
+- `tools.py:1050-1260` preserves the existing FTS implementation behind an
+  internal full-text entry point without changing its default output.
+- `tools.py:1263-1473` adds confidence-band mapping, a hard wall-clock query
+  embedding budget, provider/auth classification, FTS degradation flags,
+  profile KNN lookup, coverage surfacing, bounded snippets, and provenance.
+- `tools.py:1476-1604` adds the 50-to-500 candidate policy, node-id union/dedup,
+  two-arm RRF with `k=60`, fused rank metadata, and public mode dispatch.
+- `schemas.py:3-26` exposes `full_text`, `semantic`, and `hybrid` in the tool
+  schema while keeping `full_text` as the default.
+- `scripts/eval_retrieval_recall.py:1-284` builds the fixed-seed 60-summary
+  corpus, implements the hash/topic mock embedder, evaluates all three modes,
+  prints Markdown or stable JSON, and double-gates optional live-provider runs.
+- `tests/fixtures/retrieval_recall_queries.json` commits 30 labeled queries
+  across exact-term, paraphrase, and multi-hop-ish strata.
+- `tests/test_embedding_search_modes.py:1-337` covers semantic ordering,
+  confidence/coverage, timeout and missing-provider degradation, auth errors,
+  RRF math and dedup, candidate caps, bounded snippets, full-text byte identity,
+  and deterministic recall evaluation.
+- `docs/retrieval-tools.md:39-109` documents modes, latency/degradation behavior,
+  confidence and coverage fields, RRF, candidate limits, and offline/live eval
+  commands.
+
+RRF is the default and only fusion mechanism in this car. A Voyage
+`rerank-2.5` enhancement remains a possible later change; no external reranker
+or new dependency is called here.
+
+## Recall smoke artifact
+
+The offline command is deterministic and exits zero:
+
+```text
+python3 scripts/eval_retrieval_recall.py
+
+| Mode | Stratum | Recall@5 | Recall@10 |
+|---|---|---:|---:|
+| full_text | exact-term | 1.000 | 1.000 |
+| full_text | paraphrase | 0.100 | 0.100 |
+| full_text | multi-hop-ish | 1.000 | 1.000 |
+| semantic | exact-term | 1.000 | 1.000 |
+| semantic | paraphrase | 1.000 | 1.000 |
+| semantic | multi-hop-ish | 1.000 | 1.000 |
+| hybrid | exact-term | 1.000 | 1.000 |
+| hybrid | paraphrase | 1.000 | 1.000 |
+| hybrid | multi-hop-ish | 1.000 | 1.000 |
+```
+
+These are synthetic smoke values, not production-provider benchmark claims.
+The focused test runs the JSON form twice, asserts byte-for-byte determinism,
+and enforces hybrid recall greater than or equal to FTS recall on paraphrases.
 
 ## Acceptance
 
-Focused feature test:
+Focused mode/provider/vector/schema bundle on the final tree:
 
 ```text
-python3 -m pytest -q tests/test_embedding_backfill.py
-9 passed
+50 passed, 67 warnings in 0.82s
 ```
 
-Canonical host-stub provider/vector/command integration bundle:
+The 11 new tests also pass alone. The final full pytest run adds exactly 11
+passes over PR-3's recorded 1650-pass stack result:
 
 ```text
-119 passed
-```
-
-This is nine more tests than the stacked provider branch's recorded 110-test
-bundle. Full pytest likewise moved from the provider branch's recorded 1641
-passes to 1650 passes:
-
-```text
-3 failed, 1650 passed, 1 skipped, 12 xfailed, 1308 warnings in 45.34s
+3 failed, 1661 passed, 1 skipped, 12 xfailed, 1310 warnings in 41.22s
 ```
 
 The only failures are the SPEC-approved baseline IDs:
@@ -66,15 +87,15 @@ tests/test_path_containment.py::test_path_containment_within_allowed_base
 tests/test_path_security.py::test_configured_externalization_path_inside_allowed_base_accepted
 ```
 
-All three were rerun on the clean untouched upstream checkout
+All three reproduced unchanged on the clean untouched upstream checkout
 `/Volumes/LEXAR/repos/hermes-lcm-upstream-ro` at exact
-`31675c6ed54abd747578b4da4b1589d81b18384a` and reproduced unchanged:
+`31675c6ed54abd747578b4da4b1589d81b18384a`:
 
 ```text
-3 failed, 60 warnings in 0.46s
+3 failed, 60 warnings in 0.30s
 ```
 
-Static checks:
+Static and artifact checks on the final tree:
 
 ```text
 ruff check .
@@ -82,34 +103,35 @@ All checks passed!
 
 git diff --check
 <no output; exit 0>
+
+python3 -m py_compile tools.py schemas.py scripts/eval_retrieval_recall.py tests/test_embedding_search_modes.py
+<no output; exit 0>
 ```
 
-The last wholly completed validator packet is at
-`/Volumes/LEXAR/Codex/hermes-lcm-embedding-backfill-validation-20260715-final/validation-checklist.md`.
-After the final over-cap cost-estimate correction, a fresh validator run at
-`/Volumes/LEXAR/Codex/hermes-lcm-embedding-backfill-validation-20260715-final2/`
-repassed diff, compile, shell, focused pytest, benchmark smoke, and stress smoke,
-then wedged at 8% in its first full pytest child (sleeping at 0% CPU with no log
-progress for more than two minutes). The wedge playbook terminated only that
-validator/pytest process. The remaining gates were rerun directly on the final
-tree:
+The full validator packet is at
+`/Volumes/LEXAR/Codex/hermes-lcm-embedding-search-modes-validation-20260715/validation-checklist.md`.
+The first invocation stopped at its preflight because this machine has
+`python3`, not `python`; rerunning with `PYTHON=python3` completed normally with
+no wedge. Diff/compile/shell, focused pytest (409 passed), benchmark smoke,
+stress smoke, and release stress all passed. Release stress reports
+`failure_count: 0`.
 
-- canonical full pytest: 3 approved failures, 1650 passed, 1 skipped, 12
-  xfailed, in 45.34s
-- low-FD full pytest at `ulimit -n 1024`: the same 3 approved failures, 1650
-  passed, 1 skipped, 12 xfailed, in 40.72s
-- release stress: `failure_count: 0`, with evidence under
-  `/Volumes/LEXAR/Codex/hermes-lcm-embedding-backfill-validation-20260715-final2-stress-release/`
+The validator's normal and low-FD full-pytest gates exited nonzero only for the
+same three upstream-reproduced baseline failures:
 
-Across the completed packet and final-state wedge recovery, the only test
-failures are the exact upstream-reproduced baseline. No new feature failure,
-benchmark failure, stress failure, provider network call, or live profile
-mutation was observed.
+```text
+normal: 3 failed, 1661 passed, 1 skipped, 12 xfailed in 47.45s
+low-FD: 3 failed, 1661 passed, 1 skipped, 12 xfailed in 42.27s
+```
+
+Across the validator and final-tree reruns, there was no new feature failure,
+benchmark failure, stress failure, provider network call, model download, or
+live profile mutation.
 
 ## Scope and readiness
 
-The final diff is limited to `command.py`, `docs/operator-guide.md`, the new
-focused test file, and this required outcome report. This establishes local
-acceptance subject to the exact upstream-reproduced three-test baseline. It
-does not claim push, remote CI, review, merge, release, or deployed-runtime
-proof.
+The implementation diff is limited to `tools.py`, `schemas.py`, the new eval
+script and query fixture, `docs/retrieval-tools.md`, the focused test file, and
+this required outcome report. This establishes local acceptance subject only to
+the exact upstream-reproduced three-test baseline. It does not claim push,
+remote CI, review, merge, release, or deployed-runtime proof.

@@ -3,7 +3,7 @@
 LCM_GREP = {
     "name": "lcm_grep",
     "description": (
-        "Search the plugin-local LCM database for past conversation content. "
+        "Search the plugin-local LCM database for past conversation content using full-text, semantic, or hybrid retrieval. "
         "Default scope is the active session and returns both raw messages and summary nodes across all depths. "
         "Broader scopes ('all' or 'session') must be requested explicitly and exist for bounded archive recovery "
         "over rows already present in lcm.db, including externally backfilled rows that may carry source strings "
@@ -14,6 +14,16 @@ LCM_GREP = {
     "parameters": {
         "type": "object",
         "properties": {
+            "mode": {
+                "type": "string",
+                "enum": ["full_text", "semantic", "hybrid"],
+                "description": (
+                    "Retrieval mode. 'full_text' preserves the historical FTS behavior byte-for-byte. "
+                    "'semantic' searches embedded summaries and degrades to full-text on provider timeout or transient unavailability. "
+                    "'hybrid' fuses full-text and semantic ranks with reciprocal-rank fusion (RRF)."
+                ),
+                "default": "full_text",
+            },
             "query": {
                 "type": "string",
                 "description": (
