@@ -4,9 +4,13 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
+import json
+import math
 import os
 import sqlite3
+import time
 from typing import Any
+import uuid
 
 from .db_bootstrap import (
     check_external_content_fts_integrity,
@@ -41,11 +45,33 @@ from .maintenance import backup_database, rotate_backup_database
 from .session_patterns import build_session_match_keys, matches_session_pattern
 from .store import build_message_fts_spec
 from .embedding_provider import (
+    EmbeddingProviderError,
     FastembedProvider,
+    VoyageError,
     fastembed_download_size_note,
     resolve_provider,
 )
+from .tokens import count_tokens
 from .vector_store import VectorStore
+
+
+_EMBEDDING_BACKFILL_CLAIM_KEY = "lcm_embedding_backfill_claim"
+_EMBEDDING_BACKFILL_CLAIM_TTL_S = 10 * 60
+_EMBEDDING_BACKFILL_BATCH_SIZE = 32
+_VOYAGE_MAX_BATCH_TOKENS = 80_000
+_VOYAGE_MAX_DOCUMENT_TOKENS = 27_000
+_VOYAGE_USD_PER_MILLION_TOKENS = {
+    "voyage-4-large": 0.12,
+    "voyage-4": 0.06,
+    "voyage-4-lite": 0.02,
+    "voyage-context-3": 0.18,
+    "voyage-3-lite": 0.02,
+    "voyage-3.5-lite": 0.02,
+    "voyage-3": 0.06,
+    "voyage-3.5": 0.06,
+    "voyage-3-large": 0.18,
+    "voyage-code-3": 0.18,
+}
 
 def _fmt_bool(value: Any) -> str:
     return "yes" if bool(value) else "no"
@@ -89,6 +115,7 @@ def _help_text(error: str | None = None) -> str:
         "- /lcm preset suggest: preview the best shipped preset for the current engine state",
         "- /lcm preset apply <name> --dry-run: preview env-var changes without mutating live config",
         "- /lcm embed warmup: download/probe the configured embedding model and register its dimension",
+        "- /lcm embed backfill [--apply] [--limit N]: preview or populate missing leaf-summary embeddings",
         "- /lcm help: show this help",
     ])
     return "\n".join(lines)
@@ -1760,6 +1787,408 @@ def _embedding_warmup_text(engine) -> str:
         ])
 
 
+def _embedding_read_connection(db_path: str | Path) -> sqlite3.Connection:
+    """Open the existing database without allowing a dry run to create it."""
+    uri = f"{Path(db_path).resolve().as_uri()}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, timeout=5.0)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _embedding_current_profile(conn: sqlite3.Connection) -> sqlite3.Row | None:
+    try:
+        return conn.execute(
+            """
+            SELECT model_name, provider, dim, registered_at
+            FROM lcm_embedding_profile
+            WHERE active = 1 AND archived_at IS NULL
+            ORDER BY registered_at DESC, model_name DESC
+            LIMIT 1
+            """
+        ).fetchone()
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            return None
+        raise
+
+
+def _embedding_pending_rows(
+    conn: sqlite3.Connection,
+    model: str,
+    limit: int,
+) -> tuple[int, list[sqlite3.Row]]:
+    where = """
+        n.depth = 0
+        AND NOT EXISTS (
+            SELECT 1
+            FROM lcm_embedding_meta AS m
+            WHERE m.embedded_id = CAST(n.node_id AS TEXT)
+              AND m.embedded_kind = 'summary'
+              AND m.embedding_model = ?
+        )
+    """
+    total = int(conn.execute(
+        f"SELECT COUNT(*) FROM summary_nodes AS n WHERE {where}",
+        (model,),
+    ).fetchone()[0])
+    rows = conn.execute(
+        f"""
+        SELECT n.node_id, n.summary
+        FROM summary_nodes AS n
+        WHERE {where}
+        ORDER BY COALESCE(n.latest_at, n.created_at) DESC, n.node_id DESC
+        LIMIT ?
+        """,
+        (model, limit),
+    ).fetchall()
+    return total, rows
+
+
+def _embedding_batch_estimate(provider: str, token_counts: list[int]) -> int:
+    if not token_counts:
+        return 0
+    if provider.lower() != "voyage":
+        return int(math.ceil(len(token_counts) / _EMBEDDING_BACKFILL_BATCH_SIZE))
+    estimated = 0
+    for offset in range(0, len(token_counts), _EMBEDDING_BACKFILL_BATCH_SIZE):
+        batch_tokens = 0
+        for tokens in token_counts[offset:offset + _EMBEDDING_BACKFILL_BATCH_SIZE]:
+            if tokens > _VOYAGE_MAX_DOCUMENT_TOKENS:
+                continue
+            if batch_tokens and batch_tokens + tokens > _VOYAGE_MAX_BATCH_TOKENS:
+                estimated += 1
+                batch_tokens = 0
+            batch_tokens += tokens
+        if batch_tokens:
+            estimated += 1
+    return estimated
+
+
+def _embedding_estimated_cost(provider: str, model: str, tokens: int) -> float:
+    if provider.lower() != "voyage":
+        return 0.0
+    rate = _VOYAGE_USD_PER_MILLION_TOKENS.get(model, 0.18)
+    return (max(0, tokens) / 1_000_000.0) * rate
+
+
+def _embedding_claim_timestamp(raw: str) -> float:
+    try:
+        payload = json.loads(raw)
+        if isinstance(payload, dict):
+            return float(payload.get("claimed_at", 0.0) or 0.0)
+        return float(payload)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return 0.0
+
+
+def _acquire_embedding_backfill_claim(
+    conn: sqlite3.Connection,
+    *,
+    now: float | None = None,
+) -> str | None:
+    """Atomically claim the one-shot worker, replacing claims older than 10m."""
+    claimed_at = time.time() if now is None else float(now)
+    owner = uuid.uuid4().hex
+    value = json.dumps({"owner": owner, "claimed_at": claimed_at}, sort_keys=True)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT value FROM metadata WHERE key = ?",
+            (_EMBEDDING_BACKFILL_CLAIM_KEY,),
+        ).fetchone()
+        if row is not None:
+            age = claimed_at - _embedding_claim_timestamp(str(row[0]))
+            if age < _EMBEDDING_BACKFILL_CLAIM_TTL_S:
+                conn.rollback()
+                return None
+        conn.execute(
+            """
+            INSERT INTO metadata(key, value) VALUES(?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (_EMBEDDING_BACKFILL_CLAIM_KEY, value),
+        )
+        conn.commit()
+        return value
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _release_embedding_backfill_claim(conn: sqlite3.Connection, claim: str) -> None:
+    with conn:
+        conn.execute(
+            "DELETE FROM metadata WHERE key = ? AND value = ?",
+            (_EMBEDDING_BACKFILL_CLAIM_KEY, claim),
+        )
+
+
+def _embedding_backfill_options(tokens: list[str]) -> tuple[bool, int] | str:
+    apply = False
+    limit = 200
+    index = 0
+    while index < len(tokens):
+        token = tokens[index].lower()
+        if token == "--apply" and not apply:
+            apply = True
+            index += 1
+            continue
+        if token == "--limit" and index + 1 < len(tokens):
+            try:
+                limit = int(tokens[index + 1])
+            except ValueError:
+                return "`--limit` must be a positive integer."
+            if limit < 1:
+                return "`--limit` must be a positive integer."
+            index += 2
+            continue
+        return "`/lcm embed backfill` accepts only `--apply` and `--limit N`."
+    return apply, limit
+
+
+def _embedding_backfill_report(
+    *,
+    mode: str,
+    status: str,
+    provider: str,
+    model: str,
+    pending: int,
+    selected: int,
+    estimated_tokens: int,
+    estimated_cost_tokens: int,
+    estimated_batches: int,
+    embedded: int,
+    skipped: list[tuple[str, str]],
+    failed: list[tuple[str, str]],
+    remaining: int,
+    duration: float,
+    consumed_tokens: int,
+    error: str | None = None,
+) -> str:
+    lines = [
+        "LCM embedding backfill",
+        f"mode: {mode}",
+        f"status: {status}",
+        f"provider: {provider}",
+        f"model: {model}",
+        f"pending: {pending}",
+        f"selected: {selected}",
+        f"estimated_tokens: {estimated_tokens}",
+        f"estimated_batches: {estimated_batches}",
+        f"estimated_cost_usd: ${_embedding_estimated_cost(provider, model, estimated_cost_tokens):.6f}",
+        f"embedded: {embedded}",
+        f"skipped_overcap: {len(skipped)}",
+        f"failed: {len(failed)}",
+        f"remaining: {remaining}",
+        f"duration_seconds: {duration:.3f}",
+        f"tokens_consumed: {consumed_tokens}",
+    ]
+    if error:
+        lines.append(f"error: {error}")
+    lines.extend(
+        f"skipped_detail: node_id={node_id} reason={reason}"
+        for node_id, reason in skipped
+    )
+    lines.extend(
+        f"failed_detail: node_id={node_id} reason={reason}"
+        for node_id, reason in failed
+    )
+    if mode == "dry-run":
+        lines.append("note: preview only; no provider calls or database writes were made")
+        lines.append("next: run `/lcm embed backfill --apply` to populate embeddings")
+    return "\n".join(lines)
+
+
+def _embedding_backfill_text(tokens: list[str], engine) -> str:
+    parsed = _embedding_backfill_options(tokens)
+    if isinstance(parsed, str):
+        return _help_text(parsed)
+    apply, limit = parsed
+    mode = "apply" if apply else "dry-run"
+    started = time.monotonic()
+
+    if not bool(getattr(engine._config, "embeddings_enabled", False)):
+        return "\n".join([
+            "LCM embedding backfill",
+            f"mode: {mode}",
+            "status: refused",
+            "error: embeddings are disabled; set LCM_EMBEDDINGS_ENABLED=true, then run `/lcm embed warmup`",
+        ])
+
+    db_path = engine._store.db_path
+    try:
+        read_conn = _embedding_read_connection(db_path)
+    except sqlite3.Error as exc:
+        return "\n".join([
+            "LCM embedding backfill",
+            f"mode: {mode}",
+            "status: refused",
+            f"error: embedding database is unavailable ({exc}); run `/lcm embed warmup` first",
+        ])
+    try:
+        profile = _embedding_current_profile(read_conn)
+        if profile is None:
+            return "\n".join([
+                "LCM embedding backfill",
+                f"mode: {mode}",
+                "status: refused",
+                "error: no current embedding profile is registered; run `/lcm embed warmup` first",
+            ])
+        model = str(profile["model_name"])
+        provider_name = str(profile["provider"])
+        pending, rows = _embedding_pending_rows(read_conn, model, limit)
+    except sqlite3.Error as exc:
+        return "\n".join([
+            "LCM embedding backfill",
+            f"mode: {mode}",
+            "status: error",
+            f"error: could not discover pending summaries ({exc})",
+        ])
+    finally:
+        read_conn.close()
+
+    documents = [
+        (str(row["node_id"]), str(row["summary"]), count_tokens(row["summary"]))
+        for row in rows
+    ]
+    estimated_tokens = sum(document[2] for document in documents)
+    estimated_cost_tokens = sum(
+        document[2]
+        for document in documents
+        if provider_name.lower() != "voyage"
+        or document[2] <= _VOYAGE_MAX_DOCUMENT_TOKENS
+    )
+    estimated_batches = _embedding_batch_estimate(
+        provider_name,
+        [document[2] for document in documents],
+    )
+    if not apply:
+        return _embedding_backfill_report(
+            mode=mode,
+            status="dry-run",
+            provider=provider_name,
+            model=model,
+            pending=pending,
+            selected=len(documents),
+            estimated_tokens=estimated_tokens,
+            estimated_cost_tokens=estimated_cost_tokens,
+            estimated_batches=estimated_batches,
+            embedded=0,
+            skipped=[],
+            failed=[],
+            remaining=pending,
+            duration=time.monotonic() - started,
+            consumed_tokens=0,
+        )
+
+    store: VectorStore | None = None
+    claim: str | None = None
+    embedded = 0
+    skipped: list[tuple[str, str]] = []
+    failed: list[tuple[str, str]] = []
+    consumed_tokens = 0
+    status = "complete"
+    error: str | None = None
+    try:
+        store = VectorStore(db_path, config=engine._config)
+        claim = _acquire_embedding_backfill_claim(store.connection)
+        if claim is None:
+            return "\n".join([
+                "LCM embedding backfill",
+                "mode: apply",
+                "status: refused",
+                "error: another embedding backfill is already running; retry after it exits or after the 10-minute stale-claim window",
+            ])
+
+        provider = resolve_provider(engine._config)
+        if provider is None:
+            status = "error"
+            error = "embedding provider is not configured; run `/lcm embed warmup`"
+        elif (
+            provider.model_id != model
+            or str(provider.provider_id).lower() != provider_name.lower()
+        ):
+            status = "error"
+            error = "configured provider does not match the current profile; run `/lcm embed warmup`"
+        else:
+            for offset in range(0, len(documents), _EMBEDDING_BACKFILL_BATCH_SIZE):
+                batch = documents[offset:offset + _EMBEDDING_BACKFILL_BATCH_SIZE]
+                try:
+                    vectors = provider.embed_documents([item[1] for item in batch])
+                    skipped_indexes = {
+                        int(index)
+                        for index in getattr(provider, "last_skipped_documents", [])
+                        if 0 <= int(index) < len(batch)
+                    }
+                    accepted = [
+                        item for index, item in enumerate(batch)
+                        if index not in skipped_indexes
+                    ]
+                    if len(vectors) != len(accepted):
+                        raise EmbeddingProviderError(
+                            "provider returned a different number of embeddings than accepted documents"
+                        )
+                    for index in sorted(skipped_indexes):
+                        skipped.append((batch[index][0], "provider_document_token_cap"))
+                    consumed_tokens += sum(item[2] for item in accepted)
+                    for item, vector in zip(accepted, vectors):
+                        try:
+                            store.record_embedding(item[0], "summary", model, vector)
+                            embedded += 1
+                        except Exception as exc:
+                            failed.append((item[0], f"record_error:{exc}"))
+                except Exception as exc:
+                    reason = (
+                        f"provider_{exc.kind}:{exc}"
+                        if isinstance(exc, VoyageError)
+                        else f"provider_error:{exc}"
+                    )
+                    failed.extend((item[0], reason) for item in batch)
+                    if isinstance(exc, VoyageError) and exc.kind == "auth":
+                        status = "error"
+                        error = f"provider authentication failed; {exc}"
+                        break
+    except Exception as exc:
+        status = "error"
+        error = str(exc)
+    finally:
+        if store is not None:
+            if claim is not None:
+                try:
+                    _release_embedding_backfill_claim(store.connection, claim)
+                except Exception as exc:
+                    status = "error"
+                    error = f"{error}; claim release failed: {exc}" if error else f"claim release failed: {exc}"
+            store.close()
+
+    try:
+        check_conn = _embedding_read_connection(db_path)
+        try:
+            remaining, _ = _embedding_pending_rows(check_conn, model, 1)
+        finally:
+            check_conn.close()
+    except sqlite3.Error:
+        remaining = max(0, pending - embedded)
+    return _embedding_backfill_report(
+        mode=mode,
+        status=status,
+        provider=provider_name,
+        model=model,
+        pending=pending,
+        selected=len(documents),
+        estimated_tokens=estimated_tokens,
+        estimated_cost_tokens=estimated_cost_tokens,
+        estimated_batches=estimated_batches,
+        embedded=embedded,
+        skipped=skipped,
+        failed=failed,
+        remaining=remaining,
+        duration=time.monotonic() - started,
+        consumed_tokens=consumed_tokens,
+        error=error,
+    )
+
+
 def handle_lcm_command(raw_args: str | None, engine) -> str:
     tokens = [part.strip() for part in (raw_args or "").strip().split() if part.strip()]
     if not tokens:
@@ -1814,7 +2243,9 @@ def handle_lcm_command(raw_args: str | None, engine) -> str:
     if head == "embed":
         if len(rest) == 1 and rest[0].lower() == "warmup":
             return _embedding_warmup_text(engine)
-        return _help_text("`/lcm embed` requires the `warmup` subcommand.")
+        if rest and rest[0].lower() == "backfill":
+            return _embedding_backfill_text(rest[1:], engine)
+        return _help_text("`/lcm embed` requires the `warmup` or `backfill` subcommand.")
 
     if head == "help":
         return _help_text()
