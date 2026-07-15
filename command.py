@@ -40,6 +40,12 @@ from .presets import (
 from .maintenance import backup_database, rotate_backup_database
 from .session_patterns import build_session_match_keys, matches_session_pattern
 from .store import build_message_fts_spec
+from .embedding_provider import (
+    FastembedProvider,
+    fastembed_download_size_note,
+    resolve_provider,
+)
+from .vector_store import VectorStore
 
 def _fmt_bool(value: Any) -> str:
     return "yes" if bool(value) else "no"
@@ -82,6 +88,7 @@ def _help_text(error: str | None = None) -> str:
         "- /lcm preset show [name]: inspect shipped preset metadata and benchmark provenance",
         "- /lcm preset suggest: preview the best shipped preset for the current engine state",
         "- /lcm preset apply <name> --dry-run: preview env-var changes without mutating live config",
+        "- /lcm embed warmup: download/probe the configured embedding model and register its dimension",
         "- /lcm help: show this help",
     ])
     return "\n".join(lines)
@@ -1695,6 +1702,58 @@ def _preset_text(tokens: list[str], engine) -> str:
     return _help_text("`/lcm preset` supports `show`, `suggest`, and `apply`.")
 
 
+def _embedding_warmup_text(engine) -> str:
+    """Warm the configured provider and dimension-lock its vector profile."""
+    try:
+        provider = resolve_provider(engine._config)
+        if provider is None:
+            return (
+                "LCM embedding warmup\n"
+                "status: error\n"
+                "error: embedding provider is not configured; set "
+                "LCM_EMBEDDING_PROVIDER and LCM_EMBEDDING_MODEL"
+            )
+
+        if provider.provider_id == FastembedProvider.provider_id:
+            vector = provider.warmup()
+            progress = (
+                f"download: ready ({fastembed_download_size_note(provider.model_id)})"
+            )
+            cost_note = "local model; no per-call API charge"
+        else:
+            vector = provider.embed_query("warmup")
+            progress = "probe: complete"
+            cost_note = (
+                "API usage may incur provider charges"
+                if provider.provider_id == "voyage"
+                else "local Ollama model; no per-call API charge"
+            )
+
+        dim = len(vector)
+        if dim < 1:
+            raise ValueError("provider returned an empty warmup embedding")
+        store = VectorStore(engine._store.db_path, config=engine._config)
+        try:
+            store.register_profile(provider.model_id, provider.provider_id, dim)
+        finally:
+            store.close()
+        return "\n".join([
+            "LCM embedding warmup",
+            "status: ready",
+            progress,
+            f"provider: {provider.provider_id}",
+            f"model: {provider.model_id}",
+            f"dim: {dim}",
+            f"cost_note: {cost_note}",
+        ])
+    except Exception as exc:
+        return "\n".join([
+            "LCM embedding warmup",
+            "status: error",
+            f"error: {exc}",
+        ])
+
+
 def handle_lcm_command(raw_args: str | None, engine) -> str:
     tokens = [part.strip() for part in (raw_args or "").strip().split() if part.strip()]
     if not tokens:
@@ -1745,6 +1804,11 @@ def handle_lcm_command(raw_args: str | None, engine) -> str:
 
     if head == "preset":
         return _preset_text(rest, engine)
+
+    if head == "embed":
+        if len(rest) == 1 and rest[0].lower() == "warmup":
+            return _embedding_warmup_text(engine)
+        return _help_text("`/lcm embed` requires the `warmup` subcommand.")
 
     if head == "help":
         return _help_text()
