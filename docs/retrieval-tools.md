@@ -67,7 +67,9 @@ If rollups are missing or stale, the feature flag is off, or the request uses a
 sub-day `last Nh` window, the tool performs the existing read-only leaf-summary
 retrieval over the same time bounds. This fallback is a successful retrieval,
 including for an empty window; `provenance.fallback` is `true` and no LLM call
-is made while serving either path.
+is made while serving either path. See the
+[operator guide's temporal rollup operations](operator-guide.md#temporal-rollup-operations)
+for enablement, tuning, status inspection, and bounded rebuild commands.
 
 ### Lossless raw recovery contract
 
