@@ -27,7 +27,8 @@ class SchemaVersionTooNewError(RuntimeError):
     """
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
+_EMBEDDING_MIGRATION_VERSION = 6
 SQLITE_BUSY_TIMEOUT_MS = 30_000
 _MIN_DISK_SPACE_BYTES = 50 * 1024 * 1024
 REQUIRED_CORE_TABLES = (
@@ -266,6 +267,42 @@ def ensure_message_origin_columns(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_msg_conversation_session ON messages(conversation_id, session_id, store_id)"
+    )
+
+
+def ensure_embedding_tables(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS lcm_embedding_profile (
+            model_name TEXT PRIMARY KEY,
+            provider TEXT,
+            dim INTEGER CHECK(dim BETWEEN 1 AND 4096),
+            registered_at TEXT,
+            active INTEGER DEFAULT 1,
+            archived_at TEXT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS lcm_embedding_meta (
+            embedded_id TEXT,
+            embedded_kind TEXT CHECK(embedded_kind IN ('summary')),
+            embedding_model TEXT,
+            embedded_at TEXT,
+            source_token_count INTEGER,
+            archived INTEGER DEFAULT 0,
+            PRIMARY KEY(embedded_id, embedded_kind, embedding_model)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_lcm_embedding_meta_model_embedded_at
+            ON lcm_embedding_meta(embedding_model, embedded_at DESC)
+            WHERE archived = 0;
+
+        CREATE TABLE IF NOT EXISTS lcm_embedding_vectors (
+            embedded_id TEXT,
+            embedding_model TEXT,
+            vec BLOB NOT NULL,
+            PRIMARY KEY(embedded_id, embedding_model)
+        );
+        """
     )
 
 
@@ -699,5 +736,13 @@ def run_versioned_migrations(conn: sqlite3.Connection) -> None:
     if current_version < 5:
         mark_migration_step_complete(conn, "v5_message_conversation_id")
         current_version = 5
+
+    ensure_embedding_tables(conn)
+    if current_version < _EMBEDDING_MIGRATION_VERSION:
+        mark_migration_step_complete(
+            conn,
+            f"v{_EMBEDDING_MIGRATION_VERSION}_embeddings",
+        )
+        current_version = _EMBEDDING_MIGRATION_VERSION
 
     set_schema_version(conn, current_version)
