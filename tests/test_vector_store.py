@@ -18,7 +18,7 @@ EMBEDDING_TABLES = {
     "lcm_embedding_meta",
     "lcm_embedding_vectors",
 }
-MIGRATION_STEP = f"v{db_bootstrap.SCHEMA_VERSION}_embeddings"
+MIGRATION_STEP = "embeddings_v1"
 
 
 def _table_names(conn: sqlite3.Connection) -> set[str]:
@@ -61,31 +61,56 @@ def _add_summary(
     )
 
 
-def test_embedding_migration_is_idempotent(tmp_path):
-    conn = sqlite3.connect(tmp_path / "idempotent.db")
+def test_core_migrations_omit_embedding_tables(tmp_path):
+    """A disabled install stays at schema_version 5 with no embedding tables.
+
+    Embedding tables are opt-in and never created by the core migration path,
+    so a base build can open the DB and the numeric counter stays free for the
+    temporal train (no v6 collision).
+    """
+    conn = sqlite3.connect(tmp_path / "core_only.db")
     try:
-        db_bootstrap.run_versioned_migrations(conn)
         db_bootstrap.run_versioned_migrations(conn)
         conn.commit()
 
-        assert EMBEDDING_TABLES <= _table_names(conn)
-        assert db_bootstrap.get_schema_version(conn) == db_bootstrap.SCHEMA_VERSION
-        steps = conn.execute(
+        assert db_bootstrap.SCHEMA_VERSION == 5
+        assert db_bootstrap.get_schema_version(conn) == 5
+        assert not (EMBEDDING_TABLES & _table_names(conn))
+        marker = conn.execute(
             "SELECT step_name FROM lcm_migration_state WHERE step_name = ?",
             (MIGRATION_STEP,),
         ).fetchall()
-        assert steps == [(MIGRATION_STEP,)]
-        index_sql = conn.execute(
+        assert marker == []
+    finally:
+        conn.close()
+
+
+def test_vector_store_creates_embedding_tables_lazily_and_idempotently(tmp_path):
+    """VectorStore materializes the opt-in tables on first use, still at v5."""
+    db_path = tmp_path / "idempotent.db"
+    first = VectorStore(db_path)
+    first.close()
+    # Re-opening must not duplicate the marker or fail on existing tables.
+    store = VectorStore(db_path)
+    try:
+        assert EMBEDDING_TABLES <= _table_names(store.connection)
+        assert db_bootstrap.get_schema_version(store.connection) == 5
+        steps = store.connection.execute(
+            "SELECT step_name FROM lcm_migration_state WHERE step_name = ?",
+            (MIGRATION_STEP,),
+        ).fetchall()
+        assert [tuple(row) for row in steps] == [(MIGRATION_STEP,)]
+        index_sql = store.connection.execute(
             """
             SELECT sql
             FROM sqlite_master
             WHERE type = 'index'
-              AND name = 'idx_lcm_embedding_meta_model_embedded_at'
+              AND name = 'idx_lcm_embedding_meta_identity_embedded_at'
             """
         ).fetchone()[0]
         assert "WHERE archived = 0" in index_sql
     finally:
-        conn.close()
+        store.close()
 
 
 def test_vector_store_upgrades_previous_schema_version(tmp_path):
@@ -146,53 +171,62 @@ def test_vector_store_refuses_newer_schema_before_configuring_connection(
         check.close()
 
 
-def test_profile_registration_locks_dimension_and_is_immutable(tmp_path):
+def test_profile_identity_distinguishes_provider_without_clobber(tmp_path):
+    """Same model_name under two providers is two profiles, not a silent overwrite."""
     store = VectorStore(tmp_path / "profiles.db")
     try:
-        store.register_profile("model-a", "provider-a", 3)
-        store.register_profile("model-a", "provider-b", 3)
+        identity_a = store.register_profile("model-a", "provider-a", 3)
+        identity_b = store.register_profile("model-a", "provider-b", 3)
+        assert identity_a != identity_b
 
-        row = store.connection.execute(
-            "SELECT provider, dim FROM lcm_embedding_profile WHERE model_name = 'model-a'"
-        ).fetchone()
-        assert tuple(row) == ("provider-a", 3)
-        with pytest.raises(ValueError, match="locked at 3"):
-            store.register_profile("model-a", "provider-a", 4)
+        rows = store.connection.execute(
+            """
+            SELECT provider, dim, active
+            FROM lcm_embedding_profile
+            WHERE model_name = 'model-a'
+            ORDER BY provider
+            """
+        ).fetchall()
+        # Both provider rows survive; provider-a's metadata was not clobbered.
+        assert [tuple(r) for r in rows] == [
+            ("provider-a", 3, 0),
+            ("provider-b", 3, 1),
+        ]
+        # A different dim is a different identity (new row), not a locked error.
+        identity_c = store.register_profile("model-a", "provider-a", 4)
+        assert identity_c not in {identity_a, identity_b}
+        assert store.connection.execute(
+            "SELECT COUNT(*) FROM lcm_embedding_profile WHERE model_name = 'model-a'"
+        ).fetchone()[0] == 3
     finally:
         store.close()
 
 
-def test_current_profile_uses_newest_active_unarchived(stores):
+def test_switch_provider_a_b_a_reactivates_without_rebackfill(stores):
+    """Switching config A→B→A reactivates A's profile with its vectors intact."""
     dag, store = stores
-    first = _add_summary(dag, created_at=1.0)
-    second = _add_summary(dag, created_at=2.0)
-    store.register_profile("older", "local", 3)
-    store.register_profile("newer", "local", 3)
-    store.connection.execute(
-        "UPDATE lcm_embedding_profile SET registered_at = '2026-01-01' WHERE model_name = 'older'"
-    )
-    store.connection.execute(
-        "UPDATE lcm_embedding_profile SET registered_at = '2026-02-01' WHERE model_name = 'newer'"
-    )
-    store.connection.commit()
-    store.record_embedding(first, "summary", "older", [1.0, 0.0, 0.0])
-    store.record_embedding(second, "summary", "newer", [0.0, 1.0, 0.0])
+    node_a = _add_summary(dag, created_at=1.0)
+    node_b = _add_summary(dag, created_at=2.0)
+    store.register_profile("shared-model", "provider-a", 3)
+    store.record_embedding(node_a, "summary", "shared-model", [1.0, 0.0, 0.0])
 
-    assert store.knn([0.0, 1.0, 0.0])[0][0] == str(second)
+    # Switch to provider B (same model name); A is retained but deactivated.
+    store.register_profile("shared-model", "provider-b", 3)
+    store.record_embedding(node_b, "summary", "shared-model", [0.0, 1.0, 0.0])
+    current = store._current_profile()
+    assert current["provider"] == "provider-b"
 
-    store.connection.execute(
-        "UPDATE lcm_embedding_profile SET archived_at = '2026-03-01' WHERE model_name = 'newer'"
-    )
-    store.connection.commit()
-    assert store.knn([1.0, 0.0, 0.0])[0][0] == str(first)
-
-    store.connection.execute(
-        "UPDATE lcm_embedding_profile SET active = 0 WHERE model_name = 'older'"
-    )
-    store.connection.commit()
+    # Switch back to A: no re-backfill, A's vector must resolve again.
+    store.register_profile("shared-model", "provider-a", 3)
+    current = store._current_profile()
+    assert current["provider"] == "provider-a"
     result = store.knn([1.0, 0.0, 0.0])
-    assert result == []
-    assert result.coverage == "none"
+    assert [row[0] for row in result] == [str(node_a)]
+    # Only exactly one profile is active at a time.
+    active = store.connection.execute(
+        "SELECT COUNT(*) FROM lcm_embedding_profile WHERE active = 1 AND archived_at IS NULL"
+    ).fetchone()[0]
+    assert active == 1
 
 
 def test_record_and_knn_match_hand_computed_cosines(stores):
@@ -416,6 +450,123 @@ def test_matrix_cache_is_invalidated_on_write(stores):
     assert store._matrix_cache == {}
     updated = store.knn([0.0, 1.0, 0.0], model="cache")
     assert updated[0][0] == str(second)
+
+
+def test_time_to_filter_excludes_before_top_k(stores):
+    pytest.importorskip("numpy")
+    dag, store = stores
+    store.register_profile("time-to", "local", 2)
+    # 501 high-scoring but too-new vectors must not consume the top-k slots.
+    for index in range(501):
+        too_new = _add_summary(dag, created_at=10_000.0 + index)
+        store.record_embedding(too_new, "summary", "time-to", [1.0, 0.0])
+    eligible = _add_summary(dag, created_at=5.0)
+    store.record_embedding(eligible, "summary", "time-to", [0.0, 1.0])
+
+    result = store.knn([1.0, 0.0], k=2, model="time-to", until=100.0)
+    assert result.coverage == "full"
+    assert [row[0] for row in result] == [str(eligible)]
+
+
+def test_source_filter_enforced_before_top_k(stores):
+    pytest.importorskip("numpy")
+    dag, store = stores
+    conn = store.connection
+    conn.execute("CREATE TABLE IF NOT EXISTS messages (store_id INTEGER PRIMARY KEY, source TEXT)")
+    conn.execute("INSERT INTO messages(store_id, source) VALUES (1, 'keep'), (2, 'drop')")
+    conn.commit()
+    store.register_profile("source-filter", "local", 2)
+
+    # Many high-scoring vectors from the wrong source must be excluded before cap.
+    for index in range(300):
+        wrong = dag.add_node(
+            SummaryNode(
+                session_id="conversation-a",
+                summary=f"wrong {index}",
+                source_ids=[2],
+                created_at=float(index + 1),
+            )
+        )
+        store.record_embedding(wrong, "summary", "source-filter", [1.0, 0.0])
+    right = dag.add_node(
+        SummaryNode(
+            session_id="conversation-a",
+            summary="right",
+            source_ids=[1],
+            created_at=1_000.0,
+        )
+    )
+    store.record_embedding(right, "summary", "source-filter", [0.0, 1.0])
+
+    result = store.knn([1.0, 0.0], k=3, model="source-filter", source="keep")
+    assert result.coverage == "full"
+    assert [row[0] for row in result] == [str(right)]
+
+
+def test_data_version_bump_invalidates_cross_process_cache(stores, tmp_path):
+    pytest.importorskip("numpy")
+    dag, store = stores
+    first = _add_summary(dag, created_at=1.0)
+    second = _add_summary(dag, created_at=2.0)
+    store.register_profile("shared", "local", 3)
+    store.record_embedding(first, "summary", "shared", [1.0, 0.0, 0.0])
+
+    # Process A opens its own connection and warms its matrix cache.
+    process_a = VectorStore(store.db_path)
+    try:
+        warmed = process_a.knn([0.0, 1.0, 0.0], model="shared")
+        assert [row[0] for row in warmed] == [str(first)]
+        assert process_a._matrix_cache
+
+        # Process B writes a new vector, bumping the durable data_version in the
+        # same transaction. max_rowid/row_count alone would not reveal an
+        # in-place rewrite, but the counter forces process A to reload.
+        store.record_embedding(second, "summary", "shared", [0.0, 1.0, 0.0])
+
+        refreshed = process_a.knn([0.0, 1.0, 0.0], model="shared")
+        assert refreshed[0][0] == str(second)
+    finally:
+        process_a.close()
+
+
+def test_large_id_metadata_resolve_scales_past_variable_limit(stores):
+    pytest.importorskip("numpy")
+    dag, store = stores
+    store.register_profile("bulk", "local", 2)
+    conn = store.connection
+    # Insert 40k summary+vector rows directly for speed; a giant WHERE id IN
+    # (...) resolve would raise "too many SQL variables" at ~33k on this runtime.
+    now = 1.0
+    vec = array("f", store._normalized([1.0, 0.0], expected_dim=2)).tobytes()
+    identity = store._current_profile()["identity_hash"]
+    for node_id in range(1, 40_001):
+        conn.execute(
+            "INSERT INTO summary_nodes(node_id, session_id, depth, summary, "
+            "source_token_count, source_ids, source_type, created_at, "
+            "earliest_at, latest_at) VALUES (?, 'conversation-a', 0, 's', 1, "
+            "'[]', 'messages', ?, ?, ?)",
+            (node_id, now, now, now),
+        )
+    conn.executemany(
+        "INSERT INTO lcm_embedding_vectors(embedded_id, identity_hash, vec) VALUES (?, ?, ?)",
+        [(str(node_id), identity, vec) for node_id in range(1, 40_001)],
+    )
+    conn.executemany(
+        "INSERT INTO lcm_embedding_meta(embedded_id, embedded_kind, identity_hash, "
+        "embedded_at, source_token_count, archived) VALUES (?, 'summary', ?, '2026', 1, 0)",
+        [(str(node_id), identity) for node_id in range(1, 40_001)],
+    )
+    conn.commit()
+    store._matrix_cache.clear()
+
+    result = store.knn(
+        [1.0, 0.0],
+        k=5,
+        model="bulk",
+        conversation_ids=["conversation-a"],
+    )
+    assert result.coverage == "full"
+    assert len(result) == 5
 
 
 def test_no_profile_or_vectors_returns_none_coverage(tmp_path):
