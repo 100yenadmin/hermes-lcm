@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import math
 import sqlite3
+import threading
 from array import array
 
 import pytest
@@ -600,3 +602,241 @@ def test_embedding_config_defaults_are_inert_and_read_environment(monkeypatch):
         assert store.bounded_scan_rows == 123
     finally:
         store.close()
+
+
+def _numpy_unavailable():
+    raise ImportError("numpy not installed")
+
+
+def test_legacy_db_missing_latest_at_and_source_does_not_crash_knn(tmp_path):
+    """A VectorStore-only worker DB predating the DAG/source migrations.
+
+    Its summary_nodes lacks latest_at (added by the DAG migration) and its
+    messages lacks source (added by MessageStore._ensure_source_column). Time-
+    and source-scoped KNN must degrade gracefully instead of raising
+    "no such column: latest_at" / "no such column: source".
+    """
+    db_path = tmp_path / "legacy.db"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE summary_nodes (
+            node_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT,
+            depth INTEGER DEFAULT 0,
+            summary TEXT,
+            source_token_count INTEGER,
+            source_ids TEXT NOT NULL DEFAULT '[]',
+            source_type TEXT NOT NULL DEFAULT 'messages',
+            created_at REAL
+        );
+        CREATE TABLE messages (
+            store_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT,
+            role TEXT,
+            content TEXT
+        );
+        """
+    )
+    cur = conn.execute(
+        "INSERT INTO messages(session_id, role, content) VALUES ('s', 'user', 'hi')"
+    )
+    msg_id = cur.lastrowid
+    conn.execute(
+        "INSERT INTO summary_nodes(session_id, summary, source_token_count, source_ids, source_type, created_at) "
+        "VALUES ('s', 'legacy summary', 10, ?, 'messages', 5.0)",
+        (json.dumps([msg_id]),),
+    )
+    node_id = conn.execute("SELECT node_id FROM summary_nodes").fetchone()[0]
+    conn.commit()
+    conn.close()
+
+    store = VectorStore(db_path)
+    try:
+        store.register_profile("m", "p", 3)
+        store.record_embedding(node_id, "summary", "m", [1.0, 0.0, 0.0])
+
+        # since/until fall back to created_at when latest_at is absent.
+        in_range = store.knn([1.0, 0.0, 0.0], model="m", since=1.0, until=10.0)
+        assert [row[0] for row in in_range] == [str(node_id)]
+        assert list(store.knn([1.0, 0.0, 0.0], model="m", since=6.0)) == []
+
+        # source filter is skipped (not crashed) when messages.source is absent.
+        with_source = store.knn([1.0, 0.0, 0.0], model="m", source="whatever")
+        assert [row[0] for row in with_source] == [str(node_id)]
+    finally:
+        store.close()
+
+
+def test_record_embedding_rejects_non_integer_id_without_crashing(stores):
+    dag, store = stores
+    store.register_profile("m", "p", 3)
+    with pytest.raises(ValueError, match="summary node does not exist"):
+        store.record_embedding("not-a-node", "summary", "m", [1.0, 0.0, 0.0])
+
+
+def test_candidate_filter_uses_node_id_pk_index(stores):
+    """The candidate JOIN binds the integer node_id so the PK index is used."""
+    dag, store = stores
+    node = _add_summary(dag, created_at=1.0)
+    store.register_profile("m", "p", 3)
+    store.record_embedding(node, "summary", "m", [1.0, 0.0, 0.0])
+    plan = "\n".join(
+        str(row[-1])
+        for row in store.connection.execute(
+            "EXPLAIN QUERY PLAN "
+            "SELECT t.id FROM (SELECT ? AS id) t "
+            "JOIN summary_nodes sn ON sn.node_id = CAST(t.id AS INTEGER)",
+            (str(node),),
+        ).fetchall()
+    )
+    # An integer-keyed lookup uses the INTEGER PRIMARY KEY, never a full scan.
+    assert "SCAN summary_nodes" not in plan
+
+
+def test_bounded_path_filters_before_applying_recency_bound(tmp_path, monkeypatch):
+    """No-numpy path: a filtered match beyond the recency window is not lost.
+
+    With bounded_scan_rows=1 the old behavior loaded only the single most-recent
+    vector and then filtered it out, dropping the eligible older match. Filtering
+    before the bound keeps it.
+    """
+    db_path = tmp_path / "before_bound.db"
+    dag = SummaryDAG(db_path)
+    store = VectorStore(db_path, bounded_scan_rows=1)
+    try:
+        keep = _add_summary(dag, session_id="conversation-a", created_at=1.0)
+        drop = _add_summary(dag, session_id="conversation-b", created_at=2.0)
+        store.register_profile("m", "local", 3)
+        store.record_embedding(keep, "summary", "m", [1.0, 0.0, 0.0])
+        store.record_embedding(drop, "summary", "m", [1.0, 0.0, 0.0])
+        # The wrong-conversation row is the most recent by embedded_at, so a
+        # bound-first scan would pick only it and then filter to empty.
+        store.connection.executemany(
+            "UPDATE lcm_embedding_meta SET embedded_at = ? WHERE embedded_id = ?",
+            [
+                ("2026-07-15T05:00:00+00:00", str(drop)),
+                ("2026-07-15T01:00:00+00:00", str(keep)),
+            ],
+        )
+        store.connection.commit()
+        monkeypatch.setattr(vector_store_module, "_load_numpy", _numpy_unavailable)
+
+        result = store.knn(
+            [1.0, 0.0, 0.0], k=5, model="m", conversation_ids=["conversation-a"]
+        )
+        assert result.coverage == "bounded"
+        assert [row[0] for row in result] == [str(keep)]
+    finally:
+        store.close()
+        dag.close()
+
+
+def test_knn_resolves_by_provider_identity_not_model_name(stores):
+    """Reads follow the configured provider identity, not the bare model name."""
+    dag, store = stores
+    node = _add_summary(dag, created_at=1.0)
+    store.register_profile("shared", "provider-a", 3)
+    store.record_embedding(node, "summary", "shared", [1.0, 0.0, 0.0])
+    # Switch config to provider-b for the same model (now active, no vectors).
+    store.register_profile("shared", "provider-b", 3)
+
+    # provider-b identity has no backfilled vectors -> coverage none -> degrade.
+    res_b = store.knn([1.0, 0.0, 0.0], model="shared", provider="provider-b")
+    assert res_b.coverage == "none"
+    assert list(res_b) == []
+
+    # provider-a identity still resolves its own vectors.
+    res_a = store.knn([1.0, 0.0, 0.0], model="shared", provider="provider-a")
+    assert [row[0] for row in res_a] == [str(node)]
+
+
+def test_orphaned_embeddings_are_not_ranked_and_purge_reclaims(stores):
+    dag, store = stores
+    live = _add_summary(dag, created_at=1.0)
+    orphan = _add_summary(dag, created_at=2.0)
+    store.register_profile("m", "local", 3)
+    store.record_embedding(live, "summary", "m", [1.0, 0.0, 0.0])
+    store.record_embedding(orphan, "summary", "m", [1.0, 0.0, 0.0])
+
+    # Delete the orphan's summary node (a deletion path that has not purged yet).
+    store.connection.execute("DELETE FROM summary_nodes WHERE node_id = ?", (orphan,))
+    store.connection.commit()
+
+    result = store.knn([1.0, 0.0, 0.0], k=5, model="m")
+    assert [row[0] for row in result] == [str(live)]
+
+    assert store.purge_embeddings_for_nodes([orphan]) == 1
+    assert store.connection.execute(
+        "SELECT COUNT(*) FROM lcm_embedding_vectors WHERE embedded_id = ?",
+        (str(orphan),),
+    ).fetchone()[0] == 0
+
+
+def test_dag_node_id_helpers_for_purge_wiring(stores):
+    dag, store = stores
+    d0 = dag.add_node(
+        SummaryNode(session_id="s", depth=0, summary="a", source_token_count=1, created_at=1.0)
+    )
+    d2 = dag.add_node(
+        SummaryNode(session_id="s", depth=2, summary="b", source_token_count=1, created_at=2.0)
+    )
+    assert dag.session_node_ids_below_depth("s", 2) == [d0]
+    assert sorted(dag.session_node_ids("s")) == sorted([d0, d2])
+
+
+def test_temp_id_tables_are_unique_per_call_and_dropped(stores):
+    """Overlapping scratch tables get distinct names and never clobber each other.
+
+    The old single fixed name meant a second call's ``DELETE FROM _lcm_id_scratch``
+    wiped the first call's candidate set. Unique-per-call names keep both sets
+    intact, and each table is dropped when its context exits.
+    """
+    dag, store = stores
+    with store._temp_id_table(["1", "2"]) as first:
+        with store._temp_id_table(["3", "4"]) as second:
+            assert first != second
+            assert {r[0] for r in store.connection.execute(f"SELECT id FROM {first}")} == {"1", "2"}
+            assert {r[0] for r in store.connection.execute(f"SELECT id FROM {second}")} == {"3", "4"}
+    leftover = store.connection.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE '_lcm_id_scratch%'"
+    ).fetchall()
+    assert leftover == []
+
+
+def test_concurrent_knn_on_separate_stores_are_correct(tmp_path):
+    """Production runs one VectorStore (own connection) per query; that is safe."""
+    db_path = tmp_path / "concurrent.db"
+    dag = SummaryDAG(db_path)
+    seed = VectorStore(db_path)
+    node = _add_summary(dag, created_at=1.0)
+    seed.register_profile("m", "local", 3)
+    seed.record_embedding(node, "summary", "m", [1.0, 0.0, 0.0])
+    seed.close()
+
+    results: list[list[str]] = []
+    errors: list[BaseException] = []
+
+    def run():
+        try:
+            store = VectorStore(db_path)
+            try:
+                for _ in range(20):
+                    res = store.knn(
+                        [1.0, 0.0, 0.0], k=5, model="m", conversation_ids=["conversation-a"]
+                    )
+                    results.append([row[0] for row in res])
+            finally:
+                store.close()
+        except BaseException as exc:  # noqa: BLE001 - surfaced to the assertion
+            errors.append(exc)
+
+    threads = [threading.Thread(target=run) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    dag.close()
+
+    assert errors == []
+    assert results and all(rows == [str(node)] for rows in results)

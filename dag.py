@@ -252,6 +252,28 @@ class SummaryDAG:
             node.node_id = cur.lastrowid
             return node.node_id
 
+    def session_node_ids(self, session_id: str) -> list[int]:
+        """Return every node_id for a session.
+
+        Used to purge the corresponding embeddings when the nodes are deleted
+        (session reset / cleanup), since the vectors live in a separate store.
+        """
+        with self._db_lock:
+            rows = self._conn.execute(
+                "SELECT node_id FROM summary_nodes WHERE session_id = ?",
+                (session_id,),
+            ).fetchall()
+        return [int(row[0]) for row in rows]
+
+    def session_node_ids_below_depth(self, session_id: str, min_depth: int) -> list[int]:
+        """Return the node_ids a matching ``delete_below_depth`` would remove."""
+        with self._db_lock:
+            rows = self._conn.execute(
+                "SELECT node_id FROM summary_nodes WHERE session_id = ? AND depth < ?",
+                (session_id, min_depth),
+            ).fetchall()
+        return [int(row[0]) for row in rows]
+
     def delete_below_depth(self, session_id: str, min_depth: int) -> int:
         """Delete all nodes for a session with depth < min_depth.
 

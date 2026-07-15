@@ -12,6 +12,7 @@ import logging
 import math
 import sqlite3
 import threading
+import uuid
 from array import array
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -212,14 +213,33 @@ class VectorStore:
             (str(identity_hash),),
         ).fetchone()
 
-    def _resolve_profile(self, model_name: str) -> sqlite3.Row | None:
+    def _resolve_profile(
+        self, model_name: str, provider: str | None = None
+    ) -> sqlite3.Row | None:
         """Resolve a model name to its profile, preferring the current/active one.
 
         Multiple identities can share a ``model_name`` (e.g. the same model
-        served by two providers). Vector operations that take a bare model name
-        target the active identity for that name; recording and querying are
-        thus consistent with the operator's current provider selection.
+        served by two providers). When ``provider`` is given the resolution is
+        constrained to that provider too, so the read path selects vectors that
+        match the *configured* provider identity rather than whichever provider
+        happens to be active for the bare model name — switching provider A→B
+        for the same model no longer scores a B-embedded query against A's
+        vectors. With no ``provider`` the bare-name active identity is used
+        (recording targets the operator's current selection).
         """
+        if provider is not None:
+            return self._conn.execute(
+                """
+                SELECT identity_hash, model_name, provider, dim, registered_at,
+                       active, archived_at, data_version
+                FROM lcm_embedding_profile
+                WHERE model_name = ? AND provider = ?
+                ORDER BY (active = 1 AND archived_at IS NULL) DESC,
+                         registered_at DESC, identity_hash DESC
+                LIMIT 1
+                """,
+                (str(model_name), str(provider)),
+            ).fetchone()
         return self._conn.execute(
             """
             SELECT identity_hash, model_name, provider, dim, registered_at,
@@ -232,6 +252,19 @@ class VectorStore:
             """,
             (str(model_name),),
         ).fetchone()
+
+    @staticmethod
+    def _as_node_id(embedded_id: str) -> int | None:
+        """Coerce an embedded id to the integer ``summary_nodes.node_id`` PK.
+
+        ``node_id`` is an ``INTEGER PRIMARY KEY``; binding the integer lets the
+        lookup use the PK/rowid index instead of a ``CAST(node_id AS TEXT)``
+        full scan. A non-integer id can never match a node, so it maps to None.
+        """
+        try:
+            return int(str(embedded_id))
+        except (TypeError, ValueError):
+            return None
 
     def _current_profile(self) -> sqlite3.Row | None:
         return self._conn.execute(
@@ -331,22 +364,30 @@ class VectorStore:
         model = str(model)
         if kind != "summary":
             raise ValueError("embedded kind must be 'summary'")
-        profile = self._resolve_profile(model)
-        if profile is None:
-            raise ValueError(f"embedding profile is not registered: {model}")
-        identity = str(profile["identity_hash"])
-        normalized = self._normalized(vec, expected_dim=int(profile["dim"]))
-        packed = array("f", normalized).tobytes()
 
         with self._write_transaction():
-            summary = self._conn.execute(
-                """
-                SELECT source_token_count
-                FROM summary_nodes
-                WHERE CAST(node_id AS TEXT) = ?
-                """,
-                (embedded_id,),
-            ).fetchone()
+            # Resolve the active profile INSIDE the write transaction so a
+            # concurrent active-provider switch for the same model_name cannot
+            # let us read identity A and then write the vector under B.
+            profile = self._resolve_profile(model)
+            if profile is None:
+                raise ValueError(f"embedding profile is not registered: {model}")
+            identity = str(profile["identity_hash"])
+            normalized = self._normalized(vec, expected_dim=int(profile["dim"]))
+            packed = array("f", normalized).tobytes()
+            numeric_id = self._as_node_id(embedded_id)
+            summary = (
+                self._conn.execute(
+                    """
+                    SELECT source_token_count
+                    FROM summary_nodes
+                    WHERE node_id = ?
+                    """,
+                    (numeric_id,),
+                ).fetchone()
+                if numeric_id is not None
+                else None
+            )
             if summary is None:
                 raise ValueError(f"summary node does not exist: {embedded_id}")
             embedded_at = self._now()
@@ -409,27 +450,29 @@ class VectorStore:
 
     @contextmanager
     def _temp_id_table(self, ids: Sequence[str]) -> Iterator[str]:
-        """Load ids into a session-temp table in bounded chunks for JOINs.
+        """Load ids into a unique per-call temp table in bounded chunks for JOINs.
 
         Avoids the ``WHERE id IN (?, ?, ...)`` host-parameter cap
         (SQLITE_MAX_VARIABLE_NUMBER) that failed at ~33k ids: ``executemany``
         binds one row at a time, so an arbitrary number of ids can be staged.
+
+        The table name is unique per call (the store's connection is shared
+        across threads, ``check_same_thread=False``); a single reused name meant
+        two concurrent ``knn()`` calls scribbled over each other's candidate set.
+        The table is dropped in ``finally`` so it never outlives the call.
         """
-        table = "_lcm_id_scratch"
-        self._conn.execute(
-            f"CREATE TEMP TABLE IF NOT EXISTS {table}(id TEXT PRIMARY KEY)"
-        )
-        self._conn.execute(f"DELETE FROM {table}")
+        table = f"_lcm_id_scratch_{uuid.uuid4().hex}"
+        self._conn.execute(f"CREATE TEMP TABLE {table}(id TEXT PRIMARY KEY)")
         rows = [(str(value),) for value in ids]
-        for offset in range(0, len(rows), _ID_INSERT_CHUNK):
-            self._conn.executemany(
-                f"INSERT OR IGNORE INTO {table}(id) VALUES(?)",
-                rows[offset:offset + _ID_INSERT_CHUNK],
-            )
         try:
+            for offset in range(0, len(rows), _ID_INSERT_CHUNK):
+                self._conn.executemany(
+                    f"INSERT OR IGNORE INTO {table}(id) VALUES(?)",
+                    rows[offset:offset + _ID_INSERT_CHUNK],
+                )
             yield table
         finally:
-            self._conn.execute(f"DELETE FROM {table}")
+            self._conn.execute(f"DROP TABLE IF EXISTS {table}")
 
     def purge_embeddings_for_nodes(self, node_ids: Sequence[int | str]) -> int:
         unique_ids = list(dict.fromkeys(str(node_id) for node_id in node_ids))
@@ -520,30 +563,58 @@ class VectorStore:
             self._matrix_cache[key] = loaded
             return loaded
 
-    def _bounded_rows(
+    def _candidate_ids_by_recency(self, identity_hash: str) -> list[str]:
+        """Return every live embedded id for the identity, most-recent first.
+
+        Ordering is served directly by ``idx_lcm_embedding_meta_identity_embedded_at``
+        (identity_hash, embedded_at DESC, WHERE archived = 0) — no temp B-tree
+        over the whole table. Only ids (not vector blobs) are materialized, so
+        the no-numpy path can filter the full candidate set BEFORE applying the
+        recency bound instead of loading vectors first and losing filtered
+        matches that fall outside the most-recent window.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT m.embedded_id
+            FROM lcm_embedding_meta m
+            WHERE m.identity_hash = ? AND m.archived = 0
+            ORDER BY m.embedded_at DESC
+            """,
+            (identity_hash,),
+        ).fetchall()
+        return [str(row[0]) for row in rows]
+
+    def _load_vectors_for_ids(
         self,
         identity_hash: str,
         dim: int,
+        embedded_ids: Sequence[str],
     ) -> tuple[list[int], list[str], list[str], list[list[float]]]:
-        limit = max(0, self.bounded_scan_rows)
-        with self._cache_lock:
+        """Load vectors (pure-Python) for a bounded, already-filtered id set.
+
+        Ordering is irrelevant here — the caller has already applied the recency
+        bound and ``_ranked`` re-sorts by score — so a temp-table JOIN is used.
+        """
+        rowids: list[int] = []
+        out_ids: list[str] = []
+        kinds: list[str] = []
+        vectors: list[list[float]] = []
+        if not embedded_ids:
+            return rowids, out_ids, kinds, vectors
+        with self._temp_id_table(embedded_ids) as table:
             rows = self._conn.execute(
-                """
+                f"""
                 SELECT v.rowid, v.embedded_id, m.embedded_kind, v.vec
-                FROM lcm_embedding_vectors v
+                FROM {table} t
+                JOIN lcm_embedding_vectors v
+                  ON v.embedded_id = t.id AND v.identity_hash = ?
                 JOIN lcm_embedding_meta m
                   ON m.embedded_id = v.embedded_id
                  AND m.identity_hash = v.identity_hash
-                WHERE v.identity_hash = ? AND m.archived = 0
-                ORDER BY m.embedded_at DESC, v.rowid DESC
-                LIMIT ?
+                WHERE m.archived = 0
                 """,
-                (identity_hash, limit),
+                (identity_hash,),
             ).fetchall()
-        rowids: list[int] = []
-        embedded_ids: list[str] = []
-        kinds: list[str] = []
-        vectors: list[list[float]] = []
         for row in rows:
             vector = array("f")
             try:
@@ -553,10 +624,10 @@ class VectorStore:
             if len(vector) != dim:
                 continue
             rowids.append(int(row["rowid"]))
-            embedded_ids.append(str(row["embedded_id"]))
+            out_ids.append(str(row["embedded_id"]))
             kinds.append(str(row["embedded_kind"]))
             vectors.append(list(vector))
-        return rowids, embedded_ids, kinds, vectors
+        return rowids, out_ids, kinds, vectors
 
     @staticmethod
     def _ranked(
@@ -585,6 +656,21 @@ class VectorStore:
         """
         from .store import _UNKNOWN_SOURCE, _legacy_blank_source_clause, _normalize_source_value
 
+        # A VectorStore-only worker DB may predate MessageStore's source repair
+        # (``_ensure_source_column``) and lack ``messages.source`` entirely.
+        # Rather than crash the KNN with "no such column: source", skip the
+        # source filter (treat every candidate as allowed) so retrieval degrades
+        # instead of failing on a legacy schema.
+        message_columns = {
+            str(row[1])
+            for row in self._conn.execute("PRAGMA table_info(messages)").fetchall()
+        }
+        if "source" not in message_columns:
+            return {
+                str(row[0])
+                for row in self._conn.execute(f"SELECT id FROM {table}").fetchall()
+            }
+
         normalized_source = _normalize_source_value(source)
         legacy_blank_clause = _legacy_blank_source_clause("m.source")
         rows = self._conn.execute(
@@ -592,7 +678,7 @@ class VectorStore:
             WITH RECURSIVE walk(root_id, source_type, source_id) AS (
                 SELECT t.id, sn.source_type, CAST(j.value AS INTEGER)
                 FROM {table} t
-                JOIN summary_nodes sn ON CAST(sn.node_id AS TEXT) = t.id
+                JOIN summary_nodes sn ON sn.node_id = CAST(t.id AS INTEGER)
                 JOIN json_each(sn.source_ids) j
 
                 UNION ALL
@@ -634,16 +720,25 @@ class VectorStore:
             str(row[1])
             for row in self._conn.execute("PRAGMA table_info(summary_nodes)").fetchall()
         }
+        # ``latest_at`` is added by the DAG migration; a VectorStore opened on a
+        # DB whose summary_nodes predates it (or that only ever ran the core
+        # migrations) lacks the column, so fall back to created_at for the
+        # recency filter instead of raising "no such column: latest_at".
+        recency_expr = (
+            "COALESCE(sn.latest_at, sn.created_at)"
+            if "latest_at" in columns
+            else "sn.created_at"
+        )
         with self._temp_id_table(unique_ids) as table:
             where = ["1 = 1"]
             args: list[object] = []
             if "suppressed_at" in columns:
                 where.append("sn.suppressed_at IS NULL")
             if since is not None:
-                where.append("COALESCE(sn.latest_at, sn.created_at) >= ?")
+                where.append(f"{recency_expr} >= ?")
                 args.append(float(since))
             if until is not None:
-                where.append("COALESCE(sn.latest_at, sn.created_at) <= ?")
+                where.append(f"{recency_expr} <= ?")
                 args.append(float(until))
             if conversation_ids is not None:
                 normalized_ids = [str(value) for value in conversation_ids]
@@ -652,9 +747,9 @@ class VectorStore:
                 args.extend(normalized_ids)
             rows = self._conn.execute(
                 f"""
-                SELECT CAST(sn.node_id AS TEXT)
+                SELECT t.id
                 FROM {table} t
-                JOIN summary_nodes sn ON CAST(sn.node_id AS TEXT) = t.id
+                JOIN summary_nodes sn ON sn.node_id = CAST(t.id AS INTEGER)
                 WHERE {' AND '.join(where)}
                 """,
                 args,
@@ -677,12 +772,18 @@ class VectorStore:
         until: float | None = None,
         conversation_ids: Sequence[str] | None = None,
         source: str | None = None,
+        provider: str | None = None,
     ) -> KNNResult:
         k = int(k)
         if k <= 0:
             return KNNResult(coverage="none")
+        # Resolve by the FULL configured identity (provider + model) when the
+        # caller knows its provider, so a config switch A→B for the same model
+        # name scores the query against B's vectors, not whichever provider is
+        # active. An unbackfilled identity resolves to None → coverage "none" →
+        # the caller degrades to full_text.
         profile = (
-            self._resolve_profile(str(model))
+            self._resolve_profile(str(model), provider=provider)
             if model is not None
             else self._current_profile()
         )
@@ -721,21 +822,26 @@ class VectorStore:
             scores = matrix @ query_array
             coverage = "full"
         else:
-            rowids, embedded_ids, kinds, vectors = self._bounded_rows(
-                identity,
-                dim,
-            )
+            # Filter BEFORE the recency bound: enumerate every candidate id in
+            # recency order, drop the ineligible ones, THEN take the most-recent
+            # bounded_scan_rows survivors and load only their vectors. Bounding
+            # first (the old behavior) silently lost a filtered match that fell
+            # outside the recent window.
+            recency_ids = self._candidate_ids_by_recency(identity)
             filtered_indexes = self._filtered_candidate_indexes(
-                embedded_ids,
+                recency_ids,
                 since=since,
                 until=until,
                 conversation_ids=conversation_ids,
                 source=source,
             )
-            rowids = [rowids[index] for index in filtered_indexes]
-            embedded_ids = [embedded_ids[index] for index in filtered_indexes]
-            kinds = [kinds[index] for index in filtered_indexes]
-            vectors = [vectors[index] for index in filtered_indexes]
+            limit = max(0, self.bounded_scan_rows)
+            bounded_ids = [recency_ids[index] for index in filtered_indexes][:limit]
+            rowids, embedded_ids, kinds, vectors = self._load_vectors_for_ids(
+                identity,
+                dim,
+                bounded_ids,
+            )
             scores = [
                 sum(value * query_value for value, query_value in zip(vector, query))
                 for vector in vectors
