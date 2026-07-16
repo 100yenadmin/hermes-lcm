@@ -204,7 +204,10 @@ def test_rollup_crud_round_trip_and_rebuild(rollup_store):
     assert rebuilding["summary"] == "Daily summary"
     assert rebuilding["token_count"] == 123
     assert rebuilding["built_at"] is not None
-    assert rebuilding["source_node_ids"] == []
+    # The rebuild claim preserves the last-known-good lineage (A2): sources stay
+    # queryable until mark_ready swaps them, so a concurrent purge can still find
+    # and re-stale the rollup mid-rebuild.
+    assert rebuilding["source_node_ids"] == [3, 9]
 
     rollup_store.mark_failed(rollup_id, "summarizer unavailable")
     failed = rollup_store.get_rollup(
@@ -566,3 +569,138 @@ def test_rollup_indexes_are_scope_leading_and_cover_source_node(rollup_store):
         "SELECT DISTINCT rollup_id FROM lcm_rollup_sources WHERE node_id IN (1, 2)"
     ).fetchall()
     assert any("idx_lcm_rollup_sources_node" in str(row[3]) for row in plan)
+
+
+# --- FIXSPEC4 A1/A2/A3 store additions -----------------------------------------
+
+
+def test_late_mark_failed_cannot_flip_a_published_ready_row(rollup_store):
+    # Maintainer #387 A1 repro: mark_ready() succeeds (row -> ready), then a late
+    # mark_failed() with the SAME token still flipped row -> failed while keeping
+    # the summary, because mark_ready does not advance generation and the guard
+    # matched only (rollup_id, generation). The terminal transition must ALSO
+    # require status='building': once a row leaves 'building', no token-holder
+    # transitions it.
+    scope = "conversation:conv-1"
+    token = rollup_store.upsert_building("day", "2026-07-15", scope)
+    assert rollup_store.mark_ready(token, "published summary", 7, [1], "fp") is True
+
+    assert (
+        rollup_store.mark_failed(
+            token.rollup_id, "late boom", generation=token.generation
+        )
+        is False
+    )
+    row = rollup_store.get_rollup("day", "2026-07-15", scope)
+    assert row["status"] == "ready"
+    assert row["summary"] == "published summary"
+
+
+def test_resolve_no_source_cannot_delete_a_published_row_at_same_generation(rollup_store):
+    # Same A1 invariant for the token-guarded DELETE: mark_ready leaves the row
+    # 'ready' at the captured generation, so a late resolve_no_source with the
+    # same token must not delete the published row.
+    scope = "conversation:conv-1"
+    token = rollup_store.upsert_building("day", "2026-07-15", scope)
+    assert rollup_store.mark_ready(token, "published", 3, [1], "fp") is True
+
+    assert rollup_store.resolve_no_source(token) is False
+    assert rollup_store.get_rollup("day", "2026-07-15", scope)["status"] == "ready"
+
+
+def test_rebuild_claim_preserves_lineage_and_purge_still_restales(rollup_store):
+    # Maintainer #387 A2 repro: upsert_building cleared lcm_rollup_sources at claim
+    # time, so a concurrent purge-by-node found ZERO affected rollups and did not
+    # re-stale, letting the in-flight build publish deleted-node content. The
+    # claim must keep the prior lineage queryable until mark_ready swaps it.
+    scope = "conversation:conv-1"
+    token = rollup_store.upsert_building("day", "2026-07-15", scope)
+    assert rollup_store.mark_ready(token, "v1", 3, [10, 11], "fp1") is True
+
+    rebuild = rollup_store.upsert_building("day", "2026-07-15", scope)
+    # The last-known-good lineage survives the claim (queryable).
+    assert rollup_store.get_rollup("day", "2026-07-15", scope)["source_node_ids"] == [10, 11]
+
+    # A concurrent purge of node 11 still sees the rollup via its retained lineage
+    # and re-stales it (advancing generation).
+    assert rollup_store.purge_rollups_for_sources([11]) == 1
+    restaled = rollup_store.get_rollup("day", "2026-07-15", scope)
+    assert restaled["status"] == "stale"
+
+    # The superseded rebuild can no longer publish the now-purged content.
+    assert rollup_store.mark_ready(rebuild, "v2 with purged node", 3, [10, 11], "fp2") is False
+    assert rollup_store.get_rollup("day", "2026-07-15", scope)["status"] == "stale"
+
+
+def test_mark_ready_atomically_swaps_sources_and_status(rollup_store):
+    # The sources-replace + status='ready' write is one transaction, so a fresh
+    # rebuild atomically supersedes the old lineage (A2 atomic swap).
+    scope = "conversation:conv-1"
+    first = rollup_store.upsert_building("day", "2026-07-15", scope)
+    rollup_store.mark_ready(first, "v1", 3, [1, 2], "fp1")
+    second = rollup_store.upsert_building("day", "2026-07-15", scope)
+    assert rollup_store.mark_ready(second, "v2", 4, [3, 4], "fp2") is True
+    row = rollup_store.get_rollup("day", "2026-07-15", scope)
+    assert row["status"] == "ready"
+    assert row["summary"] == "v2"
+    assert row["source_node_ids"] == [3, 4]
+
+
+def test_upsert_stale_many_is_atomic_all_or_nothing(rollup_store):
+    # Maintainer #391 D2: seeding many targets must be all-or-nothing. A failure
+    # on any target (here a period_kind that violates the CHECK constraint) rolls
+    # the whole batch back so no target is left half-seeded.
+    scope = "conversation:conv-1"
+    with pytest.raises(sqlite3.Error):
+        rollup_store.upsert_stale_many(
+            [
+                ("day", "2026-07-15", scope),
+                ("bogus", "2026-07-13", scope),  # violates period_kind CHECK
+            ]
+        )
+    assert rollup_store.get_rollup("day", "2026-07-15", scope) is None
+
+    # A clean batch seeds every target and leaves a currently-building row alone.
+    rollup_store.upsert_building("month", "2026-07-01", scope)
+    assert rollup_store.upsert_stale_many(
+        [
+            ("day", "2026-07-15", scope),
+            ("week", "2026-07-13", scope),
+            ("month", "2026-07-01", scope),  # building -> untouched
+        ]
+    ) == 2
+    assert rollup_store.get_rollup("day", "2026-07-15", scope)["status"] == "stale"
+    assert rollup_store.get_rollup("week", "2026-07-13", scope)["status"] == "stale"
+    assert rollup_store.get_rollup("month", "2026-07-01", scope)["status"] == "building"
+
+
+def test_init_repairs_dropped_rollup_table_despite_marker(tmp_path):
+    # Maintainer #387 A3: the temporal_rollups_v1 marker can outlive its tables
+    # (a table dropped from under it). A fresh RollupStore init must not trust the
+    # marker; it verifies and repairs the missing table.
+    db_path = tmp_path / "marker-repair.db"
+    RollupStore(db_path).close()
+
+    conn = sqlite3.connect(db_path)
+    conn.execute("DROP TABLE lcm_rollup_sources")
+    marker = conn.execute(
+        "SELECT 1 FROM lcm_migration_state WHERE step_name = 'temporal_rollups_v1'"
+    ).fetchone()
+    assert marker is not None  # marker present, but a table is now missing
+    conn.commit()
+    conn.close()
+
+    store = RollupStore(db_path)
+    try:
+        assert ROLLUP_TABLES <= _table_names(store.connection)
+        assert db_bootstrap.verify_temporal_rollup_schema(store.connection) == []
+    finally:
+        store.close()
+
+
+def test_verify_temporal_rollup_schema_flags_missing_objects(rollup_store):
+    # No marker/tables missing on a healthy store; dropping an index is detected.
+    assert db_bootstrap.verify_temporal_rollup_schema(rollup_store.connection) == []
+    rollup_store.connection.execute("DROP INDEX idx_lcm_rollups_pending")
+    missing = db_bootstrap.verify_temporal_rollup_schema(rollup_store.connection)
+    assert "index:idx_lcm_rollups_pending" in missing

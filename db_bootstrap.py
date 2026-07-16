@@ -367,6 +367,47 @@ def ensure_temporal_rollup_tables(conn: sqlite3.Connection) -> None:
     )
 
 
+REQUIRED_TEMPORAL_ROLLUP_TABLES = (
+    "lcm_rollups",
+    "lcm_rollup_sources",
+    "lcm_rollup_state",
+)
+REQUIRED_TEMPORAL_ROLLUP_INDEXES = (
+    "idx_lcm_rollups_ready_period",
+    "idx_lcm_rollups_pending",
+    "idx_lcm_rollup_sources_node",
+)
+
+
+def verify_temporal_rollup_schema(conn: sqlite3.Connection) -> list[str]:
+    """Return the temporal-rollup tables/indexes that are absent.
+
+    The named ``temporal_rollups_v1`` migration marker records only that the
+    feature was once enabled; it is NOT proof the tables still exist. A marker
+    can outlive its tables (a crash mid-create, or a DB whose rollup tables were
+    dropped), so callers must verify the objects themselves rather than trusting
+    the marker (maintainer #387 A3). Returns a list of ``"table:<name>"`` /
+    ``"index:<name>"`` entries for every required object that is missing; an
+    empty list means the schema is present and consistent.
+    """
+    missing: list[str] = []
+    for name in REQUIRED_TEMPORAL_ROLLUP_TABLES:
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?",
+            (name,),
+        ).fetchone()
+        if row is None:
+            missing.append(f"table:{name}")
+    for name in REQUIRED_TEMPORAL_ROLLUP_INDEXES:
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='index' AND name = ?",
+            (name,),
+        ).fetchone()
+        if row is None:
+            missing.append(f"index:{name}")
+    return missing
+
+
 def mark_migration_step_complete(conn: sqlite3.Connection, step_name: str) -> None:
     ensure_migration_state_table(conn)
     conn.execute(
