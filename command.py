@@ -2334,6 +2334,21 @@ def _embedding_backfill_text(tokens: list[str], engine) -> str:
                 _mark_inflight(conn, identity, lease, [item[0] for item in batch])
                 try:
                     vectors = provider.embed_documents([item[1] for item in batch])
+                    # The blocking provider call can outlive the lease. Before
+                    # publishing ANY result of this batch (vector writes OR
+                    # in_flight clears), re-check ownership via the lease's
+                    # owner CAS: a worker whose lease was stolen (its TTL lapsed
+                    # and a successor took over) must DISCARD its result and exit
+                    # cleanly rather than write under the successor's claim.
+                    # Renewal-before-batch cannot stop a stale owner writing
+                    # AFTER the call; this post-call CAS does. The lease id is a
+                    # fresh uuid per acquire, so the owner CAS subsumes the
+                    # generation check. The re-marked in_flight rows are left for
+                    # the next run's stale-sweep + NOT-EXISTS rediscovery.
+                    if not lease.renew(force=True):
+                        lease_lost = True
+                        stop_reason = "lease_lost"
+                        break
                     skipped_indexes = {
                         int(index)
                         for index in getattr(provider, "last_skipped_documents", [])
@@ -2353,7 +2368,13 @@ def _embedding_backfill_text(tokens: list[str], engine) -> str:
                     consumed_tokens += sum(item[2] for item in accepted)
                     for item, vector in zip(accepted, vectors):
                         try:
-                            store.record_embedding(item[0], "summary", model, vector)
+                            # Publish under the identity CAPTURED at claim time
+                            # (the current profile when the lease was taken), not
+                            # whatever is active now: an active-provider switch
+                            # A->B mid-run must not rebind an A-vector onto B.
+                            store.record_embedding(
+                                item[0], "summary", model, vector, identity=identity
+                            )
                             _clear_inflight(conn, identity, item[0])
                             embedded += 1
                         except Exception as exc:

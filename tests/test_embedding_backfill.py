@@ -212,10 +212,10 @@ def test_per_row_record_failure_does_not_lose_rest_of_batch(
     monkeypatch.setattr(command_mod, "resolve_provider", lambda _config, **_kw: provider)
     original = VectorStore.record_embedding
 
-    def fail_one(self, embedded_id, kind, model, vector):
+    def fail_one(self, embedded_id, kind, model, vector, *, identity=None):
         if str(embedded_id) == str(node_ids[1]):
             raise sqlite3.OperationalError("synthetic row failure")
-        return original(self, embedded_id, kind, model, vector)
+        return original(self, embedded_id, kind, model, vector, identity=identity)
 
     monkeypatch.setattr(VectorStore, "record_embedding", fail_one)
 
@@ -422,6 +422,52 @@ def test_inflight_row_is_reattempted_after_crash(monkeypatch, tmp_path):
     assert "embedded: 2" in second
     assert "in_flight: 0" in second
     assert _meta_ids(engine) == [str(node_id) for node_id in node_ids]
+
+
+def test_stale_owner_after_provider_call_does_not_publish(monkeypatch, tmp_path):
+    """C1: a lease stolen DURING the blocking provider call.
+
+    Maintainer repro: the provider call outlives the lease, a successor acquires
+    it, the old worker returns and PUBLISHED the embedding + reported ``complete``
+    while the successor's claim remained. The post-provider owner CAS must make
+    the stale owner discard its result (publish nothing, exit cleanly) and leave
+    the successor's claim intact.
+    """
+    engine = _engine(tmp_path)
+    _seed(engine, 3)
+
+    successor_claim = json.dumps(
+        {"owner": "successor-owner", "generation": 99, "heartbeat_at": time.time()},
+        sort_keys=True,
+    )
+
+    class StealingProvider(FakeProvider):
+        def embed_documents(self, texts):
+            # Emulate the provider call outliving the lease: a successor steals
+            # the claim (overwrites the owner) while this call is in flight.
+            steal = sqlite3.connect(engine._store.db_path)
+            try:
+                steal.execute(
+                    "UPDATE metadata SET value = ? WHERE key = ?",
+                    (successor_claim, command_mod._EMBEDDING_BACKFILL_CLAIM_KEY),
+                )
+                steal.commit()
+            finally:
+                steal.close()
+            return super().embed_documents(texts)
+
+    provider = StealingProvider()
+    monkeypatch.setattr(command_mod, "resolve_provider", lambda _config, **_kw: provider)
+
+    result = handle_lcm_command("embed backfill --apply", engine)
+
+    # The stale owner published nothing: no meta rows written.
+    assert _meta_ids(engine) == []
+    assert "embedded: 0" in result
+    assert "stop_reason: lease_lost" in result
+    # The successor's claim is intact — the stale owner did NOT release it.
+    claim = json.loads(_claim_value(engine))
+    assert claim["owner"] == "successor-owner"
 
 
 def test_operation_budget_stops_run_between_batches(monkeypatch, tmp_path):
