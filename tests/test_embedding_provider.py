@@ -593,6 +593,10 @@ def test_warmup_command_probes_and_registers_profile(monkeypatch, tmp_path):
     provider = FakeWarmupProvider([0.1, 0.2, 0.3])
     monkeypatch.setattr(command_mod, "resolve_provider", lambda _config: provider)
     engine = _command_engine(tmp_path)
+    engine._config.embedding_provider = "ollama"
+    engine._config.embedding_model = "model-a"
+    stale_provider = FakeWarmupProvider([9.0])
+    engine._lcm_embedding_provider_cache = (("ollama", "model-a"), stale_provider)
 
     result = handle_lcm_command("embed warmup", engine)
 
@@ -601,6 +605,10 @@ def test_warmup_command_probes_and_registers_profile(monkeypatch, tmp_path):
     assert "model: model-a" in result
     assert "dim: 3" in result
     assert provider.calls == ["warmup"]
+    assert engine._lcm_embedding_provider_cache == (
+        ("ollama", "model-a"),
+        provider,
+    )
     store = VectorStore(engine._store.db_path)
     try:
         row = store.connection.execute(

@@ -1279,13 +1279,23 @@ def _lcm_grep_confidence(score: float) -> str:
 # instead of spawning unbounded threads under repeated timeouts.
 _LCM_SEMANTIC_MAX_WORKERS = 4
 _lcm_semantic_worker_slots = threading.BoundedSemaphore(_LCM_SEMANTIC_MAX_WORKERS)
+# FTS fallback has its own bounded lane so abandoned semantic calls cannot
+# consume the capacity required to degrade safely.
+_LCM_FULL_TEXT_MAX_WORKERS = 4
+_lcm_full_text_worker_slots = threading.BoundedSemaphore(_LCM_FULL_TEXT_MAX_WORKERS)
 
 
 class _WorkerCapacityError(RuntimeError):
-    """Raised when no bounded semantic worker slot is available."""
+    """Raised when no bounded worker slot is available."""
 
 
-def _run_within_deadline(fn, *, remaining_s: float, name: str):
+def _run_within_deadline(
+    fn,
+    *,
+    remaining_s: float,
+    name: str,
+    worker_slots: threading.BoundedSemaphore | None = None,
+):
     """Run ``fn`` in a bounded daemon worker, raising if the deadline lapses.
 
     ``remaining_s`` is the time left in the operation's single absolute
@@ -1295,8 +1305,9 @@ def _run_within_deadline(fn, *, remaining_s: float, name: str):
     remaining_s = float(remaining_s)
     if remaining_s <= 0:
         raise TimeoutError("semantic latency budget exhausted")
-    if not _lcm_semantic_worker_slots.acquire(blocking=False):
-        raise _WorkerCapacityError("semantic worker capacity is exhausted")
+    slots = _lcm_semantic_worker_slots if worker_slots is None else worker_slots
+    if not slots.acquire(blocking=False):
+        raise _WorkerCapacityError(f"{name} worker capacity is exhausted")
     outcome: list[tuple[bool, Any]] = []
 
     def invoke() -> None:
@@ -1305,13 +1316,13 @@ def _run_within_deadline(fn, *, remaining_s: float, name: str):
         except BaseException as exc:  # noqa: BLE001 - forwarded to caller
             outcome.append((False, exc))
         finally:
-            _lcm_semantic_worker_slots.release()
+            slots.release()
 
     worker = threading.Thread(target=invoke, name=name, daemon=True)
     try:
         worker.start()
     except BaseException:
-        _lcm_semantic_worker_slots.release()
+        slots.release()
         raise
     worker.join(remaining_s)
     if worker.is_alive():
@@ -1421,6 +1432,7 @@ def _lcm_grep_full_text_with_deadline(
             invoke,
             remaining_s=remaining,
             name="lcm-full-text",
+            worker_slots=_lcm_full_text_worker_slots,
         )
     except (_WorkerCapacityError, TimeoutError):
         return _lcm_grep_deadline_error(
@@ -1624,7 +1636,9 @@ def _lcm_grep_semantic(
             remaining_s=deadline - time.monotonic(),
             name="lcm-provider-resolution",
         )
-    except (TimeoutError, _WorkerCapacityError):
+    except _WorkerCapacityError as exc:
+        return degraded(f"semantic capacity exhausted: {exc}")
+    except TimeoutError:
         return _lcm_grep_deadline_error(mode, "provider_resolution")
     except Exception as exc:
         return degraded(f"embedding provider unavailable: {exc}")
@@ -1756,7 +1770,9 @@ def _lcm_grep_semantic(
             remaining_s=deadline - time.monotonic(),
             name="lcm-result-hydration",
         )
-    except (TimeoutError, _WorkerCapacityError):
+    except _WorkerCapacityError as exc:
+        return degraded(f"semantic capacity exhausted: {exc}")
+    except TimeoutError:
         return _lcm_grep_deadline_error(mode, "result_resolution")
     except Exception as exc:
         return degraded(f"semantic result hydration failed: {exc}")
@@ -1851,8 +1867,26 @@ def _lcm_grep_hybrid(
     )
     if "error" in fts:
         return fts
+
+    def degraded_to_fts(reason: str, *, coverage: str = "none") -> dict[str, Any]:
+        response = dict(fts)
+        response["mode"] = "hybrid"
+        response["limit"] = limit
+        response["total_results"] = len(fts.get("results", []))
+        response["results"] = list(fts.get("results", []))[:limit]
+        response["degraded_to_fts"] = True
+        response["degraded_reason"] = reason
+        response["coverage"] = coverage
+        if requested_limit > _LCM_GREP_HARD_LIMIT_CAP:
+            response["limit_clamped_from"] = requested_limit
+        else:
+            response.pop("limit_clamped_from", None)
+        return response
+
     if time.monotonic() >= deadline:
-        return _lcm_grep_deadline_error("hybrid", "semantic_entry")
+        return degraded_to_fts(
+            "semantic arm skipped because the request deadline was exhausted"
+        )
 
     semantic_args = dict(args)
     semantic_args["mode"] = "hybrid"
@@ -1865,21 +1899,17 @@ def _lcm_grep_hybrid(
         allow_fallback=False,
     )
     if "error" in semantic:
+        if semantic.get("timeout") is True:
+            return degraded_to_fts(
+                "semantic arm exceeded the request deadline",
+                coverage=str(semantic.get("coverage", "none")),
+            )
         return semantic
     if semantic.get("degraded_to_fts"):
-        response = dict(fts)
-        response["mode"] = "hybrid"
-        response["limit"] = limit
-        response["total_results"] = len(fts.get("results", []))
-        response["results"] = list(fts.get("results", []))[:limit]
-        response["degraded_to_fts"] = True
-        response["degraded_reason"] = semantic.get("degraded_reason", "semantic arm unavailable")
-        response["coverage"] = semantic.get("coverage", "none")
-        if requested_limit > _LCM_GREP_HARD_LIMIT_CAP:
-            response["limit_clamped_from"] = requested_limit
-        else:
-            response.pop("limit_clamped_from", None)
-        return response
+        return degraded_to_fts(
+            str(semantic.get("degraded_reason", "semantic arm unavailable")),
+            coverage=str(semantic.get("coverage", "none")),
+        )
 
     fused: dict[tuple[str, Any], dict[str, Any]] = {}
 
