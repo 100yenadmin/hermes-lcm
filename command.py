@@ -1705,6 +1705,12 @@ def _preset_text(tokens: list[str], engine) -> str:
 def _embedding_warmup_text(engine) -> str:
     """Warm the configured provider and dimension-lock its vector profile."""
     try:
+        if not bool(getattr(engine._config, "embeddings_enabled", False)):
+            return (
+                "LCM embedding warmup\n"
+                "status: disabled\n"
+                "error: embeddings are disabled; set LCM_EMBEDDINGS_ENABLED=true"
+            )
         provider = resolve_provider(engine._config)
         if provider is None:
             return (

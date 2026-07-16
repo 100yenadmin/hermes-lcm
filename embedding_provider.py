@@ -10,14 +10,17 @@ from __future__ import annotations
 import json
 import logging
 import os
+import queue
+import threading
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from datetime import timezone
 from email.utils import parsedate_to_datetime
+from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Mapping, Protocol, Sequence
+from typing import Any, Callable, Iterator, Mapping, Protocol, Sequence
 
 from .config import LCMConfig
 from .tokens import count_tokens
@@ -41,6 +44,10 @@ _VOYAGE_DOCUMENT_TOKEN_BUDGET = int(
 _MAX_ATTEMPTS = 3
 _RETRY_AFTER_BUDGET_S = 60.0
 _DEFAULT_FASTEMBED_CACHE = Path.home() / ".cache" / "fastembed"
+_LOCAL_EMBED_MAX_WORKERS = 4
+_LOCAL_EMBED_WORKER_SLOTS = threading.BoundedSemaphore(_LOCAL_EMBED_MAX_WORKERS)
+
+BeforeDispatch = Callable[[tuple[int, ...]], None]
 
 
 class EmbeddingProvider(Protocol):
@@ -53,6 +60,13 @@ class EmbeddingProvider(Protocol):
     def dim(self) -> int: ...
 
     def embed_documents(self, texts: Sequence[str]) -> list[list[float]]: ...
+
+    def embed_document_batches(
+        self,
+        texts: Sequence[str],
+        *,
+        before_dispatch: BeforeDispatch | None = None,
+    ) -> Iterator["EmbeddedDocumentBatch"]: ...
 
     def embed_query(self, text: str) -> list[float]: ...
 
@@ -77,6 +91,13 @@ class ProviderRateLimited(EmbeddingProviderError):
     """The local embedding call-rate guard is temporarily open."""
 
 
+class ProviderPreDispatchError(EmbeddingProviderError):
+    """Definitive outcome: durable marking ran, but provider I/O never started."""
+
+    kind = "pre_dispatch"
+    transport_started = False
+
+
 class VoyageError(EmbeddingProviderError):
     """A classified Voyage API failure."""
 
@@ -94,6 +115,55 @@ class HttpResponse:
 
 
 HttpTransport = Callable[..., HttpResponse]
+
+
+@dataclass(frozen=True)
+class EmbeddedDocumentBatch:
+    """One provider-accepted request, preserving original document indexes."""
+
+    indexes: tuple[int, ...]
+    vectors: tuple[tuple[float, ...], ...]
+
+
+def _run_blocking_with_deadline(
+    call: Callable[[], Any], *, timeout: float, provider: str
+) -> Any:
+    """Bound a local blocking encoder without waiting for an overrun worker."""
+    budget = max(0.0, float(timeout))
+    if budget <= 0:
+        raise EmbeddingProviderError(f"{provider} operation deadline exceeded")
+    deadline = time.monotonic() + budget
+    worker_slots = _LOCAL_EMBED_WORKER_SLOTS
+    if not worker_slots.acquire(timeout=budget):
+        raise EmbeddingProviderError(f"{provider} worker capacity exhausted")
+    result: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
+
+    def run() -> None:
+        try:
+            result.put((True, call()))
+        except BaseException as exc:  # propagated in the caller thread
+            result.put((False, exc))
+        finally:
+            # A timed-out caller deliberately leaves the slot held until its
+            # daemon worker really exits. Repeated timeouts therefore cannot
+            # accumulate an unbounded number of live local encoders.
+            worker_slots.release()
+
+    worker = threading.Thread(
+        target=run, name=f"lcm-{provider.lower()}-embedding", daemon=True
+    )
+    try:
+        worker.start()
+    except BaseException:
+        worker_slots.release()
+        raise
+    worker.join(max(0.0, deadline - time.monotonic()))
+    if worker.is_alive():
+        raise EmbeddingProviderError(f"{provider} operation deadline exceeded")
+    ok, value = result.get_nowait()
+    if not ok:
+        raise value
+    return value
 
 
 def _default_http_transport(
@@ -340,7 +410,9 @@ class VoyageProvider(_ResilientProvider):
     def dim(self) -> int:
         return self._dim
 
-    def _error(self, response: HttpResponse) -> VoyageError:
+    def _error(
+        self, response: HttpResponse, *, include_body: bool = True
+    ) -> VoyageError:
         status = response.status
         if status in {401, 403}:
             kind = "auth"
@@ -350,7 +422,11 @@ class VoyageProvider(_ResilientProvider):
             kind = "bad_request"
         else:
             kind = "server_error"
-        scrubbed = _scrub_response_body(response.body)
+        scrubbed = (
+            _scrub_response_body(response.body)
+            if include_body
+            else "[SKIPPED: response-processing deadline]"
+        )
         logger.warning("Voyage embedding error status=%s body=%s", status, scrubbed)
         return VoyageError(kind, f"Voyage embedding request failed ({status})", status_code=status)
 
@@ -363,6 +439,7 @@ class VoyageProvider(_ResilientProvider):
         max_attempts: int = _MAX_ATTEMPTS,
         retry_after_budget_s: float = _RETRY_AFTER_BUDGET_S,
         deadline_budget_s: float | None = None,
+        before_transport: Callable[[], None] | None = None,
     ) -> list[list[float]]:
         api_key = os.environ.get("VOYAGE_API_KEY", "").strip()
         if not api_key:
@@ -396,6 +473,17 @@ class VoyageProvider(_ResilientProvider):
                     raise last_error or VoyageError(
                         "timeout", "Voyage operation deadline exceeded"
                     )
+            if before_transport is not None:
+                before_transport()
+            # The durable callback is intentionally the final preflight. It may
+            # block on SQLite, so recompute the budget AFTER it returns and do
+            # not begin billable transport with a stale timeout.
+            remaining = _remaining()
+            if remaining is not None:
+                if remaining <= 0:
+                    raise ProviderPreDispatchError(
+                        "Voyage operation deadline exceeded before transport"
+                    )
                 attempt_timeout = min(request_timeout, remaining)
             else:
                 attempt_timeout = request_timeout
@@ -411,31 +499,92 @@ class VoyageProvider(_ResilientProvider):
                 )
             except (OSError, TimeoutError, urllib.error.URLError) as exc:
                 last_error = VoyageError("network", f"Voyage network error: {exc}")
-                if attempt + 1 >= attempts:
-                    raise last_error from exc
-                delay = min(25.0, 0.5 * (2 ** attempt))
-                if not self._sleep_within_deadline(delay, deadline):
-                    raise last_error from exc
-                continue
+                # Once transport starts, a timeout/network exception cannot
+                # prove the remote rejected the request. Never automatically
+                # resend an identical potentially-billable operation.
+                raise last_error from exc
 
             if 200 <= response.status < 300:
-                data = _response_json(response, provider="Voyage")
-                rows = data.get("data")
-                if not isinstance(rows, list):
-                    raise EmbeddingProviderError("Voyage response did not contain embedding data")
-                ordered = sorted(rows, key=lambda row: int(row.get("index", 0)))
-                vectors = _coerce_vectors(
-                    [row.get("embedding") for row in ordered if isinstance(row, dict)],
-                    provider="Voyage",
-                )
-                if len(vectors) != len(texts):
-                    raise EmbeddingProviderError(
-                        "Voyage returned a different number of embeddings than requested"
+                # Transport completion does not stop the operation clock. A
+                # large/malicious response can make JSON decode, sorting, and
+                # vector coercion block, so keep the complete success parser
+                # inside the same absolute budget and do not publish a result
+                # that only became available after expiry.
+                remaining = _remaining()
+                if remaining is not None and remaining <= 0:
+                    raise VoyageError(
+                        "timeout",
+                        "Voyage operation deadline exceeded before response processing",
+                    )
+
+                def parse_success() -> list[list[float]]:
+                    data = _response_json(response, provider="Voyage")
+                    rows = data.get("data")
+                    if not isinstance(rows, list):
+                        raise EmbeddingProviderError(
+                            "Voyage response did not contain embedding data"
+                        )
+                    ordered = sorted(rows, key=lambda row: int(row.get("index", 0)))
+                    parsed = _coerce_vectors(
+                        [
+                            row.get("embedding")
+                            for row in ordered
+                            if isinstance(row, dict)
+                        ],
+                        provider="Voyage",
+                    )
+                    if len(parsed) != len(texts):
+                        raise EmbeddingProviderError(
+                            "Voyage returned a different number of embeddings than requested"
+                        )
+                    return parsed
+
+                try:
+                    vectors = (
+                        parse_success()
+                        if remaining is None
+                        else _run_blocking_with_deadline(
+                            parse_success,
+                            timeout=remaining,
+                            provider="Voyage response processing",
+                        )
+                    )
+                except EmbeddingProviderError as exc:
+                    if deadline is not None and _remaining() <= 0:
+                        raise VoyageError(
+                            "timeout",
+                            "Voyage operation deadline exceeded during response processing",
+                        ) from exc
+                    raise
+                if deadline is not None and _remaining() <= 0:
+                    raise VoyageError(
+                        "timeout",
+                        "Voyage operation deadline exceeded during response processing",
                     )
                 return vectors
 
-            last_error = self._error(response)
-            retryable = response.status == 429 or response.status >= 500
+            remaining = _remaining()
+            if remaining is not None and remaining <= 0:
+                raise self._error(response, include_body=False)
+            if remaining is None:
+                last_error = self._error(response)
+            else:
+                try:
+                    last_error = _run_blocking_with_deadline(
+                        lambda: self._error(response),
+                        timeout=remaining,
+                        provider="Voyage error response processing",
+                    )
+                except EmbeddingProviderError:
+                    # The status code itself is already authoritative even if
+                    # diagnostic body scrubbing cannot finish in-budget. Do
+                    # not wait for it, and never turn a 5xx into an auto-retry.
+                    last_error = self._error(response, include_body=False)
+            if deadline is not None and _remaining() <= 0:
+                raise self._error(response, include_body=False)
+            # A 429 is an authoritative rejection and is safe to retry. A 5xx
+            # may follow remote acceptance, so it is deliberately fail-closed.
+            retryable = response.status == 429
             if not retryable or attempt + 1 >= attempts:
                 raise last_error
             if response.status == 429:
@@ -473,12 +622,43 @@ class VoyageProvider(_ResilientProvider):
                 raise EmbeddingProviderError("Voyage embedding dimension changed within the process")
             self._dim = len(vector)
 
-    def embed_documents(self, texts: Sequence[str]) -> list[list[float]]:
-        accepted: list[tuple[str, int]] = []
+    def embed_document_batches(
+        self,
+        texts: Sequence[str],
+        *,
+        before_dispatch: BeforeDispatch | None = None,
+    ) -> Iterator[EmbeddedDocumentBatch]:
+        deadline = time.monotonic() + max(0.0, self.timeout)
+        accepted: list[tuple[int, str, int]] = []
         self.last_skipped_documents = []
         for index, text in enumerate(texts):
-            text = str(text)
-            tokens = count_tokens(text)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise VoyageError(
+                    "timeout",
+                    "Voyage operation deadline exceeded during document preprocessing",
+                )
+
+            def prepare_document(value=text) -> tuple[str, int]:
+                prepared = str(value)
+                return prepared, count_tokens(prepared)
+
+            try:
+                text, tokens = _run_blocking_with_deadline(
+                    prepare_document,
+                    timeout=remaining,
+                    provider="Voyage document preprocessing",
+                )
+            except EmbeddingProviderError as exc:
+                raise VoyageError(
+                    "timeout",
+                    "Voyage operation deadline exceeded during document preprocessing",
+                ) from exc
+            if time.monotonic() >= deadline:
+                raise VoyageError(
+                    "timeout",
+                    "Voyage operation deadline exceeded during document preprocessing",
+                )
             if tokens > _VOYAGE_DOCUMENT_TOKEN_BUDGET:
                 self.last_skipped_documents.append(index)
                 logger.warning(
@@ -488,12 +668,12 @@ class VoyageProvider(_ResilientProvider):
                     _VOYAGE_DOCUMENT_TOKEN_BUDGET,
                 )
                 continue
-            accepted.append((text, tokens))
+            accepted.append((index, text, tokens))
 
-        vectors: list[list[float]] = []
+        batch_indexes: list[int] = []
         batch: list[str] = []
         batch_tokens = 0
-        for text, tokens in accepted:
+        for index, text, tokens in accepted:
             # Flush before the batch would exceed EITHER the token budget or the
             # provider's per-request item cap, so e.g. 1001 short documents split
             # into at least two requests.
@@ -501,23 +681,64 @@ class VoyageProvider(_ResilientProvider):
                 batch_tokens + tokens > _VOYAGE_BATCH_TOKEN_BUDGET
                 or len(batch) >= self.max_batch_items
             ):
-                vectors.extend(
-                    self._guarded(lambda current=tuple(batch): self._request(
-                        current, input_type="document", deadline_budget_s=self.timeout
-                    ))
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise VoyageError("timeout", "Voyage operation deadline exceeded")
+                indexes = tuple(batch_indexes)
+                if before_dispatch is not None:
+                    dispatch = partial(before_dispatch, indexes)
+                else:
+                    dispatch = None
+                vectors = self._guarded(
+                    lambda current=tuple(batch), budget=remaining: self._request(
+                        current,
+                        input_type="document",
+                        max_attempts=1 if before_dispatch is not None else _MAX_ATTEMPTS,
+                        deadline_budget_s=budget,
+                        before_transport=dispatch,
+                    )
                 )
+                self._remember_dim(vectors)
+                yield EmbeddedDocumentBatch(
+                    indexes,
+                    tuple(tuple(vector) for vector in vectors),
+                )
+                batch_indexes = []
                 batch = []
                 batch_tokens = 0
+            batch_indexes.append(index)
             batch.append(text)
             batch_tokens += tokens
         if batch:
-            vectors.extend(
-                self._guarded(lambda current=tuple(batch): self._request(
-                    current, input_type="document", deadline_budget_s=self.timeout
-                ))
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise VoyageError("timeout", "Voyage operation deadline exceeded")
+            indexes = tuple(batch_indexes)
+            if before_dispatch is not None:
+                dispatch = partial(before_dispatch, indexes)
+            else:
+                dispatch = None
+            vectors = self._guarded(
+                lambda current=tuple(batch), budget=remaining: self._request(
+                    current,
+                    input_type="document",
+                    max_attempts=1 if before_dispatch is not None else _MAX_ATTEMPTS,
+                    deadline_budget_s=budget,
+                    before_transport=dispatch,
+                )
             )
-        self._remember_dim(vectors)
-        return vectors
+            self._remember_dim(vectors)
+            yield EmbeddedDocumentBatch(
+                indexes,
+                tuple(tuple(vector) for vector in vectors),
+            )
+
+    def embed_documents(self, texts: Sequence[str]) -> list[list[float]]:
+        return [
+            list(vector)
+            for batch in self.embed_document_batches(texts)
+            for vector in batch.vectors
+        ]
 
     def embed_query(self, text: str) -> list[float]:
         # Normal (non-interactive) query embedding also gets ONE absolute
@@ -591,6 +812,7 @@ class OllamaProvider(_ResilientProvider):
         timeout: float | None = None,
         max_attempts: int = _MAX_ATTEMPTS,
         deadline_budget_s: float | None = None,
+        before_transport: Callable[[], None] | None = None,
     ) -> list[list[float]]:
         request_timeout = self.timeout if timeout is None else max(0.001, float(timeout))
         attempts = max(1, int(max_attempts))
@@ -604,6 +826,14 @@ class OllamaProvider(_ResilientProvider):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise EmbeddingProviderError("Ollama operation deadline exceeded")
+            if before_transport is not None:
+                before_transport()
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ProviderPreDispatchError(
+                        "Ollama operation deadline exceeded before transport"
+                    )
                 attempt_timeout = min(request_timeout, remaining)
             else:
                 attempt_timeout = request_timeout
@@ -621,25 +851,45 @@ class OllamaProvider(_ResilientProvider):
                     timeout=attempt_timeout,
                 )
             except (OSError, TimeoutError, urllib.error.URLError) as exc:
-                if attempt + 1 >= attempts:
-                    raise EmbeddingProviderError(f"Ollama network error: {exc}") from exc
-                delay = min(25.0, 0.5 * (2 ** attempt))
-                if deadline is not None and delay >= deadline - time.monotonic():
-                    raise EmbeddingProviderError(f"Ollama network error: {exc}") from exc
-                self._sleep(delay)
-                continue
+                # Remote/local daemon acceptance is ambiguous after transport
+                # begins, so an automatic identical resend is not safe.
+                raise EmbeddingProviderError(f"Ollama network error: {exc}") from exc
             if not 200 <= response.status < 300:
                 raise EmbeddingProviderError(
                     f"Ollama embedding request failed ({response.status})"
                 )
-            payload = _response_json(response, provider="Ollama")
-            raw = payload.get("embeddings")
-            if raw is None and "embedding" in payload:
-                raw = [payload["embedding"]]
-            vectors = _coerce_vectors(raw, provider="Ollama")
-            if len(vectors) != len(texts):
+            remaining = (
+                None if deadline is None else deadline - time.monotonic()
+            )
+            if remaining is not None and remaining <= 0:
                 raise EmbeddingProviderError(
-                    "Ollama returned a different number of embeddings than requested"
+                    "Ollama operation deadline exceeded before response processing"
+                )
+
+            def parse_success() -> list[list[float]]:
+                payload = _response_json(response, provider="Ollama")
+                raw = payload.get("embeddings")
+                if raw is None and "embedding" in payload:
+                    raw = [payload["embedding"]]
+                parsed = _coerce_vectors(raw, provider="Ollama")
+                if len(parsed) != len(texts):
+                    raise EmbeddingProviderError(
+                        "Ollama returned a different number of embeddings than requested"
+                    )
+                return parsed
+
+            vectors = (
+                parse_success()
+                if remaining is None
+                else _run_blocking_with_deadline(
+                    parse_success,
+                    timeout=remaining,
+                    provider="Ollama response processing",
+                )
+            )
+            if deadline is not None and time.monotonic() >= deadline:
+                raise EmbeddingProviderError(
+                    "Ollama operation deadline exceeded during response processing"
                 )
             return vectors
         raise EmbeddingProviderError("Ollama embedding request failed")
@@ -651,6 +901,7 @@ class OllamaProvider(_ResilientProvider):
         timeout: float | None = None,
         max_attempts: int = _MAX_ATTEMPTS,
         deadline_budget_s: float | None = None,
+        before_transport: Callable[[], None] | None = None,
     ) -> list[list[float]]:
         if not texts:
             return []
@@ -660,6 +911,7 @@ class OllamaProvider(_ResilientProvider):
                 timeout=timeout,
                 max_attempts=max_attempts,
                 deadline_budget_s=deadline_budget_s,
+                before_transport=before_transport,
             )
         )
         for vector in vectors:
@@ -675,6 +927,31 @@ class OllamaProvider(_ResilientProvider):
         # backoff (self.timeout), so retryable failures cannot stack backoff
         # sleeps beyond the configured budget.
         return self._embed(texts, deadline_budget_s=self.timeout)
+
+    def embed_document_batches(
+        self,
+        texts: Sequence[str],
+        *,
+        before_dispatch: BeforeDispatch | None = None,
+    ) -> Iterator[EmbeddedDocumentBatch]:
+        normalized = tuple(str(text) for text in texts)
+        if not normalized:
+            return
+        indexes = tuple(range(len(normalized)))
+        vectors = self._embed(
+            normalized,
+            max_attempts=1 if before_dispatch is not None else _MAX_ATTEMPTS,
+            deadline_budget_s=self.timeout,
+            before_transport=(
+                (lambda: before_dispatch(indexes))
+                if before_dispatch is not None
+                else None
+            ),
+        )
+        yield EmbeddedDocumentBatch(
+            indexes,
+            tuple(tuple(vector) for vector in vectors),
+        )
 
     def embed_query(self, text: str) -> list[float]:
         return self._embed((text,), deadline_budget_s=self.timeout)[0]
@@ -701,6 +978,7 @@ class FastembedProvider(_ResilientProvider):
         model: str,
         *,
         cache_dir: str | Path | None = None,
+        timeout: float = 3.0,
         breaker: EmbeddingCircuitBreaker | None = None,
         spend_guard: EmbeddingSpendGuard | None = None,
     ) -> None:
@@ -709,6 +987,7 @@ class FastembedProvider(_ResilientProvider):
         if not self._model_id:
             raise ValueError("FastEmbed embedding model must not be empty")
         self.cache_dir = Path(cache_dir) if cache_dir is not None else _DEFAULT_FASTEMBED_CACHE
+        self.timeout = float(timeout)
         self._model: Any = None
         self._dim = 0
 
@@ -748,18 +1027,31 @@ class FastembedProvider(_ResilientProvider):
             self._model = self._construct(allow_download=False)
         return self._model
 
-    def _embed(self, texts: Sequence[str], *, query: bool = False) -> list[list[float]]:
+    def _embed(
+        self,
+        texts: Sequence[str],
+        *,
+        query: bool = False,
+        before_dispatch: Callable[[], None] | None = None,
+    ) -> list[list[float]]:
         if not texts:
             return []
-        model = self._ensure_local()
-        # FastEmbed models are asymmetric: queries and passages get different
-        # instruction prefixes. Use the query-specific API for queries and the
-        # passage/document API for documents so retrieval matches training, not
-        # the generic ``embed()`` that treats everything as a passage.
-        encode = model.query_embed if query else model.embed
-        vectors = self._guarded(
-            lambda: _coerce_vectors(list(encode(list(texts))), provider="FastEmbed")
-        )
+
+        deadline = time.monotonic() + max(0.0, self.timeout)
+
+        def encode() -> list[list[float]]:
+            return _run_blocking_with_deadline(
+                lambda: self._encode_local(
+                    texts,
+                    query=query,
+                    before_dispatch=before_dispatch,
+                    deadline=deadline,
+                ),
+                timeout=deadline - time.monotonic(),
+                provider="FastEmbed",
+            )
+
+        vectors = self._guarded(encode)
         if len(vectors) != len(texts):
             raise EmbeddingProviderError(
                 "FastEmbed returned a different number of embeddings than requested"
@@ -772,6 +1064,30 @@ class FastembedProvider(_ResilientProvider):
             self._dim = len(vector)
         return vectors
 
+    def _encode_local(
+        self,
+        texts: Sequence[str],
+        *,
+        query: bool,
+        before_dispatch: Callable[[], None] | None = None,
+        deadline: float | None = None,
+    ) -> list[list[float]]:
+        model = self._ensure_local()
+        if deadline is not None and time.monotonic() >= deadline:
+            raise ProviderPreDispatchError(
+                "FastEmbed operation deadline exceeded before dispatch"
+            )
+        if before_dispatch is not None:
+            before_dispatch()
+        if deadline is not None and time.monotonic() >= deadline:
+            raise ProviderPreDispatchError(
+                "FastEmbed operation deadline exceeded before encode"
+            )
+        # FastEmbed models are asymmetric: queries and passages get different
+        # instruction prefixes. Use the query-specific API for queries.
+        encode = model.query_embed if query else model.embed
+        return _coerce_vectors(list(encode(list(texts))), provider="FastEmbed")
+
     def warmup(self) -> list[float]:
         """The only path allowed to download a missing FastEmbed model."""
         if self._model is None:
@@ -780,6 +1096,30 @@ class FastembedProvider(_ResilientProvider):
 
     def embed_documents(self, texts: Sequence[str]) -> list[list[float]]:
         return self._embed(tuple(str(text) for text in texts), query=False)
+
+    def embed_document_batches(
+        self,
+        texts: Sequence[str],
+        *,
+        before_dispatch: BeforeDispatch | None = None,
+    ) -> Iterator[EmbeddedDocumentBatch]:
+        normalized = tuple(str(text) for text in texts)
+        if not normalized:
+            return
+        indexes = tuple(range(len(normalized)))
+        vectors = self._embed(
+            normalized,
+            query=False,
+            before_dispatch=(
+                (lambda: before_dispatch(indexes))
+                if before_dispatch is not None
+                else None
+            ),
+        )
+        yield EmbeddedDocumentBatch(
+            indexes,
+            tuple(tuple(vector) for vector in vectors),
+        )
 
     def embed_query(self, text: str) -> list[float]:
         return self._embed((str(text),), query=True)[0]
@@ -811,7 +1151,7 @@ def resolve_provider(config: LCMConfig) -> EmbeddingProvider | None:
             timeout=timeout,
         )
     if provider in {"fastembed", "fast-embed"}:
-        return FastembedProvider(model)
+        return FastembedProvider(model, timeout=timeout)
     raise ProviderUnavailable(
         f"Unsupported embedding provider {provider!r}; use voyage, ollama, or fastembed"
     )

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -19,6 +21,7 @@ from hermes_lcm.embedding_provider import (
     OllamaProvider,
     ProviderCircuitOpen,
     ProviderNotWarmedUp,
+    ProviderPreDispatchError,
     ProviderRateLimited,
     ProviderUnavailable,
     VoyageError,
@@ -238,7 +241,7 @@ def test_voyage_429_honors_retry_after_and_caps_budget(monkeypatch):
     assert sleeps == [2.5]
 
 
-def test_voyage_5xx_retries_then_raises(monkeypatch):
+def test_voyage_5xx_fails_closed_without_ambiguous_resend(monkeypatch):
     monkeypatch.setenv("VOYAGE_API_KEY", "test-key")
     server_error = _response(503, {"error": "unavailable"})
     transport = FakeTransport(server_error, server_error, server_error)
@@ -249,8 +252,8 @@ def test_voyage_5xx_retries_then_raises(monkeypatch):
         provider.embed_query("question")
 
     assert exc_info.value.kind == "server_error"
-    assert len(transport.calls) == 3
-    assert sleeps == [0.5, 1.0]
+    assert len(transport.calls) == 1
+    assert sleeps == []
 
 
 @pytest.mark.parametrize(
@@ -338,7 +341,7 @@ def test_voyage_network_errors_are_classified(monkeypatch):
     assert exc_info.value.kind == "network"
 
 
-def test_ollama_request_shape_base_url_and_network_only_retry():
+def test_ollama_request_shape_and_ambiguous_network_failure_is_not_retried():
     transport = FakeTransport(OSError("starting"), _response(200, {"embeddings": [[1, 2]]}))
     sleeps = []
     provider = OllamaProvider(
@@ -348,15 +351,16 @@ def test_ollama_request_shape_base_url_and_network_only_retry():
         sleeper=sleeps.append,
     )
 
-    assert provider.embed_query("hello") == [1.0, 2.0]
-    assert len(transport.calls) == 2
-    assert transport.calls[1]["url"] == "http://ollama.internal:11434/api/embed"
-    assert transport.calls[1]["payload"] == {
+    with pytest.raises(EmbeddingProviderError, match="network"):
+        provider.embed_query("hello")
+    assert len(transport.calls) == 1
+    assert transport.calls[0]["url"] == "http://ollama.internal:11434/api/embed"
+    assert transport.calls[0]["payload"] == {
         "model": "nomic-embed-text",
         "input": ["hello"],
         "truncate": False,
     }
-    assert sleeps == [0.5]
+    assert sleeps == []
 
     http_error = FakeTransport(_response(500, {"error": "broken"}))
     provider = OllamaProvider("model", transport=http_error, sleeper=sleeps.append)
@@ -507,7 +511,9 @@ class FakeWarmupProvider:
 
 def _command_engine(tmp_path):
     return SimpleNamespace(
-        _config=LCMConfig(database_path=str(tmp_path / "warmup.db")),
+        _config=LCMConfig(
+            database_path=str(tmp_path / "warmup.db"), embeddings_enabled=True
+        ),
         _store=SimpleNamespace(db_path=tmp_path / "warmup.db"),
     )
 
@@ -608,3 +614,392 @@ def test_spend_guard_rate_limits_provider_calls():
     with pytest.raises(ProviderRateLimited):
         provider.embed_query("two")
     assert len(transport.calls) == 1
+
+
+def test_voyage_document_splits_share_one_absolute_deadline(monkeypatch):
+    monkeypatch.setenv("VOYAGE_API_KEY", "test-key")
+    monkeypatch.setattr(provider_mod, "count_tokens", lambda _text: 1)
+    calls: list[float] = []
+
+    def transport(**kwargs):
+        timeout = float(kwargs["timeout"])
+        calls.append(timeout)
+        delay = 0.015
+        if timeout < delay:
+            time.sleep(max(0.0, timeout))
+            raise TimeoutError("request exceeded remaining budget")
+        time.sleep(delay)
+        return _voyage_success(1, dim=2)
+
+    provider = VoyageProvider(
+        "voyage-test",
+        transport=transport,
+        timeout=0.02,
+        max_batch_items=1,
+        sleeper=lambda _delay: None,
+    )
+    started = time.monotonic()
+    with pytest.raises(VoyageError, match="(network error|deadline exceeded)"):
+        provider.embed_documents(["first", "second"])
+    elapsed = time.monotonic() - started
+    assert 1 <= len(calls) <= 2
+    if len(calls) == 2:
+        assert calls[1] < calls[0]
+    assert elapsed < 0.06
+
+
+def test_voyage_token_preprocessing_is_inside_absolute_deadline(monkeypatch):
+    monkeypatch.setenv("VOYAGE_API_KEY", "test-key")
+
+    def slow_count(_text):
+        time.sleep(0.1)
+        return 1
+
+    monkeypatch.setattr(provider_mod, "count_tokens", slow_count)
+    transport = FakeTransport(_voyage_success(1))
+    provider = VoyageProvider("voyage-test", transport=transport, timeout=0.02)
+
+    started = time.monotonic()
+    with pytest.raises(VoyageError, match="document preprocessing"):
+        provider.embed_documents(["slow"])
+
+    assert time.monotonic() - started < 0.08
+    assert transport.calls == []
+
+
+def test_voyage_does_not_dispatch_next_split_after_deadline(monkeypatch):
+    monkeypatch.setenv("VOYAGE_API_KEY", "test-key")
+    monkeypatch.setattr(provider_mod, "count_tokens", lambda _text: 1)
+    transport = FakeTransport(_voyage_success(1), _voyage_success(1))
+    provider = VoyageProvider(
+        "voyage-test", transport=transport, timeout=0.02, max_batch_items=1
+    )
+
+    batches = provider.embed_document_batches(["first", "second"])
+    assert next(batches).indexes == (0,)
+    time.sleep(0.03)
+    with pytest.raises(VoyageError, match="deadline exceeded"):
+        next(batches)
+    assert len(transport.calls) == 1
+
+
+def test_voyage_yields_accepted_subbatch_before_later_failure(monkeypatch):
+    monkeypatch.setenv("VOYAGE_API_KEY", "test-key")
+    monkeypatch.setattr(provider_mod, "count_tokens", lambda _text: 1)
+    transport = FakeTransport(
+        _voyage_success(1, dim=2),
+        _response(400, {"error": "bad second request"}),
+    )
+    provider = VoyageProvider(
+        "voyage-test", transport=transport, max_batch_items=1
+    )
+    batches = provider.embed_document_batches(["first", "second"])
+    first = next(batches)
+    assert first.indexes == (0,)
+    assert first.vectors == ((1.0, 1.0),)
+    with pytest.raises(VoyageError, match="400"):
+        next(batches)
+
+
+def test_document_dispatch_callback_runs_once_per_actual_request(monkeypatch):
+    monkeypatch.setenv("VOYAGE_API_KEY", "test-key")
+    monkeypatch.setattr(provider_mod, "count_tokens", lambda _text: 1)
+    transport = FakeTransport(_voyage_success(1), _voyage_success(1))
+    provider = VoyageProvider(
+        "voyage-test", transport=transport, max_batch_items=1
+    )
+    dispatched: list[tuple[int, ...]] = []
+
+    batches = list(
+        provider.embed_document_batches(
+            ["first", "second"], before_dispatch=dispatched.append
+        )
+    )
+
+    assert dispatched == [(0,), (1,)]
+    assert [batch.indexes for batch in batches] == [(0,), (1,)]
+    assert len(transport.calls) == 2
+
+
+def test_voyage_rechecks_deadline_after_dispatch_callback(monkeypatch):
+    monkeypatch.setenv("VOYAGE_API_KEY", "test-key")
+    monkeypatch.setattr(provider_mod, "count_tokens", lambda _text: 1)
+    transport = FakeTransport(_voyage_success(1))
+    provider = VoyageProvider("voyage-test", transport=transport, timeout=0.01)
+    dispatched: list[tuple[int, ...]] = []
+
+    def slow_dispatch(indexes):
+        dispatched.append(indexes)
+        time.sleep(0.03)
+
+    with pytest.raises(ProviderPreDispatchError) as exc_info:
+        list(
+            provider.embed_document_batches(
+                ["document"], before_dispatch=slow_dispatch
+            )
+        )
+
+    assert exc_info.value.kind == "pre_dispatch"
+    assert dispatched == [(0,)]
+    assert transport.calls == []
+
+
+def test_ollama_rechecks_deadline_after_dispatch_callback():
+    transport = FakeTransport(_response(200, {"embeddings": [[1.0, 0.0]]}))
+    provider = OllamaProvider("model", transport=transport, timeout=0.01)
+
+    def slow_dispatch(_indexes):
+        time.sleep(0.03)
+
+    with pytest.raises(ProviderPreDispatchError):
+        list(
+            provider.embed_document_batches(
+                ["document"], before_dispatch=slow_dispatch
+            )
+        )
+    assert transport.calls == []
+
+
+@pytest.mark.parametrize("provider_name", ["voyage", "ollama"])
+def test_http_provider_does_not_decode_response_after_deadline(
+    monkeypatch, provider_name
+):
+    monkeypatch.setenv("VOYAGE_API_KEY", "test-key")
+    decode_calls = 0
+    original_decode = provider_mod._response_json
+
+    def counted_decode(*args, **kwargs):
+        nonlocal decode_calls
+        decode_calls += 1
+        return original_decode(*args, **kwargs)
+
+    monkeypatch.setattr(provider_mod, "_response_json", counted_decode)
+
+    def slow_transport(**_kwargs):
+        time.sleep(0.03)
+        if provider_name == "voyage":
+            return _voyage_success(1)
+        return _response(200, {"embeddings": [[1.0, 0.0]]})
+
+    provider = (
+        VoyageProvider("voyage-test", transport=slow_transport, timeout=0.01)
+        if provider_name == "voyage"
+        else OllamaProvider("model", transport=slow_transport, timeout=0.01)
+    )
+
+    with pytest.raises(EmbeddingProviderError, match="response processing"):
+        provider.embed_query("too late")
+
+    assert decode_calls == 0
+
+
+def test_voyage_slow_response_decode_is_inside_absolute_deadline(monkeypatch):
+    monkeypatch.setenv("VOYAGE_API_KEY", "test-key")
+    decode_started = threading.Event()
+    original_decode = provider_mod._response_json
+
+    def slow_decode(*args, **kwargs):
+        decode_started.set()
+        time.sleep(0.05)
+        return original_decode(*args, **kwargs)
+
+    monkeypatch.setattr(provider_mod, "_response_json", slow_decode)
+    provider = VoyageProvider(
+        "voyage-test", transport=FakeTransport(_voyage_success(1)), timeout=0.01
+    )
+
+    started = time.monotonic()
+    with pytest.raises(VoyageError) as exc_info:
+        provider.embed_query("slow decode")
+
+    assert exc_info.value.kind == "timeout"
+    assert decode_started.is_set()
+    assert time.monotonic() - started < 0.04
+    # Let the side-effect-free parser worker exit before monkeypatch teardown.
+    time.sleep(0.06)
+
+
+def test_voyage_slow_error_body_scrub_is_bounded_and_never_resent(monkeypatch):
+    monkeypatch.setenv("VOYAGE_API_KEY", "test-key")
+    scrub_started = threading.Event()
+    original_scrub = provider_mod._scrub_response_body
+
+    def slow_scrub(body):
+        scrub_started.set()
+        time.sleep(0.05)
+        return original_scrub(body)
+
+    monkeypatch.setattr(provider_mod, "_scrub_response_body", slow_scrub)
+    transport = FakeTransport(
+        _response(503, {"error": "ambiguous"}),
+        _voyage_success(1),
+    )
+    provider = VoyageProvider("voyage-test", transport=transport, timeout=0.01)
+
+    started = time.monotonic()
+    with pytest.raises(VoyageError) as exc_info:
+        provider.embed_query("slow error body")
+
+    assert exc_info.value.kind == "server_error"
+    assert scrub_started.is_set()
+    assert len(transport.calls) == 1
+    assert time.monotonic() - started < 0.04
+    time.sleep(0.06)
+
+
+def test_voyage_timeout_after_possible_acceptance_is_not_resent(monkeypatch):
+    monkeypatch.setenv("VOYAGE_API_KEY", "test-key")
+    transport = FakeTransport(
+        TimeoutError("response lost after acceptance"),
+        _voyage_success(1),
+    )
+    provider = VoyageProvider(
+        "voyage-test", transport=transport, sleeper=lambda _delay: None
+    )
+
+    with pytest.raises(VoyageError) as exc_info:
+        provider.embed_query("possibly accepted")
+
+    assert exc_info.value.kind == "network"
+    assert len(transport.calls) == 1
+
+
+def test_ollama_timeout_after_possible_acceptance_is_not_resent():
+    transport = FakeTransport(
+        TimeoutError("response lost after acceptance"),
+        _response(200, {"embeddings": [[1.0, 0.0]]}),
+    )
+    provider = OllamaProvider("model", transport=transport)
+
+    with pytest.raises(EmbeddingProviderError, match="network"):
+        provider.embed_query("possibly accepted")
+
+    assert len(transport.calls) == 1
+
+
+def test_fastembed_normal_operation_is_deadline_bounded(monkeypatch, tmp_path):
+    class SlowFastembedModel:
+        def __init__(self, **_kwargs):
+            pass
+
+        def query_embed(self, texts):
+            time.sleep(0.05)
+            return ([1.0, 0.0] for _ in texts)
+
+        def embed(self, texts):
+            time.sleep(0.05)
+            return ([1.0, 0.0] for _ in texts)
+
+    monkeypatch.setattr(provider_mod, "_load_fastembed", lambda: SlowFastembedModel)
+    provider = FastembedProvider("local", cache_dir=tmp_path, timeout=0.01)
+    started = time.monotonic()
+    with pytest.raises(EmbeddingProviderError, match="deadline exceeded"):
+        provider.embed_query("slow")
+    assert time.monotonic() - started < 0.04
+
+
+def test_fastembed_timeout_capacity_is_bounded_until_worker_exits(monkeypatch, tmp_path):
+    calls = 0
+
+    class SlowFastembedModel:
+        def __init__(self, **_kwargs):
+            pass
+
+        def query_embed(self, texts):
+            nonlocal calls
+            calls += 1
+            time.sleep(0.08)
+            return ([1.0, 0.0] for _ in texts)
+
+    monkeypatch.setattr(provider_mod, "_load_fastembed", lambda: SlowFastembedModel)
+    monkeypatch.setattr(
+        provider_mod, "_LOCAL_EMBED_WORKER_SLOTS", threading.BoundedSemaphore(1)
+    )
+    first = FastembedProvider("local", cache_dir=tmp_path, timeout=0.01)
+    second = FastembedProvider("local", cache_dir=tmp_path, timeout=0.01)
+
+    with pytest.raises(EmbeddingProviderError, match="deadline exceeded"):
+        first.embed_query("slow")
+    started = time.monotonic()
+    with pytest.raises(EmbeddingProviderError, match="worker capacity exhausted"):
+        second.embed_query("must-not-start")
+
+    assert time.monotonic() - started < 0.03
+    assert calls == 1
+    time.sleep(0.09)
+
+
+def test_fastembed_preflight_and_capacity_fail_before_dispatch(monkeypatch, tmp_path):
+    FakeFastembedModel.constructions = []
+    monkeypatch.setattr(provider_mod, "_load_fastembed", lambda: FakeFastembedModel)
+    provider = FastembedProvider("missing", cache_dir=tmp_path, timeout=0.01)
+    dispatched: list[tuple[int, ...]] = []
+
+    with pytest.raises(ProviderNotWarmedUp):
+        list(
+            provider.embed_document_batches(
+                ["document"], before_dispatch=dispatched.append
+            )
+        )
+    assert dispatched == []
+
+    class CachedFastembedModel(FakeFastembedModel):
+        def __init__(self, **kwargs):
+            self.embed_calls = []
+            self.query_calls = []
+
+    monkeypatch.setattr(provider_mod, "_load_fastembed", lambda: CachedFastembedModel)
+    monkeypatch.setattr(
+        provider_mod, "_LOCAL_EMBED_WORKER_SLOTS", threading.BoundedSemaphore(0)
+    )
+    provider = FastembedProvider("cached", cache_dir=tmp_path, timeout=0.01)
+    with pytest.raises(EmbeddingProviderError, match="worker capacity exhausted"):
+        list(
+            provider.embed_document_batches(
+                ["document"], before_dispatch=dispatched.append
+            )
+        )
+    assert dispatched == []
+
+
+def test_fastembed_does_not_encode_after_dispatch_callback_exhausts_deadline(
+    monkeypatch, tmp_path
+):
+    encode_calls = 0
+
+    class CachedFastembedModel:
+        def __init__(self, **_kwargs):
+            pass
+
+        def embed(self, texts):
+            nonlocal encode_calls
+            encode_calls += 1
+            return ([1.0, 0.0] for _ in texts)
+
+        query_embed = embed
+
+    monkeypatch.setattr(provider_mod, "_load_fastembed", lambda: CachedFastembedModel)
+    provider = FastembedProvider("cached", cache_dir=tmp_path, timeout=0.01)
+
+    def slow_dispatch(_indexes):
+        time.sleep(0.03)
+
+    with pytest.raises(EmbeddingProviderError, match="deadline exceeded"):
+        list(
+            provider.embed_document_batches(
+                ["document"], before_dispatch=slow_dispatch
+            )
+        )
+    time.sleep(0.04)
+    assert encode_calls == 0
+
+
+def test_warmup_command_is_inert_when_embeddings_disabled(monkeypatch, tmp_path):
+    provider = FakeWarmupProvider([0.1, 0.2])
+    monkeypatch.setattr(command_mod, "resolve_provider", lambda _config: provider)
+    engine = _command_engine(tmp_path)
+    engine._config.embeddings_enabled = False
+    result = handle_lcm_command("embed warmup", engine)
+    assert "status: disabled" in result
+    assert provider.calls == []
+    assert not engine._store.db_path.exists()
