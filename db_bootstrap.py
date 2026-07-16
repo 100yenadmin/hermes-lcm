@@ -352,6 +352,83 @@ _REQUIRED_EMBEDDING_INDEXES = (
     "idx_lcm_embedding_meta_identity_embedded_at",
 )
 
+_EMBEDDING_TABLE_SHAPES: dict[
+    str, tuple[tuple[str, str, int, int, str | None], ...]
+] = {
+    "lcm_embedding_profile": (
+        ("identity_hash", "TEXT", 0, 1, None),
+        ("provider", "TEXT", 1, 0, None),
+        ("model_name", "TEXT", 1, 0, None),
+        ("revision", "TEXT", 1, 0, "''"),
+        ("dim", "INTEGER", 0, 0, None),
+        ("dtype", "TEXT", 1, 0, "'float32'"),
+        ("byteorder", "TEXT", 1, 0, "'little'"),
+        ("task", "TEXT", 1, 0, "'summary'"),
+        ("registered_at", "TEXT", 0, 0, None),
+        ("active", "INTEGER", 0, 0, "1"),
+        ("archived_at", "TEXT", 0, 0, None),
+        ("data_version", "INTEGER", 1, 0, "0"),
+    ),
+    "lcm_embedding_meta": (
+        ("embedded_id", "TEXT", 0, 1, None),
+        ("embedded_kind", "TEXT", 0, 2, None),
+        ("identity_hash", "TEXT", 0, 3, None),
+        ("embedded_at", "TEXT", 0, 0, None),
+        ("source_token_count", "INTEGER", 0, 0, None),
+        ("archived", "INTEGER", 0, 0, "0"),
+    ),
+    "lcm_embedding_vectors": (
+        ("embedded_id", "TEXT", 0, 1, None),
+        ("identity_hash", "TEXT", 0, 2, None),
+        ("vec", "BLOB", 1, 0, None),
+    ),
+}
+
+_EMBEDDING_INDEX_SHAPES: dict[
+    str, tuple[str, tuple[tuple[str, int], ...], str | None]
+] = {
+    "idx_lcm_embedding_profile_model": (
+        "lcm_embedding_profile",
+        (("model_name", 0), ("provider", 0)),
+        None,
+    ),
+    "idx_lcm_embedding_meta_identity_embedded_at": (
+        "lcm_embedding_meta",
+        (("identity_hash", 0), ("embedded_at", 1)),
+        "archived=0",
+    ),
+}
+
+_EMBEDDING_CHECKS = {
+    "lcm_embedding_profile": {"dimbetween1and4096"},
+    "lcm_embedding_meta": {"embedded_kindin('summary')"},
+    "lcm_embedding_vectors": set(),
+}
+
+
+def _sql_check_expressions(sql: str) -> set[str]:
+    """Extract normalized CHECK bodies while respecting nested parentheses."""
+    lowered = sql.lower()
+    expressions: set[str] = set()
+    offset = 0
+    while True:
+        start = lowered.find("check(", offset)
+        if start < 0:
+            return expressions
+        body_start = start + len("check(")
+        depth = 1
+        cursor = body_start
+        while cursor < len(lowered) and depth:
+            if lowered[cursor] == "(":
+                depth += 1
+            elif lowered[cursor] == ")":
+                depth -= 1
+            cursor += 1
+        if depth:
+            return {"<malformed>"}
+        expressions.add(re.sub(r"\s+", "", lowered[body_start:cursor - 1]))
+        offset = cursor
+
 
 def embedding_schema_missing(conn: sqlite3.Connection) -> set[str]:
     """Return the names of required embedding tables/indexes that do not exist.
@@ -368,6 +445,86 @@ def embedding_schema_missing(conn: sqlite3.Connection) -> set[str]:
     }
     required = set(_REQUIRED_EMBEDDING_TABLES) | set(_REQUIRED_EMBEDDING_INDEXES)
     return required - present
+
+
+def verify_embedding_schema(conn: sqlite3.Connection) -> list[str]:
+    """Return structural embedding-schema errors, not just missing names.
+
+    Feature state is derived and rebuildable, but silently accepting a table
+    with the right name and the wrong columns lets profile activation or vector
+    publication fail halfway through.  Missing objects are repaired by
+    ``ensure_embedding_tables``; incompatible same-name objects are rejected
+    before the named migration marker is published.
+    """
+    errors = [f"missing object: {name}" for name in sorted(embedding_schema_missing(conn))]
+    if errors:
+        return errors
+
+    for table, expected in _EMBEDDING_TABLE_SHAPES.items():
+        actual = tuple(
+            (
+                str(row[1]),
+                str(row[2]).upper(),
+                int(row[3]),
+                int(row[5]),
+                None if row[4] is None else str(row[4]).lower(),
+            )
+            for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+        )
+        if actual != expected:
+            errors.append(f"malformed table: {table}")
+
+    # CHECK expressions are not exposed by PRAGMA table_info, so fingerprint
+    # their normalized expressions exactly rather than looking for a loose
+    # substring. PK order/nullability/types/defaults were checked above.
+    table_sql = {
+        str(row[0]): " ".join(str(row[1] or "").lower().split())
+        for row in conn.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'table' "
+            "AND name IN (?, ?, ?)",
+            _REQUIRED_EMBEDDING_TABLES,
+        ).fetchall()
+    }
+    for table, expected_checks in _EMBEDDING_CHECKS.items():
+        sql = table_sql.get(table, "")
+        actual_checks = _sql_check_expressions(sql)
+        if actual_checks != expected_checks:
+            errors.append(f"malformed constraints: {table}")
+
+    for index, (table, expected_columns, predicate) in _EMBEDDING_INDEX_SHAPES.items():
+        index_shape = tuple(
+            (
+                None if row[2] is None else str(row[2]),
+                int(row[3]),
+                str(row[4]).upper(),
+                int(row[5]),
+            )
+            for row in conn.execute(f"PRAGMA index_xinfo({index})").fetchall()
+        )
+        expected_shape = tuple(
+            (column, desc, "BINARY", 1) for column, desc in expected_columns
+        ) + ((None, 0, "BINARY", 0),)
+        index_list = {
+            str(row[1]): (int(row[2]), int(row[4]))
+            for row in conn.execute(f"PRAGMA index_list({table})").fetchall()
+        }
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+            (index,),
+        ).fetchone()
+        sql = " ".join(str(row[0] or "").lower().split()) if row else ""
+        actual_predicate = None
+        if " where " in sql:
+            actual_predicate = re.sub(r"\s+", "", sql.split(" where ", 1)[1])
+        unique, partial = index_list.get(index, (-1, -1))
+        if (
+            index_shape != expected_shape
+            or unique != 0
+            or partial != int(predicate is not None)
+            or actual_predicate != predicate
+        ):
+            errors.append(f"malformed index: {index}")
+    return sorted(set(errors))
 
 
 def mark_migration_step_complete(conn: sqlite3.Connection, step_name: str) -> None:

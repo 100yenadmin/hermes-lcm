@@ -2976,19 +2976,23 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         retain = self._config.new_session_retain_depth
         if self._session_id and retain != -1:
             if retain == 0:
-                purge_ids = self._dag.session_node_ids(self._session_id)
-                self._dag.delete_session_nodes(self._session_id)
-            else:
-                purge_ids = self._dag.session_node_ids_below_depth(
-                    self._session_id, retain
+                self._dag.delete_session_nodes(
+                    self._session_id,
+                    on_deleted_batch=self._purge_embeddings_for_nodes,
                 )
-                self._dag.delete_below_depth(self._session_id, retain)
-            # Reclaim the embeddings for the summaries just deleted so orphaned
-            # vectors are not carried forward (they are also filtered out of
-            # ranking by the summary_nodes join, but purging reclaims storage).
-            self._purge_embeddings_for_nodes(purge_ids)
+            else:
+                self._dag.delete_below_depth(
+                    self._session_id,
+                    retain,
+                    on_deleted_batch=self._purge_embeddings_for_nodes,
+                )
 
-    def _purge_embeddings_for_nodes(self, node_ids: "list[int]") -> None:
+    def _purge_embeddings_for_nodes(
+        self,
+        node_ids: "list[int]",
+        *,
+        connection: "sqlite3.Connection | None" = None,
+    ) -> None:
         """Purge stored embeddings for deleted summary nodes (best effort).
 
         No-op unless embeddings are enabled. Opens a short-lived VectorStore on
@@ -3003,6 +3007,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         try:
             from .vector_store import VectorStore
 
+            if connection is not None:
+                VectorStore.purge_embedding_batch_on_connection(connection, node_ids)
+                return
             store = VectorStore(self._store.db_path, config=self._config)
             try:
                 store.purge_embeddings_for_nodes(node_ids)

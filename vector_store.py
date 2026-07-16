@@ -11,10 +11,11 @@ import hashlib
 import logging
 import math
 import sqlite3
+import struct
 import threading
 import uuid
-from array import array
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Optional, Sequence
@@ -22,11 +23,11 @@ from typing import Any, Iterator, Optional, Sequence
 from .config import LCMConfig
 from .db_bootstrap import (
     configure_connection,
-    embedding_schema_missing,
     ensure_embedding_tables,
     mark_migration_step_complete,
     refuse_schema_version_too_new,
     run_versioned_migrations,
+    verify_embedding_schema,
 )
 from .sqlite_util import _is_sqlite_locked_error
 
@@ -44,6 +45,77 @@ _DEFAULT_TASK = "summary"
 # (observed failure at ~33k ids). Candidate id resolution loads ids into a temp
 # table in bounded chunks and JOINs instead, so it scales past that limit.
 _ID_INSERT_CHUNK = 500
+_SOURCE_LINEAGE_WORK_LIMIT = 4096
+
+
+class _UnverifiableProvenance(RuntimeError):
+    """A requested provenance filter could not be checked completely."""
+
+
+def _require_supported_identity(identity: "EmbeddingIdentity") -> None:
+    """Reject profile representations this implementation cannot encode."""
+    unsupported = []
+    if identity.dtype != _VECTOR_DTYPE:
+        unsupported.append(f"dtype={identity.dtype!r}")
+    if identity.byteorder != _VECTOR_BYTEORDER:
+        unsupported.append(f"byteorder={identity.byteorder!r}")
+    if identity.task != _DEFAULT_TASK:
+        unsupported.append(f"task={identity.task!r}")
+    if unsupported:
+        raise ValueError(
+            "unsupported embedding representation: "
+            + ", ".join(unsupported)
+            + "; supported representation is float32/little/summary"
+        )
+
+
+@dataclass(frozen=True)
+class EmbeddingIdentity:
+    """Immutable canonical identity captured before provider execution."""
+
+    provider: str
+    model_name: str
+    revision: str
+    dim: int
+    dtype: str
+    byteorder: str
+    task: str
+
+    @classmethod
+    def canonical(
+        cls,
+        provider: str,
+        model_name: str,
+        revision: str,
+        dim: int,
+        dtype: str,
+        byteorder: str,
+        task: str,
+    ) -> "EmbeddingIdentity":
+        return cls(
+            provider=str(provider).strip().lower(),
+            model_name=str(model_name).strip(),
+            revision=str(revision).strip(),
+            dim=int(dim),
+            dtype=str(dtype).strip().lower(),
+            byteorder=str(byteorder).strip().lower(),
+            task=str(task).strip().lower(),
+        )
+
+    @property
+    def identity_hash(self) -> str:
+        canonical = "\x1f".join(
+            [
+                self.provider,
+                self.model_name,
+                self.revision,
+                str(self.dim),
+                self.dtype,
+                self.byteorder,
+                self.task,
+            ]
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _identity_hash(
@@ -56,18 +128,10 @@ def _identity_hash(
     task: str,
 ) -> str:
     """Return the stable canonical-identity hash for an embedding profile."""
-    canonical = "\x1f".join(
-        [
-            str(provider).strip().lower(),
-            str(model_name).strip(),
-            str(revision).strip(),
-            str(int(dim)),
-            str(dtype).strip().lower(),
-            str(byteorder).strip().lower(),
-            str(task).strip().lower(),
-        ]
+    identity = EmbeddingIdentity.canonical(
+        provider, model_name, revision, dim, dtype, byteorder, task
     )
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return identity.identity_hash
 
 
 def _load_numpy():
@@ -85,9 +149,11 @@ class KNNResult(list[tuple[str, float, str]]):
         rows: Sequence[tuple[str, float, str]] = (),
         *,
         coverage: str,
+        reason: str | None = None,
     ) -> None:
         super().__init__(rows)
         self.coverage = coverage
+        self.reason = reason
 
 
 class VectorStore:
@@ -111,12 +177,12 @@ class VectorStore:
         self._conn: Optional[sqlite3.Connection] = None
         self._write_lock = threading.RLock()
         self._cache_lock = threading.RLock()
-        # Cache key: (identity_hash, data_version, row_count). The durable
+        # Cache key: (identity_hash, data_version, candidate_ids). The durable
         # per-identity ``data_version`` counter is bumped inside every vector
         # write/delete transaction, so a cross-process write invalidates this
         # cache even when max_rowid and row_count are unchanged.
         self._matrix_cache: dict[
-            tuple[str, int, int],
+            tuple[str, int, tuple[str, ...]],
             tuple[list[int], list[str], list[str], Any],
         ] = {}
         self._init_db()
@@ -158,18 +224,18 @@ class VectorStore:
         """
         with self._write_lock:
             ensure_embedding_tables(self._conn)
-            missing = embedding_schema_missing(self._conn)
-            if missing:
+            errors = verify_embedding_schema(self._conn)
+            if errors:
                 # Should be unreachable: the ensure above is a superset of the
                 # verified set. Re-ensure once more and fail loudly if a
                 # required object still cannot be created, rather than marking a
                 # broken schema complete.
                 ensure_embedding_tables(self._conn)
-                missing = embedding_schema_missing(self._conn)
-                if missing:
+                errors = verify_embedding_schema(self._conn)
+                if errors:
                     raise sqlite3.OperationalError(
-                        "embedding schema incomplete after ensure: "
-                        + ", ".join(sorted(missing))
+                        "embedding schema incompatible after ensure: "
+                        + "; ".join(errors)
                     )
             mark_migration_step_complete(self._conn, "embeddings_v1")
             self._conn.commit()
@@ -225,8 +291,8 @@ class VectorStore:
     def _profile_by_identity(self, identity_hash: str) -> sqlite3.Row | None:
         return self._conn.execute(
             """
-            SELECT identity_hash, model_name, provider, dim, registered_at,
-                   active, archived_at, data_version
+            SELECT identity_hash, model_name, provider, revision, dim, dtype,
+                   byteorder, task, registered_at, active, archived_at, data_version
             FROM lcm_embedding_profile
             WHERE identity_hash = ?
             """,
@@ -247,30 +313,32 @@ class VectorStore:
         vectors. With no ``provider`` the bare-name active identity is used
         (recording targets the operator's current selection).
         """
+        model_name = str(model_name).strip()
         if provider is not None:
+            provider = str(provider).strip().lower()
             return self._conn.execute(
                 """
-                SELECT identity_hash, model_name, provider, dim, registered_at,
-                       active, archived_at, data_version
+                SELECT identity_hash, model_name, provider, revision, dim, dtype,
+                       byteorder, task, registered_at, active, archived_at, data_version
                 FROM lcm_embedding_profile
                 WHERE model_name = ? AND provider = ?
                 ORDER BY (active = 1 AND archived_at IS NULL) DESC,
                          registered_at DESC, identity_hash DESC
                 LIMIT 1
                 """,
-                (str(model_name), str(provider)),
+                (model_name, provider),
             ).fetchone()
         return self._conn.execute(
             """
-            SELECT identity_hash, model_name, provider, dim, registered_at,
-                   active, archived_at, data_version
+            SELECT identity_hash, model_name, provider, revision, dim, dtype,
+                   byteorder, task, registered_at, active, archived_at, data_version
             FROM lcm_embedding_profile
             WHERE model_name = ?
             ORDER BY (active = 1 AND archived_at IS NULL) DESC,
                      registered_at DESC, identity_hash DESC
             LIMIT 1
             """,
-            (str(model_name),),
+            (model_name,),
         ).fetchone()
 
     @staticmethod
@@ -286,17 +354,53 @@ class VectorStore:
         except (TypeError, ValueError):
             return None
 
+    def _table_columns(self, table: str) -> set[str]:
+        return {
+            str(row[1])
+            for row in self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+
     def _current_profile(self) -> sqlite3.Row | None:
         return self._conn.execute(
             """
-            SELECT identity_hash, model_name, provider, dim, registered_at,
-                   active, archived_at, data_version
+            SELECT identity_hash, model_name, provider, revision, dim, dtype,
+                   byteorder, task, registered_at, active, archived_at, data_version
             FROM lcm_embedding_profile
             WHERE active = 1 AND archived_at IS NULL
             ORDER BY registered_at DESC, identity_hash DESC
             LIMIT 1
             """
         ).fetchone()
+
+    @staticmethod
+    def _identity_from_profile(profile: sqlite3.Row) -> EmbeddingIdentity:
+        identity = EmbeddingIdentity.canonical(
+            profile["provider"],
+            profile["model_name"],
+            profile["revision"],
+            profile["dim"],
+            profile["dtype"],
+            profile["byteorder"],
+            profile["task"],
+        )
+        if identity.identity_hash != str(profile["identity_hash"]):
+            raise ValueError("embedding profile identity hash does not match its fields")
+        _require_supported_identity(identity)
+        return identity
+
+    def capture_identity(
+        self, model_name: str | None = None, *, provider: str | None = None
+    ) -> EmbeddingIdentity:
+        """Capture the full immutable identity before provider execution."""
+        profile = (
+            self._resolve_profile(model_name, provider=provider)
+            if model_name is not None
+            else self._current_profile()
+        )
+        if profile is None:
+            target = model_name if model_name is not None else "active"
+            raise ValueError(f"embedding profile is not registered: {target}")
+        return self._identity_from_profile(profile)
 
     def register_profile(
         self,
@@ -319,23 +423,18 @@ class VectorStore:
         needs no re-backfill). Exactly one profile is left active. Returns the
         identity hash.
         """
-        model_name = str(model_name)
-        provider = str(provider)
-        dim = int(dim)
-        revision = str(revision)
-        dtype = str(dtype)
-        byteorder = str(byteorder)
-        task = str(task)
-        if not model_name:
-            raise ValueError("model_name must not be empty")
-        if not provider:
-            raise ValueError("provider must not be empty")
-        if dim < 1 or dim > 4096:
-            raise ValueError("embedding dimension must be between 1 and 4096")
-
-        identity = _identity_hash(
+        canonical = EmbeddingIdentity.canonical(
             provider, model_name, revision, dim, dtype, byteorder, task
         )
+        if not canonical.model_name:
+            raise ValueError("model_name must not be empty")
+        if not canonical.provider:
+            raise ValueError("provider must not be empty")
+        if canonical.dim < 1 or canonical.dim > 4096:
+            raise ValueError("embedding dimension must be between 1 and 4096")
+        _require_supported_identity(canonical)
+
+        identity = canonical.identity_hash
         with self._write_transaction():
             existing = self._profile_by_identity(identity)
             if existing is None:
@@ -349,8 +448,15 @@ class VectorStore:
                     VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, 0)
                     """,
                     (
-                        identity, provider, model_name, revision, dim,
-                        dtype, byteorder, task, self._now(),
+                        identity,
+                        canonical.provider,
+                        canonical.model_name,
+                        canonical.revision,
+                        canonical.dim,
+                        canonical.dtype,
+                        canonical.byteorder,
+                        canonical.task,
+                        self._now(),
                     ),
                 )
             else:
@@ -380,13 +486,27 @@ class VectorStore:
         model: str,
         vec: Sequence[float],
         *,
-        identity: str | None = None,
+        identity: EmbeddingIdentity,
     ) -> None:
         embedded_id = str(embedded_id)
         model = str(model)
         if kind != "summary":
             raise ValueError("embedded kind must be 'summary'")
-        expected_identity = None if identity is None else str(identity)
+        if not isinstance(identity, EmbeddingIdentity):
+            raise TypeError("identity must be an EmbeddingIdentity captured before provider work")
+        canonical_identity = EmbeddingIdentity.canonical(
+            identity.provider,
+            identity.model_name,
+            identity.revision,
+            identity.dim,
+            identity.dtype,
+            identity.byteorder,
+            identity.task,
+        )
+        if identity != canonical_identity:
+            raise ValueError("embedding identity fields are not canonical")
+        _require_supported_identity(identity)
+        expected_identity = identity.identity_hash
 
         with self._write_transaction():
             # The vector was produced by a SPECIFIC provider identity. When the
@@ -398,23 +518,26 @@ class VectorStore:
             # one write transaction (CAS), so the identity is captured
             # atomically; a caller-supplied identity that is not (or no longer)
             # a registered profile is rejected rather than silently rebound.
-            if expected_identity is not None:
-                profile = self._profile_by_identity(expected_identity)
-                if profile is None:
-                    raise ValueError(
-                        f"embedding profile is not registered: {expected_identity}"
-                    )
-            else:
-                # No captured identity: resolve the active profile INSIDE the
-                # write transaction so a concurrent active-provider switch for
-                # the same model_name cannot let us read identity A and then
-                # write the vector under B.
-                profile = self._resolve_profile(model)
-                if profile is None:
-                    raise ValueError(f"embedding profile is not registered: {model}")
-            identity = str(profile["identity_hash"])
+            profile = self._profile_by_identity(expected_identity)
+            if profile is None:
+                raise ValueError(
+                    f"embedding profile is not registered: {expected_identity}"
+                )
+            registered_identity = self._identity_from_profile(profile)
+            if registered_identity != identity:
+                raise ValueError(
+                    "captured embedding identity does not match registered profile"
+                )
+            identity_hash = identity.identity_hash
+            if str(profile["model_name"]) != model.strip():
+                raise ValueError(
+                    "embedding model does not match captured identity: "
+                    f"{model} != {profile['model_name']}"
+                )
             normalized = self._normalized(vec, expected_dim=int(profile["dim"]))
-            packed = array("f", normalized).tobytes()
+            # Persist an explicit little-endian float32 wire format. Native
+            # ``array('f')`` bytes would be mislabeled on a big-endian host.
+            packed = struct.pack(f"<{len(normalized)}f", *normalized)
             numeric_id = self._as_node_id(embedded_id)
             summary = (
                 self._conn.execute(
@@ -436,21 +559,21 @@ class VectorStore:
                 DELETE FROM lcm_embedding_vectors
                 WHERE embedded_id = ? AND identity_hash = ?
                 """,
-                (embedded_id, identity),
+                (embedded_id, identity_hash),
             )
             self._conn.execute(
                 """
                 DELETE FROM lcm_embedding_meta
                 WHERE embedded_id = ? AND embedded_kind = ? AND identity_hash = ?
                 """,
-                (embedded_id, kind, identity),
+                (embedded_id, kind, identity_hash),
             )
             self._conn.execute(
                 """
                 INSERT INTO lcm_embedding_vectors(embedded_id, identity_hash, vec)
                 VALUES(?, ?, ?)
                 """,
-                (embedded_id, identity, packed),
+                (embedded_id, identity_hash, packed),
             )
             self._conn.execute(
                 """
@@ -463,12 +586,12 @@ class VectorStore:
                 (
                     embedded_id,
                     kind,
-                    identity,
+                    identity_hash,
                     embedded_at,
                     int(summary["source_token_count"] or 0),
                 ),
             )
-            self._bump_data_version(identity)
+            self._bump_data_version(identity_hash)
 
     def _bump_data_version(self, identity_hash: str) -> None:
         """Bump one identity's durable data-version counter.
@@ -503,16 +626,30 @@ class VectorStore:
         """
         table = f"_lcm_id_scratch_{uuid.uuid4().hex}"
         self._conn.execute(f"CREATE TEMP TABLE {table}(id TEXT PRIMARY KEY)")
-        rows = [(str(value),) for value in ids]
         try:
-            for offset in range(0, len(rows), _ID_INSERT_CHUNK):
+            for offset in range(0, len(ids), _ID_INSERT_CHUNK):
+                rows = [
+                    (str(value),)
+                    for value in ids[offset:offset + _ID_INSERT_CHUNK]
+                ]
                 self._conn.executemany(
                     f"INSERT OR IGNORE INTO {table}(id) VALUES(?)",
-                    rows[offset:offset + _ID_INSERT_CHUNK],
+                    rows,
                 )
             yield table
         finally:
             self._conn.execute(f"DROP TABLE IF EXISTS {table}")
+
+    @contextmanager
+    def _optional_temp_id_table(
+        self, ids: Sequence[str] | None
+    ) -> Iterator[str | None]:
+        if ids is None:
+            yield None
+            return
+        normalized = [str(value) for value in ids]
+        with self._temp_id_table(normalized) as table:
+            yield table
 
     def purge_embeddings_for_nodes(self, node_ids: Sequence[int | str]) -> int:
         unique_ids = list(dict.fromkeys(str(node_id) for node_id in node_ids))
@@ -535,19 +672,43 @@ class VectorStore:
                 self._bump_all_data_versions()
         return int(cur.rowcount or 0)
 
-    def _vector_state(self, identity_hash: str) -> tuple[int, int]:
-        row = self._conn.execute(
-            """
-            SELECT COALESCE(MAX(v.rowid), 0) AS max_rowid, COUNT(*) AS row_count
-            FROM lcm_embedding_vectors v
-            JOIN lcm_embedding_meta m
-              ON m.embedded_id = v.embedded_id
-             AND m.identity_hash = v.identity_hash
-            WHERE v.identity_hash = ? AND m.archived = 0
-            """,
-            (str(identity_hash),),
-        ).fetchone()
-        return int(row["max_rowid"] or 0), int(row["row_count"] or 0)
+    @staticmethod
+    def purge_embedding_batch_on_connection(
+        conn: sqlite3.Connection, node_ids: Sequence[int | str]
+    ) -> int:
+        """Purge one already-bounded node batch in the caller's transaction."""
+        unique_ids = list(dict.fromkeys(str(node_id) for node_id in node_ids))
+        if not unique_ids:
+            return 0
+        if len(unique_ids) > 256:
+            raise ValueError("embedding purge batch exceeds 256 rows")
+        tables = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name IN ("
+                "'lcm_embedding_vectors','lcm_embedding_meta',"
+                "'lcm_embedding_profile')"
+            ).fetchall()
+        }
+        if len(tables) != 3:
+            return 0
+        placeholders = ",".join("?" for _ in unique_ids)
+        cur = conn.execute(
+            f"DELETE FROM lcm_embedding_vectors "
+            f"WHERE embedded_id IN ({placeholders})",
+            unique_ids,
+        )
+        conn.execute(
+            f"DELETE FROM lcm_embedding_meta "
+            f"WHERE embedded_id IN ({placeholders})",
+            unique_ids,
+        )
+        if cur.rowcount:
+            conn.execute(
+                "UPDATE lcm_embedding_profile "
+                "SET data_version = data_version + 1"
+            )
+        return int(cur.rowcount or 0)
 
     def _data_version(self, identity_hash: str) -> int:
         row = self._conn.execute(
@@ -561,44 +722,24 @@ class VectorStore:
         numpy: Any,
         identity_hash: str,
         dim: int,
+        embedded_ids: Sequence[str],
     ) -> tuple[list[int], list[str], list[str], Any]:
+        """Load only the SQL-bounded candidate set into a NumPy matrix."""
         with self._cache_lock:
-            _, row_count = self._vector_state(identity_hash)
             data_version = self._data_version(identity_hash)
-            key = (identity_hash, data_version, row_count)
+            key = (identity_hash, data_version, tuple(str(value) for value in embedded_ids))
             cached = self._matrix_cache.get(key)
             if cached is not None:
                 return cached
-            rows = self._conn.execute(
-                """
-                SELECT v.rowid, v.embedded_id, m.embedded_kind, v.vec
-                FROM lcm_embedding_vectors v
-                JOIN lcm_embedding_meta m
-                  ON m.embedded_id = v.embedded_id
-                 AND m.identity_hash = v.identity_hash
-                WHERE v.identity_hash = ? AND m.archived = 0
-                ORDER BY v.rowid
-                """,
-                (identity_hash,),
-            ).fetchall()
-            rowids: list[int] = []
-            embedded_ids: list[str] = []
-            kinds: list[str] = []
-            vectors: list[Any] = []
-            for row in rows:
-                vector = numpy.frombuffer(row["vec"], dtype=numpy.float32)
-                if int(vector.size) != dim:
-                    continue
-                rowids.append(int(row["rowid"]))
-                embedded_ids.append(str(row["embedded_id"]))
-                kinds.append(str(row["embedded_kind"]))
-                vectors.append(vector)
+            rowids, loaded_ids, kinds, raw_vectors = self._load_vectors_for_ids(
+                identity_hash, dim, embedded_ids
+            )
             matrix = (
-                numpy.vstack(vectors)
-                if vectors
+                numpy.asarray(raw_vectors, dtype=numpy.float32)
+                if raw_vectors
                 else numpy.empty((0, dim), dtype=numpy.float32)
             )
-            loaded = (rowids, embedded_ids, kinds, matrix)
+            loaded = (rowids, loaded_ids, kinds, matrix)
             self._matrix_cache.clear()
             self._matrix_cache[key] = loaded
             return loaded
@@ -635,17 +776,12 @@ class VectorStore:
             return []
         if conversation_ids is not None and not list(conversation_ids):
             return []
-        columns = {
-            str(row[1])
-            for row in self._conn.execute("PRAGMA table_info(summary_nodes)").fetchall()
-        }
-        # ``latest_at`` is added by the DAG migration; a DB whose summary_nodes
-        # predates it falls back to created_at rather than raising.
-        recency_expr = (
-            "COALESCE(sn.latest_at, sn.created_at)"
-            if "latest_at" in columns
-            else "sn.created_at"
-        )
+        columns = self._table_columns("summary_nodes")
+        if not columns:
+            return []
+        if (since is not None or until is not None) and "latest_at" not in columns:
+            return []
+        recency_expr = "sn.latest_at"
         where = ["m.identity_hash = ?", "m.archived = 0"]
         args: list[object] = [str(identity_hash)]
         if "suppressed_at" in columns:
@@ -656,23 +792,25 @@ class VectorStore:
         if until is not None:
             where.append(f"{recency_expr} <= ?")
             args.append(float(until))
-        if conversation_ids is not None:
-            normalized_ids = [str(value) for value in conversation_ids]
-            placeholders = ",".join("?" for _ in normalized_ids)
-            where.append(f"sn.session_id IN ({placeholders})")
-            args.extend(normalized_ids)
         args.append(int(limit))
-        rows = self._conn.execute(
-            f"""
-            SELECT m.embedded_id
-            FROM lcm_embedding_meta m
-            JOIN summary_nodes sn ON sn.node_id = CAST(m.embedded_id AS INTEGER)
-            WHERE {' AND '.join(where)}
-            ORDER BY m.embedded_at DESC, m.embedded_id DESC
-            LIMIT ?
-            """,
-            args,
-        ).fetchall()
+        with self._optional_temp_id_table(conversation_ids) as conversation_table:
+            conversation_join = (
+                f"JOIN {conversation_table} c ON c.id = sn.session_id"
+                if conversation_table is not None
+                else ""
+            )
+            rows = self._conn.execute(
+                f"""
+                SELECT m.embedded_id
+                FROM lcm_embedding_meta m
+                JOIN summary_nodes sn ON sn.node_id = CAST(m.embedded_id AS INTEGER)
+                {conversation_join}
+                WHERE {' AND '.join(where)}
+                ORDER BY m.embedded_at DESC, m.embedded_id DESC
+                LIMIT ?
+                """,
+                args,
+            ).fetchall()
         bounded_ids = [str(row[0]) for row in rows]
         if source and bounded_ids:
             with self._temp_id_table(bounded_ids) as table:
@@ -714,12 +852,12 @@ class VectorStore:
                 (identity_hash,),
             ).fetchall()
         for row in rows:
-            vector = array("f")
             try:
-                vector.frombytes(row["vec"])
-            except (TypeError, ValueError):
-                continue
-            if len(vector) != dim:
+                blob = bytes(row["vec"])
+                if len(blob) != dim * 4:
+                    continue
+                vector = struct.unpack(f"<{dim}f", blob)
+            except (TypeError, ValueError, struct.error):
                 continue
             rowids.append(int(row["rowid"]))
             out_ids.append(str(row["embedded_id"]))
@@ -786,18 +924,36 @@ class VectorStore:
                 JOIN summary_nodes child
                   ON w.source_type = 'nodes' AND child.node_id = w.source_id
                 JOIN json_each(child.source_ids) j
+                LIMIT ?
+            ), matched AS (
+                SELECT DISTINCT w.root_id
+                FROM walk w
+                JOIN messages m
+                  ON w.source_type = 'messages' AND m.store_id = w.source_id
+                WHERE CASE
+                        WHEN ? = ? THEN (m.source = ? OR {legacy_blank_clause})
+                        ELSE m.source = ?
+                      END
+            ), work_count AS (
+                SELECT COUNT(*) AS visited FROM walk
             )
-            SELECT DISTINCT w.root_id
-            FROM walk w
-            JOIN messages m
-              ON w.source_type = 'messages' AND m.store_id = w.source_id
-            WHERE CASE
-                    WHEN ? = ? THEN (m.source = ? OR {legacy_blank_clause})
-                    ELSE m.source = ?
-                  END
+            SELECT root_id, 0 AS overflow FROM matched
+            UNION ALL
+            SELECT NULL, 1 FROM work_count WHERE visited > ?
             """,
-            (normalized_source, _UNKNOWN_SOURCE, normalized_source, normalized_source),
+            (
+                _SOURCE_LINEAGE_WORK_LIMIT + 1,
+                normalized_source,
+                _UNKNOWN_SOURCE,
+                normalized_source,
+                normalized_source,
+                _SOURCE_LINEAGE_WORK_LIMIT,
+            ),
         ).fetchall()
+        if any(int(row[1]) for row in rows):
+            raise _UnverifiableProvenance(
+                "source lineage exceeded the bounded verification budget"
+            )
         return {str(row[0]) for row in rows}
 
     def _filtered_candidate_indexes(
@@ -814,19 +970,10 @@ class VectorStore:
         if conversation_ids is not None and not list(conversation_ids):
             return []
         unique_ids = list(dict.fromkeys(str(value) for value in embedded_ids))
-        columns = {
-            str(row[1])
-            for row in self._conn.execute("PRAGMA table_info(summary_nodes)").fetchall()
-        }
-        # ``latest_at`` is added by the DAG migration; a VectorStore opened on a
-        # DB whose summary_nodes predates it (or that only ever ran the core
-        # migrations) lacks the column, so fall back to created_at for the
-        # recency filter instead of raising "no such column: latest_at".
-        recency_expr = (
-            "COALESCE(sn.latest_at, sn.created_at)"
-            if "latest_at" in columns
-            else "sn.created_at"
-        )
+        columns = self._table_columns("summary_nodes")
+        if (since is not None or until is not None) and "latest_at" not in columns:
+            return []
+        recency_expr = "sn.latest_at"
         with self._temp_id_table(unique_ids) as table:
             where = ["1 = 1"]
             args: list[object] = []
@@ -838,20 +985,22 @@ class VectorStore:
             if until is not None:
                 where.append(f"{recency_expr} <= ?")
                 args.append(float(until))
-            if conversation_ids is not None:
-                normalized_ids = [str(value) for value in conversation_ids]
-                conversation_placeholders = ",".join("?" for _ in normalized_ids)
-                where.append(f"sn.session_id IN ({conversation_placeholders})")
-                args.extend(normalized_ids)
-            rows = self._conn.execute(
-                f"""
-                SELECT t.id
-                FROM {table} t
-                JOIN summary_nodes sn ON sn.node_id = CAST(t.id AS INTEGER)
-                WHERE {' AND '.join(where)}
-                """,
-                args,
-            ).fetchall()
+            with self._optional_temp_id_table(conversation_ids) as conversation_table:
+                conversation_join = (
+                    f"JOIN {conversation_table} c ON c.id = sn.session_id"
+                    if conversation_table is not None
+                    else ""
+                )
+                rows = self._conn.execute(
+                    f"""
+                    SELECT t.id
+                    FROM {table} t
+                    JOIN summary_nodes sn ON sn.node_id = CAST(t.id AS INTEGER)
+                    {conversation_join}
+                    WHERE {' AND '.join(where)}
+                    """,
+                    args,
+                ).fetchall()
             allowed = {str(row[0]) for row in rows}
             if source:
                 allowed &= self._source_allowed_ids(table, source)
@@ -875,6 +1024,13 @@ class VectorStore:
         k = int(k)
         if k <= 0:
             return KNNResult(coverage="none")
+        summary_columns = self._table_columns("summary_nodes")
+        if conversation_ids is not None and "session_id" not in summary_columns:
+            return KNNResult(coverage="none", reason="unverifiable_provenance")
+        if (since is not None or until is not None) and "latest_at" not in summary_columns:
+            return KNNResult(coverage="none", reason="unverifiable_provenance")
+        if source is not None and "source" not in self._table_columns("messages"):
+            return KNNResult(coverage="none", reason="unverifiable_provenance")
         # Resolve by the FULL configured identity (provider + model) when the
         # caller knows its provider, so a config switch A→B for the same model
         # name scores the query against B's vectors, not whichever provider is
@@ -890,35 +1046,45 @@ class VectorStore:
         identity = str(profile["identity_hash"])
         dim = int(profile["dim"])
         query = self._normalized(query_vec, expected_dim=dim)
-        _, row_count = self._vector_state(identity)
-        if row_count == 0:
-            return KNNResult(coverage="none")
-
         try:
             numpy = _load_numpy()
         except ImportError:
             numpy = None
+
+        limit = max(0, self.bounded_scan_rows)
+        # Probe at most bound+1 through the indexed candidate query. This
+        # determines full-vs-bounded coverage without COUNT(*) scanning the
+        # entire identity on every request.
+        try:
+            probed_ids = self._bounded_candidate_ids(
+                identity,
+                since=since,
+                until=until,
+                conversation_ids=conversation_ids,
+                source=source,
+                limit=limit + 1,
+            )
+        except _UnverifiableProvenance:
+            return KNNResult(coverage="none", reason="unverifiable_provenance")
+        if not probed_ids:
+            return KNNResult(coverage="none")
+        bounded_ids = probed_ids[:limit]
+        candidate_coverage = (
+            "bounded"
+            if source is not None or len(probed_ids) > limit
+            else "full"
+        )
 
         if numpy is not None:
             rowids, embedded_ids, kinds, matrix = self._numpy_rows(
                 numpy,
                 identity,
                 dim,
+                bounded_ids,
             )
-            filtered_indexes = self._filtered_candidate_indexes(
-                embedded_ids,
-                since=since,
-                until=until,
-                conversation_ids=conversation_ids,
-                source=source,
-            )
-            rowids = [rowids[index] for index in filtered_indexes]
-            embedded_ids = [embedded_ids[index] for index in filtered_indexes]
-            kinds = [kinds[index] for index in filtered_indexes]
-            matrix = matrix[filtered_indexes]
             query_array = numpy.asarray(query, dtype=numpy.float32)
             scores = matrix @ query_array
-            coverage = "full"
+            coverage = candidate_coverage
         else:
             # Bound the candidate enumeration at the SQL layer: the column
             # filters + ORDER BY embedded_at DESC + LIMIT run inside SQLite, so
@@ -926,15 +1092,6 @@ class VectorStore:
             # corpus. Filters live in the WHERE clause (applied before the
             # bound), so a filtered match inside the bounded window is not lost;
             # only the source-lineage walk runs on the already-bounded set.
-            limit = max(0, self.bounded_scan_rows)
-            bounded_ids = self._bounded_candidate_ids(
-                identity,
-                since=since,
-                until=until,
-                conversation_ids=conversation_ids,
-                source=source,
-                limit=limit,
-            )
             rowids, embedded_ids, kinds, vectors = self._load_vectors_for_ids(
                 identity,
                 dim,
