@@ -62,19 +62,28 @@ The response-level `coverage` value comes directly from the vector store:
 dependency-free bounded-scan fallback was used, and `none` means no usable
 profile/vector coverage was available.
 
-The whole semantic operation runs under one absolute wall-clock deadline from
+The **semantic attempt** runs under one absolute wall-clock deadline from
 `embedding_query_timeout_s` (3 seconds by default) — covering query embedding,
 vector-store construction, and the KNN scan, not just the embed call. Disabled
 embeddings, a missing/unavailable provider, exceeding the deadline (embed or
 KNN), transient provider failures, or vector search failures fall back to the
 existing full-text result and add `degraded_to_fts: true`, `degraded_reason`,
-and `coverage: 'none'`. Provider authentication failures do not degrade: they
-return an operator-readable error so a missing or invalid credential is repaired
-instead of silently hidden.
+and `coverage: 'none'`. This is a **semantic-arm-only** budget: the deadline
+bounds the semantic attempt, and once it is exhausted the query degrades to the
+full-text path, which then runs to **completion** — full-text is a synchronous,
+uncancellable SQLite path on the shared store connection, so it is deliberately
+not covered by the deadline (degradation is itself triggered by budget
+exhaustion). Provider authentication failures do not degrade: they return an
+operator-readable error so a missing or invalid credential is repaired instead
+of silently hidden.
 
 `source` is enforced inside the KNN eligibility step **before** the top-k cap
 (by descendant source lineage), so an ineligible high-scoring vector cannot
-displace an eligible lower-scoring one. The remaining raw-message filters are
+displace an eligible lower-scoring one. When provenance cannot be verified (a
+legacy DB whose `messages` table lacks a `source` column), the source filter
+**fails closed** — it returns no semantic candidate rather than treating "can't
+check" as "all allowed", so a source-filtered query never surfaces a
+false-positive legacy hit. The remaining raw-message filters are
 governed by the advertised contract: `role`, `time_from`, `time_to`,
 `conversation_id`, and broader `session_scope` values (`all`/`session`) all
 return raw-message hits only. Because a summary node has no single role/lane and
