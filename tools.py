@@ -221,6 +221,109 @@ _LCM_INSPECT_DEFAULT_LIMIT = 20
 _LCM_INSPECT_HARD_LIMIT_CAP = 200
 _LCM_INSPECT_REF_SCAN_MESSAGE_LIMIT = 10_000
 _LCM_INSPECT_PAYLOAD_METADATA_READ_BYTES = 16_384
+_LCM_INSPECT_MAX_RESPONSE_CHARS = 20_000
+_OPERATOR_TEXT_FIELD_MAX_CHARS = 1_000
+
+
+def _bounded_operator_field(value: object) -> tuple[str, bool]:
+    text = str(value or "")
+    if len(text) <= _OPERATOR_TEXT_FIELD_MAX_CHARS:
+        return text, False
+    suffix = "..."
+    return text[: _OPERATOR_TEXT_FIELD_MAX_CHARS - len(suffix)] + suffix, True
+
+
+def _bound_operator_strings(value: Any) -> tuple[Any, int]:
+    """Return a JSON-compatible copy with every free-text field bounded."""
+    if isinstance(value, str):
+        bounded, truncated = _bounded_operator_field(value)
+        return bounded, int(truncated)
+    if isinstance(value, list):
+        result: list[Any] = []
+        truncated_fields = 0
+        for item in value:
+            bounded, count = _bound_operator_strings(item)
+            result.append(bounded)
+            truncated_fields += count
+        return result, truncated_fields
+    if isinstance(value, dict):
+        result: dict[Any, Any] = {}
+        truncated_fields = 0
+        for key, item in value.items():
+            bounded, count = _bound_operator_strings(item)
+            result[key] = bounded
+            truncated_fields += count
+        return result, truncated_fields
+    return value, 0
+
+
+def _bounded_inspect_json(response: dict[str, Any]) -> str:
+    """Serialize ``lcm_inspect`` under one final response-size invariant."""
+    payload, truncated_fields = _bound_operator_strings(response)
+    rollup_truncated_fields = (
+        (payload.get("temporal_rollups") or {}).get("truncated_fields") or []
+    )
+    total_truncated_fields = truncated_fields + len(rollup_truncated_fields)
+    payload["char_limit"] = _LCM_INSPECT_MAX_RESPONSE_CHARS
+    payload["truncated"] = bool(total_truncated_fields)
+    if total_truncated_fields:
+        payload["truncated_field_count"] = total_truncated_fields
+    encoded = json.dumps(payload, ensure_ascii=False)
+    if len(encoded) <= _LCM_INSPECT_MAX_RESPONSE_CHARS:
+        return encoded
+
+    # If cardinality rather than one text field exceeds the cap, keep whole
+    # top-level sections in a deterministic priority order.  Never cut encoded
+    # JSON mid-token; omitted sections are reported explicitly.
+    priority = [
+        "read_only",
+        "session_id",
+        "conversation_id",
+        "limit",
+        "temporal_rollups",
+        "runtime_identity",
+        "lineage",
+        "messages",
+        "compaction",
+        "dag",
+        "externalized_refs",
+        "ingest_protection",
+        "filters",
+        "limit_clamped_from",
+    ]
+    compact: dict[str, Any] = {
+        "char_limit": _LCM_INSPECT_MAX_RESPONSE_CHARS,
+        "truncated": True,
+        "truncation": {
+            "reason": "response_char_limit",
+            "omitted_top_level_sections": [],
+        },
+    }
+    if total_truncated_fields:
+        compact["truncated_field_count"] = total_truncated_fields
+    retained: list[str] = []
+    omitted: list[str] = []
+    ordered_keys = priority + [key for key in payload if key not in priority]
+    for key in dict.fromkeys(ordered_keys):
+        if key in {"char_limit", "truncated", "truncated_field_count"}:
+            continue
+        if key not in payload:
+            continue
+        compact[key] = payload[key]
+        if len(json.dumps(compact, ensure_ascii=False)) <= _LCM_INSPECT_MAX_RESPONSE_CHARS - 1_000:
+            retained.append(key)
+        else:
+            compact.pop(key)
+            omitted.append(key)
+    compact["truncation"]["omitted_top_level_sections"] = omitted
+    encoded = json.dumps(compact, ensure_ascii=False)
+    while len(encoded) > _LCM_INSPECT_MAX_RESPONSE_CHARS and retained:
+        key = retained.pop()
+        compact.pop(key, None)
+        omitted.append(key)
+        compact["truncation"]["omitted_top_level_sections"] = omitted
+        encoded = json.dumps(compact, ensure_ascii=False)
+    return encoded
 _TEMPORAL_ROLLUP_PERIOD_KINDS = ("day", "week", "month")
 _TEMPORAL_ROLLUP_STATUSES = ("ready", "stale", "building", "failed")
 
@@ -2694,19 +2797,27 @@ def _temporal_rollups_status(engine: "LCMEngine") -> dict[str, Any]:
 
         error_row = conn.execute(
             """
-            SELECT error
+            SELECT substr(error, 1, ?)
             FROM lcm_rollups
             WHERE scope = ? AND error IS NOT NULL AND error != ''
             ORDER BY rollup_id DESC
             LIMIT 1
             """,
-            (scope,),
+            (_OPERATOR_TEXT_FIELD_MAX_CHARS + 1, scope),
         ).fetchone()
         if error_row:
-            payload["last_error"] = str(error_row[0])
+            last_error, was_truncated = _bounded_operator_field(error_row[0])
+            payload["last_error"] = last_error
+            if was_truncated:
+                payload.setdefault("truncated_fields", []).append("last_error")
     except Exception as exc:  # pragma: no cover - defensive legacy-schema degradation
         logger.debug("LCM temporal rollup status query failed", exc_info=True)
-        payload["query_error"] = f"{type(exc).__name__}: {exc}"
+        query_error, was_truncated = _bounded_operator_field(
+            f"{type(exc).__name__}: {exc}"
+        )
+        payload["query_error"] = query_error
+        if was_truncated:
+            payload.setdefault("truncated_fields", []).append("query_error")
     return payload
 
 
@@ -2729,7 +2840,7 @@ def lcm_inspect(args: Dict[str, Any], **kwargs) -> str:
     conversation_id = engine.current_conversation_id
     if not session_id:
         full_status = engine.get_status()
-        return json.dumps({
+        return _bounded_inspect_json({
             "error": "No active session",
             "read_only": True,
             "runtime_identity": full_status.get("runtime_identity") or engine.get_runtime_identity(),
@@ -2870,7 +2981,7 @@ def lcm_inspect(args: Dict[str, Any], **kwargs) -> str:
     }
     if requested_limit > _LCM_INSPECT_HARD_LIMIT_CAP:
         response["limit_clamped_from"] = requested_limit
-    return json.dumps(response)
+    return _bounded_inspect_json(response)
 
 
 def lcm_status(args: Dict[str, Any], **kwargs) -> str:

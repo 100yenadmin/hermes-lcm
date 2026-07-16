@@ -74,8 +74,10 @@ def test_lcm_inspect_reports_counts_cursor_stale_age_and_last_error(engine):
         store.connection.execute(
             "UPDATE lcm_rollups SET status = 'stale' WHERE period_kind = 'week'"
         )
-        failed_id = store.upsert_building("month", "2026-07-01", engine.current_session_id).rollup_id
-        store.mark_failed(failed_id, "mocked summary failure")
+        failed_token = store.upsert_building(
+            "month", "2026-07-01", engine.current_session_id
+        )
+        store.mark_failed(failed_token, "mocked summary failure")
         store.set_cursor("day", "2026-07-15", engine.current_session_id, built_at="2026-07-15T12:00:00+00:00")
         store.connection.commit()
 
@@ -244,6 +246,63 @@ def test_rollups_rebuild_attempted_failure_is_not_reported_complete(engine, monk
     assert "status: complete" not in result
     assert "status: partial" in result
     assert "- day 2026-07-15: failed" in result
+
+
+def test_rollups_rebuild_attempted_no_source_is_not_reported_complete(engine):
+    result = handle_lcm_command("rollups rebuild day 2026-07-15", engine)
+
+    assert "status: complete" not in result
+    assert "status: partial" in result
+    assert "- day 2026-07-15: no-source" in result
+
+
+def test_rollups_rebuild_attempted_incomplete_aggregate_is_deferred(engine):
+    scope = engine.current_session_id
+    timestamp = datetime(2026, 7, 13, 12, tzinfo=timezone.utc).timestamp()
+    engine._dag.add_node(
+        SummaryNode(
+            session_id=scope,
+            depth=0,
+            summary="Monday content without a ready daily",
+            token_count=6,
+            source_token_count=6,
+            source_ids=[1],
+            source_type="messages",
+            created_at=timestamp,
+            earliest_at=timestamp,
+            latest_at=timestamp,
+        )
+    )
+
+    result = handle_lcm_command("rollups rebuild week 2026-07-13", engine)
+
+    assert "status: complete" not in result
+    assert "status: partial" in result
+    assert "- week 2026-07-13: deferred (incomplete:" in result
+
+
+def test_rollup_operator_surfaces_bound_adversarial_error_text(engine):
+    store = RollupStore(engine._dag.db_path)
+    try:
+        token = store.upsert_building(
+            "day", "2026-07-15", engine.current_session_id
+        )
+        store.mark_failed(token, "x" * 50_000)
+    finally:
+        store.close()
+
+    slash = handle_lcm_command("rollups", engine)
+    inspect_raw = lcm_tools.lcm_inspect({"limit": 1}, engine=engine)
+    inspect = json.loads(inspect_raw)
+
+    assert len(slash) <= 20_000
+    assert "truncated: true" in slash
+    assert "truncated_fields: last_error" in slash
+    assert len(inspect_raw) <= 20_000
+    assert inspect["char_limit"] == 20_000
+    assert inspect["truncated"] is True
+    assert inspect["temporal_rollups"]["truncated_fields"] == ["last_error"]
+    assert len(inspect["temporal_rollups"]["last_error"]) <= 1_000
 
 
 def test_rollups_rebuild_multi_target_seed_is_atomic(engine, monkeypatch):

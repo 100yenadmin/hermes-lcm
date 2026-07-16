@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
+from enum import Enum
 from pathlib import Path
 import os
 import sqlite3
@@ -42,6 +44,39 @@ from . import rollup_builder
 from .rollup_store import RollupStore
 from .session_patterns import build_session_match_keys, matches_session_pattern
 from .store import build_message_fts_spec
+
+
+_ROLLUPS_OUTPUT_CHAR_LIMIT = 20_000
+
+
+class _RollupBuildOutcome(str, Enum):
+    READY = "ready"
+    DEFERRED = "deferred"
+    NO_SOURCE = "no-source"
+    SUPERSEDED = "superseded"
+    FAILED = "failed"
+    QUEUED = "queued"
+
+
+@dataclass(frozen=True)
+class _RollupRebuildResult:
+    period_kind: str
+    period_start: str
+    outcome: _RollupBuildOutcome
+    attempted: bool
+    detail: str | None = None
+
+
+def _bounded_rollups_text(text: str) -> str:
+    """Apply one final bound to every ``/lcm rollups`` serialization."""
+    if len(text) <= _ROLLUPS_OUTPUT_CHAR_LIMIT:
+        return text
+    marker = (
+        "\ntruncated: true"
+        f"\nchar_limit: {_ROLLUPS_OUTPUT_CHAR_LIMIT}"
+        "\ntruncation_reason: response_char_limit"
+    )
+    return text[: _ROLLUPS_OUTPUT_CHAR_LIMIT - len(marker)] + marker
 
 def _fmt_bool(value: Any) -> str:
     return "yes" if bool(value) else "no"
@@ -1688,6 +1723,9 @@ def _rollups_status_text(engine) -> str:
     lines.append(f"last_error: {status['last_error'] or '(none)'}")
     if status.get("query_error"):
         lines.append(f"query_error: {status['query_error']}")
+    if status.get("truncated_fields"):
+        lines.append("truncated: true")
+        lines.append("truncated_fields: " + ", ".join(status["truncated_fields"]))
     if not status["enabled"]:
         lines.append("note: temporal rollups are disabled; set LCM_TEMPORAL_ROLLUPS_ENABLED=true and restart Hermes to enable them")
     return "\n".join(lines)
@@ -1703,6 +1741,29 @@ def _rollup_period_targets(kind: str, target_date: date) -> list[tuple[str, date
     }
     kinds = ("day", "week", "month") if kind == "all" else (kind,)
     return [(period_kind, starts[period_kind]) for period_kind in kinds]
+
+
+def _classify_rollup_build_outcome(
+    result: dict[str, object] | None,
+    row: dict[str, object] | None,
+) -> tuple[_RollupBuildOutcome, str | None]:
+    """Map a completed builder call to an honest typed operator outcome."""
+    if result is not None and str(result.get("status") or "") == "ready":
+        return _RollupBuildOutcome.READY, None
+    if row is None:
+        return _RollupBuildOutcome.NO_SOURCE, None
+
+    status = str(row.get("status") or "missing")
+    error = str(row.get("error") or "").strip() or None
+    if status == "ready":
+        return _RollupBuildOutcome.READY, None
+    if status == "failed":
+        return _RollupBuildOutcome.FAILED, error
+    if status == "stale" and error and error.startswith("incomplete:"):
+        return _RollupBuildOutcome.DEFERRED, error
+    # A builder that returns with its claimed row stale/building/missing a
+    # success result no longer owns a publishable terminal transition.
+    return _RollupBuildOutcome.SUPERSEDED, status
 
 
 def _rollups_rebuild_text(tokens: list[str], engine) -> str:
@@ -1737,7 +1798,7 @@ def _rollups_rebuild_text(tokens: list[str], engine) -> str:
     targets = _rollup_period_targets(kind, target_date)
     limit = max(0, int(engine._config.rollup_builds_per_pass))
     store = RollupStore(engine._dag.db_path)
-    outcomes: list[tuple[str, str, str]] = []
+    outcomes: list[_RollupRebuildResult] = []
     try:
         if store.connection is None:  # pragma: no cover - RollupStore initialization contract
             raise RuntimeError("temporal rollup store is unavailable")
@@ -1760,13 +1821,20 @@ def _rollups_rebuild_text(tokens: list[str], engine) -> str:
             "week": rollup_builder.build_week,
             "month": rollup_builder.build_month,
         }
-        attempted_failure = False
         for index, (period_kind, period_start) in enumerate(targets):
             period_key = period_start.isoformat()
             if index >= limit:
                 row = store.get_rollup(period_kind, period_key, scope)
                 status = str(row["status"]) if row else "missing"
-                outcomes.append((period_kind, period_key, f"{status} (bounded; not attempted)"))
+                outcomes.append(
+                    _RollupRebuildResult(
+                        period_kind,
+                        period_key,
+                        _RollupBuildOutcome.QUEUED,
+                        attempted=False,
+                        detail=status,
+                    )
+                )
                 continue
             result = builders[period_kind](
                 store,
@@ -1777,18 +1845,17 @@ def _rollups_rebuild_text(tokens: list[str], engine) -> str:
                 circuit_breaker=engine._summary_circuit_breaker,
                 spend_guard=engine._summary_spend_guard,
             )
-            if result is not None:
-                outcome = str(result.get("status") or "ready")
-            else:
-                row = store.get_rollup(period_kind, period_key, scope)
-                outcome = str(row["status"]) if row else "no source summaries"
-            # An ATTEMPTED target that ended 'failed' means the build itself
-            # failed; the top-level status must not read 'complete' over it
-            # (maintainer #391 D1). A bounded/not-attempted target is queued debt,
-            # not a failure.
-            if outcome == "failed":
-                attempted_failure = True
-            outcomes.append((period_kind, period_key, outcome))
+            row = store.get_rollup(period_kind, period_key, scope)
+            outcome, detail = _classify_rollup_build_outcome(result, row)
+            outcomes.append(
+                _RollupRebuildResult(
+                    period_kind,
+                    period_key,
+                    outcome,
+                    attempted=True,
+                    detail=detail,
+                )
+            )
     except Exception as exc:  # pragma: no cover - defensive operator surface
         return "\n".join([
             "LCM temporal rollup rebuild",
@@ -1798,10 +1865,13 @@ def _rollups_rebuild_text(tokens: list[str], engine) -> str:
     finally:
         store.close()
 
-    # 'complete' is reserved for successful attempted targets plus intentionally
-    # bounded queued debt; a failed attempted target downgrades to 'partial'
-    # (maintainer #391 D1).
-    top_status = "partial" if attempted_failure else "complete"
+    # ``complete`` is reserved for attempted targets that all reached ready.
+    # Explicitly bounded, unattempted queued debt may coexist with complete.
+    attempted_incomplete = any(
+        outcome.attempted and outcome.outcome is not _RollupBuildOutcome.READY
+        for outcome in outcomes
+    )
+    top_status = "partial" if attempted_incomplete else "complete"
     lines = [
         "LCM temporal rollup rebuild",
         f"status: {top_status}",
@@ -1811,19 +1881,25 @@ def _rollups_rebuild_text(tokens: list[str], engine) -> str:
         f"build_limit: {limit}",
         "outcomes:",
     ]
-    lines.extend(
-        f"- {period_kind} {period_start}: {outcome}"
-        for period_kind, period_start, outcome in outcomes
-    )
+    for outcome in outcomes:
+        if not outcome.attempted:
+            rendered = f"{outcome.detail or 'missing'} (bounded; not attempted)"
+        else:
+            rendered = outcome.outcome.value
+            if outcome.detail:
+                rendered += f" ({outcome.detail})"
+        lines.append(f"- {outcome.period_kind} {outcome.period_start}: {rendered}")
     return "\n".join(lines)
 
 
 def _rollups_text(tokens: list[str], engine) -> str:
     if not tokens:
-        return _rollups_status_text(engine)
-    if tokens[0].lower() == "rebuild":
-        return _rollups_rebuild_text(tokens[1:], engine)
-    return _help_text("`/lcm rollups` accepts only `rebuild <day|week|month|all> [date]`.")
+        result = _rollups_status_text(engine)
+    elif tokens[0].lower() == "rebuild":
+        result = _rollups_rebuild_text(tokens[1:], engine)
+    else:
+        result = _help_text("`/lcm rollups` accepts only `rebuild <day|week|month|all> [date]`.")
+    return _bounded_rollups_text(result)
 
 
 def handle_lcm_command(raw_args: str | None, engine) -> str:
