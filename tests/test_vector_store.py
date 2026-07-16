@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import sqlite3
+import struct
 import threading
 from array import array
 
@@ -11,7 +12,7 @@ import pytest
 from hermes_lcm import db_bootstrap
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.dag import SummaryDAG, SummaryNode
-from hermes_lcm.vector_store import VectorStore
+from hermes_lcm.vector_store import EmbeddingIdentity, VectorStore
 import hermes_lcm.vector_store as vector_store_module
 
 
@@ -60,6 +61,23 @@ def _add_summary(
             earliest_at=created_at,
             latest_at=created_at,
         )
+    )
+
+
+def _record_embedding(
+    store: VectorStore,
+    embedded_id: str | int,
+    kind: str,
+    model: str,
+    vec,
+    *,
+    identity: EmbeddingIdentity | None = None,
+) -> None:
+    """Test helper that captures identity before invoking the write API."""
+    if identity is None:
+        identity = store.capture_identity(model)
+    store.record_embedding(
+        embedded_id, kind, model, vec, identity=identity
     )
 
 
@@ -210,11 +228,11 @@ def test_switch_provider_a_b_a_reactivates_without_rebackfill(stores):
     node_a = _add_summary(dag, created_at=1.0)
     node_b = _add_summary(dag, created_at=2.0)
     store.register_profile("shared-model", "provider-a", 3)
-    store.record_embedding(node_a, "summary", "shared-model", [1.0, 0.0, 0.0])
+    _record_embedding(store, node_a, "summary", "shared-model", [1.0, 0.0, 0.0])
 
     # Switch to provider B (same model name); A is retained but deactivated.
     store.register_profile("shared-model", "provider-b", 3)
-    store.record_embedding(node_b, "summary", "shared-model", [0.0, 1.0, 0.0])
+    _record_embedding(store, node_b, "summary", "shared-model", [0.0, 1.0, 0.0])
     current = store._current_profile()
     assert current["provider"] == "provider-b"
 
@@ -237,9 +255,9 @@ def test_record_and_knn_match_hand_computed_cosines(stores):
     diagonal = _add_summary(dag, source_token_count=22, created_at=2.0)
     axis_y = _add_summary(dag, source_token_count=33, created_at=3.0)
     store.register_profile("three-d", "local", 3)
-    store.record_embedding(axis_x, "summary", "three-d", [1.0, 0.0, 0.0])
-    store.record_embedding(diagonal, "summary", "three-d", [1.0, 1.0, 0.0])
-    store.record_embedding(axis_y, "summary", "three-d", [0.0, 1.0, 0.0])
+    _record_embedding(store, axis_x, "summary", "three-d", [1.0, 0.0, 0.0])
+    _record_embedding(store, diagonal, "summary", "three-d", [1.0, 1.0, 0.0])
+    _record_embedding(store, axis_y, "summary", "three-d", [0.0, 1.0, 0.0])
 
     result = store.knn([1.0, 0.0, 0.0], k=3, model="three-d")
 
@@ -268,7 +286,7 @@ def test_record_normalizes_vector_before_packing(stores):
     dag, store = stores
     node_id = _add_summary(dag)
     store.register_profile("normalized", "local", 3)
-    store.record_embedding(node_id, "summary", "normalized", [3.0, 4.0, 0.0])
+    _record_embedding(store, node_id, "summary", "normalized", [3.0, 4.0, 0.0])
 
     blob = store.connection.execute(
         "SELECT vec FROM lcm_embedding_vectors WHERE embedded_id = ?",
@@ -281,15 +299,43 @@ def test_record_normalizes_vector_before_packing(stores):
     assert result[0][1] == pytest.approx(1.0, abs=1e-6)
 
 
+@pytest.mark.parametrize(
+    "identity_field",
+    [
+        {"dtype": "float64"},
+        {"byteorder": "big"},
+        {"task": "query"},
+    ],
+)
+def test_profile_rejects_unsupported_vector_representation(stores, identity_field):
+    _dag, store = stores
+    with pytest.raises(ValueError, match="supported representation is float32/little/summary"):
+        store.register_profile("unsupported", "local", 2, **identity_field)
+
+
+def test_vector_wire_format_is_explicit_little_endian_float32(stores):
+    dag, store = stores
+    node_id = _add_summary(dag)
+    store.register_profile("wire", "local", 2)
+    _record_embedding(store, node_id, "summary", "wire", [3.0, 4.0])
+
+    blob = store.connection.execute(
+        "SELECT vec FROM lcm_embedding_vectors WHERE embedded_id = ?",
+        (str(node_id),),
+    ).fetchone()[0]
+    assert blob == struct.pack("<2f", 0.6, 0.8)
+    assert store.knn([3.0, 4.0], model="wire")[0][0] == str(node_id)
+
+
 def test_numpy_absent_uses_bounded_scan_with_same_top_k(stores, monkeypatch):
     dag, store = stores
     first = _add_summary(dag, created_at=1.0)
     second = _add_summary(dag, created_at=2.0)
     third = _add_summary(dag, created_at=3.0)
     store.register_profile("fallback", "local", 3)
-    store.record_embedding(first, "summary", "fallback", [1.0, 0.0, 0.0])
-    store.record_embedding(second, "summary", "fallback", [1.0, 1.0, 0.0])
-    store.record_embedding(third, "summary", "fallback", [0.0, 1.0, 0.0])
+    _record_embedding(store, first, "summary", "fallback", [1.0, 0.0, 0.0])
+    _record_embedding(store, second, "summary", "fallback", [1.0, 1.0, 0.0])
+    _record_embedding(store, third, "summary", "fallback", [0.0, 1.0, 0.0])
 
     def unavailable():
         raise ImportError("numpy not installed")
@@ -316,9 +362,9 @@ def test_bounded_scan_only_scores_most_recent_rows(tmp_path, monkeypatch):
         store.register_profile("bounded", "local", 3)
         # Backfill writes newest content first, so recent content can have the
         # lowest vector rowids. The bounded window must use embedded_at instead.
-        store.record_embedding(recent_a, "summary", "bounded", [0.0, 1.0, 0.0])
-        store.record_embedding(recent_b, "summary", "bounded", [0.0, 0.0, 1.0])
-        store.record_embedding(oldest, "summary", "bounded", [1.0, 0.0, 0.0])
+        _record_embedding(store, recent_a, "summary", "bounded", [0.0, 1.0, 0.0])
+        _record_embedding(store, recent_b, "summary", "bounded", [0.0, 0.0, 1.0])
+        _record_embedding(store, oldest, "summary", "bounded", [1.0, 0.0, 0.0])
         store.connection.executemany(
             "UPDATE lcm_embedding_meta SET embedded_at = ? WHERE embedded_id = ?",
             [
@@ -348,8 +394,8 @@ def test_suppressed_summaries_are_filtered_and_purge_removes_embeddings(stores):
     suppressed = _add_summary(dag, created_at=1.0)
     kept = _add_summary(dag, created_at=2.0)
     store.register_profile("suppression", "local", 3)
-    store.record_embedding(suppressed, "summary", "suppression", [1.0, 0.0, 0.0])
-    store.record_embedding(kept, "summary", "suppression", [0.0, 1.0, 0.0])
+    _record_embedding(store, suppressed, "summary", "suppression", [1.0, 0.0, 0.0])
+    _record_embedding(store, kept, "summary", "suppression", [0.0, 1.0, 0.0])
     store.connection.execute("ALTER TABLE summary_nodes ADD COLUMN suppressed_at TEXT")
     store.connection.execute(
         "UPDATE summary_nodes SET suppressed_at = '2026-07-15' WHERE node_id = ?",
@@ -377,9 +423,9 @@ def test_filter_overfetch_uses_summary_time_and_session_columns(stores):
     new_a = _add_summary(dag, session_id="conversation-a", created_at=20.0)
     new_b = _add_summary(dag, session_id="conversation-b", created_at=30.0)
     store.register_profile("filters", "local", 3)
-    store.record_embedding(old_a, "summary", "filters", [1.0, 0.0, 0.0])
-    store.record_embedding(new_a, "summary", "filters", [0.9, 0.1, 0.0])
-    store.record_embedding(new_b, "summary", "filters", [0.8, 0.2, 0.0])
+    _record_embedding(store, old_a, "summary", "filters", [1.0, 0.0, 0.0])
+    _record_embedding(store, new_a, "summary", "filters", [0.9, 0.1, 0.0])
+    _record_embedding(store, new_b, "summary", "filters", [0.8, 0.2, 0.0])
 
     result = store.knn(
         [1.0, 0.0, 0.0],
@@ -402,7 +448,8 @@ def test_filters_are_applied_before_score_top_k_truncation(stores):
             session_id="conversation-other",
             created_at=float(index + 1),
         )
-        store.record_embedding(
+        _record_embedding(
+            store,
             unfiltered,
             "summary",
             "filter-before-top-k",
@@ -418,7 +465,8 @@ def test_filters_are_applied_before_score_top_k_truncation(stores):
         for index in range(2)
     ]
     for node_id in filtered_ids:
-        store.record_embedding(
+        _record_embedding(
+            store,
             node_id,
             "summary",
             "filter-before-top-k",
@@ -442,13 +490,13 @@ def test_matrix_cache_is_invalidated_on_write(stores):
     first = _add_summary(dag, created_at=1.0)
     second = _add_summary(dag, created_at=2.0)
     store.register_profile("cache", "local", 3)
-    store.record_embedding(first, "summary", "cache", [1.0, 0.0, 0.0])
+    _record_embedding(store, first, "summary", "cache", [1.0, 0.0, 0.0])
 
     initial = store.knn([0.0, 1.0, 0.0], model="cache")
     assert initial[0][0] == str(first)
     assert store._matrix_cache
 
-    store.record_embedding(second, "summary", "cache", [0.0, 1.0, 0.0])
+    _record_embedding(store, second, "summary", "cache", [0.0, 1.0, 0.0])
     assert store._matrix_cache == {}
     updated = store.knn([0.0, 1.0, 0.0], model="cache")
     assert updated[0][0] == str(second)
@@ -461,9 +509,9 @@ def test_time_to_filter_excludes_before_top_k(stores):
     # 501 high-scoring but too-new vectors must not consume the top-k slots.
     for index in range(501):
         too_new = _add_summary(dag, created_at=10_000.0 + index)
-        store.record_embedding(too_new, "summary", "time-to", [1.0, 0.0])
+        _record_embedding(store, too_new, "summary", "time-to", [1.0, 0.0])
     eligible = _add_summary(dag, created_at=5.0)
-    store.record_embedding(eligible, "summary", "time-to", [0.0, 1.0])
+    _record_embedding(store, eligible, "summary", "time-to", [0.0, 1.0])
 
     result = store.knn([1.0, 0.0], k=2, model="time-to", until=100.0)
     assert result.coverage == "full"
@@ -489,7 +537,7 @@ def test_source_filter_enforced_before_top_k(stores):
                 created_at=float(index + 1),
             )
         )
-        store.record_embedding(wrong, "summary", "source-filter", [1.0, 0.0])
+        _record_embedding(store, wrong, "summary", "source-filter", [1.0, 0.0])
     right = dag.add_node(
         SummaryNode(
             session_id="conversation-a",
@@ -498,10 +546,10 @@ def test_source_filter_enforced_before_top_k(stores):
             created_at=1_000.0,
         )
     )
-    store.record_embedding(right, "summary", "source-filter", [0.0, 1.0])
+    _record_embedding(store, right, "summary", "source-filter", [0.0, 1.0])
 
     result = store.knn([1.0, 0.0], k=3, model="source-filter", source="keep")
-    assert result.coverage == "full"
+    assert result.coverage == "bounded"
     assert [row[0] for row in result] == [str(right)]
 
 
@@ -511,7 +559,7 @@ def test_data_version_bump_invalidates_cross_process_cache(stores, tmp_path):
     first = _add_summary(dag, created_at=1.0)
     second = _add_summary(dag, created_at=2.0)
     store.register_profile("shared", "local", 3)
-    store.record_embedding(first, "summary", "shared", [1.0, 0.0, 0.0])
+    _record_embedding(store, first, "summary", "shared", [1.0, 0.0, 0.0])
 
     # Process A opens its own connection and warms its matrix cache.
     process_a = VectorStore(store.db_path)
@@ -523,7 +571,7 @@ def test_data_version_bump_invalidates_cross_process_cache(stores, tmp_path):
         # Process B writes a new vector, bumping the durable data_version in the
         # same transaction. max_rowid/row_count alone would not reveal an
         # in-place rewrite, but the counter forces process A to reload.
-        store.record_embedding(second, "summary", "shared", [0.0, 1.0, 0.0])
+        _record_embedding(store, second, "summary", "shared", [0.0, 1.0, 0.0])
 
         refreshed = process_a.knn([0.0, 1.0, 0.0], model="shared")
         assert refreshed[0][0] == str(second)
@@ -567,7 +615,7 @@ def test_large_id_metadata_resolve_scales_past_variable_limit(stores):
         model="bulk",
         conversation_ids=["conversation-a"],
     )
-    assert result.coverage == "full"
+    assert result.coverage == "bounded"
     assert len(result) == 5
 
 
@@ -608,7 +656,7 @@ def _numpy_unavailable():
     raise ImportError("numpy not installed")
 
 
-def test_legacy_db_missing_latest_at_and_source_does_not_crash_knn(tmp_path):
+def test_legacy_db_missing_latest_at_and_source_fails_filters_closed(tmp_path):
     """A VectorStore-only worker DB predating the DAG/source migrations.
 
     Its summary_nodes lacks latest_at (added by the DAG migration) and its
@@ -654,12 +702,13 @@ def test_legacy_db_missing_latest_at_and_source_does_not_crash_knn(tmp_path):
     store = VectorStore(db_path)
     try:
         store.register_profile("m", "p", 3)
-        store.record_embedding(node_id, "summary", "m", [1.0, 0.0, 0.0])
+        _record_embedding(store, node_id, "summary", "m", [1.0, 0.0, 0.0])
 
-        # since/until fall back to created_at when latest_at is absent.
+        # Publication time is not coverage time.  If latest_at is absent a
+        # requested time filter is unverifiable and must fail closed.
         in_range = store.knn([1.0, 0.0, 0.0], model="m", since=1.0, until=10.0)
-        assert [row[0] for row in in_range] == [str(node_id)]
-        assert list(store.knn([1.0, 0.0, 0.0], model="m", since=6.0)) == []
+        assert list(in_range) == []
+        assert in_range.reason == "unverifiable_provenance"
 
         # source filter FAILS CLOSED (not crashed, not fail-open) when
         # messages.source is absent: provenance is unverifiable, so a
@@ -675,7 +724,7 @@ def test_record_embedding_rejects_non_integer_id_without_crashing(stores):
     dag, store = stores
     store.register_profile("m", "p", 3)
     with pytest.raises(ValueError, match="summary node does not exist"):
-        store.record_embedding("not-a-node", "summary", "m", [1.0, 0.0, 0.0])
+        _record_embedding(store, "not-a-node", "summary", "m", [1.0, 0.0, 0.0])
 
 
 def test_candidate_filter_uses_node_id_pk_index(stores):
@@ -683,7 +732,7 @@ def test_candidate_filter_uses_node_id_pk_index(stores):
     dag, store = stores
     node = _add_summary(dag, created_at=1.0)
     store.register_profile("m", "p", 3)
-    store.record_embedding(node, "summary", "m", [1.0, 0.0, 0.0])
+    _record_embedding(store, node, "summary", "m", [1.0, 0.0, 0.0])
     plan = "\n".join(
         str(row[-1])
         for row in store.connection.execute(
@@ -711,8 +760,8 @@ def test_bounded_path_filters_before_applying_recency_bound(tmp_path, monkeypatc
         keep = _add_summary(dag, session_id="conversation-a", created_at=1.0)
         drop = _add_summary(dag, session_id="conversation-b", created_at=2.0)
         store.register_profile("m", "local", 3)
-        store.record_embedding(keep, "summary", "m", [1.0, 0.0, 0.0])
-        store.record_embedding(drop, "summary", "m", [1.0, 0.0, 0.0])
+        _record_embedding(store, keep, "summary", "m", [1.0, 0.0, 0.0])
+        _record_embedding(store, drop, "summary", "m", [1.0, 0.0, 0.0])
         # The wrong-conversation row is the most recent by embedded_at, so a
         # bound-first scan would pick only it and then filter to empty.
         store.connection.executemany(
@@ -740,7 +789,7 @@ def test_knn_resolves_by_provider_identity_not_model_name(stores):
     dag, store = stores
     node = _add_summary(dag, created_at=1.0)
     store.register_profile("shared", "provider-a", 3)
-    store.record_embedding(node, "summary", "shared", [1.0, 0.0, 0.0])
+    _record_embedding(store, node, "summary", "shared", [1.0, 0.0, 0.0])
     # Switch config to provider-b for the same model (now active, no vectors).
     store.register_profile("shared", "provider-b", 3)
 
@@ -759,8 +808,8 @@ def test_orphaned_embeddings_are_not_ranked_and_purge_reclaims(stores):
     live = _add_summary(dag, created_at=1.0)
     orphan = _add_summary(dag, created_at=2.0)
     store.register_profile("m", "local", 3)
-    store.record_embedding(live, "summary", "m", [1.0, 0.0, 0.0])
-    store.record_embedding(orphan, "summary", "m", [1.0, 0.0, 0.0])
+    _record_embedding(store, live, "summary", "m", [1.0, 0.0, 0.0])
+    _record_embedding(store, orphan, "summary", "m", [1.0, 0.0, 0.0])
 
     # Delete the orphan's summary node (a deletion path that has not purged yet).
     store.connection.execute("DELETE FROM summary_nodes WHERE node_id = ?", (orphan,))
@@ -776,16 +825,67 @@ def test_orphaned_embeddings_are_not_ranked_and_purge_reclaims(stores):
     ).fetchone()[0] == 0
 
 
-def test_dag_node_id_helpers_for_purge_wiring(stores):
-    dag, store = stores
-    d0 = dag.add_node(
-        SummaryNode(session_id="s", depth=0, summary="a", source_token_count=1, created_at=1.0)
-    )
-    d2 = dag.add_node(
-        SummaryNode(session_id="s", depth=2, summary="b", source_token_count=1, created_at=2.0)
-    )
-    assert dag.session_node_ids_below_depth("s", 2) == [d0]
-    assert sorted(dag.session_node_ids("s")) == sorted([d0, d2])
+def test_large_session_delete_purges_exact_ids_in_bounded_batches(tmp_path):
+    db_path = tmp_path / "batched-delete.db"
+    dag = SummaryDAG(db_path)
+    store = VectorStore(db_path)
+    try:
+        node_ids = list(range(1, 5_001))
+        dag.connection.executemany(
+            "INSERT INTO summary_nodes("
+            "node_id, session_id, depth, summary, source_token_count, "
+            "source_ids, source_type, created_at) "
+            "VALUES (?, 'large', 0, 'summary', 1, '[]', 'messages', ?)",
+            ((node_id, float(node_id)) for node_id in node_ids),
+        )
+        dag.connection.commit()
+        identity = store.register_profile("bulk-delete", "local", 2)
+        vec = struct.pack("<2f", 1.0, 0.0)
+        store.connection.executemany(
+            "INSERT INTO lcm_embedding_vectors(embedded_id, identity_hash, vec) "
+            "VALUES (?, ?, ?)",
+            ((str(node_id), identity, vec) for node_id in node_ids),
+        )
+        store.connection.executemany(
+            "INSERT INTO lcm_embedding_meta("
+            "embedded_id, embedded_kind, identity_hash, embedded_at, "
+            "source_token_count, archived) "
+            "VALUES (?, 'summary', ?, '2026-01-01', 1, 0)",
+            ((str(node_id), identity) for node_id in node_ids),
+        )
+        store.connection.commit()
+        batches: list[list[int]] = []
+
+        def purge_batch(batch: list[int]) -> None:
+            batches.append(list(batch))
+            store.purge_embeddings_for_nodes(batch)
+
+        deleted = dag.delete_session_nodes(
+            "large", on_deleted_batch=purge_batch
+        )
+
+        assert deleted == len(node_ids)
+        assert batches
+        assert max(map(len, batches)) == 256
+        assert [node_id for batch in batches for node_id in batch] == node_ids
+        assert store.connection.execute(
+            "SELECT COUNT(*) FROM lcm_embedding_vectors"
+        ).fetchone()[0] == 0
+        assert store.connection.execute(
+            "SELECT COUNT(*) FROM lcm_embedding_meta"
+        ).fetchone()[0] == 0
+    finally:
+        store.close()
+        dag.close()
+
+
+def test_delete_node_batch_stages_scope_past_sqlite_bind_cap(tmp_path):
+    dag = SummaryDAG(tmp_path / "large-scope.db")
+    try:
+        session_ids = [f"session-{index}" for index in range(250_001)]
+        assert SummaryDAG.delete_node_batch(dag.connection, session_ids) == []
+    finally:
+        dag.close()
 
 
 def test_temp_id_tables_are_unique_per_call_and_dropped(stores):
@@ -814,7 +914,7 @@ def test_concurrent_knn_on_separate_stores_are_correct(tmp_path):
     seed = VectorStore(db_path)
     node = _add_summary(dag, created_at=1.0)
     seed.register_profile("m", "local", 3)
-    seed.record_embedding(node, "summary", "m", [1.0, 0.0, 0.0])
+    _record_embedding(seed, node, "summary", "m", [1.0, 0.0, 0.0])
     seed.close()
 
     results: list[list[str]] = []
@@ -856,14 +956,16 @@ def test_record_embedding_publishes_under_captured_identity_not_active(stores):
     """
     dag, store = stores
     node = _add_summary(dag, created_at=1.0)
-    identity_a = store.register_profile("shared-model", "provider-a", 3)
+    identity_a_hash = store.register_profile("shared-model", "provider-a", 3)
+    identity_a = store.capture_identity("shared-model", provider="provider-a")
     # Flip the active identity to provider B for the SAME model/dim mid-flight.
-    identity_b = store.register_profile("shared-model", "provider-b", 3)
-    assert identity_a != identity_b
+    identity_b_hash = store.register_profile("shared-model", "provider-b", 3)
+    assert identity_a_hash != identity_b_hash
     active = store._current_profile()["identity_hash"]
-    assert active == identity_b  # B is active; a bare-name resolve would pick B.
+    assert active == identity_b_hash  # B is active; a bare-name resolve would pick B.
 
-    store.record_embedding(
+    _record_embedding(
+        store,
         node, "summary", "shared-model", [1.0, 0.0, 0.0], identity=identity_a
     )
 
@@ -875,10 +977,10 @@ def test_record_embedding_publishes_under_captured_identity_not_active(stores):
         "SELECT identity_hash FROM lcm_embedding_meta WHERE embedded_id = ?",
         (str(node),),
     ).fetchall()
-    assert [row[0] for row in vectors] == [identity_a]
-    assert [row[0] for row in meta] == [identity_a]
+    assert [row[0] for row in vectors] == [identity_a_hash]
+    assert [row[0] for row in meta] == [identity_a_hash]
     # Nothing is ever written under B's active identity.
-    assert identity_b not in {row[0] for row in vectors}
+    assert identity_b_hash not in {row[0] for row in vectors}
 
 
 def test_record_embedding_rejects_unregistered_captured_identity(stores):
@@ -887,8 +989,15 @@ def test_record_embedding_rejects_unregistered_captured_identity(stores):
     node = _add_summary(dag, created_at=1.0)
     store.register_profile("m", "p", 3)
     with pytest.raises(ValueError, match="profile is not registered"):
-        store.record_embedding(
-            node, "summary", "m", [1.0, 0.0, 0.0], identity="deadbeef"
+        _record_embedding(
+            store,
+            node,
+            "summary",
+            "m",
+            [1.0, 0.0, 0.0],
+            identity=EmbeddingIdentity.canonical(
+                "other-provider", "m", "", 3, "float32", "little", "summary"
+            ),
         )
 
 
@@ -938,7 +1047,7 @@ def test_source_filter_fails_closed_on_legacy_db_without_source_column(tmp_path)
     store = VectorStore(db_path)
     try:
         store.register_profile("m", "p", 3)
-        store.record_embedding(node_id, "summary", "m", [1.0, 0.0, 0.0])
+        _record_embedding(store, node_id, "summary", "m", [1.0, 0.0, 0.0])
         # Without a source filter the summary is returned (baseline).
         assert [row[0] for row in store.knn([1.0, 0.0, 0.0], model="m")] == [
             str(node_id)
@@ -970,11 +1079,68 @@ def test_source_filter_fails_closed_on_bounded_path(tmp_path, monkeypatch):
             )
         )
         store.register_profile("m", "p", 3)
-        store.record_embedding(node, "summary", "m", [1.0, 0.0, 0.0])
+        _record_embedding(store, node, "summary", "m", [1.0, 0.0, 0.0])
         monkeypatch.setattr(vector_store_module, "_load_numpy", _numpy_unavailable)
         result = store.knn([1.0, 0.0, 0.0], model="m", source="nope")
-        assert result.coverage == "bounded"
+        assert result.coverage == "none"
+        assert result.reason == "unverifiable_provenance"
         assert list(result) == []
+    finally:
+        store.close()
+        dag.close()
+
+
+def test_source_lineage_overflow_fails_closed_with_bounded_sql_work(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "bounded-lineage.db"
+    dag = SummaryDAG(db_path)
+    store = VectorStore(db_path, bounded_scan_rows=10)
+    try:
+        store.connection.execute(
+            "CREATE TABLE IF NOT EXISTS messages("
+            "store_id INTEGER PRIMARY KEY, source TEXT)"
+        )
+        store.connection.execute(
+            "INSERT INTO messages(store_id, source) VALUES (1, 'keep')"
+        )
+        child = dag.add_node(
+            SummaryNode(
+                session_id="conversation-a",
+                summary="leaf",
+                source_ids=[1],
+                source_type="messages",
+                created_at=1.0,
+            )
+        )
+        for index in range(40):
+            child = dag.add_node(
+                SummaryNode(
+                    session_id="conversation-a",
+                    summary=f"parent-{index}",
+                    source_ids=[child],
+                    source_type="nodes",
+                    created_at=float(index + 2),
+                )
+            )
+        store.register_profile("lineage", "local", 2)
+        _record_embedding(store, child, "summary", "lineage", [1.0, 0.0])
+        monkeypatch.setattr(vector_store_module, "_SOURCE_LINEAGE_WORK_LIMIT", 16)
+        statements: list[str] = []
+        store.connection.set_trace_callback(statements.append)
+        try:
+            result = store.knn(
+                [1.0, 0.0], model="lineage", source="keep"
+            )
+        finally:
+            store.connection.set_trace_callback(None)
+
+        assert list(result) == []
+        assert result.coverage == "none"
+        assert result.reason == "unverifiable_provenance"
+        recursive = [sql for sql in statements if "WITH RECURSIVE walk" in sql]
+        assert recursive
+        assert "LIMIT 17" in recursive[0]
     finally:
         store.close()
         dag.close()
@@ -994,7 +1160,7 @@ def test_bounded_candidate_enumeration_is_capped_at_sql_layer(tmp_path, monkeypa
         identity = store.register_profile("m", "p", 3)
         for index in range(100):
             node = _add_summary(dag, created_at=float(index + 1))
-            store.record_embedding(node, "summary", "m", [1.0, 0.0, 0.0])
+            _record_embedding(store, node, "summary", "m", [1.0, 0.0, 0.0])
 
         # Direct: the enumerator returns exactly the bound from a 100-row corpus.
         bounded = store._bounded_candidate_ids(
@@ -1053,3 +1219,184 @@ def test_embedding_schema_repaired_when_marker_set_but_table_dropped(tmp_path):
         assert db_bootstrap.embedding_schema_missing(repaired.connection) == set()
     finally:
         repaired.close()
+
+
+def test_record_embedding_requires_captured_identity(stores):
+    dag, store = stores
+    node = _add_summary(dag)
+    store.register_profile("shared", "provider-a", 3)
+    with pytest.raises(TypeError, match="identity"):
+        store.record_embedding(node, "summary", "shared", [1.0, 0.0, 0.0])
+    identity_hash = store._current_profile()["identity_hash"]
+    with pytest.raises(TypeError, match="EmbeddingIdentity"):
+        store.record_embedding(
+            node,
+            "summary",
+            "shared",
+            [1.0, 0.0, 0.0],
+            identity=identity_hash,
+        )
+
+
+def test_provider_identity_fields_are_canonical_at_write_and_lookup(stores):
+    dag, store = stores
+    node = _add_summary(dag)
+    identity_hash = store.register_profile(" shared ", " Voyage ", 3)
+    identity = store.capture_identity("shared", provider="voyage")
+    _record_embedding(
+        store, node, "summary", "shared", [1.0, 0.0, 0.0], identity=identity
+    )
+    profile = store._profile_by_identity(identity_hash)
+    assert profile["provider"] == "voyage"
+    assert profile["model_name"] == "shared"
+    canonical = store.knn(
+        [1.0, 0.0, 0.0], model="shared", provider="voyage"
+    )
+    display_form = store.knn(
+        [1.0, 0.0, 0.0], model=" shared ", provider=" Voyage "
+    )
+    assert [row[0] for row in canonical] == [str(node)]
+    assert list(display_form) == list(canonical)
+
+
+def test_numpy_candidate_load_is_sql_bounded(tmp_path, monkeypatch):
+    numpy = pytest.importorskip("numpy")
+    db_path = tmp_path / "bounded_numpy.db"
+    dag = SummaryDAG(db_path)
+    store = VectorStore(db_path, bounded_scan_rows=10)
+    try:
+        identity = store.register_profile("m", "p", 2)
+        vec = array("f", [1.0, 0.0]).tobytes()
+        for index in range(30):
+            node = _add_summary(dag, created_at=float(index + 1))
+            store.connection.execute(
+                "INSERT INTO lcm_embedding_vectors(embedded_id, identity_hash, vec) "
+                "VALUES (?, ?, ?)",
+                (str(node), identity, vec),
+            )
+            store.connection.execute(
+                "INSERT INTO lcm_embedding_meta(embedded_id, embedded_kind, "
+                "identity_hash, embedded_at, source_token_count, archived) "
+                "VALUES (?, 'summary', ?, ?, 1, 0)",
+                (str(node), identity, f"2026-01-01T00:00:{index:02d}+00:00"),
+            )
+        store.connection.commit()
+        loaded: list[int] = []
+        original = store._numpy_rows
+
+        def counted(np, identity_hash, dim, ids):
+            loaded.append(len(ids))
+            return original(np, identity_hash, dim, ids)
+
+        monkeypatch.setattr(store, "_numpy_rows", counted)
+        result = store.knn([1.0, 0.0], k=1, model="m")
+        assert result.coverage == "bounded"
+        assert loaded == [10]
+        assert len(result) == 1
+        assert numpy is not None
+    finally:
+        store.close()
+        dag.close()
+
+
+def test_conversation_filter_above_sqlite_bind_cap_is_staged(stores, monkeypatch):
+    dag, store = stores
+    node = _add_summary(dag, session_id="target")
+    store.register_profile("m", "p", 3)
+    _record_embedding(store, node, "summary", "m", [1.0, 0.0, 0.0])
+    monkeypatch.setattr(vector_store_module, "_load_numpy", _numpy_unavailable)
+    conversation_ids = [f"other-{index}" for index in range(250_000)] + ["target"]
+    result = store.knn(
+        [1.0, 0.0, 0.0], model="m", conversation_ids=conversation_ids
+    )
+    assert [row[0] for row in result] == [str(node)]
+
+
+def test_malformed_same_name_embedding_table_is_rejected(tmp_path):
+    db_path = tmp_path / "malformed.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "CREATE TABLE lcm_embedding_profile("
+        "identity_hash TEXT, provider TEXT, model_name TEXT)"
+    )
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(sqlite3.OperationalError, match="malformed table"):
+        VectorStore(db_path)
+    check = sqlite3.connect(db_path)
+    try:
+        marker = check.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='lcm_migration_state'"
+        ).fetchone()
+        if marker:
+            assert check.execute(
+                "SELECT 1 FROM lcm_migration_state WHERE step_name='embeddings_v1'"
+            ).fetchone() is None
+    finally:
+        check.close()
+
+
+def test_malformed_same_name_embedding_index_is_rejected(tmp_path):
+    db_path = tmp_path / "bad_index.db"
+    store = VectorStore(db_path)
+    store.close()
+    conn = sqlite3.connect(db_path)
+    conn.execute("DROP INDEX idx_lcm_embedding_meta_identity_embedded_at")
+    conn.execute(
+        "CREATE UNIQUE INDEX idx_lcm_embedding_meta_identity_embedded_at "
+        "ON lcm_embedding_meta(identity_hash, embedded_at ASC)"
+    )
+    conn.commit()
+    conn.close()
+    with pytest.raises(sqlite3.OperationalError, match="malformed index"):
+        VectorStore(db_path)
+
+
+def test_malformed_embedding_index_collation_is_rejected(tmp_path):
+    db_path = tmp_path / "bad_index_collation.db"
+    store = VectorStore(db_path)
+    store.close()
+    conn = sqlite3.connect(db_path)
+    conn.execute("DROP INDEX idx_lcm_embedding_profile_model")
+    conn.execute(
+        "CREATE INDEX idx_lcm_embedding_profile_model "
+        "ON lcm_embedding_profile(model_name COLLATE NOCASE, provider)"
+    )
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(sqlite3.OperationalError, match="malformed index"):
+        VectorStore(db_path)
+
+
+@pytest.mark.parametrize(
+    "dim_clause,data_version_default",
+    [
+        ("CHECK(dim BETWEEN 0 AND 4096)", "0"),
+        ("CHECK(dim BETWEEN 1 AND 4096)", "1"),
+    ],
+)
+def test_malformed_embedding_constraint_or_default_is_rejected(
+    tmp_path, dim_clause, data_version_default
+):
+    db_path = tmp_path / f"bad_shape_{data_version_default}.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "CREATE TABLE lcm_embedding_profile ("
+        "identity_hash TEXT PRIMARY KEY, provider TEXT NOT NULL, "
+        "model_name TEXT NOT NULL, revision TEXT NOT NULL DEFAULT '', "
+        f"dim INTEGER {dim_clause}, "
+        "dtype TEXT NOT NULL DEFAULT 'float32', "
+        "byteorder TEXT NOT NULL DEFAULT 'little', "
+        "task TEXT NOT NULL DEFAULT 'summary', registered_at TEXT, "
+        "active INTEGER DEFAULT 1, archived_at TEXT NULL, "
+        f"data_version INTEGER NOT NULL DEFAULT {data_version_default})"
+    )
+    conn.commit()
+    conn.close()
+    with pytest.raises(
+        sqlite3.OperationalError, match="malformed (table|constraints)"
+    ):
+        VectorStore(db_path)

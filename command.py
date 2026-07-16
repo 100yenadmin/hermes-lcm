@@ -25,7 +25,7 @@ from .ingest_protection import (
     scan_sqlite_payload_risks,
     sensitive_pattern_status,
 )
-from .dag import build_nodes_fts_spec
+from .dag import SummaryDAG, build_nodes_fts_spec
 from .presets import (
     explicit_operator_overrides,
     get_preset,
@@ -1260,67 +1260,93 @@ def _delete_clean_candidates_atomically(engine, session_ids: set[str]) -> dict[s
             "lifecycle_skipped": 0,
         }
 
-    placeholders = ",".join("?" for _ in session_ids)
-    params = tuple(sorted(session_ids))
-    lifecycle_rows = conn.execute(
-        """
-        SELECT conversation_id, current_session_id, last_finalized_session_id
-        FROM lcm_lifecycle_state
-        """
-    ).fetchall()
-    lifecycle_delete_conversation_ids: list[str] = []
-    lifecycle_skipped = 0
-    for conversation_id, current_session_id, last_finalized_session_id in lifecycle_rows:
-        refs = {
-            str(value)
-            for value in (current_session_id, last_finalized_session_id)
-            if value
-        }
-        if not refs or not (refs & session_ids):
-            continue
-        if refs & protected_session_ids:
-            lifecycle_skipped += 1
-            continue
-        if refs <= session_ids:
-            lifecycle_delete_conversation_ids.append(str(conversation_id))
-            continue
-        lifecycle_skipped += 1
-
     try:
         conn.execute("BEGIN IMMEDIATE")
-        # Capture the node_ids about to be deleted so their embeddings can be
-        # purged after the delete commits (the vectors live in a separate store).
-        purged_node_ids = [
-            int(row[0])
-            for row in conn.execute(
-                f"SELECT node_id FROM summary_nodes WHERE session_id IN ({placeholders})",
-                params,
-            ).fetchall()
-        ]
-        msg_cur = conn.execute(f"DELETE FROM messages WHERE session_id IN ({placeholders})", params)
-        node_cur = conn.execute(f"DELETE FROM summary_nodes WHERE session_id IN ({placeholders})", params)
+        SummaryDAG.stage_delete_session_scope(conn, session_ids)
+        scope_table = SummaryDAG.DELETE_SESSION_SCOPE_TABLE
+        msg_cur = conn.execute(
+            f"DELETE FROM messages WHERE EXISTS ("
+            f"SELECT 1 FROM {scope_table} AS scope "
+            "WHERE scope.session_id = messages.session_id)"
+        )
+        nodes_deleted = 0
+        purge = getattr(engine, "_purge_embeddings_for_nodes", None)
+        while True:
+            deleted_ids = SummaryDAG.delete_node_batch(
+                conn,
+                (),
+                staged_scope=True,
+            )
+            if not deleted_ids:
+                break
+            nodes_deleted += len(deleted_ids)
+            if callable(purge):
+                purge(deleted_ids, connection=conn)
+
+        lifecycle_scope = "temp_lcm_delete_lifecycle_scope"
+        conn.execute(
+            f"CREATE TEMP TABLE IF NOT EXISTS {lifecycle_scope}("
+            "conversation_id TEXT PRIMARY KEY) WITHOUT ROWID"
+        )
+        conn.execute(f"DELETE FROM {lifecycle_scope}")
+        conn.execute(
+            f"INSERT OR IGNORE INTO {lifecycle_scope}(conversation_id) "
+            f"SELECT state.conversation_id FROM {scope_table} AS scope "
+            "JOIN lcm_lifecycle_state AS state "
+            "INDEXED BY idx_lcm_lifecycle_current_session "
+            "ON state.current_session_id = scope.session_id"
+        )
+        conn.execute(
+            f"INSERT OR IGNORE INTO {lifecycle_scope}(conversation_id) "
+            f"SELECT state.conversation_id FROM {scope_table} AS scope "
+            "JOIN lcm_lifecycle_state AS state "
+            "INDEXED BY idx_lcm_lifecycle_last_finalized_session "
+            "ON state.last_finalized_session_id = scope.session_id"
+        )
+
+        protected = next(iter(protected_session_ids), "")
+        deletable_where = f"""
+            scoped.conversation_id = state.conversation_id
+            AND (state.current_session_id IS NULL OR state.current_session_id = ''
+                 OR EXISTS (SELECT 1 FROM {scope_table} AS current_scope
+                            WHERE current_scope.session_id = state.current_session_id))
+            AND (state.last_finalized_session_id IS NULL
+                 OR state.last_finalized_session_id = ''
+                 OR EXISTS (SELECT 1 FROM {scope_table} AS finalized_scope
+                            WHERE finalized_scope.session_id = state.last_finalized_session_id))
+            AND (? = '' OR COALESCE(state.current_session_id, '') != ?)
+            AND (? = '' OR COALESCE(state.last_finalized_session_id, '') != ?)
+        """
+        scoped_count = int(
+            conn.execute(f"SELECT COUNT(*) FROM {lifecycle_scope}").fetchone()[0]
+        )
         lifecycle_deleted = 0
-        for conversation_id in lifecycle_delete_conversation_ids:
+        while True:
+            rows = conn.execute(
+                f"SELECT state.conversation_id FROM lcm_lifecycle_state AS state "
+                f"JOIN {lifecycle_scope} AS scoped ON {deletable_where} "
+                "ORDER BY state.conversation_id LIMIT 256",
+                (protected, protected, protected, protected),
+            ).fetchall()
+            if not rows:
+                break
+            conversation_ids = [str(row[0]) for row in rows]
+            placeholders = ",".join("?" for _ in conversation_ids)
             cur = conn.execute(
-                "DELETE FROM lcm_lifecycle_state WHERE conversation_id = ?",
-                (conversation_id,),
+                f"DELETE FROM lcm_lifecycle_state "
+                f"WHERE conversation_id IN ({placeholders})",
+                conversation_ids,
             )
             lifecycle_deleted += cur.rowcount if cur.rowcount is not None else 0
+        lifecycle_skipped = scoped_count - lifecycle_deleted
         conn.commit()
     except Exception:
         conn.rollback()
         raise
 
-    # Best-effort embedding reclamation for the deleted summaries (no-op unless
-    # embeddings are enabled); runs after commit so a purge issue cannot roll
-    # back the cleanup.
-    purge = getattr(engine, "_purge_embeddings_for_nodes", None)
-    if callable(purge):
-        purge(purged_node_ids)
-
     return {
         "messages_deleted": msg_cur.rowcount if msg_cur.rowcount is not None else 0,
-        "nodes_deleted": node_cur.rowcount if node_cur.rowcount is not None else 0,
+        "nodes_deleted": nodes_deleted,
         "lifecycle_deleted": lifecycle_deleted,
         "lifecycle_skipped": lifecycle_skipped,
     }
