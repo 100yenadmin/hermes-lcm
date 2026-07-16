@@ -67,13 +67,14 @@ Semantic and hybrid requests run under one absolute wall-clock deadline from
 The same deadline covers provider resolution, query embedding, optional NumPy
 import, bounded KNN, result hydration, FTS fallback, both hybrid arms, and
 fusion. A disabled/missing provider or transient semantic failure degrades to
-the existing full-text result only when enough time remains, adding
+the existing full-text result when one is available, adding
 `degraded_to_fts: true`, `degraded_reason`, and `coverage: 'none'`. Fallback
 uses independent read-only SQLite connections with progress interruption. If
-the absolute deadline is exhausted, the tool returns an explicit `timeout`
-error and does not start another fallback or hybrid arm. Provider
-authentication failures also remain operator-readable rather than being
-silently hidden.
+the absolute deadline is exhausted before a usable result exists, the tool
+returns an explicit `timeout` error and does not start another fallback or
+hybrid arm. Hybrid may still return FTS results computed before its semantic
+arm timed out; this starts no new I/O after expiry. Provider authentication
+failures also remain operator-readable rather than being silently hidden.
 
 `source` first uses the SQL-bounded candidate window, then verifies descendant
 source lineage within that window before ranking. This avoids corpus-sized
@@ -103,10 +104,12 @@ rrf_score = sum(1 / (60 + rank))
 Hybrid hits surface `fts_rank` and/or `semantic_rank`, plus `rrf_score`.
 Semantic hits also retain `semantic_score` and `confidence`. Both arms inspect
 `min(500, max(50, limit * 3))` candidates before the public result limit is
-applied. If the semantic arm fails while deadline remains, hybrid returns its
-already-computed FTS results with the same degradation fields. If the FTS arm
-consumes the deadline, the semantic arm is not started; if fusion exhausts it,
-an explicit timeout is returned. No external reranker is called.
+applied. If the semantic arm fails or times out after FTS completed, hybrid
+returns those already-computed FTS results with the same degradation fields;
+it does not start a new fallback operation. If the FTS arm itself returns no
+usable result before the deadline, the semantic arm is not started and an
+explicit timeout is returned. Fusion expiry also returns an explicit timeout.
+No external reranker is called.
 
 ### Deterministic recall smoke evaluation
 

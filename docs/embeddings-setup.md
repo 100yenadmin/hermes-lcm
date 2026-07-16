@@ -109,12 +109,13 @@ post-call ownership CAS remain authoritative independently of both timeouts.
 
 Semantic and hybrid requests use one absolute deadline beginning at `lcm_grep` entry. It includes
 provider resolution, query embedding, optional NumPy import, bounded KNN, result hydration, any FTS
-fallback, both hybrid arms, and fusion. If a semantic failure occurs while time remains, the tool
-can degrade to full-text with `degraded_to_fts`; the fallback uses separate read-only SQLite
-connections with progress interruption. If no time remains, the request returns an explicit
-`timeout` error and starts no later fallback/arm. Provider authentication errors also remain
-operator-visible instead of degrading. Explicit `full_text` mode itself is unchanged and
-byte-for-byte identical to prior behavior.
+fallback, both hybrid arms, and fusion. A semantic failure can degrade to full-text with
+`degraded_to_fts`; the fallback uses separate read-only SQLite connections with progress
+interruption. If hybrid already computed FTS results before its semantic arm times out, it may
+return that existing payload without starting new I/O. If no usable result exists when time runs
+out, the request returns an explicit `timeout` error and starts no later fallback/arm. Provider
+authentication errors also remain operator-visible instead of degrading. Explicit `full_text`
+mode itself is unchanged and byte-for-byte identical to prior behavior.
 
 Role, time, conversation, and broader-session filters degrade to raw FTS before provider work,
 because summaries cannot prove those raw-message dimensions. Source is different: SQL first selects
