@@ -1744,16 +1744,23 @@ def _rollups_rebuild_text(tokens: list[str], engine) -> str:
         # Durably seed a stale row for EVERY requested target BEFORE applying the
         # per-pass build budget, so targets beyond the budget remain durably
         # 'stale' (not absent) and are built by later maintenance (maintainer #391
-        # blocker). upsert_stale reuses the COMMIT-A store upsert and leaves a
-        # currently-'building' row untouched.
-        for period_kind, period_start in targets:
-            store.upsert_stale(period_kind, period_start.isoformat(), scope)
+        # blocker). The whole multi-target seed is ONE transaction so a mid-batch
+        # failure cannot leave some targets seeded and others absent — e.g. a
+        # missing month with no row (maintainer #391 D2). upsert_stale_many leaves
+        # a currently-'building' row untouched.
+        store.upsert_stale_many(
+            [
+                (period_kind, period_start.isoformat(), scope)
+                for period_kind, period_start in targets
+            ]
+        )
 
         builders = {
             "day": rollup_builder.build_day,
             "week": rollup_builder.build_week,
             "month": rollup_builder.build_month,
         }
+        attempted_failure = False
         for index, (period_kind, period_start) in enumerate(targets):
             period_key = period_start.isoformat()
             if index >= limit:
@@ -1775,6 +1782,12 @@ def _rollups_rebuild_text(tokens: list[str], engine) -> str:
             else:
                 row = store.get_rollup(period_kind, period_key, scope)
                 outcome = str(row["status"]) if row else "no source summaries"
+            # An ATTEMPTED target that ended 'failed' means the build itself
+            # failed; the top-level status must not read 'complete' over it
+            # (maintainer #391 D1). A bounded/not-attempted target is queued debt,
+            # not a failure.
+            if outcome == "failed":
+                attempted_failure = True
             outcomes.append((period_kind, period_key, outcome))
     except Exception as exc:  # pragma: no cover - defensive operator surface
         return "\n".join([
@@ -1785,9 +1798,13 @@ def _rollups_rebuild_text(tokens: list[str], engine) -> str:
     finally:
         store.close()
 
+    # 'complete' is reserved for successful attempted targets plus intentionally
+    # bounded queued debt; a failed attempted target downgrades to 'partial'
+    # (maintainer #391 D1).
+    top_status = "partial" if attempted_failure else "complete"
     lines = [
         "LCM temporal rollup rebuild",
-        "status: complete",
+        f"status: {top_status}",
         f"scope: {scope}",
         f"requested: {kind}",
         f"date_utc: {target_date.isoformat()}",
