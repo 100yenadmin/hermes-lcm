@@ -11,8 +11,12 @@ import hermes_lcm.command as command_mod
 from hermes_lcm.command import handle_lcm_command
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.dag import SummaryDAG, SummaryNode
-from hermes_lcm.embedding_provider import VoyageError
-from hermes_lcm.vector_store import VectorStore
+from hermes_lcm.embedding_provider import (
+    EmbeddedDocumentBatch,
+    ProviderPreDispatchError,
+    VoyageError,
+)
+from hermes_lcm.vector_store import EmbeddingPublishOutcome, VectorStore
 
 
 class FakeProvider:
@@ -103,6 +107,45 @@ def _claim_value(engine):
             (command_mod._EMBEDDING_BACKFILL_CLAIM_KEY,),
         ).fetchone()
         return None if row is None else str(row[0])
+    finally:
+        conn.close()
+
+
+def _mark_uncertain(engine, node_ids: list[int]) -> str:
+    """Create deterministic durable uncertainty for full-command retry tests."""
+    store = VectorStore(engine._store.db_path, config=engine._config)
+    try:
+        conn = store.connection
+        command_mod._ensure_inflight_table(conn)
+        identity = str(conn.execute(
+            "SELECT identity_hash FROM lcm_embedding_profile WHERE active=1"
+        ).fetchone()[0])
+        conn.executemany(
+            "INSERT INTO lcm_embedding_backfill_inflight("
+            "embedded_id, identity_hash, lease_id, generation, claimed_at, "
+            "state, request_id, updated_at, last_error) "
+            "VALUES (?, ?, 'prior', 1, 1, 'uncertain', 'prior-request', ?, "
+            "'remote acceptance unknown')",
+            (
+                (str(node_id), identity, float(index + 1))
+                for index, node_id in enumerate(node_ids)
+            ),
+        )
+        return identity
+    finally:
+        store.close()
+
+
+def _inflight_rows(engine) -> list[tuple[str, str]]:
+    conn = sqlite3.connect(engine._store.db_path)
+    try:
+        return [
+            (str(row[0]), str(row[1]))
+            for row in conn.execute(
+                "SELECT embedded_id, state "
+                "FROM lcm_embedding_backfill_inflight ORDER BY updated_at, embedded_id"
+            ).fetchall()
+        ]
     finally:
         conn.close()
 
@@ -203,28 +246,35 @@ def test_apply_limit_embeds_newest_rows_first(monkeypatch, tmp_path):
     assert _meta_ids(engine) == [str(node_ids[-2]), str(node_ids[-1])]
 
 
-def test_per_row_record_failure_does_not_lose_rest_of_batch(
+def test_accepted_then_local_publish_failure_becomes_uncertain(
     monkeypatch, tmp_path
 ):
     engine = _engine(tmp_path)
     node_ids = _seed(engine, 3)
     provider = FakeProvider()
     monkeypatch.setattr(command_mod, "resolve_provider", lambda _config, **_kw: provider)
-    original = VectorStore.record_embedding
+    original = VectorStore.publish_embedding_under_lease
 
-    def fail_one(self, embedded_id, kind, model, vector, *, identity=None):
+    def fail_one(self, embedded_id, kind, model, vector, **kwargs):
         if str(embedded_id) == str(node_ids[1]):
             raise sqlite3.OperationalError("synthetic row failure")
-        return original(self, embedded_id, kind, model, vector, identity=identity)
+        return original(self, embedded_id, kind, model, vector, **kwargs)
 
-    monkeypatch.setattr(VectorStore, "record_embedding", fail_one)
+    monkeypatch.setattr(VectorStore, "publish_embedding_under_lease", fail_one)
 
     result = handle_lcm_command("embed backfill --apply", engine)
 
-    assert "embedded: 2" in result
-    assert "failed: 1" in result
+    assert "embedded: 1" in result
+    assert "uncertain_remote_acceptance: 2" in result
     assert f"node_id={node_ids[1]} reason=record_error:synthetic row failure" in result
-    assert _meta_ids(engine) == [str(node_ids[0]), str(node_ids[2])]
+    assert _meta_ids(engine) == [str(node_ids[-1])]
+
+    # Normal retry performs no provider calls for uncertain remote acceptance.
+    healthy = FakeProvider()
+    monkeypatch.setattr(command_mod, "resolve_provider", lambda _config, **_kw: healthy)
+    retry = handle_lcm_command("embed backfill --apply", engine)
+    assert healthy.calls == []
+    assert "uncertain_remote_acceptance: 2" in retry
 
 
 def test_auth_error_aborts_immediately_and_releases_claim(monkeypatch, tmp_path):
@@ -238,12 +288,11 @@ def test_auth_error_aborts_immediately_and_releases_claim(monkeypatch, tmp_path)
 
     provider.provider_id = "voyage"
     engine._config.embedding_provider = "voyage"
-    conn = sqlite3.connect(engine._store.db_path)
-    conn.execute(
-        "UPDATE lcm_embedding_profile SET provider = 'voyage' WHERE model_name = 'model-a'"
-    )
-    conn.commit()
-    conn.close()
+    store = VectorStore(engine._store.db_path, config=engine._config)
+    try:
+        store.register_profile("model-a", "voyage", 2)
+    finally:
+        store.close()
     provider.embed_documents = auth_error
     monkeypatch.setattr(command_mod, "resolve_provider", lambda _config, **_kw: provider)
 
@@ -277,7 +326,8 @@ def test_transient_provider_error_skips_batch_and_continues(monkeypatch, tmp_pat
     assert "status: partial" in result
     assert "embedded: 1" in result
     assert "failed: 32" in result
-    assert "remaining: 32" in result
+    assert "remaining: 0" in result
+    assert "uncertain_remote_acceptance: 32" in result
     assert len(provider.calls) == 2
     assert _claim_value(engine) is None
 
@@ -350,7 +400,13 @@ def test_apply_claims_before_discovery_and_skips_already_embedded(monkeypatch, t
     # Another writer embeds the newest row before this run claims + discovers.
     store = VectorStore(engine._store.db_path, config=engine._config)
     try:
-        store.record_embedding(str(node_ids[-1]), "summary", "model-a", [1.0, 1.0])
+        store.record_embedding(
+            str(node_ids[-1]),
+            "summary",
+            "model-a",
+            [1.0, 1.0],
+            identity=store.capture_identity("model-a", provider="ollama"),
+        )
     finally:
         store.close()
 
@@ -395,7 +451,7 @@ def test_heartbeat_lease_blocks_takeover_until_expiry(tmp_path):
         store.close()
 
 
-def test_inflight_row_is_reattempted_after_crash(monkeypatch, tmp_path):
+def test_inflight_row_requires_explicit_uncertain_retry_after_crash(monkeypatch, tmp_path):
     engine = _engine(tmp_path)
     node_ids = _seed(engine, 2)
     provider = FakeProvider()
@@ -409,7 +465,7 @@ def test_inflight_row_is_reattempted_after_crash(monkeypatch, tmp_path):
 
     first = handle_lcm_command("embed backfill --apply", engine)
     # Nothing recorded; both rows are left marked in_flight.
-    assert "status: failed" in first
+    assert "status: partial" in first
     assert "embedded: 0" in first
     assert "in_flight: 2" in first
     assert _meta_ids(engine) == []
@@ -417,11 +473,179 @@ def test_inflight_row_is_reattempted_after_crash(monkeypatch, tmp_path):
     healthy = FakeProvider()
     monkeypatch.setattr(command_mod, "resolve_provider", lambda _config, **_kw: healthy)
     second = handle_lcm_command("embed backfill --apply", engine)
-    # The in_flight rows are re-discovered and embedded; markers clear.
-    assert "status: complete" in second
-    assert "embedded: 2" in second
-    assert "in_flight: 0" in second
+    # A normal retry is fail-closed: no repeat provider charge.
+    assert "status: partial" in second
+    assert "embedded: 0" in second
+    assert "uncertain_remote_acceptance: 2" in second
+    assert healthy.calls == []
+
+    authorized = handle_lcm_command(
+        "embed backfill --apply --retry-uncertain", engine
+    )
+    assert "status: complete" in authorized
+    assert "embedded: 2" in authorized
+    assert "in_flight: 0" in authorized
     assert _meta_ids(engine) == [str(node_id) for node_id in node_ids]
+
+
+def test_retry_uncertain_limit_binds_exact_old_row_before_new_ordinary(
+    monkeypatch, tmp_path
+):
+    """The authorized row cannot be deleted then displaced by newer work."""
+    engine = _engine(tmp_path)
+    node_ids = _seed(engine, 2)
+    _mark_uncertain(engine, [node_ids[0]])
+    retry_provider = FakeProvider()
+    monkeypatch.setattr(
+        command_mod, "resolve_provider", lambda _config, **_kw: retry_provider
+    )
+
+    first = handle_lcm_command(
+        "embed backfill --apply --retry-uncertain --limit 1", engine
+    )
+
+    assert "status: complete" in first
+    assert retry_provider.calls == [["summary-0"]]
+    assert _meta_ids(engine) == [str(node_ids[0])]
+    assert _inflight_rows(engine) == []
+
+    ordinary_provider = FakeProvider()
+    monkeypatch.setattr(
+        command_mod, "resolve_provider", lambda _config, **_kw: ordinary_provider
+    )
+    second = handle_lcm_command("embed backfill --apply --limit 1", engine)
+
+    assert "status: complete" in second
+    assert ordinary_provider.calls == [["summary-1"]]
+    assert _meta_ids(engine) == [str(node_id) for node_id in node_ids]
+
+
+def test_retry_uncertain_partial_publish_preserves_unused_authorization(
+    monkeypatch, tmp_path
+):
+    engine = _engine(tmp_path)
+    node_ids = _seed(engine, 2)
+    _mark_uncertain(engine, node_ids)
+
+    class SplitRejectedProvider(FakeProvider):
+        def embed_document_batches(self, texts, *, before_dispatch):
+            before_dispatch((0,))
+            self.calls.append([str(texts[0])])
+            yield EmbeddedDocumentBatch((0,), ((1.0, 0.0),))
+            before_dispatch((1,))
+            self.calls.append([str(texts[1])])
+            raise ProviderPreDispatchError("second request rejected before transport")
+
+    provider = SplitRejectedProvider()
+    monkeypatch.setattr(command_mod, "resolve_provider", lambda _config, **_kw: provider)
+
+    result = handle_lcm_command(
+        "embed backfill --apply --retry-uncertain --limit 2", engine
+    )
+
+    assert "status: partial" in result
+    assert "embedded: 1" in result
+    assert _meta_ids(engine) == [str(node_ids[0])]
+    assert _inflight_rows(engine) == [(str(node_ids[1]), "uncertain")]
+
+    ordinary = FakeProvider()
+    monkeypatch.setattr(command_mod, "resolve_provider", lambda _config, **_kw: ordinary)
+    followup = handle_lcm_command("embed backfill --apply", engine)
+    assert ordinary.calls == []
+    assert "uncertain_remote_acceptance: 1" in followup
+
+
+def test_retry_uncertain_definitive_failure_preserves_marker(monkeypatch, tmp_path):
+    engine = _engine(tmp_path)
+    node_ids = _seed(engine, 1)
+    _mark_uncertain(engine, node_ids)
+
+    class RejectedProvider(FakeProvider):
+        def embed_document_batches(self, texts, *, before_dispatch):
+            before_dispatch((0,))
+            self.calls.append(list(texts))
+            raise ProviderPreDispatchError("rejected before transport")
+            yield  # pragma: no cover - keeps this an iterator
+
+    provider = RejectedProvider()
+    monkeypatch.setattr(command_mod, "resolve_provider", lambda _config, **_kw: provider)
+
+    result = handle_lcm_command(
+        "embed backfill --apply --retry-uncertain --limit 1", engine
+    )
+
+    assert "status: partial" in result
+    assert _meta_ids(engine) == []
+    assert _inflight_rows(engine) == [(str(node_ids[0]), "uncertain")]
+
+    ordinary = FakeProvider()
+    monkeypatch.setattr(command_mod, "resolve_provider", lambda _config, **_kw: ordinary)
+    handle_lcm_command("embed backfill --apply", engine)
+    assert ordinary.calls == []
+
+
+def test_retry_uncertain_lease_loss_before_dispatch_preserves_marker(
+    monkeypatch, tmp_path
+):
+    engine = _engine(tmp_path)
+    node_ids = _seed(engine, 1)
+    _mark_uncertain(engine, node_ids)
+    successor_claim = json.dumps(
+        {"owner": "successor", "generation": 99, "heartbeat_at": time.time()},
+        sort_keys=True,
+    )
+
+    class StealingProvider(FakeProvider):
+        def embed_document_batches(self, texts, *, before_dispatch):
+            steal = sqlite3.connect(engine._store.db_path)
+            try:
+                steal.execute(
+                    "UPDATE metadata SET value=? WHERE key=?",
+                    (successor_claim, command_mod._EMBEDDING_BACKFILL_CLAIM_KEY),
+                )
+                steal.commit()
+            finally:
+                steal.close()
+            before_dispatch((0,))
+            yield EmbeddedDocumentBatch((0,), ((1.0, 0.0),))
+
+    provider = StealingProvider()
+    monkeypatch.setattr(command_mod, "resolve_provider", lambda _config, **_kw: provider)
+
+    result = handle_lcm_command(
+        "embed backfill --apply --retry-uncertain --limit 1", engine
+    )
+
+    assert "stop_reason: lease_lost" in result
+    assert _meta_ids(engine) == []
+    assert _inflight_rows(engine) == [(str(node_ids[0]), "uncertain")]
+    assert json.loads(_claim_value(engine))["owner"] == "successor"
+
+
+def test_retry_uncertain_budget_expiry_preserves_unselected_marker(
+    monkeypatch, tmp_path
+):
+    engine = _engine(tmp_path)
+    node_ids = _seed(engine, 1)
+    _mark_uncertain(engine, node_ids)
+    provider = FakeProvider()
+    monkeypatch.setattr(command_mod, "resolve_provider", lambda _config, **_kw: provider)
+    monkeypatch.setenv("LCM_EMBEDDING_BACKFILL_BUDGET_S", "1")
+    calls = {"n": 0}
+
+    def fake_monotonic():
+        calls["n"] += 1
+        return 0.0 if calls["n"] == 1 else 1_000.0
+
+    monkeypatch.setattr(command_mod.time, "monotonic", fake_monotonic)
+
+    result = handle_lcm_command(
+        "embed backfill --apply --retry-uncertain --limit 1", engine
+    )
+
+    assert "stop_reason: op_budget_exhausted" in result
+    assert provider.calls == []
+    assert _inflight_rows(engine) == [(str(node_ids[0]), "uncertain")]
 
 
 def test_stale_owner_after_provider_call_does_not_publish(monkeypatch, tmp_path):
@@ -468,6 +692,513 @@ def test_stale_owner_after_provider_call_does_not_publish(monkeypatch, tmp_path)
     # The successor's claim is intact — the stale owner did NOT release it.
     claim = json.loads(_claim_value(engine))
     assert claim["owner"] == "successor-owner"
+
+
+def test_lease_takeover_between_row_publications_stops_stale_worker(
+    monkeypatch, tmp_path
+):
+    engine = _engine(tmp_path)
+    node_ids = _seed(engine, 3)
+    provider = FakeProvider()
+    monkeypatch.setattr(command_mod, "resolve_provider", lambda _config, **_kw: provider)
+    original = VectorStore.publish_embedding_under_lease
+    publications = 0
+
+    def takeover_after_first(self, *args, **kwargs):
+        nonlocal publications
+        published = original(self, *args, **kwargs)
+        if published is EmbeddingPublishOutcome.PUBLISHED and publications == 0:
+            publications += 1
+            successor = sqlite3.connect(engine._store.db_path)
+            try:
+                successor.execute(
+                    "UPDATE metadata SET value=? WHERE key=?",
+                    (
+                        json.dumps(
+                            {
+                                "owner": "successor",
+                                "generation": 99,
+                                "heartbeat_at": time.time(),
+                            },
+                            sort_keys=True,
+                        ),
+                        command_mod._EMBEDDING_BACKFILL_CLAIM_KEY,
+                    ),
+                )
+                successor.commit()
+            finally:
+                successor.close()
+        return published
+
+    monkeypatch.setattr(
+        VectorStore, "publish_embedding_under_lease", takeover_after_first
+    )
+    result = handle_lcm_command("embed backfill --apply", engine)
+    assert "embedded: 1" in result
+    assert "stop_reason: lease_lost" in result
+    assert _meta_ids(engine) == [str(node_ids[-1])]
+    conn = sqlite3.connect(engine._store.db_path)
+    try:
+        version = conn.execute(
+            "SELECT data_version FROM lcm_embedding_profile WHERE active=1"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert version == 1
+    assert json.loads(_claim_value(engine))["owner"] == "successor"
+
+
+def test_active_identity_switch_quarantines_accepted_request_and_releases_claim(
+    monkeypatch, tmp_path
+):
+    engine = _engine(tmp_path)
+    _seed(engine, 35)
+
+    class SwitchingProvider(FakeProvider):
+        def embed_documents(self, texts):
+            # The request has been durably marked dispatched. Emulate an
+            # operator activating B while the accepted A request is in flight.
+            switch = VectorStore(engine._store.db_path, config=engine._config)
+            try:
+                switch.register_profile("model-a", "voyage", 2)
+            finally:
+                switch.close()
+            return super().embed_documents(texts)
+
+    provider = SwitchingProvider()
+    monkeypatch.setattr(command_mod, "resolve_provider", lambda _config, **_kw: provider)
+
+    result = handle_lcm_command("embed backfill --apply", engine)
+
+    assert "status: partial" in result
+    assert "embedded: 0" in result
+    assert "stop_reason: identity_superseded" in result
+    assert "stop_reason: lease_lost" not in result
+    assert "uncertain_remote_acceptance: 32" in result
+    assert len(provider.calls) == 1
+    assert len(provider.calls[0]) == 32
+    assert _meta_ids(engine) == []
+    assert _claim_value(engine) is None
+    conn = sqlite3.connect(engine._store.db_path)
+    try:
+        rows = conn.execute(
+            "SELECT state, last_error FROM lcm_embedding_backfill_inflight "
+            "ORDER BY embedded_id"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert len(rows) == 32
+    assert {str(row[0]) for row in rows} == {"uncertain"}
+    assert all("identity superseded" in str(row[1]) for row in rows)
+
+
+def test_accepted_provider_subbatch_survives_later_subbatch_failure(
+    monkeypatch, tmp_path
+):
+    engine = _engine(tmp_path)
+    node_ids = _seed(engine, 2)
+
+    class SplitProvider(FakeProvider):
+        def embed_document_batches(self, texts, *, before_dispatch):
+            before_dispatch((0,))
+            self.calls.append([str(texts[0])])
+            yield EmbeddedDocumentBatch((0,), ((1.0, 0.0),))
+            before_dispatch((1,))
+            self.calls.append([str(texts[1])])
+            raise VoyageError("bad_request", "second request rejected")
+
+    provider = SplitProvider()
+    monkeypatch.setattr(command_mod, "resolve_provider", lambda _config, **_kw: provider)
+    first = handle_lcm_command("embed backfill --apply", engine)
+    assert "embedded: 1" in first
+    assert "uncertain_remote_acceptance: 0" in first
+    assert "remaining: 1" in first
+    assert _meta_ids(engine) == [str(node_ids[-1])]
+
+    healthy = FakeProvider()
+    monkeypatch.setattr(command_mod, "resolve_provider", lambda _config, **_kw: healthy)
+    second = handle_lcm_command("embed backfill --apply", engine)
+    assert healthy.calls == [["summary-0"]]
+    assert "status: complete" in second
+    assert _meta_ids(engine) == [str(node_id) for node_id in node_ids]
+
+
+def test_accepted_split_survives_later_ambiguous_timeout(monkeypatch, tmp_path):
+    engine = _engine(tmp_path)
+    node_ids = _seed(engine, 2)
+
+    class SplitProvider(FakeProvider):
+        def embed_document_batches(self, texts, *, before_dispatch):
+            before_dispatch((0,))
+            self.calls.append([str(texts[0])])
+            yield EmbeddedDocumentBatch((0,), ((1.0, 0.0),))
+            before_dispatch((1,))
+            self.calls.append([str(texts[1])])
+            raise VoyageError("network", "ambiguous timeout")
+
+    provider = SplitProvider()
+    monkeypatch.setattr(command_mod, "resolve_provider", lambda _config, **_kw: provider)
+    first = handle_lcm_command("embed backfill --apply", engine)
+
+    assert "embedded: 1" in first
+    assert "uncertain_remote_acceptance: 1" in first
+    assert _meta_ids(engine) == [str(node_ids[-1])]
+    healthy = FakeProvider()
+    monkeypatch.setattr(command_mod, "resolve_provider", lambda _config, **_kw: healthy)
+    second = handle_lcm_command("embed backfill --apply", engine)
+    assert healthy.calls == []
+    assert "uncertain_remote_acceptance: 1" in second
+
+
+def test_definitive_pre_dispatch_expiry_is_safe_for_automatic_retry(
+    monkeypatch, tmp_path
+):
+    engine = _engine(tmp_path)
+    _seed(engine, 2)
+
+    class ExpiredBeforeTransport(FakeProvider):
+        def embed_document_batches(self, texts, *, before_dispatch):
+            indexes = tuple(range(len(texts)))
+            before_dispatch(indexes)
+            raise ProviderPreDispatchError("deadline expired before transport")
+            yield  # pragma: no cover - keeps this an iterator
+
+    first_provider = ExpiredBeforeTransport()
+    monkeypatch.setattr(
+        command_mod, "resolve_provider", lambda _config, **_kw: first_provider
+    )
+    first = handle_lcm_command("embed backfill --apply", engine)
+    assert "embedded: 0" in first
+    assert "uncertain_remote_acceptance: 0" in first
+    assert "in_flight: 0" in first
+
+    healthy = FakeProvider()
+    monkeypatch.setattr(command_mod, "resolve_provider", lambda _config, **_kw: healthy)
+    second = handle_lcm_command("embed backfill --apply", engine)
+    assert "status: complete" in second
+    assert "embedded: 2" in second
+    assert len(healthy.calls) == 1
+
+
+def test_inflight_maintenance_processes_only_one_bounded_chunk(tmp_path):
+    store = VectorStore(tmp_path / "bounded-inflight.db")
+    try:
+        conn = store.connection
+        command_mod._ensure_inflight_table(conn)
+        identity = "identity"
+        conn.executemany(
+            "INSERT INTO lcm_embedding_backfill_inflight("
+            "embedded_id, identity_hash, lease_id, generation, claimed_at, "
+            "state, updated_at) VALUES (?, ?, 'stale', 1, 1, 'claimed', 1)",
+            ((str(index), identity) for index in range(250_001)),
+        )
+        lease = command_mod._acquire_embedding_backfill_lease(
+            conn, ttl_s=600.0, heartbeat_s=60.0
+        )
+        assert lease is not None
+        plan = [
+            str(row[3])
+            for row in conn.execute(
+                "EXPLAIN QUERY PLAN SELECT rowid, embedded_id "
+                "FROM lcm_embedding_backfill_inflight "
+                "WHERE identity_hash=? AND state=? "
+                "AND (lease_id IS NOT ? OR generation IS NOT ?) "
+                "ORDER BY updated_at, embedded_id LIMIT ?",
+                (identity, "claimed", lease.lease_id, lease.generation, 256),
+            )
+        ]
+        assert any("idx_lcm_embedding_inflight_maintenance" in row for row in plan)
+        assert not any("USE TEMP B-TREE" in row for row in plan)
+
+        command_mod._prepare_inflight_for_lease(
+            conn,
+            identity,
+            lease,
+        )
+
+        remaining = conn.execute(
+            "SELECT COUNT(*) FROM lcm_embedding_backfill_inflight"
+        ).fetchone()[0]
+        assert remaining == 250_001 - 256
+        lease.release()
+    finally:
+        store.close()
+
+
+def test_retry_uncertain_limit_authorizes_only_deterministic_rows(tmp_path):
+    engine = _engine(tmp_path)
+    node_ids = _seed(engine, 10)
+    store = VectorStore(engine._store.db_path, config=engine._config)
+    try:
+        conn = store.connection
+        command_mod._ensure_inflight_table(conn)
+        identity = str(conn.execute(
+            "SELECT identity_hash FROM lcm_embedding_profile WHERE active=1"
+        ).fetchone()[0])
+        conn.executemany(
+            "INSERT INTO lcm_embedding_backfill_inflight("
+            "embedded_id, identity_hash, lease_id, generation, claimed_at, "
+            "state, updated_at) VALUES (?, ?, 'stale', 1, 1, 'uncertain', ?)",
+            (
+                (str(node_id), identity, float(index))
+                for index, node_id in enumerate(node_ids)
+            ),
+        )
+        lease = command_mod._acquire_embedding_backfill_lease(
+            conn, ttl_s=600.0, heartbeat_s=60.0
+        )
+        assert lease is not None
+
+        command_mod._prepare_inflight_for_lease(
+            conn,
+            identity,
+            lease,
+        )
+
+        pending, rows = command_mod._embedding_authorized_uncertain_rows(
+            conn, identity, 3
+        )
+        selected = [
+            str(row["node_id"])
+            for row in rows
+        ]
+        remaining = [
+            str(row[0])
+            for row in conn.execute(
+                "SELECT embedded_id FROM lcm_embedding_backfill_inflight "
+                "ORDER BY updated_at, embedded_id"
+            )
+        ]
+        assert pending == 10
+        assert selected == [str(node_id) for node_id in node_ids[:3]]
+        assert set(remaining) == {str(node_id) for node_id in node_ids}
+        lease.release()
+    finally:
+        store.close()
+
+
+def test_inflight_maintenance_fails_closed_after_successor_takeover(tmp_path):
+    store = VectorStore(tmp_path / "successor-inflight.db")
+    try:
+        conn = store.connection
+        command_mod._ensure_inflight_table(conn)
+        lease = command_mod._acquire_embedding_backfill_lease(
+            conn, ttl_s=600.0, heartbeat_s=60.0
+        )
+        assert lease is not None
+        conn.execute(
+            "INSERT INTO lcm_embedding_backfill_inflight("
+            "embedded_id, identity_hash, lease_id, generation, claimed_at, "
+            "state, request_id, updated_at) "
+            "VALUES ('row', 'identity', 'successor', 99, 1, "
+            "'dispatched', 'successor-request', 1)"
+        )
+        conn.execute(
+            "UPDATE metadata SET value=? WHERE key=?",
+            (
+                json.dumps(
+                    {
+                        "owner": "successor",
+                        "generation": 99,
+                        "heartbeat_at": time.time(),
+                    },
+                    sort_keys=True,
+                ),
+                command_mod._EMBEDDING_BACKFILL_CLAIM_KEY,
+            ),
+        )
+
+        with pytest.raises(command_mod._BackfillLeaseLost):
+            command_mod._prepare_inflight_for_lease(
+                conn,
+                "identity",
+                lease,
+            )
+
+        row = conn.execute(
+            "SELECT lease_id, generation, state, request_id "
+            "FROM lcm_embedding_backfill_inflight WHERE embedded_id='row'"
+        ).fetchone()
+        assert tuple(row) == ("successor", 99, "dispatched", "successor-request")
+    finally:
+        store.close()
+
+
+def test_inflight_maintenance_exact_snapshot_cannot_mutate_replaced_row(tmp_path):
+    store = VectorStore(tmp_path / "snapshot-inflight.db")
+    try:
+        conn = store.connection
+        command_mod._ensure_inflight_table(conn)
+        lease = command_mod._acquire_embedding_backfill_lease(
+            conn, ttl_s=600.0, heartbeat_s=60.0
+        )
+        assert lease is not None
+        conn.executemany(
+            "INSERT INTO lcm_embedding_backfill_inflight("
+            "embedded_id, identity_hash, lease_id, generation, claimed_at, "
+            "state, request_id, updated_at) VALUES (?, 'identity', 'old', 1, "
+            "1, ?, ?, 1)",
+            [
+                ("trigger", "claimed", None),
+                ("replaced", "dispatched", "old-request"),
+            ],
+        )
+        conn.execute(
+            "CREATE TEMP TRIGGER replace_dispatched_after_delete "
+            "AFTER DELETE ON lcm_embedding_backfill_inflight "
+            "WHEN OLD.embedded_id = 'trigger' BEGIN "
+            "UPDATE lcm_embedding_backfill_inflight "
+            "SET lease_id='successor', generation=99, request_id='successor-request' "
+            "WHERE embedded_id='replaced'; END"
+        )
+
+        command_mod._prepare_inflight_for_lease(
+            conn,
+            "identity",
+            lease,
+        )
+
+        row = conn.execute(
+            "SELECT lease_id, generation, state, request_id "
+            "FROM lcm_embedding_backfill_inflight WHERE embedded_id='replaced'"
+        ).fetchone()
+        assert tuple(row) == ("successor", 99, "dispatched", "successor-request")
+        lease.release()
+    finally:
+        store.close()
+
+
+def test_inflight_schema_repairs_legacy_shape_and_malformed_index(tmp_path):
+    store = VectorStore(tmp_path / "legacy-inflight.db")
+    try:
+        conn = store.connection
+        conn.execute(
+            "CREATE TABLE lcm_embedding_backfill_inflight("
+            "embedded_id TEXT, identity_hash TEXT, lease_id TEXT, "
+            "generation INTEGER, claimed_at REAL, "
+            "PRIMARY KEY(embedded_id, identity_hash))"
+        )
+        conn.execute(
+            "INSERT INTO lcm_embedding_backfill_inflight VALUES "
+            "('row', 'identity', 'old-owner', 1, 10)"
+        )
+
+        command_mod._ensure_inflight_table(conn)
+        row = conn.execute(
+            "SELECT state, updated_at FROM lcm_embedding_backfill_inflight"
+        ).fetchone()
+        assert tuple(row) == ("uncertain", 10.0)
+        conn.execute("DROP INDEX idx_lcm_embedding_inflight_maintenance")
+        conn.execute(
+            "CREATE INDEX idx_lcm_embedding_inflight_maintenance "
+            "ON lcm_embedding_backfill_inflight("
+            "identity_hash COLLATE NOCASE, state, updated_at DESC, embedded_id) "
+            "WHERE state = 'claimed'"
+        )
+
+        command_mod._ensure_inflight_table(conn)
+        columns = tuple(
+            row[2]
+            for row in conn.execute(
+                "PRAGMA index_info(idx_lcm_embedding_inflight_maintenance)"
+            )
+        )
+        assert columns == ("identity_hash", "state", "updated_at", "embedded_id")
+        before = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' "
+            "AND name='lcm_embedding_backfill_inflight'"
+        ).fetchone()[0]
+        traced: list[str] = []
+        conn.set_trace_callback(traced.append)
+        command_mod._ensure_inflight_table(conn)
+        conn.set_trace_callback(None)
+        after = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' "
+            "AND name='lcm_embedding_backfill_inflight'"
+        ).fetchone()[0]
+        assert after == before
+        assert not any(
+            statement.lstrip().upper().startswith(("CREATE ", "DROP ", "ALTER "))
+            for statement in traced
+        )
+        assert conn.execute(
+            "SELECT COUNT(*) FROM lcm_embedding_backfill_inflight"
+        ).fetchone()[0] == 1
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize(
+    ("state_check", "extra_check"),
+    [
+        (
+            "CHECK(state IN ('claimed', 'dispatched', 'uncertain'))",
+            "CHECK(lease_id = 'forced')",
+        ),
+        (
+            "CHECK(state IN ('uncertain', 'dispatched', 'claimed'))",
+            "",
+        ),
+        (
+            "CHECK(state IN ('CLAIMED', 'dispatched', 'uncertain'))",
+            "",
+        ),
+        (
+            "CHECK(state IN ('claimed ', 'dispatched', 'uncertain'))",
+            "",
+        ),
+    ],
+)
+def test_inflight_schema_repairs_noncanonical_complete_check_set(
+    tmp_path, state_check, extra_check
+):
+    store = VectorStore(tmp_path / "check-fingerprint.db")
+    try:
+        conn = store.connection
+        conn.execute(
+            "CREATE TABLE lcm_embedding_backfill_inflight("
+            "embedded_id TEXT, identity_hash TEXT, lease_id TEXT, "
+            "generation INTEGER, claimed_at REAL, "
+            "state TEXT NOT NULL DEFAULT 'claimed' "
+            f"{state_check}, request_id TEXT, updated_at REAL, last_error TEXT, "
+            f"{extra_check}{',' if extra_check else ''} "
+            "PRIMARY KEY(embedded_id, identity_hash))"
+        )
+
+        command_mod._ensure_inflight_table(conn)
+
+        sql = str(
+            conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' "
+                "AND name='lcm_embedding_backfill_inflight'"
+            ).fetchone()[0]
+        ).lower()
+        assert sql.count("check") == 1
+        assert "forced" not in sql
+        assert sql.index("'claimed'") < sql.index("'dispatched'") < sql.index("'uncertain'")
+        lease = command_mod._acquire_embedding_backfill_lease(
+            conn, ttl_s=600.0, heartbeat_s=60.0
+        )
+        assert lease is not None
+        command_mod._mark_inflight(conn, "identity", lease, ["row"])
+        lease.release()
+    finally:
+        store.close()
+
+
+def test_inflight_schema_rejects_incompatible_primary_key(tmp_path):
+    store = VectorStore(tmp_path / "bad-inflight.db")
+    try:
+        conn = store.connection
+        conn.execute(
+            "CREATE TABLE lcm_embedding_backfill_inflight("
+            "embedded_id TEXT PRIMARY KEY, identity_hash TEXT, lease_id TEXT, "
+            "generation INTEGER, claimed_at REAL)"
+        )
+        with pytest.raises(RuntimeError, match="incompatible.*column"):
+            command_mod._ensure_inflight_table(conn)
+    finally:
+        store.close()
 
 
 def test_operation_budget_stops_run_between_batches(monkeypatch, tmp_path):
