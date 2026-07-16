@@ -1136,11 +1136,13 @@ def resolve_provider(
 ) -> EmbeddingProvider | None:
     """Resolve inert embedding config without making provider calls.
 
-    ``for_backfill`` bypasses the interactive per-minute spend guard: bulk
-    ``lcm embed backfill --apply`` embeds thousands of documents (e.g. ~1920
-    docs at batch 32 → ~60 provider calls) and would otherwise trip the 60/min
-    guard mid-run and stall. The backfill worker has its own op budget + lease,
-    so the guard is redundant there; interactive query embedding keeps it.
+    ``for_backfill`` selects the bulk-operation contract. It bypasses the
+    interactive per-minute spend guard and uses the separate backfill timeout:
+    bulk ``lcm embed backfill --apply`` embeds thousands of documents (e.g.
+    ~1920 docs at batch 32 → ~60 provider calls), and neither its call volume
+    nor a normal document batch/local model load should be governed by the
+    latency-sensitive query policy. The backfill worker retains its own
+    operation budget and renewable lease.
     """
     provider = str(getattr(config, "embedding_provider", "") or "").strip().lower()
     model = str(getattr(config, "embedding_model", "") or "").strip()
@@ -1153,7 +1155,13 @@ def resolve_provider(
     # max_calls=0 disables the sliding-window guard (allows() always True,
     # record_call() a no-op); the circuit breaker still trips on failures.
     spend_guard = EmbeddingSpendGuard(max_calls=0) if for_backfill else None
-    timeout = float(getattr(config, "embedding_query_timeout_s", 3.0))
+    timeout_field = (
+        "embedding_backfill_timeout_s"
+        if for_backfill
+        else "embedding_query_timeout_s"
+    )
+    timeout_default = 120.0 if for_backfill else 3.0
+    timeout = float(getattr(config, timeout_field, timeout_default))
     if provider in {"voyage", "voyageai"}:
         return VoyageProvider(
             model,

@@ -7,6 +7,7 @@ from pathlib import Path
 import json
 import math
 import os
+import re
 import sqlite3
 import time
 from typing import Any
@@ -45,14 +46,16 @@ from .maintenance import backup_database, rotate_backup_database
 from .session_patterns import build_session_match_keys, matches_session_pattern
 from .store import build_message_fts_spec
 from .embedding_provider import (
+    EmbeddedDocumentBatch,
     EmbeddingProviderError,
     FastembedProvider,
+    ProviderPreDispatchError,
     VoyageError,
     fastembed_download_size_note,
     resolve_provider,
 )
 from .tokens import count_tokens
-from .vector_store import VectorStore
+from .vector_store import EmbeddingPublishOutcome, VectorStore
 
 
 _EMBEDDING_BACKFILL_CLAIM_KEY = "lcm_embedding_backfill_claim"
@@ -90,18 +93,258 @@ def _embedding_backfill_budget_s() -> float:
 
 
 def _ensure_inflight_table(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS lcm_embedding_backfill_inflight (
-            embedded_id TEXT,
-            identity_hash TEXT,
-            lease_id TEXT,
-            generation INTEGER,
-            claimed_at REAL,
-            PRIMARY KEY(embedded_id, identity_hash)
-        )
-        """
+    expected_columns = (
+        ("embedded_id", "TEXT", 0, None, 1),
+        ("identity_hash", "TEXT", 0, None, 2),
+        ("lease_id", "TEXT", 0, None, 0),
+        ("generation", "INTEGER", 0, None, 0),
+        ("claimed_at", "REAL", 0, None, 0),
+        ("state", "TEXT", 1, "'claimed'", 0),
+        ("request_id", "TEXT", 0, None, 0),
+        ("updated_at", "REAL", 0, None, 0),
+        ("last_error", "TEXT", 0, None, 0),
     )
+    expected_checks = ("statein('claimed','dispatched','uncertain')",)
+
+    def normalize_check_expression(expression: str) -> str:
+        # SQL keywords/identifiers are case-insensitive, but quoted literal
+        # bytes are not. Preserve literal case and whitespace so e.g.
+        # 'CLAIMED' or 'claimed ' cannot collide with the canonical CHECK.
+        normalized: list[str] = []
+        quote: str | None = None
+        cursor = 0
+        while cursor < len(expression):
+            char = expression[cursor]
+            if quote is not None:
+                normalized.append(char)
+                if quote == "]":
+                    if char == "]":
+                        quote = None
+                elif char == quote:
+                    if cursor + 1 < len(expression) and expression[cursor + 1] == quote:
+                        cursor += 1
+                        normalized.append(expression[cursor])
+                    else:
+                        quote = None
+            elif char in {"'", '"', "`"}:
+                quote = char
+                normalized.append(char)
+            elif char == "[":
+                quote = "]"
+                normalized.append(char)
+            elif not char.isspace():
+                normalized.append(char.lower())
+            cursor += 1
+        return "".join(normalized)
+
+    def check_expressions(sql: str) -> tuple[str, ...]:
+        """Return every normalized CHECK body, including duplicates and order."""
+        lowered = sql.lower()
+        expressions: list[str] = []
+        offset = 0
+        while True:
+            match = re.search(r"\bcheck\s*\(", lowered[offset:])
+            if match is None:
+                return tuple(expressions)
+            body_start = offset + match.end()
+            cursor = body_start
+            depth = 1
+            quote: str | None = None
+            while cursor < len(lowered) and depth:
+                char = lowered[cursor]
+                if quote is not None:
+                    if quote == "]":
+                        if char == "]":
+                            quote = None
+                    elif char == quote:
+                        # SQLite escapes quotes by doubling them.
+                        if cursor + 1 < len(lowered) and lowered[cursor + 1] == quote:
+                            cursor += 1
+                        else:
+                            quote = None
+                elif char in {"'", '"', "`"}:
+                    quote = char
+                elif char == "[":
+                    quote = "]"
+                elif char == "(":
+                    depth += 1
+                elif char == ")":
+                    depth -= 1
+                cursor += 1
+            if depth:
+                return ("<malformed>",)
+            expressions.append(
+                normalize_check_expression(sql[body_start:cursor - 1])
+            )
+            offset = cursor
+
+    def create_table() -> None:
+        conn.execute(
+            """
+            CREATE TABLE lcm_embedding_backfill_inflight (
+                embedded_id TEXT,
+                identity_hash TEXT,
+                lease_id TEXT,
+                generation INTEGER,
+                claimed_at REAL,
+                state TEXT NOT NULL DEFAULT 'claimed'
+                    CHECK(state IN ('claimed', 'dispatched', 'uncertain')),
+                request_id TEXT,
+                updated_at REAL,
+                last_error TEXT,
+                PRIMARY KEY(embedded_id, identity_hash)
+            )
+            """
+        )
+
+    def table_info() -> tuple[tuple[object, ...], ...]:
+        return tuple(
+            (str(row[1]), str(row[2]).upper(), int(row[3]), row[4], int(row[5]))
+            for row in conn.execute(
+                "PRAGMA table_info(lcm_embedding_backfill_inflight)"
+            ).fetchall()
+        )
+
+    exists = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' "
+        "AND name='lcm_embedding_backfill_inflight'"
+    ).fetchone()
+    started_transaction = not conn.in_transaction
+    try:
+        if started_transaction:
+            conn.execute("BEGIN IMMEDIATE")
+        if exists is None:
+            create_table()
+        else:
+            actual = table_info()
+            actual_names = {str(column[0]) for column in actual}
+            expected_by_name = {column[0]: column for column in expected_columns}
+            required_legacy = {column[0] for column in expected_columns[:5]}
+            if not required_legacy <= actual_names or not actual_names <= set(expected_by_name):
+                raise RuntimeError(
+                    "incompatible lcm_embedding_backfill_inflight columns"
+                )
+            # Types and the composite PK are never safe to reinterpret. The
+            # newer lifecycle columns are additive and can be rebuilt into the
+            # exact checked/defaulted shape below.
+            for column in actual:
+                expected = expected_by_name[str(column[0])]
+                if str(column[1]) != expected[1] or int(column[4]) != expected[4]:
+                    raise RuntimeError(
+                        "incompatible lcm_embedding_backfill_inflight column "
+                        f"{column[0]}"
+                    )
+            table_sql = str(exists[0] or "")
+            exact = (
+                actual == expected_columns
+                and check_expressions(table_sql) == expected_checks
+            )
+            if not exact:
+                old_table = "lcm_embedding_backfill_inflight_legacy"
+                if conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE name=?", (old_table,)
+                ).fetchone() is not None:
+                    raise RuntimeError(
+                        "cannot repair lcm_embedding_backfill_inflight: "
+                        "legacy staging table already exists"
+                    )
+                conn.execute(
+                    "ALTER TABLE lcm_embedding_backfill_inflight "
+                    f"RENAME TO {old_table}"
+                )
+                create_table()
+                state_expr = (
+                    "CASE WHEN state IN ('claimed','dispatched','uncertain') "
+                    "THEN state ELSE 'uncertain' END"
+                    if "state" in actual_names
+                    else "'uncertain'"
+                )
+                request_expr = "request_id" if "request_id" in actual_names else "NULL"
+                updated_expr = (
+                    "COALESCE(updated_at, claimed_at)"
+                    if "updated_at" in actual_names
+                    else "claimed_at"
+                )
+                error_expr = "last_error" if "last_error" in actual_names else "NULL"
+                conn.execute(
+                    "INSERT INTO lcm_embedding_backfill_inflight("
+                    "embedded_id, identity_hash, lease_id, generation, claimed_at, "
+                    "state, request_id, updated_at, last_error) "
+                    "SELECT embedded_id, identity_hash, lease_id, generation, claimed_at, "
+                    f"{state_expr}, {request_expr}, {updated_expr}, {error_expr} "
+                    f"FROM {old_table}"
+                )
+                conn.execute(f"DROP TABLE {old_table}")
+
+        if table_info() != expected_columns:
+            raise RuntimeError(
+                "lcm_embedding_backfill_inflight schema verification failed"
+            )
+        verified_sql = str(conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' "
+            "AND name='lcm_embedding_backfill_inflight'"
+        ).fetchone()[0] or "")
+        if check_expressions(verified_sql) != expected_checks:
+            raise RuntimeError(
+                "lcm_embedding_backfill_inflight CHECK constraints are not exact"
+            )
+
+        expected_indexes = {
+            "idx_lcm_embedding_inflight_identity_state": (
+                "identity_hash", "state", "embedded_id"
+            ),
+            "idx_lcm_embedding_inflight_maintenance": (
+                "identity_hash", "state", "updated_at", "embedded_id"
+            ),
+        }
+
+        def index_shape(name: str) -> tuple[tuple[object, ...], ...]:
+            return tuple(
+                (
+                    None if row[2] is None else str(row[2]),
+                    int(row[3]),
+                    str(row[4]).upper(),
+                    int(row[5]),
+                )
+                for row in conn.execute(f"PRAGMA index_xinfo({name})").fetchall()
+            )
+
+        for name, columns in expected_indexes.items():
+            expected_shape = tuple(
+                (column, 0, "BINARY", 1) for column in columns
+            ) + ((None, 0, "BINARY", 0),)
+            index = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name=?",
+                (name,),
+            ).fetchone()
+            needs_create = index is None
+            if index is not None:
+                index_flags = next(
+                    (
+                        (int(row[2]), int(row[4]))
+                        for row in conn.execute(
+                            "PRAGMA index_list(lcm_embedding_backfill_inflight)"
+                        ).fetchall()
+                        if str(row[1]) == name
+                    ),
+                    None,
+                )
+                if index_shape(name) != expected_shape or index_flags != (0, 0):
+                    conn.execute(f"DROP INDEX {name}")
+                    needs_create = True
+            if needs_create:
+                conn.execute(
+                    f"CREATE INDEX {name} "
+                    f"ON lcm_embedding_backfill_inflight({', '.join(columns)})"
+                )
+            if index_shape(name) != expected_shape:
+                raise RuntimeError(f"in-flight index verification failed: {name}")
+        if started_transaction:
+            conn.commit()
+    except Exception:
+        if started_transaction:
+            conn.rollback()
+        raise
 _VOYAGE_MAX_BATCH_TOKENS = 80_000
 _VOYAGE_MAX_DOCUMENT_TOKENS = 27_000
 _VOYAGE_USD_PER_MILLION_TOKENS = {
@@ -1861,11 +2104,25 @@ def _embedding_pending_rows(
     identity_hash: str,
     limit: int,
 ) -> tuple[int, list[sqlite3.Row]]:
-    # Discovery is by NOT-EXISTS against the identity's recorded embeddings, so
-    # a row already embedded under this identity is never re-sent. Rows left
-    # ``in_flight`` by a crashed run have no meta yet and are naturally
-    # re-discovered here, giving crash-safe re-attempt without re-billing any
-    # row whose embedding was actually recorded.
+    # Discovery excludes both recorded rows and every durable in-flight state.
+    # A dispatched/uncertain row may already have been accepted remotely, so it
+    # must never be silently resent; only explicit --retry-uncertain operator
+    # authorization can return it to discovery.
+    inflight_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name='lcm_embedding_backfill_inflight'"
+    ).fetchone() is not None
+    inflight_clause = (
+        """
+        AND NOT EXISTS (
+            SELECT 1 FROM lcm_embedding_backfill_inflight AS f
+            WHERE f.embedded_id = CAST(n.node_id AS TEXT)
+              AND f.identity_hash = ?
+        )
+        """
+        if inflight_exists
+        else ""
+    )
     where = """
         n.depth = 0
         AND NOT EXISTS (
@@ -1875,10 +2132,13 @@ def _embedding_pending_rows(
               AND m.embedded_kind = 'summary'
               AND m.identity_hash = ?
         )
-    """
+    """ + inflight_clause
+    args: tuple[object, ...] = (
+        (identity_hash, identity_hash) if inflight_exists else (identity_hash,)
+    )
     total = int(conn.execute(
         f"SELECT COUNT(*) FROM summary_nodes AS n WHERE {where}",
-        (identity_hash,),
+        args,
     ).fetchone()[0])
     rows = conn.execute(
         f"""
@@ -1888,7 +2148,45 @@ def _embedding_pending_rows(
         ORDER BY COALESCE(n.latest_at, n.created_at) DESC, n.node_id DESC
         LIMIT ?
         """,
-        (identity_hash, limit),
+        (*args, limit),
+    ).fetchall()
+    return total, rows
+
+
+def _embedding_authorized_uncertain_rows(
+    conn: sqlite3.Connection,
+    identity_hash: str,
+    limit: int,
+) -> tuple[int, list[sqlite3.Row]]:
+    """Select exact uncertain rows without consuming their durable markers."""
+    where = """
+        f.identity_hash = ?
+        AND f.state = 'uncertain'
+        AND n.depth = 0
+        AND NOT EXISTS (
+            SELECT 1
+            FROM lcm_embedding_meta AS m
+            WHERE m.embedded_id = f.embedded_id
+              AND m.embedded_kind = 'summary'
+              AND m.identity_hash = f.identity_hash
+        )
+    """
+    total = int(
+        conn.execute(
+            "SELECT COUNT(*) "
+            "FROM lcm_embedding_backfill_inflight AS f "
+            "JOIN summary_nodes AS n ON n.node_id = CAST(f.embedded_id AS INTEGER) "
+            f"WHERE {where}",
+            (identity_hash,),
+        ).fetchone()[0]
+    )
+    rows = conn.execute(
+        "SELECT n.node_id, n.summary "
+        "FROM lcm_embedding_backfill_inflight AS f "
+        "JOIN summary_nodes AS n ON n.node_id = CAST(f.embedded_id AS INTEGER) "
+        f"WHERE {where} "
+        "ORDER BY f.updated_at, f.embedded_id LIMIT ?",
+        (identity_hash, max(0, int(limit))),
     ).fetchall()
     return total, rows
 
@@ -1931,6 +2229,10 @@ def _embedding_lease_heartbeat(raw: str) -> float:
         return float(payload)
     except (TypeError, ValueError, json.JSONDecodeError):
         return 0.0
+
+
+class _BackfillLeaseLost(RuntimeError):
+    """The caller no longer owns the exact backfill lease generation."""
 
 
 class _BackfillLease:
@@ -1980,8 +2282,14 @@ class _BackfillLease:
             SET value = ?
             WHERE key = ?
               AND json_extract(value, '$.owner') = ?
+              AND CAST(json_extract(value, '$.generation') AS INTEGER) = ?
             """,
-            (self._value(now), _EMBEDDING_BACKFILL_CLAIM_KEY, self.lease_id),
+            (
+                self._value(now),
+                _EMBEDDING_BACKFILL_CLAIM_KEY,
+                self.lease_id,
+                self.generation,
+            ),
         )
         if not cur.rowcount:
             return False
@@ -1994,8 +2302,9 @@ class _BackfillLease:
             DELETE FROM metadata
             WHERE key = ?
               AND json_extract(value, '$.owner') = ?
+              AND CAST(json_extract(value, '$.generation') AS INTEGER) = ?
             """,
-            (_EMBEDDING_BACKFILL_CLAIM_KEY, self.lease_id),
+            (_EMBEDDING_BACKFILL_CLAIM_KEY, self.lease_id, self.generation),
         )
 
 
@@ -2043,18 +2352,107 @@ def _acquire_embedding_backfill_lease(
         raise
 
 
-def _clear_stale_inflight(conn: sqlite3.Connection, identity_hash: str, lease_id: str) -> None:
-    """Drop in_flight markers left by a previous (crashed) lease for this identity.
+def _prepare_inflight_for_lease(
+    conn: sqlite3.Connection,
+    identity_hash: str,
+    lease: "_BackfillLease",
+) -> None:
+    """Recover predecessor rows atomically under the exact current lease CAS."""
+    # ``claimed`` is written before dispatch. If an older lease died in that
+    # state, no provider call had begun and retry is safe. ``dispatched`` is the
+    # opposite: remote acceptance is unknowable after a crash, so convert it to
+    # the durable operator state instead of auto-clearing it.
+    maintenance_limit = 256
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        owner = conn.execute(
+            "SELECT 1 FROM metadata WHERE key=? "
+            "AND json_extract(value, '$.owner')=? "
+            "AND CAST(json_extract(value, '$.generation') AS INTEGER)=?",
+            (
+                _EMBEDDING_BACKFILL_CLAIM_KEY,
+                lease.lease_id,
+                lease.generation,
+            ),
+        ).fetchone()
+        if owner is None:
+            raise _BackfillLeaseLost("embedding backfill lease lost before maintenance")
 
-    Those rows have no recorded embedding, so NOT-EXISTS discovery re-attempts
-    them anyway; clearing the stale marker keeps the table bounded and lets this
-    run re-mark them under its own lease.
-    """
-    conn.execute(
-        "DELETE FROM lcm_embedding_backfill_inflight "
-        "WHERE identity_hash = ? AND lease_id != ?",
-        (identity_hash, lease_id),
-    )
+        # Freeze the exact predecessor ownership tuples before changing any
+        # row. BEGIN IMMEDIATE prevents a real successor from appearing while
+        # this transaction is open; the tuple predicates additionally ensure
+        # a replaced row can never be mistaken for the staged predecessor.
+        conn.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS "
+            "lcm_embedding_backfill_predecessor_batch("
+            "source_rowid INTEGER PRIMARY KEY, embedded_id TEXT, "
+            "identity_hash TEXT, lease_id TEXT, generation INTEGER, "
+            "state TEXT, request_id TEXT, sort_updated_at REAL)"
+        )
+        conn.execute(
+            "DELETE FROM lcm_embedding_backfill_predecessor_batch"
+        )
+        state_limits = [
+            ("claimed", maintenance_limit),
+            ("dispatched", maintenance_limit),
+        ]
+        for state, state_limit in state_limits:
+            # idx_lcm_embedding_inflight_maintenance serves the complete
+            # identity/state/order prefix, so each predecessor class is both
+            # SQL-limited and index-bounded rather than corpus-sorted.
+            conn.execute(
+                "INSERT INTO lcm_embedding_backfill_predecessor_batch("
+                "source_rowid, embedded_id, identity_hash, lease_id, generation, "
+                "state, request_id, sort_updated_at) "
+                "SELECT rowid, embedded_id, identity_hash, lease_id, generation, "
+                "state, request_id, updated_at "
+                "FROM lcm_embedding_backfill_inflight "
+                "WHERE identity_hash = ? AND state = ? "
+                "AND (lease_id IS NOT ? OR generation IS NOT ?) "
+                "ORDER BY updated_at, embedded_id LIMIT ?",
+                (
+                    identity_hash,
+                    state,
+                    lease.lease_id,
+                    lease.generation,
+                    state_limit,
+                ),
+            )
+        conn.execute(
+            "DELETE FROM lcm_embedding_backfill_inflight "
+            "WHERE rowid IN (SELECT source_rowid "
+            "FROM lcm_embedding_backfill_predecessor_batch "
+            "WHERE state = 'claimed') AND state = 'claimed' AND EXISTS ("
+            "SELECT 1 FROM lcm_embedding_backfill_predecessor_batch staged "
+            "WHERE staged.source_rowid = lcm_embedding_backfill_inflight.rowid "
+            "AND staged.embedded_id IS lcm_embedding_backfill_inflight.embedded_id "
+            "AND staged.identity_hash IS lcm_embedding_backfill_inflight.identity_hash "
+            "AND staged.lease_id IS lcm_embedding_backfill_inflight.lease_id "
+            "AND staged.generation IS lcm_embedding_backfill_inflight.generation "
+            "AND staged.request_id IS lcm_embedding_backfill_inflight.request_id "
+            "AND staged.state = 'claimed')"
+        )
+        conn.execute(
+            "UPDATE lcm_embedding_backfill_inflight "
+            "SET state = 'uncertain', updated_at = ?, "
+            "last_error = COALESCE(last_error, 'prior lease ended after dispatch') "
+            "WHERE rowid IN (SELECT source_rowid "
+            "FROM lcm_embedding_backfill_predecessor_batch "
+            "WHERE state = 'dispatched') AND state = 'dispatched' AND EXISTS ("
+            "SELECT 1 FROM lcm_embedding_backfill_predecessor_batch staged "
+            "WHERE staged.source_rowid = lcm_embedding_backfill_inflight.rowid "
+            "AND staged.embedded_id IS lcm_embedding_backfill_inflight.embedded_id "
+            "AND staged.identity_hash IS lcm_embedding_backfill_inflight.identity_hash "
+            "AND staged.lease_id IS lcm_embedding_backfill_inflight.lease_id "
+            "AND staged.generation IS lcm_embedding_backfill_inflight.generation "
+            "AND staged.request_id IS lcm_embedding_backfill_inflight.request_id "
+            "AND staged.state = 'dispatched')",
+            (time.time(),),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def _mark_inflight(
@@ -2063,43 +2461,288 @@ def _mark_inflight(
     lease: "_BackfillLease",
     embedded_ids: list[str],
     *,
+    authorized_uncertain_ids: set[str] | frozenset[str] = frozenset(),
     now: float | None = None,
 ) -> None:
+    """Reserve the exact selected rows without consuming retry authorization."""
     now = time.time() if now is None else float(now)
-    conn.executemany(
-        """
-        INSERT INTO lcm_embedding_backfill_inflight(
-            embedded_id, identity_hash, lease_id, generation, claimed_at
-        )
-        VALUES(?, ?, ?, ?, ?)
-        ON CONFLICT(embedded_id, identity_hash) DO UPDATE SET
-            lease_id = excluded.lease_id,
-            generation = excluded.generation,
-            claimed_at = excluded.claimed_at
-        """,
-        [
-            (embedded_id, identity_hash, lease.lease_id, lease.generation, now)
-            for embedded_id in embedded_ids
-        ],
-    )
+    authorized = {str(embedded_id) for embedded_id in authorized_uncertain_ids}
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        owner = conn.execute(
+            "SELECT 1 FROM metadata WHERE key=? "
+            "AND json_extract(value, '$.owner')=? "
+            "AND CAST(json_extract(value, '$.generation') AS INTEGER)=?",
+            (
+                _EMBEDDING_BACKFILL_CLAIM_KEY,
+                lease.lease_id,
+                lease.generation,
+            ),
+        ).fetchone()
+        if owner is None:
+            raise _BackfillLeaseLost("embedding backfill lease lost before reservation")
+
+        for raw_embedded_id in embedded_ids:
+            embedded_id = str(raw_embedded_id)
+            if embedded_id in authorized:
+                # Keep the durable state uncertain until the exact provider
+                # request begins. A crash, budget expiry, or lease loss before
+                # dispatch therefore cannot turn an authorized retry into an
+                # ordinary automatically-discoverable row.
+                cur = conn.execute(
+                    "UPDATE lcm_embedding_backfill_inflight "
+                    "SET lease_id=?, generation=?, claimed_at=?, request_id=NULL, "
+                    "updated_at=? WHERE embedded_id=? AND identity_hash=? "
+                    "AND state='uncertain'",
+                    (
+                        lease.lease_id,
+                        lease.generation,
+                        now,
+                        now,
+                        embedded_id,
+                        identity_hash,
+                    ),
+                )
+                if int(cur.rowcount or 0) != 1:
+                    raise RuntimeError(
+                        "authorized uncertain embedding changed before reservation"
+                    )
+                continue
+
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO lcm_embedding_backfill_inflight("
+                "embedded_id, identity_hash, lease_id, generation, claimed_at, "
+                "state, request_id, updated_at, last_error) "
+                "VALUES(?, ?, ?, ?, ?, 'claimed', NULL, ?, NULL)",
+                (
+                    embedded_id,
+                    identity_hash,
+                    lease.lease_id,
+                    lease.generation,
+                    now,
+                    now,
+                ),
+            )
+            if int(cur.rowcount or 0) != 1:
+                raise RuntimeError("embedding candidate changed before reservation")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
 
 
-def _clear_inflight(conn: sqlite3.Connection, identity_hash: str, embedded_id: str) -> None:
-    conn.execute(
-        "DELETE FROM lcm_embedding_backfill_inflight "
-        "WHERE embedded_id = ? AND identity_hash = ?",
-        (embedded_id, identity_hash),
-    )
+def _mark_dispatched(
+    conn: sqlite3.Connection,
+    identity_hash: str,
+    lease: "_BackfillLease",
+    embedded_ids: list[str],
+    request_id: str,
+    *,
+    authorized_uncertain_ids: set[str] | frozenset[str] = frozenset(),
+) -> int:
+    if not embedded_ids:
+        return 0
+    authorized = {str(embedded_id) for embedded_id in authorized_uncertain_ids}
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        owner = conn.execute(
+            "SELECT 1 FROM metadata WHERE key=? "
+            "AND json_extract(value, '$.owner')=? "
+            "AND CAST(json_extract(value, '$.generation') AS INTEGER)=?",
+            (
+                _EMBEDDING_BACKFILL_CLAIM_KEY,
+                lease.lease_id,
+                lease.generation,
+            ),
+        ).fetchone()
+        if owner is None:
+            conn.rollback()
+            return 0
+        now = time.time()
+        for raw_embedded_id in embedded_ids:
+            embedded_id = str(raw_embedded_id)
+            prior_state = "uncertain" if embedded_id in authorized else "claimed"
+            cur = conn.execute(
+                "UPDATE lcm_embedding_backfill_inflight "
+                "SET state='dispatched', request_id=?, updated_at=? "
+                "WHERE embedded_id=? AND identity_hash=? AND lease_id=? "
+                "AND generation=? AND state=? AND request_id IS NULL",
+                (
+                    request_id,
+                    now,
+                    embedded_id,
+                    identity_hash,
+                    lease.lease_id,
+                    lease.generation,
+                    prior_state,
+                ),
+            )
+            if int(cur.rowcount or 0) != 1:
+                conn.rollback()
+                return 0
+        conn.commit()
+        return len(embedded_ids)
+    except Exception:
+        conn.rollback()
+        raise
 
 
-def _embedding_backfill_options(tokens: list[str]) -> tuple[bool, int] | str:
+def _owned_inflight_transition(
+    conn: sqlite3.Connection,
+    identity_hash: str,
+    lease: "_BackfillLease",
+    request_id: str | None,
+    *,
+    embedded_id: str | None = None,
+    error: str | None = None,
+    retryable: bool = False,
+    authorized_uncertain_ids: set[str] | frozenset[str] = frozenset(),
+) -> bool:
+    """Mutate only the caller-owned exact request under the lease CAS."""
+    authorized = {str(item) for item in authorized_uncertain_ids}
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        owner = conn.execute(
+            "SELECT 1 FROM metadata WHERE key=? "
+            "AND json_extract(value, '$.owner')=? "
+            "AND CAST(json_extract(value, '$.generation') AS INTEGER)=?",
+            (
+                _EMBEDDING_BACKFILL_CLAIM_KEY,
+                lease.lease_id,
+                lease.generation,
+            ),
+        ).fetchone()
+        if owner is None:
+            conn.rollback()
+            return False
+        if embedded_id is not None:
+            embedded_id = str(embedded_id)
+            if embedded_id in authorized and request_id is None:
+                # Reservation deliberately leaves authorized rows uncertain;
+                # no provider dispatch occurred, so there is nothing to undo.
+                pass
+            elif embedded_id in authorized:
+                conn.execute(
+                    "UPDATE lcm_embedding_backfill_inflight "
+                    "SET state='uncertain', request_id=NULL, updated_at=?, "
+                    "last_error=? WHERE embedded_id=? AND identity_hash=? "
+                    "AND lease_id=? AND generation=? AND request_id=? "
+                    "AND state='dispatched'",
+                    (
+                        time.time(),
+                        str(error or "authorized retry was not published"),
+                        embedded_id,
+                        identity_hash,
+                        lease.lease_id,
+                        lease.generation,
+                        request_id,
+                    ),
+                )
+            elif request_id is None:
+                conn.execute(
+                    "DELETE FROM lcm_embedding_backfill_inflight "
+                    "WHERE embedded_id=? AND identity_hash=? AND lease_id=? "
+                    "AND generation=? AND state='claimed'",
+                    (
+                        embedded_id,
+                        identity_hash,
+                        lease.lease_id,
+                        lease.generation,
+                    ),
+                )
+            else:
+                conn.execute(
+                    "DELETE FROM lcm_embedding_backfill_inflight "
+                    "WHERE embedded_id=? AND identity_hash=? AND lease_id=? "
+                    "AND generation=? AND request_id=? AND state='dispatched'",
+                    (
+                        embedded_id,
+                        identity_hash,
+                        lease.lease_id,
+                        lease.generation,
+                        request_id,
+                    ),
+                )
+        elif retryable:
+            for authorized_id in authorized:
+                conn.execute(
+                    "UPDATE lcm_embedding_backfill_inflight "
+                    "SET state='uncertain', request_id=NULL, updated_at=?, "
+                    "last_error=? WHERE embedded_id=? AND identity_hash=? "
+                    "AND lease_id=? AND generation=? AND request_id=? "
+                    "AND state='dispatched'",
+                    (
+                        time.time(),
+                        str(error or "authorized retry was definitively rejected"),
+                        authorized_id,
+                        identity_hash,
+                        lease.lease_id,
+                        lease.generation,
+                        request_id,
+                    ),
+                )
+            if authorized:
+                placeholders = ",".join("?" for _ in authorized)
+                conn.execute(
+                    "DELETE FROM lcm_embedding_backfill_inflight "
+                    "WHERE identity_hash=? AND lease_id=? AND generation=? "
+                    f"AND request_id=? AND state='dispatched' "
+                    f"AND embedded_id NOT IN ({placeholders})",
+                    (
+                        identity_hash,
+                        lease.lease_id,
+                        lease.generation,
+                        request_id,
+                        *sorted(authorized),
+                    ),
+                )
+            else:
+                conn.execute(
+                    "DELETE FROM lcm_embedding_backfill_inflight "
+                    "WHERE identity_hash=? AND lease_id=? AND generation=? "
+                    "AND request_id=? AND state='dispatched'",
+                    (
+                        identity_hash,
+                        lease.lease_id,
+                        lease.generation,
+                        request_id,
+                    ),
+                )
+        else:
+            conn.execute(
+                "UPDATE lcm_embedding_backfill_inflight "
+                "SET state='uncertain', updated_at=?, last_error=? "
+                "WHERE identity_hash=? AND lease_id=? AND generation=? "
+                "AND request_id=? AND state='dispatched'",
+                (
+                    time.time(),
+                    str(error or "remote acceptance could not be verified"),
+                    identity_hash,
+                    lease.lease_id,
+                    lease.generation,
+                    request_id,
+                ),
+            )
+        conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _embedding_backfill_options(tokens: list[str]) -> tuple[bool, int, bool] | str:
     apply = False
     limit = 200
+    retry_uncertain = False
     index = 0
     while index < len(tokens):
         token = tokens[index].lower()
         if token == "--apply" and not apply:
             apply = True
+            index += 1
+            continue
+        if token == "--retry-uncertain" and not retry_uncertain:
+            retry_uncertain = True
             index += 1
             continue
         if token == "--limit" and index + 1 < len(tokens):
@@ -2111,8 +2754,13 @@ def _embedding_backfill_options(tokens: list[str]) -> tuple[bool, int] | str:
                 return "`--limit` must be a positive integer."
             index += 2
             continue
-        return "`/lcm embed backfill` accepts only `--apply` and `--limit N`."
-    return apply, limit
+        return (
+            "`/lcm embed backfill` accepts only `--apply`, "
+            "`--retry-uncertain`, and `--limit N`."
+        )
+    if retry_uncertain and not apply:
+        return "`--retry-uncertain` requires `--apply` because it may incur charges."
+    return apply, limit, retry_uncertain
 
 
 def _embedding_backfill_report(
@@ -2134,6 +2782,7 @@ def _embedding_backfill_report(
     consumed_tokens: int,
     error: str | None = None,
     in_flight: int = 0,
+    uncertain: int = 0,
     stop_reason: str | None = None,
 ) -> str:
     lines = [
@@ -2151,6 +2800,7 @@ def _embedding_backfill_report(
         f"skipped_overcap: {len(skipped)}",
         f"failed: {len(failed)}",
         f"in_flight: {in_flight}",
+        f"uncertain_remote_acceptance: {uncertain}",
         f"remaining: {remaining}",
         f"duration_seconds: {duration:.3f}",
         f"tokens_consumed: {consumed_tokens}",
@@ -2159,6 +2809,15 @@ def _embedding_backfill_report(
         lines.append(f"stop_reason: {stop_reason}")
     if error:
         lines.append(f"error: {error}")
+    if uncertain:
+        lines.append(
+            "warning: remote acceptance is uncertain; rows are excluded from "
+            "automatic retry to prevent duplicate billing"
+        )
+        lines.append(
+            "next: inspect provider records, then use `--apply --retry-uncertain` "
+            "only if re-embedding is explicitly authorized"
+        )
     lines.extend(
         f"skipped_detail: node_id={node_id} reason={reason}"
         for node_id, reason in skipped
@@ -2173,11 +2832,31 @@ def _embedding_backfill_report(
     return "\n".join(lines)
 
 
+def _provider_document_batches(provider, texts: list[str], *, before_dispatch):
+    """Yield accepted provider requests, adapting legacy deterministic fakes."""
+    method = getattr(provider, "embed_document_batches", None)
+    if callable(method):
+        yield from method(texts, before_dispatch=before_dispatch)
+        return
+    before_dispatch(tuple(range(len(texts))))
+    vectors = provider.embed_documents(texts)
+    skipped = {
+        int(index)
+        for index in getattr(provider, "last_skipped_documents", [])
+        if 0 <= int(index) < len(texts)
+    }
+    indexes = tuple(index for index in range(len(texts)) if index not in skipped)
+    yield EmbeddedDocumentBatch(
+        indexes=indexes,
+        vectors=tuple(tuple(vector) for vector in vectors),
+    )
+
+
 def _embedding_backfill_text(tokens: list[str], engine) -> str:
     parsed = _embedding_backfill_options(tokens)
     if isinstance(parsed, str):
         return _help_text(parsed)
-    apply, limit = parsed
+    apply, limit, retry_uncertain = parsed
     mode = "apply" if apply else "dry-run"
     started = time.monotonic()
 
@@ -2277,6 +2956,7 @@ def _embedding_backfill_text(tokens: list[str], engine) -> str:
     error: str | None = None
     stop_reason: str | None = None
     lease_lost = False
+    identity_superseded = False
     budget_exhausted = False
     try:
         store = VectorStore(db_path, config=engine._config)
@@ -2295,8 +2975,27 @@ def _embedding_backfill_text(tokens: list[str], engine) -> str:
                 "status: refused",
                 "error: another embedding backfill holds the lease; retry after it exits or after the lease TTL expires",
             ])
-        _clear_stale_inflight(conn, identity, lease.lease_id)
-        pending, rows = _embedding_pending_rows(conn, identity, limit)
+        _prepare_inflight_for_lease(conn, identity, lease)
+        captured_identity = store.capture_identity(model, provider=provider_name)
+        if captured_identity.identity_hash != identity:
+            raise ValueError(
+                "active embedding identity changed before backfill dispatch; "
+                "run `/lcm embed warmup` and retry"
+            )
+        # A risky retry invocation is an exact, exclusive authorization for
+        # the bounded uncertain rows selected here. Ordinary pending work is
+        # deliberately left for a normal invocation, so a newer ordinary row
+        # can never displace an older authorized row under --limit.
+        if retry_uncertain:
+            pending, rows = _embedding_authorized_uncertain_rows(
+                conn, identity, limit
+            )
+            authorized_uncertain_ids = {
+                str(row["node_id"]) for row in rows
+            }
+        else:
+            pending, rows = _embedding_pending_rows(conn, identity, limit)
+            authorized_uncertain_ids = set()
         documents = [
             (str(row["node_id"]), str(row["summary"]), count_tokens(row["summary"]))
             for row in rows
@@ -2327,75 +3026,223 @@ def _embedding_backfill_text(tokens: list[str], engine) -> str:
                     stop_reason = "op_budget_exhausted"
                     break
                 batch = documents[offset:offset + _EMBEDDING_BACKFILL_BATCH_SIZE]
-                # Mark in_flight BEFORE the provider call. A crash between here
-                # and record_embedding leaves committed in_flight rows; because
-                # discovery is NOT-EXISTS on recorded meta, they are re-attempted
-                # next run and only never-recorded rows can be re-billed.
-                _mark_inflight(conn, identity, lease, [item[0] for item in batch])
+                # Claim the bounded outer batch. The provider invokes the
+                # callback immediately before EACH real sub-request, and only
+                # those exact indexes become dispatched under that request's
+                # distinct durable id.
+                batch_authorized_ids = {
+                    item[0]
+                    for item in batch
+                    if item[0] in authorized_uncertain_ids
+                }
+                _mark_inflight(
+                    conn,
+                    identity,
+                    lease,
+                    [item[0] for item in batch],
+                    authorized_uncertain_ids=batch_authorized_ids,
+                )
+                request_by_index: dict[int, str] = {}
+                indexes_by_request: dict[str, set[int]] = {}
+                transitioned_requests: set[str] = set()
+                latest_request_id: str | None = None
+
+                def before_dispatch(indexes: tuple[int, ...]) -> None:
+                    nonlocal latest_request_id
+                    normalized = tuple(int(index) for index in indexes)
+                    if (
+                        not normalized
+                        or len(set(normalized)) != len(normalized)
+                        or any(index < 0 or index >= len(batch) for index in normalized)
+                        or any(index in request_by_index for index in normalized)
+                    ):
+                        raise EmbeddingProviderError(
+                            "provider dispatched invalid or duplicate document indexes"
+                        )
+                    request_id = uuid.uuid4().hex
+                    ids = [batch[index][0] for index in normalized]
+                    if _mark_dispatched(
+                        conn,
+                        identity,
+                        lease,
+                        ids,
+                        request_id,
+                        authorized_uncertain_ids=batch_authorized_ids,
+                    ) != len(ids):
+                        raise EmbeddingProviderError(
+                            "embedding lease lost before provider dispatch"
+                        )
+                    indexes_by_request[request_id] = set(normalized)
+                    request_by_index.update(
+                        (index, request_id) for index in normalized
+                    )
+                    latest_request_id = request_id
+
                 try:
-                    vectors = provider.embed_documents([item[1] for item in batch])
-                    # The blocking provider call can outlive the lease. Before
-                    # publishing ANY result of this batch (vector writes OR
-                    # in_flight clears), re-check ownership via the lease's
-                    # owner CAS: a worker whose lease was stolen (its TTL lapsed
-                    # and a successor took over) must DISCARD its result and exit
-                    # cleanly rather than write under the successor's claim.
-                    # Renewal-before-batch cannot stop a stale owner writing
-                    # AFTER the call; this post-call CAS does. The lease id is a
-                    # fresh uuid per acquire, so the owner CAS subsumes the
-                    # generation check. The re-marked in_flight rows are left for
-                    # the next run's stale-sweep + NOT-EXISTS rediscovery.
-                    if not lease.renew(force=True):
-                        lease_lost = True
-                        stop_reason = "lease_lost"
+                    accepted_indexes: set[int] = set()
+                    for accepted_batch in _provider_document_batches(
+                        provider,
+                        [item[1] for item in batch],
+                        before_dispatch=before_dispatch,
+                    ):
+                        if len(accepted_batch.indexes) != len(accepted_batch.vectors):
+                            raise EmbeddingProviderError(
+                                "provider returned a different number of indexes and embeddings"
+                            )
+                        for batch_index, vector in zip(
+                            accepted_batch.indexes, accepted_batch.vectors
+                        ):
+                            index = int(batch_index)
+                            if index < 0 or index >= len(batch) or index in accepted_indexes:
+                                raise EmbeddingProviderError(
+                                    "provider returned an invalid accepted document index"
+                                )
+                            accepted_indexes.add(index)
+                            item = batch[index]
+                            request_id = request_by_index.get(index)
+                            if request_id is None:
+                                raise EmbeddingProviderError(
+                                    "provider returned an embedding before durable dispatch"
+                                )
+                            try:
+                                publish_outcome = store.publish_embedding_under_lease(
+                                    item[0],
+                                    "summary",
+                                    model,
+                                    vector,
+                                    identity=captured_identity,
+                                    claim_key=_EMBEDDING_BACKFILL_CLAIM_KEY,
+                                    lease_id=lease.lease_id,
+                                    generation=lease.generation,
+                                    request_id=request_id,
+                                )
+                            except Exception as exc:
+                                failed.append((item[0], f"record_error:{exc}"))
+                                if not _owned_inflight_transition(
+                                    conn,
+                                    identity,
+                                    lease,
+                                    request_id,
+                                    error=f"accepted remotely; local publish failed: {exc}",
+                                    authorized_uncertain_ids=batch_authorized_ids,
+                                ):
+                                    lease_lost = True
+                                    stop_reason = "lease_lost"
+                                else:
+                                    transitioned_requests.add(request_id)
+                                    raise EmbeddingProviderError(
+                                        "accepted remotely; local publication failed"
+                                    ) from exc
+                                break
+                            if publish_outcome is EmbeddingPublishOutcome.OWNERSHIP_LOST:
+                                lease_lost = True
+                                stop_reason = "lease_lost"
+                                break
+                            if (
+                                publish_outcome
+                                is EmbeddingPublishOutcome.IDENTITY_SUPERSEDED
+                            ):
+                                identity_superseded = True
+                                stop_reason = "identity_superseded"
+                                failed.append(
+                                    (
+                                        item[0],
+                                        "identity_superseded_after_remote_acceptance",
+                                    )
+                                )
+                                transitioned_requests.add(request_id)
+                                break
+                            embedded += 1
+                            consumed_tokens += item[2]
+                        if lease_lost or identity_superseded:
+                            break
+                    if lease_lost or identity_superseded:
                         break
                     skipped_indexes = {
                         int(index)
                         for index in getattr(provider, "last_skipped_documents", [])
                         if 0 <= int(index) < len(batch)
                     }
-                    accepted = [
-                        item for index, item in enumerate(batch)
-                        if index not in skipped_indexes
-                    ]
                     for index in sorted(skipped_indexes):
                         skipped.append((batch[index][0], "provider_document_token_cap"))
-                        _clear_inflight(conn, identity, batch[index][0])
-                    if len(vectors) != len(accepted):
+                        request_id = request_by_index.get(index)
+                        if not _owned_inflight_transition(
+                            conn,
+                            identity,
+                            lease,
+                            request_id,
+                            embedded_id=batch[index][0],
+                            error="provider document token cap",
+                            authorized_uncertain_ids=batch_authorized_ids,
+                        ):
+                            lease_lost = True
+                            stop_reason = "lease_lost"
+                            break
+                    unresolved = set(range(len(batch))) - accepted_indexes - skipped_indexes
+                    if unresolved:
                         raise EmbeddingProviderError(
-                            "provider returned a different number of embeddings than accepted documents"
+                            "provider did not resolve every dispatched document"
                         )
-                    consumed_tokens += sum(item[2] for item in accepted)
-                    for item, vector in zip(accepted, vectors):
-                        try:
-                            # Publish under the identity CAPTURED at claim time
-                            # (the current profile when the lease was taken), not
-                            # whatever is active now: an active-provider switch
-                            # A->B mid-run must not rebind an A-vector onto B.
-                            store.record_embedding(
-                                item[0], "summary", model, vector, identity=identity
-                            )
-                            _clear_inflight(conn, identity, item[0])
-                            embedded += 1
-                        except Exception as exc:
-                            # Leave the in_flight marker: the row was not recorded
-                            # and will be re-discovered on the next run.
-                            failed.append((item[0], f"record_error:{exc}"))
                 except Exception as exc:
                     reason = (
                         f"provider_{exc.kind}:{exc}"
                         if isinstance(exc, VoyageError)
                         else f"provider_error:{exc}"
                     )
-                    failed.extend((item[0], reason) for item in batch)
+                    definitive_rejection = (
+                        isinstance(exc, ProviderPreDispatchError)
+                        or (
+                            isinstance(exc, VoyageError)
+                            and exc.kind in {"auth", "bad_request", "rate_limit"}
+                        )
+                    )
+                    if latest_request_id is not None:
+                        failed_indexes = indexes_by_request[latest_request_id] - accepted_indexes
+                        failed.extend((batch[index][0], reason) for index in failed_indexes)
+                        if (
+                            not lease_lost
+                            and latest_request_id not in transitioned_requests
+                            and not _owned_inflight_transition(
+                                conn,
+                                identity,
+                                lease,
+                                latest_request_id,
+                                error=reason,
+                                retryable=definitive_rejection,
+                                authorized_uncertain_ids=batch_authorized_ids,
+                            )
+                        ):
+                            lease_lost = True
+                            stop_reason = "lease_lost"
+                    # Exact rows not yet handed to a provider remain provably
+                    # unsent; clear their claims so ordinary discovery can
+                    # retry them without operator billing authorization.
+                    if not lease_lost:
+                        for index, item in enumerate(batch):
+                            if index in request_by_index:
+                                continue
+                            if not _owned_inflight_transition(
+                                conn,
+                                identity,
+                                lease,
+                                None,
+                                embedded_id=item[0],
+                                authorized_uncertain_ids=batch_authorized_ids,
+                            ):
+                                lease_lost = True
+                                stop_reason = "lease_lost"
+                                break
                     if isinstance(exc, VoyageError) and exc.kind == "auth":
                         error = f"provider authentication failed; {exc}"
                         break
+    except _BackfillLeaseLost:
+        lease_lost = True
+        stop_reason = "lease_lost"
     except Exception as exc:
         error = str(exc)
     finally:
         if store is not None:
-            if lease is not None and not lease_lost:
+            if lease is not None and not lease_lost and not identity_superseded:
                 try:
                     lease.release()
                 except Exception as exc:
@@ -2406,7 +3253,9 @@ def _embedding_backfill_text(tokens: list[str], engine) -> str:
                     )
             store.close()
 
-    remaining, in_flight_count = _embedding_backfill_remaining(db_path, identity, pending, embedded)
+    remaining, in_flight_count, uncertain_count = _embedding_backfill_remaining(
+        db_path, identity, pending, embedded
+    )
     selected_embeddable = len(documents) - len(skipped)
     status = _embedding_backfill_status(
         error=error,
@@ -2415,6 +3264,7 @@ def _embedding_backfill_text(tokens: list[str], engine) -> str:
         embedded=embedded,
         selected_embeddable=selected_embeddable,
         failed=failed,
+        uncertain=uncertain_count,
     )
     estimated_tokens, estimated_cost_tokens, estimated_batches = _estimates(documents)
     return _embedding_backfill_report(
@@ -2435,13 +3285,14 @@ def _embedding_backfill_text(tokens: list[str], engine) -> str:
         consumed_tokens=consumed_tokens,
         error=error,
         in_flight=in_flight_count,
+        uncertain=uncertain_count,
         stop_reason=stop_reason,
     )
 
 
 def _embedding_backfill_remaining(
     db_path, identity_hash: str, pending: int, embedded: int
-) -> tuple[int, int]:
+) -> tuple[int, int, int]:
     """Re-read pending + in_flight counts after an apply run for a truthful report."""
     try:
         check_conn = _embedding_read_connection(db_path)
@@ -2452,14 +3303,21 @@ def _embedding_backfill_remaining(
                     "SELECT COUNT(*) FROM lcm_embedding_backfill_inflight WHERE identity_hash = ?",
                     (identity_hash,),
                 ).fetchone()[0])
+                uncertain = int(check_conn.execute(
+                    "SELECT COUNT(*) FROM lcm_embedding_backfill_inflight "
+                    "WHERE identity_hash = ? AND state IN ('dispatched', 'uncertain')",
+                    (identity_hash,),
+                ).fetchone()[0])
             except sqlite3.OperationalError:
                 in_flight = 0
+                uncertain = 0
         finally:
             check_conn.close()
     except sqlite3.Error:
         remaining = max(0, pending - embedded)
         in_flight = 0
-    return remaining, in_flight
+        uncertain = 0
+    return remaining, in_flight, uncertain
 
 
 def _embedding_backfill_status(
@@ -2470,11 +3328,14 @@ def _embedding_backfill_status(
     embedded: int,
     selected_embeddable: int,
     failed: list[tuple[str, str]],
+    uncertain: int = 0,
 ) -> str:
     """Report the truthful terminal status — never a premature ``complete``."""
     if error:
         return "error"
     if lease_lost or budget_exhausted:
+        return "partial"
+    if uncertain:
         return "partial"
     if failed:
         return "failed" if embedded == 0 else "partial"

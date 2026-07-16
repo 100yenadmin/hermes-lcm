@@ -298,6 +298,7 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("embedding_model", "LCM_EMBEDDING_MODEL", str),
     _EnvFieldSpec("ollama_base_url", "LCM_OLLAMA_BASE_URL", str),
     _EnvFieldSpec("embedding_query_timeout_s", "LCM_EMBEDDING_QUERY_TIMEOUT_S", float),
+    _EnvFieldSpec("embedding_backfill_timeout_s", "LCM_EMBEDDING_BACKFILL_TIMEOUT_S", float),
     _EnvFieldSpec("embedding_max_batch_items", "LCM_EMBEDDING_MAX_BATCH_ITEMS", int),
     _EnvFieldSpec("new_session_retain_depth", "LCM_NEW_SESSION_RETAIN_DEPTH", int),
     _EnvFieldSpec("doctor_clean_apply_enabled", "LCM_DOCTOR_CLEAN_APPLY_ENABLED", bool),
@@ -467,6 +468,11 @@ class LCMConfig:
     embedding_model: str = ""
     ollama_base_url: str = "http://localhost:11434"
     embedding_query_timeout_s: float = 3.0
+    # Per-provider-operation deadline for bulk document embedding. This is
+    # deliberately separate from the latency-sensitive query deadline; the
+    # whole backfill invocation is additionally governed by
+    # LCM_EMBEDDING_BACKFILL_BUDGET_S (0 = unlimited, checked between batches).
+    embedding_backfill_timeout_s: float = 120.0
     # Voyage caps a single embeddings request at 1000 input items; document
     # batches split at this many items in addition to the token budget.
     embedding_max_batch_items: int = 1000

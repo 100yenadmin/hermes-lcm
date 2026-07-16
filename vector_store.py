@@ -17,6 +17,7 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Any, Iterator, Optional, Sequence
 
@@ -154,6 +155,14 @@ class KNNResult(list[tuple[str, float, str]]):
         super().__init__(rows)
         self.coverage = coverage
         self.reason = reason
+
+
+class EmbeddingPublishOutcome(str, Enum):
+    """Typed result for the post-provider publication CAS."""
+
+    PUBLISHED = "published"
+    OWNERSHIP_LOST = "ownership_lost"
+    IDENTITY_SUPERSEDED = "identity_superseded"
 
 
 class VectorStore:
@@ -488,10 +497,124 @@ class VectorStore:
         *,
         identity: EmbeddingIdentity,
     ) -> None:
+        with self._write_transaction():
+            profile = self._validate_embedding_write(identity, model=model)
+            self._write_embedding_row(
+                str(embedded_id), kind, vec, identity=identity, profile=profile
+            )
+
+    def publish_embedding_under_lease(
+        self,
+        embedded_id: str,
+        kind: str,
+        model: str,
+        vec: Sequence[float],
+        *,
+        identity: EmbeddingIdentity,
+        claim_key: str,
+        lease_id: str,
+        generation: int,
+        request_id: str,
+    ) -> EmbeddingPublishOutcome:
+        """Atomically revalidate ownership and publish one accepted vector.
+
+        The metadata owner/generation check, active captured identity check,
+        matching dispatched-row check, vector/meta write, data-version bump,
+        and in-flight clear all share one ``BEGIN IMMEDIATE`` transaction. A
+        superseded worker therefore performs none of these mutations.
+        """
         embedded_id = str(embedded_id)
+        with self._write_transaction():
+            owner = self._conn.execute(
+                """
+                SELECT 1
+                FROM metadata
+                WHERE key = ?
+                  AND json_extract(value, '$.owner') = ?
+                  AND CAST(json_extract(value, '$.generation') AS INTEGER) = ?
+                """,
+                (claim_key, str(lease_id), int(generation)),
+            ).fetchone()
+            inflight = self._conn.execute(
+                """
+                SELECT 1
+                FROM lcm_embedding_backfill_inflight
+                WHERE embedded_id = ? AND identity_hash = ?
+                  AND lease_id = ? AND generation = ?
+                  AND request_id = ? AND state = 'dispatched'
+                """,
+                (
+                    embedded_id,
+                    identity.identity_hash,
+                    str(lease_id),
+                    int(generation),
+                    str(request_id),
+                ),
+            ).fetchone()
+            if owner is None or inflight is None:
+                return EmbeddingPublishOutcome.OWNERSHIP_LOST
+            profile = self._validate_embedding_write(identity, model=model)
+            if int(profile["active"] or 0) != 1 or profile["archived_at"] is not None:
+                transitioned = self._conn.execute(
+                    """
+                    UPDATE lcm_embedding_backfill_inflight
+                    SET state = 'uncertain', updated_at = ?,
+                        last_error = 'embedding identity superseded after remote acceptance'
+                    WHERE identity_hash = ? AND lease_id = ? AND generation = ?
+                      AND request_id = ? AND state = 'dispatched'
+                    """,
+                    (
+                        datetime.now(timezone.utc).timestamp(),
+                        identity.identity_hash,
+                        str(lease_id),
+                        int(generation),
+                        str(request_id),
+                    ),
+                )
+                if int(transitioned.rowcount or 0) < 1:
+                    return EmbeddingPublishOutcome.OWNERSHIP_LOST
+                released = self._conn.execute(
+                    """
+                    DELETE FROM metadata
+                    WHERE key = ?
+                      AND json_extract(value, '$.owner') = ?
+                      AND CAST(json_extract(value, '$.generation') AS INTEGER) = ?
+                    """,
+                    (claim_key, str(lease_id), int(generation)),
+                )
+                if int(released.rowcount or 0) != 1:
+                    raise sqlite3.OperationalError(
+                        "identity supersession lost lease release ownership"
+                    )
+                return EmbeddingPublishOutcome.IDENTITY_SUPERSEDED
+            self._write_embedding_row(
+                embedded_id, kind, vec, identity=identity, profile=profile
+            )
+            cleared = self._conn.execute(
+                """
+                DELETE FROM lcm_embedding_backfill_inflight
+                WHERE embedded_id = ? AND identity_hash = ?
+                  AND lease_id = ? AND generation = ?
+                  AND request_id = ? AND state = 'dispatched'
+                """,
+                (
+                    embedded_id,
+                    identity.identity_hash,
+                    str(lease_id),
+                    int(generation),
+                    str(request_id),
+                ),
+            )
+            if cleared.rowcount != 1:
+                raise sqlite3.OperationalError(
+                    "embedding publication lost its in-flight ownership"
+                )
+            return EmbeddingPublishOutcome.PUBLISHED
+
+    def _validate_embedding_write(
+        self, identity: EmbeddingIdentity, *, model: str
+    ) -> sqlite3.Row:
         model = str(model)
-        if kind != "summary":
-            raise ValueError("embedded kind must be 'summary'")
         if not isinstance(identity, EmbeddingIdentity):
             raise TypeError("identity must be an EmbeddingIdentity captured before provider work")
         canonical_identity = EmbeddingIdentity.canonical(
@@ -507,91 +630,84 @@ class VectorStore:
             raise ValueError("embedding identity fields are not canonical")
         _require_supported_identity(identity)
         expected_identity = identity.identity_hash
+        profile = self._profile_by_identity(expected_identity)
+        if profile is None:
+            raise ValueError(f"embedding profile is not registered: {expected_identity}")
+        registered_identity = self._identity_from_profile(profile)
+        if registered_identity != identity:
+            raise ValueError(
+                "captured embedding identity does not match registered profile"
+            )
+        if str(profile["model_name"]) != model.strip():
+            raise ValueError(
+                "embedding model does not match captured identity: "
+                f"{model} != {profile['model_name']}"
+            )
+        return profile
 
-        with self._write_transaction():
-            # The vector was produced by a SPECIFIC provider identity. When the
-            # caller captured that durable identity at provider-resolution time
-            # (``identity=``), publish under THAT identity and never re-resolve
-            # to whatever is active now: a config switch A->B for the same
-            # model_name between the provider call and this write must not
-            # rebind an A-vector onto B's profile. The lookup + write share this
-            # one write transaction (CAS), so the identity is captured
-            # atomically; a caller-supplied identity that is not (or no longer)
-            # a registered profile is rejected rather than silently rebound.
-            profile = self._profile_by_identity(expected_identity)
-            if profile is None:
-                raise ValueError(
-                    f"embedding profile is not registered: {expected_identity}"
-                )
-            registered_identity = self._identity_from_profile(profile)
-            if registered_identity != identity:
-                raise ValueError(
-                    "captured embedding identity does not match registered profile"
-                )
-            identity_hash = identity.identity_hash
-            if str(profile["model_name"]) != model.strip():
-                raise ValueError(
-                    "embedding model does not match captured identity: "
-                    f"{model} != {profile['model_name']}"
-                )
-            normalized = self._normalized(vec, expected_dim=int(profile["dim"]))
-            # Persist an explicit little-endian float32 wire format. Native
-            # ``array('f')`` bytes would be mislabeled on a big-endian host.
-            packed = struct.pack(f"<{len(normalized)}f", *normalized)
-            numeric_id = self._as_node_id(embedded_id)
-            summary = (
-                self._conn.execute(
-                    """
-                    SELECT source_token_count
-                    FROM summary_nodes
-                    WHERE node_id = ?
-                    """,
-                    (numeric_id,),
-                ).fetchone()
-                if numeric_id is not None
-                else None
-            )
-            if summary is None:
-                raise ValueError(f"summary node does not exist: {embedded_id}")
-            embedded_at = self._now()
+    def _write_embedding_row(
+        self,
+        embedded_id: str,
+        kind: str,
+        vec: Sequence[float],
+        *,
+        identity: EmbeddingIdentity,
+        profile: sqlite3.Row,
+    ) -> None:
+        if kind != "summary":
+            raise ValueError("embedded kind must be 'summary'")
+        identity_hash = identity.identity_hash
+        normalized = self._normalized(vec, expected_dim=int(profile["dim"]))
+        # Persist an explicit little-endian float32 wire format. Native
+        # ``array('f')`` bytes would be mislabeled on a big-endian host.
+        packed = struct.pack(f"<{len(normalized)}f", *normalized)
+        numeric_id = self._as_node_id(embedded_id)
+        summary = (
             self._conn.execute(
                 """
-                DELETE FROM lcm_embedding_vectors
-                WHERE embedded_id = ? AND identity_hash = ?
+                SELECT source_token_count
+                FROM summary_nodes
+                WHERE node_id = ?
                 """,
-                (embedded_id, identity_hash),
-            )
-            self._conn.execute(
-                """
-                DELETE FROM lcm_embedding_meta
-                WHERE embedded_id = ? AND embedded_kind = ? AND identity_hash = ?
-                """,
-                (embedded_id, kind, identity_hash),
-            )
-            self._conn.execute(
-                """
-                INSERT INTO lcm_embedding_vectors(embedded_id, identity_hash, vec)
-                VALUES(?, ?, ?)
-                """,
-                (embedded_id, identity_hash, packed),
-            )
-            self._conn.execute(
-                """
-                INSERT INTO lcm_embedding_meta(
-                    embedded_id, embedded_kind, identity_hash, embedded_at,
-                    source_token_count, archived
-                )
-                VALUES(?, ?, ?, ?, ?, 0)
-                """,
-                (
-                    embedded_id,
-                    kind,
-                    identity_hash,
-                    embedded_at,
-                    int(summary["source_token_count"] or 0),
-                ),
-            )
-            self._bump_data_version(identity_hash)
+                (numeric_id,),
+            ).fetchone()
+            if numeric_id is not None
+            else None
+        )
+        if summary is None:
+            raise ValueError(f"summary node does not exist: {embedded_id}")
+        embedded_at = self._now()
+        self._conn.execute(
+            "DELETE FROM lcm_embedding_vectors "
+            "WHERE embedded_id = ? AND identity_hash = ?",
+            (embedded_id, identity_hash),
+        )
+        self._conn.execute(
+            "DELETE FROM lcm_embedding_meta WHERE embedded_id = ? "
+            "AND embedded_kind = ? AND identity_hash = ?",
+            (embedded_id, kind, identity_hash),
+        )
+        self._conn.execute(
+            "INSERT INTO lcm_embedding_vectors(embedded_id, identity_hash, vec) "
+            "VALUES(?, ?, ?)",
+            (embedded_id, identity_hash, packed),
+        )
+        self._conn.execute(
+            """
+            INSERT INTO lcm_embedding_meta(
+                embedded_id, embedded_kind, identity_hash, embedded_at,
+                source_token_count, archived
+            ) VALUES(?, ?, ?, ?, ?, 0)
+            """,
+            (
+                embedded_id,
+                kind,
+                identity_hash,
+                embedded_at,
+                int(summary["source_token_count"] or 0),
+            ),
+        )
+        self._bump_data_version(identity_hash)
 
     def _bump_data_version(self, identity_hash: str) -> None:
         """Bump one identity's durable data-version counter.

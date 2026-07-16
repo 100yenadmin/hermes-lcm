@@ -493,24 +493,77 @@ def test_resolve_provider_for_backfill_bypasses_spend_guard():
     assert backfill.breaker.allows() is True
 
 
+@pytest.mark.parametrize("provider_name", ["voyage", "ollama", "fastembed"])
+def test_resolve_provider_for_backfill_uses_separate_bulk_timeout(provider_name):
+    config = LCMConfig(
+        embedding_provider=provider_name,
+        embedding_model="model-x",
+        embedding_query_timeout_s=0.02,
+        embedding_backfill_timeout_s=12.5,
+    )
+
+    interactive = resolve_provider(config)
+    backfill = resolve_provider(config, for_backfill=True)
+
+    assert interactive.timeout == 0.02
+    assert backfill.timeout == 12.5
+
+
+def test_fastembed_backfill_is_not_bound_by_interactive_query_timeout(monkeypatch):
+    class SlowBulkModel:
+        def __init__(self, **_kwargs):
+            pass
+
+        def embed(self, texts):
+            time.sleep(0.03)
+            return [[1.0, 0.0] for _text in texts]
+
+        def query_embed(self, texts):
+            return [[0.0, 1.0] for _text in texts]
+
+    monkeypatch.setattr(provider_mod, "_load_fastembed", lambda: SlowBulkModel)
+    provider = resolve_provider(
+        LCMConfig(
+            embedding_provider="fastembed",
+            embedding_model="local-model",
+            embedding_query_timeout_s=0.01,
+            embedding_backfill_timeout_s=0.2,
+        ),
+        for_backfill=True,
+    )
+
+    batches = list(
+        provider.embed_document_batches(
+            ["ordinary backfill document"],
+            before_dispatch=lambda _indexes: None,
+        )
+    )
+
+    assert [batch.indexes for batch in batches] == [(0,)]
+    assert [list(vector) for vector in batches[0].vectors] == [[1.0, 0.0]]
+
+
 def test_embedding_config_defaults_and_environment(monkeypatch):
     defaults = LCMConfig()
     assert defaults.embedding_provider == ""
     assert defaults.embedding_model == ""
     assert defaults.ollama_base_url == "http://localhost:11434"
     assert defaults.embedding_query_timeout_s == 3.0
+    assert defaults.embedding_backfill_timeout_s == 120.0
     assert defaults.embedding_max_batch_items == 1000
 
     monkeypatch.setenv("LCM_EMBEDDING_PROVIDER", "ollama")
     monkeypatch.setenv("LCM_EMBEDDING_MODEL", "model-a")
     monkeypatch.setenv("LCM_OLLAMA_BASE_URL", "http://ollama:11434")
     monkeypatch.setenv("LCM_EMBEDDING_QUERY_TIMEOUT_S", "4.5")
+    monkeypatch.setenv("LCM_EMBEDDING_BACKFILL_TIMEOUT_S", "45.0")
     monkeypatch.setenv("LCM_EMBEDDING_MAX_BATCH_ITEMS", "500")
     configured = LCMConfig.from_env()
     assert configured.embedding_provider == "ollama"
     assert configured.embedding_model == "model-a"
     assert configured.ollama_base_url == "http://ollama:11434"
     assert configured.embedding_query_timeout_s == 4.5
+    assert configured.embedding_backfill_timeout_s == 45.0
     assert configured.embedding_max_batch_items == 500
 
 
