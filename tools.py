@@ -1493,9 +1493,16 @@ def _lcm_grep_semantic(
     except Exception:
         pass
 
-    # ONE absolute deadline across query-embed + vector-store construction + KNN,
-    # not just the embed call. Exceeding it (or exhausting worker capacity)
-    # degrades to full_text within budget.
+    # ONE absolute deadline bounds the SEMANTIC ATTEMPT — query-embed +
+    # vector-store construction + KNN — not just the embed call. This is a
+    # semantic-arm-only budget: exceeding it (or exhausting worker capacity)
+    # abandons the semantic attempt and degrades to full_text. The full_text
+    # fallback then runs to COMPLETION — it is a synchronous, uncancellable
+    # SQLite path on the SHARED store connection (unlike KNN, which runs on a
+    # throwaway VectorStore connection), so it cannot be safely preempted and is
+    # deliberately NOT covered by this deadline. "Degrade within budget" is a
+    # bound on the semantic attempt, not an end-to-end guarantee over the
+    # fallback (degradation is itself triggered by budget exhaustion).
     timeout_s = max(0.001, float(getattr(engine._config, "embedding_query_timeout_s", 3.0)))
     deadline = time.monotonic() + timeout_s
 

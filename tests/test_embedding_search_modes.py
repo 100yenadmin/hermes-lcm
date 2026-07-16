@@ -164,6 +164,64 @@ def test_semantic_timeout_degrades_to_fts_within_budget(semantic_engine, monkeyp
     assert "latency budget" in payload["degraded_reason"]
 
 
+def test_semantic_budget_bounds_the_attempt_not_the_fallback(
+    semantic_engine, monkeypatch
+):
+    """D1: the latency budget bounds the SEMANTIC ATTEMPT, not the fallback.
+
+    Maintainer repro: a 0.02s budget + a KNN that exceeded it + a synthetic
+    0.08s fallback returned a correct-but-late result at 0.171s. The enforceable
+    contract (see OUTCOME: enforce-vs-narrow -> NARROW, because the full_text
+    fallback is a synchronous, uncancellable SQLite path on the SHARED store
+    connection) is: the semantic attempt (embed + KNN) is bounded by the budget
+    and the slow KNN is ABANDONED near the budget rather than run to completion;
+    the full_text fallback then runs to completion and returns the correct hit.
+    """
+    semantic_engine._config.embedding_query_timeout_s = 0.02
+    semantic_engine._store.append(
+        "session-a", {"role": "user", "content": "needle survives a slow knn"}
+    )
+
+    class SlowKNNStore:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def knn(self, *_args, **_kwargs):
+            time.sleep(0.2)  # far exceeds the 0.02s budget
+            return KNNResult(coverage="full")
+
+        def close(self):
+            pass
+
+    real_full_text = lcm_tools._lcm_grep_full_text
+
+    def slow_full_text(args, **kwargs):
+        time.sleep(0.08)  # synthetic slow fallback
+        return real_full_text(args, **kwargs)
+
+    monkeypatch.setattr(lcm_tools, "VectorStore", SlowKNNStore)
+    monkeypatch.setattr(lcm_tools, "resolve_provider", lambda _config: MockProvider())
+    monkeypatch.setattr(lcm_tools, "_lcm_grep_full_text", slow_full_text)
+
+    started = time.monotonic()
+    payload = json.loads(
+        lcm_tools.lcm_grep(
+            {"query": "needle", "mode": "semantic"}, engine=semantic_engine
+        )
+    )
+    elapsed = time.monotonic() - started
+
+    # The slow KNN was abandoned at ~budget (semantic attempt bounded), so total
+    # time is (bounded attempt ~0.02) + (fallback ~0.08), NOT the KNN's full
+    # 0.2s stacked on the fallback (~0.28). This is the tell that the budget
+    # bounds the attempt.
+    assert elapsed < 0.2
+    # The fallback ran to completion and returned the correct FTS hit.
+    assert payload["degraded_to_fts"] is True
+    assert "latency budget" in payload["degraded_reason"]
+    assert payload["results"][0]["type"] == "message"
+
+
 def test_timeout_worker_is_daemon_and_provider_call_is_bounded(
     semantic_engine,
     monkeypatch,
