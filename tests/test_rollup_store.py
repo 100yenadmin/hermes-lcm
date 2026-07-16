@@ -1,15 +1,20 @@
 from __future__ import annotations
 
 import sqlite3
+from datetime import datetime, timezone
 
 import pytest
 
 from hermes_lcm import db_bootstrap
 from hermes_lcm.config import LCMConfig
+from hermes_lcm.dag import SummaryDAG, SummaryNode
 from hermes_lcm.rollup_store import RollupBuildToken, RollupStore
 
 
-ROLLUP_TABLES = {"lcm_rollups", "lcm_rollup_sources", "lcm_rollup_state"}
+ROLLUP_TABLES = {
+    "lcm_rollups", "lcm_rollup_sources", "lcm_rollup_state",
+    "lcm_rollup_invalidations",
+}
 
 
 @pytest.fixture
@@ -209,7 +214,7 @@ def test_rollup_crud_round_trip_and_rebuild(rollup_store):
     # and re-stale the rollup mid-rebuild.
     assert rebuilding["source_node_ids"] == [3, 9]
 
-    rollup_store.mark_failed(rollup_id, "summarizer unavailable")
+    rollup_store.mark_failed(rebuilt, "summarizer unavailable")
     failed = rollup_store.get_rollup(
         "day", "2026-07-15", "conversation:conv-1"
     )
@@ -235,7 +240,7 @@ def test_ready_rollups_for_window_is_inclusive_and_scoped(rollup_store):
     third = _ready_rollup(rollup_store, "day", "2026-07-31", "global")
     _ready_rollup(rollup_store, "day", "2026-07-15", "conversation:other")
     failed = rollup_store.upsert_building("day", "2026-07-20", "global")
-    rollup_store.mark_failed(failed.rollup_id, "failed")
+    rollup_store.mark_failed(failed, "failed")
 
     rows = rollup_store.ready_rollups_for_window(
         "day", "2026-07-15", "2026-07-31", "global"
@@ -500,14 +505,12 @@ def test_mark_failed_generation_guard_rejects_superseded_failure(rollup_store):
     token = rollup_store.upsert_building("day", "2026-07-15", scope)
     rollup_store.mark_stale_for_day("2026-07-15", scope)  # advances generation
 
-    assert rollup_store.mark_failed(token.rollup_id, "late boom", generation=token.generation) is False
+    assert rollup_store.mark_failed(token, "late boom") is False
     row = rollup_store.get_rollup("day", "2026-07-15", scope)
     assert row["status"] == "stale"
     assert row["error"] is None
 
-    # An unguarded call still writes (used to seed a known failure directly).
-    assert rollup_store.mark_failed(token.rollup_id, "seeded") is True
-    assert rollup_store.get_rollup("day", "2026-07-15", scope)["status"] == "failed"
+    assert rollup_store.get_rollup("day", "2026-07-15", scope)["status"] == "stale"
 
 
 def test_defer_incomplete_is_token_guarded(rollup_store):
@@ -524,6 +527,11 @@ def test_defer_incomplete_is_token_guarded(rollup_store):
     row = rollup_store.get_rollup("week", "2026-07-13", scope)
     assert row["status"] == "stale"
     assert "incomplete: 2 dailies" in row["error"]
+    nonce = rollup_store.connection.execute(
+        "SELECT lease_nonce FROM lcm_rollups WHERE rollup_id=?",
+        (token2.rollup_id,),
+    ).fetchone()[0]
+    assert nonce == ""
 
 
 def test_resolve_no_source_clears_only_when_owned(rollup_store):
@@ -586,9 +594,7 @@ def test_late_mark_failed_cannot_flip_a_published_ready_row(rollup_store):
     assert rollup_store.mark_ready(token, "published summary", 7, [1], "fp") is True
 
     assert (
-        rollup_store.mark_failed(
-            token.rollup_id, "late boom", generation=token.generation
-        )
+        rollup_store.mark_failed(token, "late boom")
         is False
     )
     row = rollup_store.get_rollup("day", "2026-07-15", scope)
@@ -704,3 +710,368 @@ def test_verify_temporal_rollup_schema_flags_missing_objects(rollup_store):
     rollup_store.connection.execute("DROP INDEX idx_lcm_rollups_pending")
     missing = db_bootstrap.verify_temporal_rollup_schema(rollup_store.connection)
     assert "index:idx_lcm_rollups_pending" in missing
+
+
+# --- Proactive invariant-class audit regressions ------------------------------
+
+
+def test_first_build_cannot_publish_a_source_deleted_mid_build(tmp_path):
+    db_path = tmp_path / "first-build-delete.db"
+    dag = SummaryDAG(db_path)
+    node_id = dag.add_node(
+        SummaryNode(
+            session_id="scope-a", summary="source", created_at=1.0,
+            earliest_at=1.0, latest_at=1.0,
+        )
+    )
+    store = RollupStore(db_path)
+    try:
+        token = store.upsert_building("day", "1970-01-01", "scope-a")
+        dag.connection.execute("DELETE FROM summary_nodes WHERE node_id=?", (node_id,))
+        dag.connection.commit()
+
+        assert store.mark_ready(token, "stale", 1, [node_id], "fp") is False
+        row = store.get_rollup("day", "1970-01-01", "scope-a")
+        assert row["status"] == "stale"
+        assert row["source_node_ids"] == []
+    finally:
+        store.close()
+        dag.close()
+
+
+def test_deleted_token_never_authorizes_a_reused_rollup_identity(rollup_store):
+    old = rollup_store.upsert_building("day", "2026-07-15", "scope-a")
+    assert rollup_store.resolve_no_source(old) is True
+    replacement = rollup_store.upsert_building("week", "2026-07-13", "scope-b")
+
+    assert replacement.nonce != old.nonce
+    with pytest.raises(ValueError, match="unknown rollup_id"):
+        rollup_store.mark_ready(old, "zombie", 1, [99], "old")
+    assert rollup_store.get_rollup("week", "2026-07-13", "scope-b")["status"] == "building"
+
+
+def test_purge_source_ids_above_sqlite_bind_limit_is_sql_bounded(rollup_store):
+    rollup_id = _ready_rollup(
+        rollup_store, "day", "2026-07-15", source_node_ids=[250_001]
+    )
+    assert rollup_store.purge_rollups_for_sources(range(1, 250_002)) == 1
+    row = rollup_store.get_rollup("day", "2026-07-15", "global")
+    assert row["rollup_id"] == rollup_id
+    assert row["status"] == "stale"
+
+
+def test_failure_timestamp_is_terminal_time_not_claim_time(rollup_store):
+    token = rollup_store.upsert_building("day", "2026-07-15", "scope-a")
+    rollup_store.connection.execute(
+        "UPDATE lcm_rollups SET built_at='2000-01-01T00:00:00+00:00' WHERE rollup_id=?",
+        (token.rollup_id,),
+    )
+    rollup_store.connection.commit()
+
+    assert rollup_store.mark_failed(token, "boom") is True
+    row = rollup_store.connection.execute(
+        "SELECT built_at, failed_at FROM lcm_rollups WHERE rollup_id=?",
+        (token.rollup_id,),
+    ).fetchone()
+    assert row["built_at"] == "2000-01-01T00:00:00+00:00"
+    assert row["failed_at"] > "2026-01-01"
+
+
+def test_supported_partial_rollup_schema_is_repaired_before_marker(tmp_path):
+    db_path = tmp_path / "partial.db"
+    conn = sqlite3.connect(db_path)
+    db_bootstrap.run_versioned_migrations(conn)
+    conn.execute(
+        """
+        CREATE TABLE lcm_rollups(
+            rollup_id INTEGER PRIMARY KEY,
+            period_kind TEXT NOT NULL CHECK(period_kind IN ('day', 'week', 'month')),
+            period_start TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'building'
+                CHECK(status IN ('building', 'ready', 'stale', 'failed')),
+            generation INTEGER NOT NULL DEFAULT 0,
+            lease_expires_at TEXT,
+            UNIQUE(period_kind, period_start, scope)
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    store = RollupStore(db_path)
+    try:
+        assert db_bootstrap.verify_temporal_rollup_schema(store.connection) == []
+        columns = {
+            row[1] for row in store.connection.execute("PRAGMA table_info(lcm_rollups)")
+        }
+        assert {"summary", "token_count", "built_at", "source_fingerprint", "error"} <= columns
+        assert store.connection.execute(
+            "SELECT 1 FROM lcm_migration_state WHERE step_name='temporal_rollups_v1'"
+        ).fetchone()
+    finally:
+        store.close()
+
+
+def test_incompatible_rollup_schema_is_not_marked_complete(tmp_path):
+    db_path = tmp_path / "incompatible.db"
+    conn = sqlite3.connect(db_path)
+    db_bootstrap.run_versioned_migrations(conn)
+    conn.execute(
+        "CREATE TABLE lcm_rollups(rollup_id INTEGER PRIMARY KEY, "
+        "period_kind TEXT, period_start TEXT, scope TEXT, status TEXT, "
+        "generation INTEGER DEFAULT 0, lease_expires_at TEXT)"
+    )
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(RuntimeError, match="unique:lcm_rollups"):
+        RollupStore(db_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        assert conn.execute(
+            "SELECT 1 FROM lcm_migration_state WHERE step_name='temporal_rollups_v1'"
+        ).fetchone() is None
+    finally:
+        conn.close()
+
+
+def test_schema_verifier_rejects_wrong_shape_on_previously_unchecked_column(tmp_path):
+    db_path = tmp_path / "wrong-summary-shape.db"
+    conn = sqlite3.connect(db_path)
+    db_bootstrap.run_versioned_migrations(conn)
+    conn.execute(
+        """
+        CREATE TABLE lcm_rollups (
+            rollup_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            period_kind TEXT NOT NULL CHECK(period_kind IN ('day', 'week', 'month')),
+            period_start TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            summary INTEGER NOT NULL,
+            token_count INTEGER,
+            status TEXT NOT NULL DEFAULT 'building'
+                CHECK(status IN ('building', 'ready', 'stale', 'failed')),
+            built_at TEXT,
+            source_fingerprint TEXT,
+            error TEXT,
+            generation INTEGER NOT NULL DEFAULT 0,
+            lease_expires_at TEXT,
+            lease_nonce TEXT NOT NULL DEFAULT '',
+            failed_at TEXT,
+            UNIQUE(period_kind, period_start, scope)
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(RuntimeError, match=r"column-shape:lcm_rollups\.summary"):
+        RollupStore(db_path)
+
+    conn = sqlite3.connect(db_path)
+    try:
+        assert conn.execute(
+            "SELECT 1 FROM lcm_migration_state "
+            "WHERE step_name='temporal_rollups_v1'"
+        ).fetchone() is None
+    finally:
+        conn.close()
+
+
+def test_healthy_reopen_executes_no_schema_ddl(tmp_path):
+    db_path = tmp_path / "no-hot-ddl.db"
+    RollupStore(db_path).close()
+    conn = sqlite3.connect(db_path)
+    before = conn.execute("PRAGMA schema_version").fetchone()[0]
+    conn.close()
+
+    RollupStore(db_path).close()
+    conn = sqlite3.connect(db_path)
+    try:
+        assert conn.execute("PRAGMA schema_version").fetchone()[0] == before
+    finally:
+        conn.close()
+
+
+def test_summary_mutation_outbox_is_in_same_transaction(tmp_path):
+    db_path = tmp_path / "outbox.db"
+    dag = SummaryDAG(db_path)
+    RollupStore(db_path).close()  # installs triggers after summary_nodes exists
+    try:
+        dag.connection.execute("BEGIN")
+        dag.connection.execute(
+            """
+            INSERT INTO summary_nodes(
+                session_id, summary, created_at, earliest_at, latest_at
+            ) VALUES('scope-a', 'source', 10, 5, 15)
+            """
+        )
+        assert dag.connection.execute(
+            "SELECT COUNT(*) FROM lcm_rollup_invalidations"
+        ).fetchone()[0] == 1
+        dag.connection.rollback()
+        assert dag.connection.execute(
+            "SELECT COUNT(*) FROM lcm_rollup_invalidations"
+        ).fetchone()[0] == 0
+    finally:
+        dag.close()
+
+
+def test_long_span_invalidation_resumes_at_bounded_day_cursor(rollup_store):
+    start = datetime(2020, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2030, 1, 1, tzinfo=timezone.utc)
+    rollup_store.connection.execute(
+        """
+        INSERT INTO lcm_rollup_invalidations(
+            node_id, scope, covered_start, covered_end, operation
+        ) VALUES(1, 'long-scope', ?, ?, 'insert')
+        """,
+        (start.timestamp(), end.timestamp()),
+    )
+    rollup_store.connection.commit()
+
+    assert rollup_store.drain_invalidations(event_limit=10, day_budget=7) == 7
+    event = rollup_store.connection.execute(
+        "SELECT next_day FROM lcm_rollup_invalidations"
+    ).fetchone()
+    assert event["next_day"] == "2020-01-08"
+    assert rollup_store.connection.execute(
+        "SELECT COUNT(*) FROM lcm_rollups WHERE scope='long-scope' AND period_kind='day'"
+    ).fetchone()[0] == 7
+
+    assert rollup_store.drain_invalidations(event_limit=10, day_budget=7) == 7
+    event = rollup_store.connection.execute(
+        "SELECT next_day FROM lcm_rollup_invalidations"
+    ).fetchone()
+    assert event["next_day"] == "2020-01-15"
+    assert rollup_store.connection.execute(
+        "SELECT COUNT(*) FROM lcm_rollups WHERE scope='long-scope' AND period_kind='day'"
+    ).fetchone()[0] == 14
+
+
+def test_day_only_rebuild_seed_atomically_stales_containing_aggregates(rollup_store):
+    scope = "rebuild-cascade"
+    _ready_rollup(rollup_store, "day", "2026-07-15", scope)
+    _ready_rollup(rollup_store, "week", "2026-07-13", scope)
+    _ready_rollup(rollup_store, "month", "2026-07-01", scope)
+
+    assert rollup_store.upsert_stale_many([("day", "2026-07-15", scope)]) == 3
+    statuses = {
+        row["period_kind"]: row["status"]
+        for row in rollup_store.connection.execute(
+            "SELECT period_kind, status FROM lcm_rollups WHERE scope=?", (scope,)
+        ).fetchall()
+    }
+    assert statuses == {"day": "stale", "week": "stale", "month": "stale"}
+
+
+def test_schema_verifier_rejects_wrong_same_name_index_shape(rollup_store):
+    rollup_store.connection.execute("DROP INDEX idx_lcm_rollups_pending")
+    rollup_store.connection.execute(
+        "CREATE INDEX idx_lcm_rollups_pending ON lcm_rollups(period_start)"
+    )
+    problems = db_bootstrap.verify_temporal_rollup_schema(rollup_store.connection)
+    assert "index-shape:idx_lcm_rollups_pending" in problems
+
+
+def test_schema_verifier_rejects_wrong_index_direction(rollup_store):
+    rollup_store.connection.execute("DROP INDEX idx_lcm_rollups_ready_period")
+    rollup_store.connection.execute(
+        "CREATE INDEX idx_lcm_rollups_ready_period "
+        "ON lcm_rollups(scope, period_kind, period_start ASC) "
+        "WHERE status='ready'"
+    )
+    problems = db_bootstrap.verify_temporal_rollup_schema(rollup_store.connection)
+    assert "index-shape:idx_lcm_rollups_ready_period" in problems
+
+
+def test_schema_verifier_rejects_unique_same_name_feature_index(rollup_store):
+    rollup_store.connection.execute("DROP INDEX idx_lcm_rollups_pending")
+    rollup_store.connection.execute(
+        "CREATE UNIQUE INDEX idx_lcm_rollups_pending "
+        "ON lcm_rollups(scope, status, failed_at, period_start) "
+        "WHERE status IN ('stale', 'failed')"
+    )
+
+    problems = db_bootstrap.verify_temporal_rollup_schema(rollup_store.connection)
+
+    assert "index-shape:idx_lcm_rollups_pending" in problems
+
+
+def test_schema_verifier_rejects_wrong_partial_flag(rollup_store):
+    rollup_store.connection.execute("DROP INDEX idx_lcm_rollups_expired_lease")
+    rollup_store.connection.execute(
+        "CREATE INDEX idx_lcm_rollups_expired_lease "
+        "ON lcm_rollups(lease_expires_at, rollup_id)"
+    )
+
+    problems = db_bootstrap.verify_temporal_rollup_schema(rollup_store.connection)
+
+    assert "index-shape:idx_lcm_rollups_expired_lease" in problems
+
+
+def test_outbox_update_covers_content_fields_and_normalizes_interval(tmp_path):
+    db_path = tmp_path / "content-update.db"
+    dag = SummaryDAG(db_path)
+    RollupStore(db_path).close()
+    try:
+        node_id = dag.add_node(
+            SummaryNode(
+                session_id="scope-a", summary="before", created_at=20,
+                earliest_at=30, latest_at=10,
+            )
+        )
+        inserted = dag.connection.execute(
+            "SELECT covered_start, covered_end FROM lcm_rollup_invalidations"
+        ).fetchone()
+        assert tuple(inserted) == (10.0, 30.0)
+        dag.connection.execute(
+            "UPDATE summary_nodes SET summary='after', token_count=99 WHERE node_id=?",
+            (node_id,),
+        )
+        dag.connection.commit()
+        operations = dag.connection.execute(
+            "SELECT operation FROM lcm_rollup_invalidations ORDER BY event_id"
+        ).fetchall()
+        assert [row[0] for row in operations] == ["insert", "update", "update"]
+    finally:
+        dag.close()
+
+
+def test_invalidation_existence_and_overlap_queries_are_index_served(rollup_store):
+    scope_plan = rollup_store.connection.execute(
+        "EXPLAIN QUERY PLAN SELECT 1 FROM lcm_rollup_invalidations "
+        "WHERE scope='scope-a' ORDER BY event_id LIMIT 1"
+    ).fetchall()
+    assert any(
+        "idx_lcm_rollup_invalidations_scope_event" in str(row[3])
+        for row in scope_plan
+    )
+    overlap_plan = rollup_store.connection.execute(
+        "EXPLAIN QUERY PLAN SELECT 1 FROM lcm_rollup_invalidations "
+        "WHERE scope='scope-a' AND covered_start < 20 AND covered_end >= 10 LIMIT 1"
+    ).fetchall()
+    assert any(
+        "idx_lcm_rollup_invalidations_scope_coverage" in str(row[3])
+        for row in overlap_plan
+    )
+
+
+def test_same_name_malformed_trigger_is_verified_and_repaired(tmp_path):
+    db_path = tmp_path / "trigger-repair.db"
+    dag = SummaryDAG(db_path)
+    RollupStore(db_path).close()
+    dag.connection.execute("DROP TRIGGER lcm_rollup_node_insert")
+    dag.connection.execute(
+        "CREATE TRIGGER lcm_rollup_node_insert AFTER INSERT ON summary_nodes "
+        "BEGIN SELECT 1; END"
+    )
+    dag.connection.commit()
+    try:
+        assert "trigger-shape:lcm_rollup_node_insert" in (
+            db_bootstrap.verify_temporal_rollup_schema(dag.connection)
+        )
+        RollupStore(db_path).close()
+        assert db_bootstrap.verify_temporal_rollup_schema(dag.connection) == []
+    finally:
+        dag.close()
