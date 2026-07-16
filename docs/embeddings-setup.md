@@ -87,14 +87,20 @@ rather than being silently truncated to a misleading embedding.
   "have we discussed X?" mode. (Fusion is RRF only — there is no external reranker.)
 
 Both degrade **transparently**: if the provider is down, not configured, or the operation runs past
-its latency budget — a single absolute deadline covering query embedding **and** the vector search
-(KNN) — results come from full-text search with an explicit `degraded_to_fts` flag, never an error.
-`full_text` mode itself is unchanged and byte-for-byte identical to prior behavior.
+its latency budget, results come from full-text search with an explicit `degraded_to_fts` flag,
+never an error. The latency budget is a single absolute deadline that bounds the **semantic attempt**
+— query embedding **and** the vector search (KNN). It is a semantic-arm-only budget: once it is
+exhausted the query degrades to `full_text`, and that fallback then runs to **completion** (a
+synchronous local SQLite path that cannot be preempted mid-query), so the budget is a bound on the
+semantic attempt rather than an end-to-end guarantee over the fallback. `full_text` mode itself is
+unchanged and byte-for-byte identical to prior behavior.
 
 Search filters (`conversation_id`, `source`, `time_from`, `time_to`) are enforced inside the vector
-search before the top-k cap, so an ineligible high-scoring vector never displaces an eligible one.
-`role` is a raw-message dimension summaries do not carry, so a `role` filter degrades a semantic
-query to `full_text` (which does enforce role) rather than being ignored.
+search before the top-k cap, so an ineligible high-scoring vector never displaces an eligible one. A
+`source` filter **fails closed** when provenance cannot be verified (e.g. a legacy DB whose messages
+lack a `source` column): it returns no semantic hit rather than a false positive, degrading to
+`full_text`. `role` is a raw-message dimension summaries do not carry, so a `role` filter degrades a
+semantic query to `full_text` (which does enforce role) rather than being ignored.
 
 ## Performance & footprint
 
@@ -103,16 +109,16 @@ query to `full_text` (which does enforce role) rather than being ignored.
 - Metadata/id resolution uses a temp-table join rather than a giant `IN (...)` list, so it scales
   past the SQLite host-parameter limit that previously failed near ~32k ids (validated to 40k).
 - Without numpy, search scans the most recent `LCM_EMBEDDING_BOUNDED_SCAN_ROWS` vectors (default
-  2,000) and reports `coverage: bounded`.
-- `sqlite-vec` can be enabled as an accelerator where it works, but note it cannot load on macOS
-  stock/system Python (Apple compiles SQLite without extension loading) — which is why it is not the
-  default path.
+  2,000) and reports `coverage: bounded`. The candidate enumeration is bounded at the SQL layer
+  (`ORDER BY` recency `+ LIMIT`), so a large corpus never materializes every id in host memory.
 
 ## Switching or removing providers
 
 Change provider/model → run `/lcm embed warmup` (registers the new profile as the current identity)
 → `/lcm embed backfill --apply` (embeds under the new identity; the previous model's vectors are
-kept separate and never mixed). Because each identity `(provider, model, revision, dim, dtype,
-byteorder, task)` owns its own vectors, switching **back** to a previously-registered provider
-reactivates it with its existing vectors — no re-backfill needed. Disable everything with
+kept separate and never mixed). Every vector is published under the exact identity that produced it
+— the identity is captured at provider-resolution time and carried through the write, so switching
+the active provider A→B mid-backfill can never rebind an A-vector onto B. Because each identity
+`(provider, model, revision, dim, dtype, byteorder, task)` owns its own vectors, switching **back**
+to a previously-registered provider reactivates it with its existing vectors — no re-backfill needed. Disable everything with
 `LCM_EMBEDDINGS_ENABLED=false` — data stays, behavior reverts to FTS-only instantly.
