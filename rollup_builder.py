@@ -13,7 +13,7 @@ from typing import Callable, Sequence
 from .config import LCMConfig
 from .dag import SummaryDAG
 from .escalation import _deterministic_truncate, summarize_with_escalation
-from .rollup_periods import CoverageNode, canonical_frontier, covered_days
+from .rollup_periods import CoverageNode, canonical_frontier, load_source_lineage
 from .rollup_store import RollupBuildToken, RollupStore
 from .tokens import count_tokens
 
@@ -21,22 +21,59 @@ logger = logging.getLogger(__name__)
 
 Summarizer = Callable[..., tuple[str, int]]
 _FAILED_ROLLUP_BACKOFF = timedelta(seconds=30)
+_FRONTIER_WORK_LIMIT = 4_096
 
 _PENDING_ROLLUPS_SQL = """
     SELECT period_kind, period_start
     FROM lcm_rollups
     WHERE scope = ?
-      AND status IN ('stale', 'failed')
-      AND (
-        status = 'stale'
-        OR built_at IS NULL
-        OR built_at <= ?
-      )
-    ORDER BY CASE WHEN period_kind = 'day' THEN 0 ELSE 1 END,
-             period_start,
-             period_kind
+      AND status = 'stale'
+      AND period_kind = 'day'
+    ORDER BY period_start
     LIMIT ?
 """
+
+_PENDING_AGGREGATES_SQL = """
+    SELECT period_kind, period_start
+    FROM lcm_rollups
+    WHERE scope = ?
+      AND status = 'stale'
+      AND period_kind IN ('week', 'month')
+    ORDER BY period_start, period_kind
+    LIMIT ?
+"""
+
+_FAILED_ROLLUPS_SQL = """
+    SELECT period_kind, period_start
+    FROM lcm_rollups
+    WHERE scope = ?
+      AND status = 'failed'
+      AND period_kind = 'day'
+      AND (failed_at IS NULL OR failed_at <= ?)
+    ORDER BY failed_at, period_start, period_kind
+    LIMIT ?
+"""
+
+_FAILED_AGGREGATES_SQL = """
+    SELECT period_kind, period_start
+    FROM lcm_rollups
+    WHERE scope = ?
+      AND status = 'failed'
+      AND period_kind IN ('week', 'month')
+      AND (failed_at IS NULL OR failed_at <= ?)
+    ORDER BY failed_at, period_start, period_kind
+    LIMIT ?
+"""
+
+
+class RollupWorkLimitExceeded(RuntimeError):
+    """Raised when correctness would require more than one bounded work pass."""
+
+
+def initialize_rollup_invalidation_outbox(dag: SummaryDAG) -> None:
+    """Enable mutation triggers before the feature can publish summary nodes."""
+    store = RollupStore(dag.db_path)
+    store.close()
 
 
 def _as_date(value: date | str) -> date:
@@ -53,90 +90,143 @@ def _stable_hash(value: object) -> str:
 
 
 def _scope_frontier(dag: SummaryDAG, scope: str) -> list[dict[str, object]]:
-    """The scope's canonical frontier nodes, each tagged with a representative day.
+    """The scope's canonical frontier nodes with normalized interval bounds.
 
     Loads every summary node for ``scope`` and applies the shared interval-aware
     :func:`canonical_frontier`: a node condensed by a higher-depth parent anywhere
     in the scope is suppressed, so a parent that spans several days stands in for
     the children it covers even when those children land on adjacent days. Each
-    surviving frontier node is assigned to exactly ONE representative day (the UTC
-    day of its newest covered timestamp) so its lineage appears in a single daily
-    rollup — never duplicated across adjacent dailies (maintainer #388 B1).
+    SQL enumeration is capped; exceeding the cap fails closed instead of silently
+    returning a non-canonical prefix.
     """
-    connection = dag.connection
-    if connection is None:
-        return []
-    rows = connection.execute(
-        """
-        SELECT node_id, depth, summary, source_ids, source_type,
-               COALESCE(earliest_at, created_at) AS earliest_at,
-               COALESCE(latest_at, created_at) AS latest_at
-        FROM summary_nodes
-        WHERE session_id = ?
-        ORDER BY COALESCE(latest_at, created_at), node_id
-        """,
-        (scope,),
-    ).fetchall()
-    candidates: list[CoverageNode] = []
-    meta: dict[int, dict[str, object]] = {}
-    for row in rows:
-        node_id = int(row[0])
-        source_type = str(row[4] or "")
-        source_node_ids: tuple[int, ...] = ()
-        if source_type == "nodes" and row[3]:
-            try:
-                source_node_ids = tuple(int(value) for value in json.loads(row[3]))
-            except (TypeError, ValueError):
-                source_node_ids = ()
-        latest_at = row[6]
-        candidates.append(
-            CoverageNode(
-                node_id=node_id,
-                depth=int(row[1] or 0),
-                source_node_ids=source_node_ids,
-                earliest_at=row[5],
-                latest_at=latest_at,
+    # All temp tables below belong to this SQLite connection, not to a thread.
+    # Keep the probe, staging table, ordered read, and transitive-lineage temp
+    # walk under one DAG lock so concurrent scopes cannot clear or replace one
+    # another's staged IDs.
+    with dag._db_lock:
+        connection = dag.connection
+        if connection is None:
+            return []
+        # Probe without an expression ORDER BY first. The session index can stop
+        # at the sentinel row, so an oversized scope never scans/sorts its corpus.
+        id_rows = connection.execute(
+            "SELECT node_id FROM summary_nodes WHERE session_id = ? LIMIT ?",
+            (scope, _FRONTIER_WORK_LIMIT + 1),
+        ).fetchall()
+        if len(id_rows) > _FRONTIER_WORK_LIMIT:
+            raise RollupWorkLimitExceeded(
+                f"scope frontier exceeds bounded work limit ({_FRONTIER_WORK_LIMIT})"
             )
+        if not id_rows:
+            return []
+
+        connection.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS lcm_scope_frontier_ids "
+            "(node_id INTEGER PRIMARY KEY) WITHOUT ROWID"
         )
-        representative_day = (
-            datetime.fromtimestamp(float(latest_at), tz=timezone.utc).date().isoformat()
-            if latest_at is not None
-            else None
-        )
-        meta[node_id] = {
-            "summary": str(row[2] or ""),
-            "representative_day": representative_day,
-        }
-    frontier: list[dict[str, object]] = []
-    for node in canonical_frontier(candidates):
-        info = meta[node.node_id]
-        frontier.append(
-            {
-                "node_id": node.node_id,
-                "summary": info["summary"],
-                "representative_day": info["representative_day"],
+        connection.execute("DELETE FROM temp.lcm_scope_frontier_ids")
+        try:
+            connection.executemany(
+                "INSERT INTO temp.lcm_scope_frontier_ids(node_id) VALUES(?)",
+                ((int(row[0]),) for row in id_rows),
+            )
+            # Any sort below is over a set already proven to contain at most
+            # 4,096 rows. The temp-table join also avoids a dynamic IN-list.
+            rows = connection.execute(
+                """
+                SELECT node.node_id, node.depth, node.summary, node.source_ids,
+                       node.source_type,
+                       COALESCE(node.earliest_at, node.created_at) AS earliest_at,
+                       COALESCE(node.latest_at, node.created_at) AS latest_at
+                FROM temp.lcm_scope_frontier_ids wanted
+                JOIN summary_nodes node ON node.node_id = wanted.node_id
+                ORDER BY COALESCE(node.latest_at, node.created_at), node.node_id
+                """
+            ).fetchall()
+        finally:
+            connection.execute("DELETE FROM temp.lcm_scope_frontier_ids")
+
+        candidates: list[CoverageNode] = []
+        meta: dict[int, dict[str, object]] = {}
+        for row in rows:
+            node_id = int(row[0])
+            source_type = str(row[4] or "")
+            source_node_ids: tuple[int, ...] = ()
+            if source_type == "nodes" and row[3]:
+                try:
+                    source_node_ids = tuple(
+                        int(value) for value in json.loads(row[3])
+                    )
+                except (TypeError, ValueError):
+                    source_node_ids = ()
+            latest_at = row[6]
+            candidates.append(
+                CoverageNode(
+                    node_id=node_id,
+                    depth=int(row[1] or 0),
+                    source_node_ids=source_node_ids,
+                    earliest_at=row[5],
+                    latest_at=latest_at,
+                )
+            )
+            earliest_at = row[5]
+            covered_start = float(earliest_at) if earliest_at is not None else None
+            covered_end = float(latest_at) if latest_at is not None else None
+            if (
+                covered_start is not None
+                and covered_end is not None
+                and covered_end < covered_start
+            ):
+                covered_start, covered_end = covered_end, covered_start
+            meta[node_id] = {
+                "summary": str(row[2] or ""),
+                "covered_start": covered_start,
+                "covered_end": covered_end,
             }
-        )
-    return frontier
+        try:
+            source_lineage = load_source_lineage(
+                connection,
+                [candidate.node_id for candidate in candidates],
+                limit=_FRONTIER_WORK_LIMIT,
+            )
+        except RuntimeError as exc:
+            raise RollupWorkLimitExceeded(str(exc)) from exc
+
+        frontier: list[dict[str, object]] = []
+        for node in canonical_frontier(candidates, source_lineage=source_lineage):
+            info = meta[node.node_id]
+            frontier.append(
+                {
+                    "node_id": node.node_id,
+                    "summary": info["summary"],
+                    "covered_start": info["covered_start"],
+                    "covered_end": info["covered_end"],
+                }
+            )
+        return frontier
 
 
 def _daily_sources(dag: SummaryDAG, scope: str, day: date) -> list[dict[str, object]]:
-    """Return the canonical frontier nodes whose representative day is ``day``.
+    """Return canonical frontier nodes whose full interval intersects ``day``.
 
     A condensed child and its condensing parent must not both feed rollups: the
     parent already covers the child's lineage. Crucially the parent may land on a
     DIFFERENT day than the child (its span crosses midnight), so the suppression
     is computed over the whole scope's frontier, not just this day's rows — a
     child on Jul15 covered by a parent whose representative day is Jul16 is
-    suppressed from Jul15, and the parent feeds only Jul16, so adjacent dailies
-    never duplicate the same covered leaf lineage (maintainer #388 B1 /
-    #389 source-dedup).
+    suppressed from Jul15, and the parent feeds every UTC day its full interval
+    intersects, so adjacent dailies use one canonical lineage (maintainer #388
+    B1 / #389 source-dedup).
     """
-    day_key = day.isoformat()
+    day_start = datetime.combine(day, datetime.min.time(), tzinfo=timezone.utc).timestamp()
+    day_end = day_start + timedelta(days=1).total_seconds()
     return [
         {"node_id": node["node_id"], "summary": node["summary"]}
         for node in _scope_frontier(dag, scope)
-        if node["representative_day"] == day_key
+        if node["covered_start"] is not None
+        and node["covered_end"] is not None
+        and float(node["covered_start"]) < day_end
+        and float(node["covered_end"]) >= day_start
     ]
 
 
@@ -194,11 +284,7 @@ def _mark_failed(
         try:
             # Generation-guarded: a superseded builder's late exception must not
             # flip a newer ready/stale row to failed (maintainer #387 blocker 2).
-            store.mark_failed(
-                token.rollup_id,
-                f"{type(exc).__name__}: {exc}",
-                generation=token.generation,
-            )
+            store.mark_failed(token, f"{type(exc).__name__}: {exc}")
         except Exception:
             logger.debug("LCM temporal rollup failure state could not be persisted", exc_info=True)
     logger.debug("LCM temporal rollup build failed", exc_info=True)
@@ -220,6 +306,7 @@ def build_day(
     try:
         summarizer = summarizer or summarize_with_escalation
         day = _as_date(period_date)
+        store.drain_invalidations(event_limit=256, day_budget=256)
         # Capture the build token (advancing the generation) BEFORE reading the
         # source snapshot, so an invalidation that arrives while we build is
         # guaranteed to supersede this token's mark_ready — a snapshot read
@@ -319,20 +406,30 @@ def _days_with_content(
     """UTC days in ``[start, end]`` that have canonical-frontier content for ``scope``.
 
     A rollup consumes the scope's canonical frontier; a day counts as having
-    content when a frontier node's representative day falls on it. This MUST use
+    content when a frontier node's full interval intersects it. This MUST use
     the same frontier as :func:`_daily_sources`: a day whose only node is a child
     suppressed by a multi-day parent has NO daily to build, so it must not count
     as content and block the aggregate's completeness gate (maintainer #388 B1).
     A day with no frontier content legitimately has no daily rollup.
     """
-    start_key = start.isoformat()
-    end_key = end.isoformat()
-    return {
-        str(node["representative_day"])
-        for node in _scope_frontier(dag, scope)
-        if node["representative_day"] is not None
-        and start_key <= str(node["representative_day"]) <= end_key
-    }
+    frontier = _scope_frontier(dag, scope)
+    result: set[str] = set()
+    current = start
+    while current <= end:
+        day_start = datetime.combine(
+            current, datetime.min.time(), tzinfo=timezone.utc
+        ).timestamp()
+        day_end = day_start + timedelta(days=1).total_seconds()
+        if any(
+            node["covered_start"] is not None
+            and node["covered_end"] is not None
+            and float(node["covered_start"]) < day_end
+            and float(node["covered_end"]) >= day_start
+            for node in frontier
+        ):
+            result.add(current.isoformat())
+        current += timedelta(days=1)
+    return result
 
 
 def _rollup_source_ids(store: RollupStore, rollup_ids: Sequence[int]) -> list[int]:
@@ -351,6 +448,77 @@ def _rollup_source_ids(store: RollupStore, rollup_ids: Sequence[int]) -> list[in
     return [int(row[0]) for row in rows]
 
 
+def _canonical_aggregate_sources(
+    dag: SummaryDAG, source_ids: Sequence[int]
+) -> list[dict[str, object]]:
+    """Resolve one bounded canonical node frontier for aggregate publication."""
+    unique_ids = list(dict.fromkeys(int(node_id) for node_id in source_ids))
+    if len(unique_ids) > _FRONTIER_WORK_LIMIT:
+        raise RollupWorkLimitExceeded(
+            f"aggregate frontier exceeds bounded work limit ({_FRONTIER_WORK_LIMIT})"
+        )
+    if not unique_ids:
+        return []
+    # Aggregate staging and the shared lineage temp walk use the same connection
+    # and therefore participate in the same serialization contract as scopes.
+    with dag._db_lock:
+        connection = dag.connection
+        if connection is None:
+            return []
+        connection.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS lcm_aggregate_source_ids "
+            "(node_id INTEGER PRIMARY KEY) WITHOUT ROWID"
+        )
+        connection.execute("DELETE FROM temp.lcm_aggregate_source_ids")
+        try:
+            connection.executemany(
+                "INSERT INTO temp.lcm_aggregate_source_ids(node_id) VALUES(?)",
+                ((node_id,) for node_id in unique_ids),
+            )
+            rows = connection.execute(
+                """
+                SELECT node.node_id, node.depth, node.summary, node.source_ids,
+                       node.source_type,
+                       COALESCE(node.earliest_at, node.created_at),
+                       COALESCE(node.latest_at, node.created_at)
+                FROM temp.lcm_aggregate_source_ids wanted
+                JOIN summary_nodes node ON node.node_id = wanted.node_id
+                ORDER BY node.node_id
+                """
+            ).fetchall()
+            source_lineage = load_source_lineage(
+                connection, unique_ids, limit=_FRONTIER_WORK_LIMIT
+            )
+        except RuntimeError as exc:
+            raise RollupWorkLimitExceeded(str(exc)) from exc
+        finally:
+            connection.execute("DELETE FROM temp.lcm_aggregate_source_ids")
+    candidates: list[CoverageNode] = []
+    summaries: dict[int, str] = {}
+    for row in rows:
+        parent_sources: tuple[int, ...] = ()
+        if str(row[4] or "") == "nodes" and row[3]:
+            try:
+                parent_sources = tuple(int(value) for value in json.loads(row[3]))
+            except (TypeError, ValueError):
+                parent_sources = ()
+        node_id = int(row[0])
+        candidates.append(
+            CoverageNode(
+                node_id=node_id,
+                depth=int(row[1] or 0),
+                source_node_ids=parent_sources,
+                earliest_at=row[5],
+                latest_at=row[6],
+            )
+        )
+        summaries[node_id] = str(row[2] or "")
+    return [
+        {"node_id": node.node_id, "summary": summaries[node.node_id]}
+        for node in canonical_frontier(candidates, source_lineage=source_lineage)
+    ]
+
+
 def _build_aggregate(
     period_kind: str,
     store: RollupStore,
@@ -367,6 +535,7 @@ def _build_aggregate(
     try:
         summarizer = summarizer or summarize_with_escalation
         start, end = _period_window(period_kind, period_start)
+        store.drain_invalidations(event_limit=256, day_budget=256)
         # Capture the build token (advancing the generation) BEFORE reading the
         # daily-status snapshot, so a daily (re)build that stales this aggregate
         # while we build supersedes this token's mark_ready — reading dailies
@@ -417,13 +586,18 @@ def _build_aggregate(
             return None
 
         fingerprint = _stable_hash(days)
-        text = "\n\n".join(
-            f"[Daily rollup {day_key}]\n{row.get('summary') or ''}"
-            for day_key, row in ready
-        )
-        source_ids = _rollup_source_ids(
+        constituent_source_ids = _rollup_source_ids(
             store,
             [int(row["rollup_id"]) for _day_key, row in ready],
+        )
+        frontier_sources = _canonical_aggregate_sources(dag, constituent_source_ids)
+        if not frontier_sources:
+            store.defer_incomplete(token, "incomplete: no canonical aggregate sources")
+            return None
+        source_ids = [int(source["node_id"]) for source in frontier_sources]
+        text = "\n\n".join(
+            f"[Summary node {source['node_id']}]\n{source['summary']}"
+            for source in frontier_sources
         )
         summary, token_count = _summarize_capped(
             text,
@@ -506,19 +680,14 @@ def mark_stale_for_published_summary(
     covers more than one day; keying only on ``latest_at`` left the earlier day(s)
     ``ready`` (maintainer #388 B2). The covered span is
     ``[earliest_at, latest_at]`` (each falling back to ``created_at``); the shared
-    :func:`covered_days` helper enumerates the intersected UTC days.
+    durable outbox drains the interval in bounded UTC-day chunks.
     """
     store: RollupStore | None = None
     try:
-        span_end = latest_at if latest_at is not None else created_at
-        span_start = earliest_at if earliest_at is not None else span_end
-        if not scope or span_end is None or span_start is None:
+        if not scope:
             return 0
         store = RollupStore(dag.db_path)
-        affected = 0
-        for day_key in covered_days(span_start, span_end):
-            affected += store.mark_stale_for_day(day_key, scope)
-        return affected
+        return store.drain_invalidations(event_limit=256, day_budget=256) * 3
     except Exception:
         logger.debug("LCM temporal rollup publication staleness update failed", exc_info=True)
         return 0
@@ -528,35 +697,13 @@ def mark_stale_for_published_summary(
 
 
 def mark_stale_for_deleted_nodes(dag: SummaryDAG, node_ids: Sequence[int]) -> int:
-    """Mark rollups that reference deleted summary nodes stale for rebuilding."""
+    """Compatibility wrapper: mutation triggers own deletion invalidation."""
     store: RollupStore | None = None
     try:
-        unique_node_ids = list(dict.fromkeys(int(node_id) for node_id in node_ids))
-        if not unique_node_ids:
-            return 0
-        placeholders = ",".join("?" for _ in unique_node_ids)
         store = RollupStore(dag.db_path)
-        with store.connection:
-            # Advance generation on the invalidation so an in-flight build for
-            # any affected rollup is superseded and cannot publish deleted-node
-            # content over the stale row (maintainer #388 blocker: deletion must
-            # bump generation, mirroring mark_stale_for_day).
-            cur = store.connection.execute(
-                f"""
-                UPDATE lcm_rollups
-                SET status = 'stale',
-                    generation = generation + 1,
-                    lease_expires_at = NULL
-                WHERE status != 'stale'
-                  AND rollup_id IN (
-                    SELECT rollup_id
-                    FROM lcm_rollup_sources
-                    WHERE node_id IN ({placeholders})
-                  )
-                """,
-                unique_node_ids,
-            )
-        return int(cur.rowcount or 0)
+        before = store.has_pending_invalidations()
+        drained = store.drain_invalidations(event_limit=256, day_budget=256)
+        return drained if before else 0
     except Exception:
         logger.debug("LCM temporal rollup deletion staleness update failed", exc_info=True)
         return 0
@@ -583,15 +730,44 @@ def run_rollup_maintenance(
         if limit <= 0 or budget_ms <= 0 or connection is None:
             return 0
         store = RollupStore(dag.db_path)
+        if (monotonic() - started_at) * 1000 >= budget_ms:
+            return 0
+        store.drain_invalidations(event_limit=256, day_budget=256)
+        if (monotonic() - started_at) * 1000 >= budget_ms:
+            return 0
         # Reclaim rows whose build lease expired (a crashed builder left them
         # 'building' forever) back to 'stale' so this pass can retry them
         # (maintainer #388 blocker 2).
-        store.reclaim_stale_building()
+        store.reclaim_stale_building(limit=256)
+        if (monotonic() - started_at) * 1000 >= budget_ms:
+            return 0
         retry_before = (datetime.now(timezone.utc) - _FAILED_ROLLUP_BACKOFF).isoformat()
-        rows = connection.execute(
+        stale_rows = connection.execute(
             _PENDING_ROLLUPS_SQL,
-            (scope, retry_before, limit),
+            (scope, limit),
         ).fetchall()
+        rows = list(stale_rows)
+        if len(rows) < limit and (monotonic() - started_at) * 1000 < budget_ms:
+            rows.extend(
+                connection.execute(
+                    _FAILED_ROLLUPS_SQL,
+                    (scope, retry_before, limit - len(rows)),
+                ).fetchall()
+            )
+        if len(rows) < limit and (monotonic() - started_at) * 1000 < budget_ms:
+            rows.extend(
+                connection.execute(
+                    _PENDING_AGGREGATES_SQL,
+                    (scope, limit - len(rows)),
+                ).fetchall()
+            )
+        if len(rows) < limit and (monotonic() - started_at) * 1000 < budget_ms:
+            rows.extend(
+                connection.execute(
+                    _FAILED_AGGREGATES_SQL,
+                    (scope, retry_before, limit - len(rows)),
+                ).fetchall()
+            )
         if not rows:
             return 0
         builders: dict[str, Callable[..., dict[str, object] | None]] = {
