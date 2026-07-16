@@ -1360,17 +1360,24 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             )
 
     def _invalidate_rollups_for_published_node(self, node: "SummaryNode") -> None:
-        """Stale the rollups covering a just-published summary node's day.
+        """Stale the rollups covering EVERY UTC day a just-published node spans.
 
         Rollups consume published summary nodes, so publication — not raw ingest
         — is the load-bearing staleness signal (maintainer #388 blocker 1). This
         is called after every ``_dag.add_node`` on the engine so a later summary
-        cannot leave an older rollup ``ready`` and apparently current.
+        cannot leave an older rollup ``ready`` and apparently current. The node's
+        ``earliest_at``/``latest_at`` coverage span is passed through so a summary
+        crossing midnight stales BOTH days, not only its newest (maintainer #388
+        blocker 2 / B2).
         """
         if not self._config.temporal_rollups_enabled:
             return
         mark_stale_for_published_summary(
-            self._dag, str(node.session_id or ""), node.latest_at, node.created_at
+            self._dag,
+            str(node.session_id or ""),
+            node.latest_at,
+            node.created_at,
+            earliest_at=node.earliest_at,
         )
 
     def _register_active_engine_binding(self) -> None:
