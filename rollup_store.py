@@ -20,6 +20,7 @@ from .db_bootstrap import (
     mark_migration_step_complete,
     refuse_schema_version_too_new,
     run_versioned_migrations,
+    verify_temporal_rollup_schema,
 )
 from .sqlite_util import _is_sqlite_locked_error
 
@@ -72,6 +73,20 @@ class RollupStore:
         # creating them here keeps a disabled install at the base schema with no
         # rollup tables while still being idempotent under concurrent construction.
         ensure_temporal_rollup_tables(self._conn)
+        # Do NOT trust the named marker alone: it can be present on a DB whose
+        # tables were dropped or left partial by a crash mid-create. Verify the
+        # required tables+indexes actually exist and re-ensure (idempotent
+        # CREATE IF NOT EXISTS makes this safe) before recording the step, so a
+        # stale marker can never mask a missing table (maintainer #387 A3).
+        missing = verify_temporal_rollup_schema(self._conn)
+        if missing:
+            ensure_temporal_rollup_tables(self._conn)
+            missing = verify_temporal_rollup_schema(self._conn)
+            if missing:
+                raise RuntimeError(
+                    "temporal rollup schema incomplete after ensure: "
+                    + ", ".join(missing)
+                )
         mark_migration_step_complete(self._conn, "temporal_rollups_v1")
         self._conn.commit()
 
@@ -151,6 +166,14 @@ class RollupStore:
         row starts at generation 0 (no prior claimant to race). A
         ``lease_expires_at`` is stamped so a crashed builder's row can later be
         reclaimed by :meth:`reclaim_stale_building`.
+
+        The claim deliberately does NOT clear ``lcm_rollup_sources``: the prior
+        last-known-good lineage stays queryable until :meth:`mark_ready` swaps it
+        (sources-replace + ``status = 'ready'`` in one transaction). Clearing at
+        claim opened a purge/deletion race — a concurrent purge-by-node queried
+        the affected rollups, found ZERO sources (lineage already cleared) and so
+        did not re-stale, letting the in-flight build publish deleted-node
+        content as ``ready`` (maintainer #387 A2).
         """
         with self._write_transaction():
             self._conn.execute(
@@ -176,10 +199,6 @@ class RollupStore:
                 (period_kind, period_start, scope),
             ).fetchone()
             rollup_id = int(row["rollup_id"])
-            self._conn.execute(
-                "DELETE FROM lcm_rollup_sources WHERE rollup_id = ?",
-                (rollup_id,),
-            )
         return RollupBuildToken(rollup_id, int(row["generation"] or 0))
 
     def mark_ready(
@@ -196,6 +215,13 @@ class RollupStore:
         was superseded (an invalidation advanced the row's generation past the
         token, or the row was reclaimed) — in which case the newer state is left
         untouched. Raises ``ValueError`` only for a genuinely unknown rollup id.
+
+        The compare-and-set also requires ``status = 'building'``: once a row has
+        left ``building`` (published ``ready``, or reclaimed to ``stale``) no
+        token-holder may transition it, even at the captured generation
+        (maintainer #387 A1). ``mark_ready`` does not itself advance
+        ``generation``, so the status clause is what stops a late ``mark_failed``
+        from the same token flipping a just-published row.
         """
         unique_source_ids = list(dict.fromkeys(int(node_id) for node_id in source_node_ids))
         with self._write_transaction():
@@ -204,7 +230,7 @@ class RollupStore:
                 UPDATE lcm_rollups
                 SET summary = ?, token_count = ?, status = 'ready', built_at = ?,
                     source_fingerprint = ?, error = NULL, lease_expires_at = NULL
-                WHERE rollup_id = ? AND generation = ?
+                WHERE rollup_id = ? AND generation = ? AND status = 'building'
                 """,
                 (
                     summary,
@@ -241,10 +267,14 @@ class RollupStore:
 
         When ``generation`` is given the update is a compare-and-set (exactly
         like :meth:`mark_ready`): a superseded builder's late exception cannot
-        flip a newer ready/stale row to ``failed``. Returns ``True`` when a row
-        was updated, ``False`` when the build was superseded. An unguarded call
-        (``generation is None``) always writes and is used only to seed a known
-        failure state directly.
+        flip a newer ready/stale row to ``failed``. The guarded update also
+        requires ``status = 'building'`` so a late failure cannot flip a row that
+        has already left ``building`` at the SAME generation — e.g. a
+        ``mark_ready`` (which does not advance ``generation``) followed by a
+        stale builder's ``mark_failed`` with the same token (maintainer #387 A1).
+        Returns ``True`` when a row was updated, ``False`` when the build was
+        superseded. An unguarded call (``generation is None``) always writes and
+        is used only to seed a known failure state directly.
         """
         with self._write_transaction():
             if generation is None:
@@ -261,7 +291,7 @@ class RollupStore:
                     """
                     UPDATE lcm_rollups
                     SET status = 'failed', error = ?
-                    WHERE rollup_id = ? AND generation = ?
+                    WHERE rollup_id = ? AND generation = ? AND status = 'building'
                     """,
                     (error, int(rollup_id), int(generation)),
                 )
@@ -353,6 +383,42 @@ class RollupStore:
             )
         return int(cur.rowcount or 0)
 
+    def upsert_stale_many(
+        self, targets: Sequence[tuple[str, str, str]]
+    ) -> int:
+        """Durably seed several ``stale`` rows in ONE transaction (all-or-nothing).
+
+        ``/lcm rollups rebuild`` queues every requested target before applying
+        the per-pass build budget. Seeding each target in its own transaction let
+        a mid-batch failure leave some targets seeded and others absent (e.g. a
+        missing month with no row); seeding them together makes the batch
+        atomic — a failure on any target rolls the whole seed back so no target
+        is left half-queued (maintainer #391 D2). Per-target semantics match
+        :meth:`upsert_stale`: a currently-``building`` row is left untouched, and
+        a conflicting seed advances ``generation`` to supersede an in-flight
+        build.
+        """
+        rows = [(str(kind), str(start), str(scope)) for kind, start, scope in targets]
+        if not rows:
+            return 0
+        affected = 0
+        with self._write_transaction():
+            for period_kind, period_start, scope in rows:
+                cur = self._conn.execute(
+                    """
+                    INSERT INTO lcm_rollups(period_kind, period_start, scope, status)
+                    VALUES(?, ?, ?, 'stale')
+                    ON CONFLICT(period_kind, period_start, scope) DO UPDATE SET
+                        status = 'stale',
+                        generation = lcm_rollups.generation + 1,
+                        lease_expires_at = NULL
+                    WHERE lcm_rollups.status != 'building'
+                    """,
+                    (period_kind, period_start, scope),
+                )
+                affected += int(cur.rowcount or 0)
+        return affected
+
     def defer_incomplete(self, token: RollupBuildToken, reason: str) -> bool:
         """Release a claimed aggregate build back to ``stale`` with a reason.
 
@@ -382,13 +448,17 @@ class RollupStore:
         sources were deleted, or a rebuild request seeded a contentless target).
         Such a period must not linger ``stale`` forever consuming a per-pass build
         slot: this deletes the claimed row (and its sources) iff this builder
-        still owns it (compare-and-set on ``generation``). A later covering
-        publication re-seeds a fresh ``stale`` row. Returns ``True`` when cleared,
-        ``False`` when superseded (a newer invalidation is left to rebuild).
+        still owns it (compare-and-set on ``generation`` AND ``status =
+        'building'``, so a row that already left ``building`` at the same
+        generation cannot be deleted out from under a newer state — same
+        terminal-transition invariant as :meth:`mark_ready`, maintainer #387 A1).
+        A later covering publication re-seeds a fresh ``stale`` row. Returns
+        ``True`` when cleared, ``False`` when superseded (a newer invalidation is
+        left to rebuild).
         """
         with self._write_transaction():
             cur = self._conn.execute(
-                "DELETE FROM lcm_rollups WHERE rollup_id = ? AND generation = ?",
+                "DELETE FROM lcm_rollups WHERE rollup_id = ? AND generation = ? AND status = 'building'",
                 (int(token.rollup_id), int(token.generation)),
             )
             if int(cur.rowcount or 0) > 0:
