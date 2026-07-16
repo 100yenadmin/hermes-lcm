@@ -284,8 +284,14 @@ class _ResilientProvider:
         self.spend_guard.record_call()
         try:
             result = call()
-        except Exception:
-            self.breaker.record_failure()
+        except Exception as exc:
+            # Authentication failures are definitive operator/configuration
+            # errors, not evidence that the provider is temporarily
+            # unavailable. Keeping them out of the breaker preserves the
+            # actionable VoyageError on every attempt instead of eventually
+            # replacing it with a misleading cooling-down error.
+            if not (isinstance(exc, VoyageError) and exc.kind == "auth"):
+                self.breaker.record_failure()
             raise
         self.breaker.record_success()
         return result

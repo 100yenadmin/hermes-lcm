@@ -605,6 +605,29 @@ def test_circuit_breaker_opens_then_cools_down():
     assert breaker.allows(now=breaker._open_until + 0.1) is True
 
 
+def test_voyage_auth_errors_never_open_circuit_breaker(monkeypatch):
+    monkeypatch.setenv("VOYAGE_API_KEY", "invalid-key")
+    breaker = EmbeddingCircuitBreaker(failure_threshold=2, cooldown_seconds=10)
+    transport = FakeTransport(
+        _response(401, {"error": "invalid key"}),
+        _response(401, {"error": "invalid key"}),
+        _response(401, {"error": "invalid key"}),
+    )
+    provider = VoyageProvider(
+        "voyage-test",
+        transport=transport,
+        breaker=breaker,
+    )
+
+    for _ in range(3):
+        with pytest.raises(VoyageError) as exc_info:
+            provider.embed_query("query")
+        assert exc_info.value.kind == "auth"
+
+    assert len(transport.calls) == 3
+    assert breaker.allows() is True
+
+
 def test_spend_guard_rate_limits_provider_calls():
     guard = EmbeddingSpendGuard(max_calls=1, window_seconds=100, backoff_seconds=50)
     transport = FakeTransport(_response(200, {"embeddings": [[1, 2]]}))
