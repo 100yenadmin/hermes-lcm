@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import time
 from types import SimpleNamespace
 
@@ -1197,6 +1198,80 @@ def test_inflight_schema_rejects_incompatible_primary_key(tmp_path):
         )
         with pytest.raises(RuntimeError, match="incompatible.*column"):
             command_mod._ensure_inflight_table(conn)
+    finally:
+        store.close()
+
+
+def test_concurrent_first_run_inflight_schema_creation_is_idempotent(tmp_path):
+    db_path = tmp_path / "concurrent-inflight.db"
+    sqlite3.connect(db_path).close()
+    begin_barrier = threading.Barrier(2)
+    outcomes: list[str] = []
+    outcome_lock = threading.Lock()
+
+    class BeginBarrierConnection:
+        def __init__(self, conn):
+            self._conn = conn
+            self._synchronized = False
+
+        @property
+        def in_transaction(self):
+            return self._conn.in_transaction
+
+        def execute(self, sql, params=()):
+            if sql == "BEGIN IMMEDIATE" and not self._synchronized:
+                self._synchronized = True
+                begin_barrier.wait(timeout=2)
+            return self._conn.execute(sql, params)
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    def initialize() -> None:
+        conn = sqlite3.connect(db_path, timeout=3, check_same_thread=False)
+        try:
+            command_mod._ensure_inflight_table(BeginBarrierConnection(conn))
+            outcome = "success"
+        except Exception as exc:  # pragma: no cover - assertion reports detail
+            outcome = f"{type(exc).__name__}: {exc}"
+        finally:
+            conn.close()
+        with outcome_lock:
+            outcomes.append(outcome)
+
+    threads = [threading.Thread(target=initialize) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert not any(thread.is_alive() for thread in threads)
+    assert sorted(outcomes) == ["success", "success"]
+
+
+@pytest.mark.parametrize("shared_connection", [False, True])
+def test_embedding_purge_removes_orphaned_inflight_markers(
+    tmp_path, shared_connection
+):
+    store = VectorStore(tmp_path / f"purge-inflight-{shared_connection}.db")
+    try:
+        command_mod._ensure_inflight_table(store.connection)
+        store.connection.execute(
+            "INSERT INTO lcm_embedding_backfill_inflight("
+            "embedded_id, identity_hash, state, updated_at) "
+            "VALUES ('7', 'identity', 'uncertain', 1)"
+        )
+        store.connection.commit()
+
+        if shared_connection:
+            VectorStore.purge_embedding_batch_on_connection(store.connection, [7])
+        else:
+            store.purge_embeddings_for_nodes([7])
+
+        assert store.connection.execute(
+            "SELECT COUNT(*) FROM lcm_embedding_backfill_inflight "
+            "WHERE embedded_id = '7'"
+        ).fetchone()[0] == 0
     finally:
         store.close()
 

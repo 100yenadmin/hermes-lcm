@@ -781,6 +781,14 @@ class VectorStore:
                     f"DELETE FROM lcm_embedding_meta "
                     f"WHERE embedded_id IN (SELECT id FROM {table})"
                 )
+                if self._conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' "
+                    "AND name='lcm_embedding_backfill_inflight'"
+                ).fetchone() is not None:
+                    self._conn.execute(
+                        f"DELETE FROM lcm_embedding_backfill_inflight "
+                        f"WHERE embedded_id IN (SELECT id FROM {table})"
+                    )
             # Purge spans every identity keyed by these ids; bump all data
             # versions so any cached matrix that referenced a removed vector is
             # invalidated. Over-invalidation across identities is safe.
@@ -803,10 +811,14 @@ class VectorStore:
             for row in conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name IN ("
                 "'lcm_embedding_vectors','lcm_embedding_meta',"
-                "'lcm_embedding_profile')"
+                "'lcm_embedding_profile','lcm_embedding_backfill_inflight')"
             ).fetchall()
         }
-        if len(tables) != 3:
+        if not {
+            "lcm_embedding_vectors",
+            "lcm_embedding_meta",
+            "lcm_embedding_profile",
+        } <= tables:
             return 0
         placeholders = ",".join("?" for _ in unique_ids)
         cur = conn.execute(
@@ -819,6 +831,12 @@ class VectorStore:
             f"WHERE embedded_id IN ({placeholders})",
             unique_ids,
         )
+        if "lcm_embedding_backfill_inflight" in tables:
+            conn.execute(
+                f"DELETE FROM lcm_embedding_backfill_inflight "
+                f"WHERE embedded_id IN ({placeholders})",
+                unique_ids,
+            )
         if cur.rowcount:
             conn.execute(
                 "UPDATE lcm_embedding_profile "
