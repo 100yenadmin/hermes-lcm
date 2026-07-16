@@ -751,6 +751,83 @@ def test_bypassed_session_skips_rollup_maintenance(tmp_path, monkeypatch):
         engine.shutdown()
 
 
+def test_daily_frontier_does_not_duplicate_multiday_parent_lineage(rollup_parts):
+    # Maintainer #388 B1 repro: a child covers Jul15; a parent condenses it
+    # spanning Jul15-16. Keying dailies on latest_at put the child in Jul15's
+    # source set and the parent in Jul16's, so adjacent dailies duplicated the
+    # same covered leaf lineage. The interval-aware canonical frontier must
+    # suppress the child (its parent covers it across the day boundary) so the
+    # parent feeds only Jul16 and Jul15 has no duplicate.
+    store, dag, config = rollup_parts
+    scope = "session-b1"
+    jul15 = date(2026, 7, 15)
+    jul16 = date(2026, 7, 16)
+    child = _add_node(dag, scope, jul15, "child leaf covering jul15")
+    parent = dag.add_node(
+        SummaryNode(
+            session_id=scope,
+            depth=1,
+            summary="parent spanning jul15-16",
+            token_count=count_tokens("parent spanning jul15-16"),
+            source_token_count=10,
+            source_ids=[child],
+            source_type="nodes",
+            created_at=_timestamp(jul16, 18),
+            earliest_at=_timestamp(jul15, 8),
+            latest_at=_timestamp(jul16, 22),
+        )
+    )
+
+    jul15_sources = builder_module._daily_sources(dag, scope, jul15)
+    jul16_sources = builder_module._daily_sources(dag, scope, jul16)
+    jul15_ids = {source["node_id"] for source in jul15_sources}
+    jul16_ids = {source["node_id"] for source in jul16_sources}
+
+    # The child is suppressed everywhere (its parent covers it); the parent feeds
+    # only its representative day (Jul16). Jul15 and Jul16 do NOT both carry the
+    # child's lineage.
+    assert child not in jul15_ids and child not in jul16_ids
+    assert jul16_ids == {parent}
+    assert jul15_ids == set()
+    # Days-with-content agrees with the frontier so the aggregate gate is not
+    # blocked waiting on a Jul15 daily that legitimately does not exist.
+    assert builder_module._days_with_content(dag, scope, jul15, jul16) == {jul16.isoformat()}
+
+
+def test_publication_stales_every_day_a_summary_spans(rollup_parts):
+    # Maintainer #388 B2 repro: a newly published summary spanning Jul15-16 left
+    # Jul15 ready and only Jul16 went stale. Publication must stale every UTC day
+    # the coverage interval intersects (and their week/month).
+    store, dag, config = rollup_parts
+    scope = "session-b2"
+    jul15 = date(2026, 7, 15)
+    jul16 = date(2026, 7, 16)
+    node = _add_node(dag, scope, jul15, "spanning summary", latest_day=jul16)
+    for kind, start in (
+        ("day", jul15),
+        ("day", jul16),
+        ("week", date(2026, 7, 13)),
+        ("month", date(2026, 7, 1)),
+    ):
+        _ready(
+            store, kind, start.isoformat(), scope,
+            summary=f"ready {kind} {start}", source_ids=[node], fingerprint=f"{kind}-{start}",
+        )
+
+    from hermes_lcm.rollup_builder import mark_stale_for_published_summary
+
+    published = dag.get_node(node)
+    mark_stale_for_published_summary(
+        dag, scope, published.latest_at, published.created_at,
+        earliest_at=published.earliest_at,
+    )
+
+    assert store.get_rollup("day", jul15.isoformat(), scope)["status"] == "stale"
+    assert store.get_rollup("day", jul16.isoformat(), scope)["status"] == "stale"
+    assert store.get_rollup("week", "2026-07-13", scope)["status"] == "stale"
+    assert store.get_rollup("month", "2026-07-01", scope)["status"] == "stale"
+
+
 def test_deleted_node_staleness_covers_more_than_get_session_nodes_limit(rollup_parts):
     # get_session_nodes caps at 1000; the unbounded id capture must return every
     # deleted node so rollups past the cap are still staled (maintainer #388).

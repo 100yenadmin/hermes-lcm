@@ -6,13 +6,14 @@ import hashlib
 import json
 import logging
 from calendar import monthrange
-from datetime import date, datetime, time as datetime_time, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from time import monotonic
 from typing import Callable, Sequence
 
 from .config import LCMConfig
 from .dag import SummaryDAG
 from .escalation import _deterministic_truncate, summarize_with_escalation
+from .rollup_periods import CoverageNode, canonical_frontier, covered_days
 from .rollup_store import RollupBuildToken, RollupStore
 from .tokens import count_tokens
 
@@ -46,52 +47,96 @@ def _as_date(value: date | str) -> date:
     return date.fromisoformat(str(value))
 
 
-def _utc_bounds(day: date) -> tuple[float, float]:
-    start = datetime.combine(day, datetime_time.min, tzinfo=timezone.utc)
-    return start.timestamp(), (start + timedelta(days=1)).timestamp()
-
-
 def _stable_hash(value: object) -> str:
     encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _daily_sources(dag: SummaryDAG, scope: str, day: date) -> list[dict[str, object]]:
-    """Return summaries whose newest covered source message falls on ``day``.
+def _scope_frontier(dag: SummaryDAG, scope: str) -> list[dict[str, object]]:
+    """The scope's canonical frontier nodes, each tagged with a representative day.
 
-    A condensed child and its condensing parent can both land on the same day
-    (a parent's ``latest_at`` equals its newest child's), which would double-count
-    that content in the rollup. Exclude any node that is referenced as a source by
-    a higher-depth node also present in the day's set, so the parent stands in for
-    the children it covers (maintainer #389 source-dedup blocker).
+    Loads every summary node for ``scope`` and applies the shared interval-aware
+    :func:`canonical_frontier`: a node condensed by a higher-depth parent anywhere
+    in the scope is suppressed, so a parent that spans several days stands in for
+    the children it covers even when those children land on adjacent days. Each
+    surviving frontier node is assigned to exactly ONE representative day (the UTC
+    day of its newest covered timestamp) so its lineage appears in a single daily
+    rollup — never duplicated across adjacent dailies (maintainer #388 B1).
     """
     connection = dag.connection
     if connection is None:
         return []
-    start, end = _utc_bounds(day)
     rows = connection.execute(
         """
-        SELECT n.node_id, n.summary
-        FROM summary_nodes n
-        WHERE n.session_id = ?
-          AND COALESCE(n.latest_at, n.created_at) >= ?
-          AND COALESCE(n.latest_at, n.created_at) < ?
-          AND n.node_id NOT IN (
-              SELECT je.value
-              FROM summary_nodes p, json_each(p.source_ids) je
-              WHERE p.session_id = n.session_id
-                AND p.source_type = 'nodes'
-                AND p.depth > n.depth
-                AND COALESCE(p.latest_at, p.created_at) >= ?
-                AND COALESCE(p.latest_at, p.created_at) < ?
-          )
-        ORDER BY COALESCE(n.latest_at, n.created_at), n.node_id
+        SELECT node_id, depth, summary, source_ids, source_type,
+               COALESCE(earliest_at, created_at) AS earliest_at,
+               COALESCE(latest_at, created_at) AS latest_at
+        FROM summary_nodes
+        WHERE session_id = ?
+        ORDER BY COALESCE(latest_at, created_at), node_id
         """,
-        (scope, start, end, start, end),
+        (scope,),
     ).fetchall()
+    candidates: list[CoverageNode] = []
+    meta: dict[int, dict[str, object]] = {}
+    for row in rows:
+        node_id = int(row[0])
+        source_type = str(row[4] or "")
+        source_node_ids: tuple[int, ...] = ()
+        if source_type == "nodes" and row[3]:
+            try:
+                source_node_ids = tuple(int(value) for value in json.loads(row[3]))
+            except (TypeError, ValueError):
+                source_node_ids = ()
+        latest_at = row[6]
+        candidates.append(
+            CoverageNode(
+                node_id=node_id,
+                depth=int(row[1] or 0),
+                source_node_ids=source_node_ids,
+                earliest_at=row[5],
+                latest_at=latest_at,
+            )
+        )
+        representative_day = (
+            datetime.fromtimestamp(float(latest_at), tz=timezone.utc).date().isoformat()
+            if latest_at is not None
+            else None
+        )
+        meta[node_id] = {
+            "summary": str(row[2] or ""),
+            "representative_day": representative_day,
+        }
+    frontier: list[dict[str, object]] = []
+    for node in canonical_frontier(candidates):
+        info = meta[node.node_id]
+        frontier.append(
+            {
+                "node_id": node.node_id,
+                "summary": info["summary"],
+                "representative_day": info["representative_day"],
+            }
+        )
+    return frontier
+
+
+def _daily_sources(dag: SummaryDAG, scope: str, day: date) -> list[dict[str, object]]:
+    """Return the canonical frontier nodes whose representative day is ``day``.
+
+    A condensed child and its condensing parent must not both feed rollups: the
+    parent already covers the child's lineage. Crucially the parent may land on a
+    DIFFERENT day than the child (its span crosses midnight), so the suppression
+    is computed over the whole scope's frontier, not just this day's rows — a
+    child on Jul15 covered by a parent whose representative day is Jul16 is
+    suppressed from Jul15, and the parent feeds only Jul16, so adjacent dailies
+    never duplicate the same covered leaf lineage (maintainer #388 B1 /
+    #389 source-dedup).
+    """
+    day_key = day.isoformat()
     return [
-        {"node_id": int(row[0]), "summary": str(row[1] or "")}
-        for row in rows
+        {"node_id": node["node_id"], "summary": node["summary"]}
+        for node in _scope_frontier(dag, scope)
+        if node["representative_day"] == day_key
     ]
 
 
@@ -271,31 +316,23 @@ def _days_with_content(
     start: date,
     end: date,
 ) -> set[str]:
-    """UTC days in ``[start, end]`` that have any summary node for ``scope``.
+    """UTC days in ``[start, end]`` that have canonical-frontier content for ``scope``.
 
-    A rollup consumes published summary nodes; a day counts as having content
-    when at least one summary node's newest covered timestamp falls on it. This
-    is the set of days that an aggregate is expected to cover — a day with no
-    content legitimately has no daily rollup and must not block the aggregate.
+    A rollup consumes the scope's canonical frontier; a day counts as having
+    content when a frontier node's representative day falls on it. This MUST use
+    the same frontier as :func:`_daily_sources`: a day whose only node is a child
+    suppressed by a multi-day parent has NO daily to build, so it must not count
+    as content and block the aggregate's completeness gate (maintainer #388 B1).
+    A day with no frontier content legitimately has no daily rollup.
     """
-    connection = dag.connection
-    if connection is None:
-        return set()
-    window_start = datetime.combine(start, datetime_time.min, tzinfo=timezone.utc).timestamp()
-    window_end = datetime.combine(
-        end + timedelta(days=1), datetime_time.min, tzinfo=timezone.utc
-    ).timestamp()
-    rows = connection.execute(
-        """
-        SELECT DISTINCT date(COALESCE(latest_at, created_at), 'unixepoch')
-        FROM summary_nodes
-        WHERE session_id = ?
-          AND COALESCE(latest_at, created_at) >= ?
-          AND COALESCE(latest_at, created_at) < ?
-        """,
-        (scope, window_start, window_end),
-    ).fetchall()
-    return {str(row[0]) for row in rows if row[0]}
+    start_key = start.isoformat()
+    end_key = end.isoformat()
+    return {
+        str(node["representative_day"])
+        for node in _scope_frontier(dag, scope)
+        if node["representative_day"] is not None
+        and start_key <= str(node["representative_day"]) <= end_key
+    }
 
 
 def _rollup_source_ids(store: RollupStore, rollup_ids: Sequence[int]) -> list[int]:
@@ -456,24 +493,32 @@ def mark_stale_for_published_summary(
     scope: str,
     latest_at: float | None,
     created_at: float | None = None,
+    *,
+    earliest_at: float | None = None,
 ) -> int:
-    """Invalidate the rollups for the day a newly published summary node covers.
+    """Invalidate the rollups for EVERY UTC day a published summary node covers.
 
     Rollups consume PUBLISHED summary nodes, not raw messages, so publication is
     the load-bearing staleness signal (maintainer #388 blocker 1): when a summary
-    covering day D is published, D and its containing week/month must go stale so
-    a later summary cannot leave an older rollup ``ready`` and apparently current.
-    ``latest_at`` is the node's newest covered-message timestamp (its day);
-    ``created_at`` is a fallback when coverage bounds are unavailable.
+    covering days D..D' is published, each of those days and their containing
+    week/month must go stale so a later summary cannot leave an older rollup
+    ``ready`` and apparently current. A summary whose coverage spans past midnight
+    covers more than one day; keying only on ``latest_at`` left the earlier day(s)
+    ``ready`` (maintainer #388 B2). The covered span is
+    ``[earliest_at, latest_at]`` (each falling back to ``created_at``); the shared
+    :func:`covered_days` helper enumerates the intersected UTC days.
     """
     store: RollupStore | None = None
     try:
-        stamp = latest_at if latest_at is not None else created_at
-        if not scope or stamp is None:
+        span_end = latest_at if latest_at is not None else created_at
+        span_start = earliest_at if earliest_at is not None else span_end
+        if not scope or span_end is None or span_start is None:
             return 0
-        day = datetime.fromtimestamp(float(stamp), tz=timezone.utc).date()
         store = RollupStore(dag.db_path)
-        return store.mark_stale_for_day(day, scope)
+        affected = 0
+        for day_key in covered_days(span_start, span_end):
+            affected += store.mark_stale_for_day(day_key, scope)
+        return affected
     except Exception:
         logger.debug("LCM temporal rollup publication staleness update failed", exc_info=True)
         return 0
