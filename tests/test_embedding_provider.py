@@ -126,6 +126,64 @@ def test_voyage_absolute_deadline_bounds_total_retry_time(monkeypatch):
     assert slept == []
 
 
+def test_voyage_normal_embed_query_bounds_total_retry_time(monkeypatch):
+    # Maintainer repro (B1): normal embed_query() with timeout=0.02 + 3 retryable
+    # failures made three attempts and took ~1.501s (the 0.5s + 1.0s backoffs sat
+    # outside any total budget). The NORMAL path must get ONE absolute deadline
+    # too, just like the interactive path: a tiny budget returns in ~that budget.
+    monkeypatch.setattr(provider_mod, "count_tokens", lambda _text: 1)
+    monkeypatch.setenv("VOYAGE_API_KEY", "test-key")
+    slept: list[float] = []
+    transport = FakeTransport(
+        _response(500, {"error": "x"}),
+        _response(500, {"error": "x"}),
+        _response(500, {"error": "x"}),
+    )
+    provider = VoyageProvider(
+        "voyage-test", transport=transport, timeout=0.02, sleeper=slept.append
+    )
+
+    with pytest.raises(VoyageError):
+        provider.embed_query("q")
+
+    # One attempt, zero backoff sleeps (the 0.5s backoff would exceed 0.02s).
+    assert len(transport.calls) == 1
+    assert slept == []
+
+
+def test_ollama_normal_embed_query_bounds_total_retry_time():
+    # B1 for Ollama's normal path: a tiny timeout budget bounds all attempts +
+    # backoff so retryable network failures cannot stack backoff sleeps.
+    slept: list[float] = []
+    transport = FakeTransport(OSError("boom"), OSError("boom"), OSError("boom"))
+    provider = OllamaProvider(
+        "model", transport=transport, timeout=0.02, sleeper=slept.append
+    )
+
+    with pytest.raises(EmbeddingProviderError):
+        provider.embed_query("q")
+
+    assert len(transport.calls) == 1
+    assert slept == []
+
+
+def test_voyage_item_cap_clamped_to_hard_limit(monkeypatch):
+    # Maintainer repro (B2): configuring max_batch_items=2000 emitted a request
+    # with 1,001 inputs. Voyage's hard 1,000 cap is authoritative regardless of
+    # config: clamp down so no request ever exceeds 1000 inputs.
+    monkeypatch.setattr(provider_mod, "count_tokens", lambda _text: 1)
+    monkeypatch.setenv("VOYAGE_API_KEY", "test-key")
+    transport = FakeTransport(_voyage_success(1000), _voyage_success(1))
+    provider = VoyageProvider("voyage-test", transport=transport, max_batch_items=2000)
+
+    assert provider.max_batch_items == 1000
+    provider.embed_documents([f"doc-{index}" for index in range(1001)])
+
+    sizes = [len(call["payload"]["input"]) for call in transport.calls]
+    assert sizes == [1000, 1]
+    assert all(size <= 1000 for size in sizes)
+
+
 def test_voyage_over_cap_document_is_skipped_and_reported(monkeypatch, caplog):
     monkeypatch.setattr(
         provider_mod,

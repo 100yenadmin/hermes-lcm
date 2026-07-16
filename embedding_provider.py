@@ -326,7 +326,10 @@ class VoyageProvider(_ResilientProvider):
         self.timeout = float(timeout)
         self._sleep = sleeper
         self._dim = 0
-        self.max_batch_items = max(1, int(max_batch_items))
+        # Voyage rejects any request above 1,000 input items; that hard limit is
+        # authoritative regardless of config, so clamp down to it. A config value
+        # above the cap (e.g. 2000) would otherwise emit a >1000-input request.
+        self.max_batch_items = max(1, min(int(max_batch_items), _VOYAGE_MAX_BATCH_ITEMS))
         self.last_skipped_documents: list[int] = []
 
     @property
@@ -499,7 +502,9 @@ class VoyageProvider(_ResilientProvider):
                 or len(batch) >= self.max_batch_items
             ):
                 vectors.extend(
-                    self._guarded(lambda current=tuple(batch): self._request(current, input_type="document"))
+                    self._guarded(lambda current=tuple(batch): self._request(
+                        current, input_type="document", deadline_budget_s=self.timeout
+                    ))
                 )
                 batch = []
                 batch_tokens = 0
@@ -507,14 +512,22 @@ class VoyageProvider(_ResilientProvider):
             batch_tokens += tokens
         if batch:
             vectors.extend(
-                self._guarded(lambda current=tuple(batch): self._request(current, input_type="document"))
+                self._guarded(lambda current=tuple(batch): self._request(
+                    current, input_type="document", deadline_budget_s=self.timeout
+                ))
             )
         self._remember_dim(vectors)
         return vectors
 
     def embed_query(self, text: str) -> list[float]:
+        # Normal (non-interactive) query embedding also gets ONE absolute
+        # deadline across every attempt AND its backoff sleeps, so a tiny
+        # configured timeout returns in ~that budget instead of stacking
+        # per-attempt timeouts plus exponential backoff.
         vectors = self._guarded(
-            lambda: self._request((str(text),), input_type="query")
+            lambda: self._request(
+                (str(text),), input_type="query", deadline_budget_s=self.timeout
+            )
         )
         self._remember_dim(vectors)
         return vectors[0]
@@ -658,10 +671,13 @@ class OllamaProvider(_ResilientProvider):
         return vectors
 
     def embed_documents(self, texts: Sequence[str]) -> list[list[float]]:
-        return self._embed(texts)
+        # Normal operations also get ONE absolute deadline across attempts +
+        # backoff (self.timeout), so retryable failures cannot stack backoff
+        # sleeps beyond the configured budget.
+        return self._embed(texts, deadline_budget_s=self.timeout)
 
     def embed_query(self, text: str) -> list[float]:
-        return self._embed((text,))[0]
+        return self._embed((text,), deadline_budget_s=self.timeout)[0]
 
     def embed_query_interactive(self, text: str, *, timeout: float) -> list[float]:
         """Embed a latency-sensitive query under one absolute time budget."""
