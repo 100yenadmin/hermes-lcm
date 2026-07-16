@@ -62,28 +62,27 @@ The response-level `coverage` value comes directly from the vector store:
 dependency-free bounded-scan fallback was used, and `none` means no usable
 profile/vector coverage was available.
 
-The **semantic attempt** runs under one absolute wall-clock deadline from
-`embedding_query_timeout_s` (3 seconds by default) — covering query embedding,
-vector-store construction, and the KNN scan, not just the embed call. Disabled
-embeddings, a missing/unavailable provider, exceeding the deadline (embed or
-KNN), transient provider failures, or vector search failures fall back to the
-existing full-text result and add `degraded_to_fts: true`, `degraded_reason`,
-and `coverage: 'none'`. This is a **semantic-arm-only** budget: the deadline
-bounds the semantic attempt, and once it is exhausted the query degrades to the
-full-text path, which then runs to **completion** — full-text is a synchronous,
-uncancellable SQLite path on the shared store connection, so it is deliberately
-not covered by the deadline (degradation is itself triggered by budget
-exhaustion). Provider authentication failures do not degrade: they return an
-operator-readable error so a missing or invalid credential is repaired instead
-of silently hidden.
+Semantic and hybrid requests run under one absolute wall-clock deadline from
+`embedding_query_timeout_s` (3 seconds by default), started at `lcm_grep` entry.
+The same deadline covers provider resolution, query embedding, optional NumPy
+import, bounded KNN, result hydration, FTS fallback, both hybrid arms, and
+fusion. A disabled/missing provider or transient semantic failure degrades to
+the existing full-text result only when enough time remains, adding
+`degraded_to_fts: true`, `degraded_reason`, and `coverage: 'none'`. Fallback
+uses independent read-only SQLite connections with progress interruption. If
+the absolute deadline is exhausted, the tool returns an explicit `timeout`
+error and does not start another fallback or hybrid arm. Provider
+authentication failures also remain operator-readable rather than being
+silently hidden.
 
-`source` is enforced inside the KNN eligibility step **before** the top-k cap
-(by descendant source lineage), so an ineligible high-scoring vector cannot
-displace an eligible lower-scoring one. When provenance cannot be verified (a
-legacy DB whose `messages` table lacks a `source` column), the source filter
-**fails closed** — it returns no semantic candidate rather than treating "can't
-check" as "all allowed", so a source-filtered query never surfaces a
-false-positive legacy hit. The remaining raw-message filters are
+`source` first uses the SQL-bounded candidate window, then verifies descendant
+source lineage within that window before ranking. This avoids corpus-sized
+lineage enumeration but means source-filtered semantic coverage is explicitly
+`bounded`, not a claim that source was applied before the global corpus bound.
+The recursive lineage walk has its own hard work cap. If that cap is exceeded,
+or a legacy DB lacks the `messages.source` column, provenance is
+`unverifiable_provenance` and the filter **fails closed** rather than treating
+"can't check" as "all allowed". The remaining raw-message filters are
 governed by the advertised contract: `role`, `time_from`, `time_to`,
 `conversation_id`, and broader `session_scope` values (`all`/`session`) all
 return raw-message hits only. Because a summary node has no single role/lane and
@@ -104,8 +103,10 @@ rrf_score = sum(1 / (60 + rank))
 Hybrid hits surface `fts_rank` and/or `semantic_rank`, plus `rrf_score`.
 Semantic hits also retain `semantic_score` and `confidence`. Both arms inspect
 `min(500, max(50, limit * 3))` candidates before the public result limit is
-applied. If the semantic arm fails or times out, hybrid returns FTS-only results
-with the same degradation fields. No external reranker is called.
+applied. If the semantic arm fails while deadline remains, hybrid returns its
+already-computed FTS results with the same degradation fields. If the FTS arm
+consumes the deadline, the semantic arm is not started; if fusion exhausts it,
+an explicit timeout is returned. No external reranker is called.
 
 ### Deterministic recall smoke evaluation
 
