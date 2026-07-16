@@ -41,7 +41,7 @@ def semantic_engine(tmp_path):
         embeddings_enabled=True,
         embedding_provider="ollama",
         embedding_model="mock-model",
-        embedding_query_timeout_s=0.1,
+        embedding_query_timeout_s=2.0,
     )
     store = MessageStore(config.database_path, ingest_protection_config=config)
     dag = SummaryDAG(config.database_path)
@@ -80,8 +80,15 @@ def _seed_vectors(engine, rows):
     store = VectorStore(engine._store.db_path, config=engine._config)
     try:
         store.register_profile("mock-model", "mock", 2)
+        identity = store.capture_identity("mock-model", provider="mock")
         for node_id, vector in rows:
-            store.record_embedding(str(node_id), "summary", "mock-model", vector)
+            store.record_embedding(
+                str(node_id),
+                "summary",
+                "mock-model",
+                vector,
+                identity=identity,
+            )
     finally:
         store.close()
 
@@ -136,7 +143,9 @@ def test_semantic_happy_path_orders_by_cosine_and_surfaces_confidence_coverage(
     assert provider.queries == ["meaning-preserving query"]
 
 
-def test_semantic_timeout_degrades_to_fts_within_budget(semantic_engine, monkeypatch):
+def test_semantic_timeout_returns_explicit_deadline_without_starting_fallback(
+    semantic_engine, monkeypatch
+):
     semantic_engine._config.embedding_query_timeout_s = 0.02
     semantic_engine._store.append(
         "session-a",
@@ -158,25 +167,15 @@ def test_semantic_timeout_degrades_to_fts_within_budget(semantic_engine, monkeyp
     )
 
     assert time.monotonic() - started < 0.09
-    assert payload["degraded_to_fts"] is True
-    assert payload["coverage"] == "none"
-    assert payload["results"][0]["type"] == "message"
-    assert "latency budget" in payload["degraded_reason"]
+    assert payload["timeout"] is True
+    assert payload["mode"] == "semantic"
+    assert payload["timeout_stage"] == "full_text"
 
 
-def test_semantic_budget_bounds_the_attempt_not_the_fallback(
+def test_semantic_budget_bounds_knn_and_does_not_start_fallback_after_expiry(
     semantic_engine, monkeypatch
 ):
-    """D1: the latency budget bounds the SEMANTIC ATTEMPT, not the fallback.
-
-    Maintainer repro: a 0.02s budget + a KNN that exceeded it + a synthetic
-    0.08s fallback returned a correct-but-late result at 0.171s. The enforceable
-    contract (see OUTCOME: enforce-vs-narrow -> NARROW, because the full_text
-    fallback is a synchronous, uncancellable SQLite path on the SHARED store
-    connection) is: the semantic attempt (embed + KNN) is bounded by the budget
-    and the slow KNN is ABANDONED near the budget rather than run to completion;
-    the full_text fallback then runs to completion and returns the correct hit.
-    """
+    """The one request deadline prevents a post-timeout fallback from starting."""
     semantic_engine._config.embedding_query_timeout_s = 0.02
     semantic_engine._store.append(
         "session-a", {"role": "user", "content": "needle survives a slow knn"}
@@ -193,11 +192,13 @@ def test_semantic_budget_bounds_the_attempt_not_the_fallback(
         def close(self):
             pass
 
-    real_full_text = lcm_tools._lcm_grep_full_text
+    fallback_calls = 0
 
-    def slow_full_text(args, **kwargs):
-        time.sleep(0.08)  # synthetic slow fallback
-        return real_full_text(args, **kwargs)
+    def slow_full_text(_args, **_kwargs):
+        nonlocal fallback_calls
+        fallback_calls += 1
+        time.sleep(0.08)
+        return json.dumps({"results": []})
 
     monkeypatch.setattr(lcm_tools, "VectorStore", SlowKNNStore)
     monkeypatch.setattr(lcm_tools, "resolve_provider", lambda _config: MockProvider())
@@ -211,15 +212,9 @@ def test_semantic_budget_bounds_the_attempt_not_the_fallback(
     )
     elapsed = time.monotonic() - started
 
-    # The slow KNN was abandoned at ~budget (semantic attempt bounded), so total
-    # time is (bounded attempt ~0.02) + (fallback ~0.08), NOT the KNN's full
-    # 0.2s stacked on the fallback (~0.28). This is the tell that the budget
-    # bounds the attempt.
-    assert elapsed < 0.2
-    # The fallback ran to completion and returned the correct FTS hit.
-    assert payload["degraded_to_fts"] is True
-    assert "latency budget" in payload["degraded_reason"]
-    assert payload["results"][0]["type"] == "message"
+    assert elapsed < 0.08
+    assert payload["timeout"] is True
+    assert fallback_calls == 0
 
 
 def test_timeout_worker_is_daemon_and_provider_call_is_bounded(
@@ -254,7 +249,7 @@ def test_timeout_worker_is_daemon_and_provider_call_is_bounded(
             for thread in threading.enumerate()
             if thread.name == "lcm-query-embed" and thread.is_alive()
         ]
-        assert payload["degraded_to_fts"] is True
+        assert payload["timeout"] is True
         # The interactive timeout is the remaining absolute budget (~0.02s),
         # computed from a monotonic clock so a few microseconds may have elapsed.
         assert observed_timeouts and observed_timeouts[0] == pytest.approx(0.02, abs=0.01)
@@ -651,12 +646,205 @@ def test_slow_knn_degrades_within_total_budget(semantic_engine, monkeypatch):
     )
     elapsed = time.monotonic() - started
 
-    # The whole operation degrades within the tiny budget, well under the 0.3s
-    # the KNN would otherwise take.
+    # The whole operation returns within the tiny budget and does not begin a
+    # fallback after the KNN consumes the remaining time.
     assert elapsed < 0.2
-    assert payload["degraded_to_fts"] is True
-    assert "latency budget" in payload["degraded_reason"]
-    assert payload["results"][0]["type"] == "message"
+    assert payload["timeout"] is True
+
+
+def test_provider_resolution_is_bounded_and_does_not_start_query_or_fallback(
+    semantic_engine, monkeypatch
+):
+    semantic_engine._config.embedding_query_timeout_s = 0.02
+    query_calls = 0
+    fallback_calls = 0
+
+    class CountingProvider(MockProvider):
+        def embed_query(self, text):
+            nonlocal query_calls
+            query_calls += 1
+            return super().embed_query(text)
+
+    def slow_resolve(_config):
+        time.sleep(0.1)
+        return CountingProvider()
+
+    def counted_full_text(_args, **_kwargs):
+        nonlocal fallback_calls
+        fallback_calls += 1
+        return json.dumps({"results": []})
+
+    monkeypatch.setattr(lcm_tools, "resolve_provider", slow_resolve)
+    monkeypatch.setattr(lcm_tools, "_lcm_grep_full_text", counted_full_text)
+    started = time.monotonic()
+    payload = json.loads(
+        lcm_tools.lcm_grep(
+            {"query": "deadline", "mode": "semantic"}, engine=semantic_engine
+        )
+    )
+
+    assert time.monotonic() - started < 0.08
+    assert payload["timeout"] is True
+    assert payload["timeout_stage"] == "provider_resolution"
+    assert query_calls == 0
+    assert fallback_calls == 0
+
+
+def test_hybrid_does_not_start_semantic_arm_after_fts_exhausts_deadline(
+    semantic_engine, monkeypatch
+):
+    semantic_engine._config.embedding_query_timeout_s = 0.02
+    provider_calls = 0
+
+    def slow_full_text(_args, **_kwargs):
+        time.sleep(0.1)
+        return json.dumps({"results": []})
+
+    def resolve(_config):
+        nonlocal provider_calls
+        provider_calls += 1
+        return MockProvider()
+
+    monkeypatch.setattr(lcm_tools, "_lcm_grep_full_text", slow_full_text)
+    monkeypatch.setattr(lcm_tools, "resolve_provider", resolve)
+    started = time.monotonic()
+    payload = json.loads(
+        lcm_tools.lcm_grep(
+            {"query": "deadline", "mode": "hybrid"}, engine=semantic_engine
+        )
+    )
+
+    assert time.monotonic() - started < 0.08
+    assert payload["timeout"] is True
+    assert payload["mode"] == "hybrid"
+    assert provider_calls == 0
+
+
+def test_full_text_setup_expiry_does_not_start_search(semantic_engine, monkeypatch):
+    semantic_engine._config.embedding_query_timeout_s = 0.02
+    search_calls = 0
+    release = threading.Event()
+    opened = []
+
+    class LateConnection:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    def blocking_connect(*args, **kwargs):
+        release.wait(1.0)
+        connection = LateConnection()
+        opened.append(connection)
+        return connection
+
+    def counted_full_text(_args, **_kwargs):
+        nonlocal search_calls
+        search_calls += 1
+        return json.dumps({"results": []})
+
+    monkeypatch.setattr(lcm_tools.sqlite3, "connect", blocking_connect)
+    monkeypatch.setattr(lcm_tools, "_lcm_grep_full_text", counted_full_text)
+    semantic_engine._config.embeddings_enabled = False
+    try:
+        payload = json.loads(
+            lcm_tools.lcm_grep(
+                {"query": "deadline", "mode": "semantic"}, engine=semantic_engine
+            )
+        )
+        assert payload["timeout"] is True
+        assert search_calls == 0
+    finally:
+        release.set()
+        for thread in threading.enumerate():
+            if thread.name == "lcm-full-text":
+                thread.join(timeout=0.2)
+    assert len(opened) == 1
+    assert opened[0].closed is True
+
+
+def test_result_hydration_is_inside_request_deadline(semantic_engine, monkeypatch):
+    semantic_engine._config.embedding_query_timeout_s = 0.02
+
+    class OneResultStore:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def knn(self, *_args, **_kwargs):
+            return KNNResult([("1", 1.0, "summary")], coverage="full")
+
+        def close(self):
+            pass
+
+    release = threading.Event()
+
+    def blocking_get_node(_node_id):
+        release.wait(1.0)
+        return None
+
+    monkeypatch.setattr(lcm_tools, "VectorStore", OneResultStore)
+    monkeypatch.setattr(lcm_tools, "resolve_provider", lambda _config: MockProvider())
+    monkeypatch.setattr(semantic_engine._dag, "get_node", blocking_get_node)
+    try:
+        started = time.monotonic()
+        payload = json.loads(
+            lcm_tools.lcm_grep(
+                {"query": "deadline", "mode": "semantic"}, engine=semantic_engine
+            )
+        )
+        assert time.monotonic() - started < 0.08
+        assert payload["timeout"] is True
+        assert payload["timeout_stage"] == "result_resolution"
+    finally:
+        release.set()
+        for thread in threading.enumerate():
+            if thread.name == "lcm-result-hydration":
+                thread.join(timeout=0.2)
+
+
+def test_result_hydration_path_expiry_never_starts_database_connection(
+    semantic_engine, monkeypatch
+):
+    semantic_engine._config.embedding_query_timeout_s = 0.02
+
+    class OneResultStore:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def knn(self, *_args, **_kwargs):
+            return KNNResult([("1", 1.0, "summary")], coverage="full")
+
+        def close(self):
+            pass
+
+    real_resolve = lcm_tools.Path.resolve
+    connect_calls = 0
+
+    def slow_resolve(path, *args, **kwargs):
+        time.sleep(0.05)
+        return real_resolve(path, *args, **kwargs)
+
+    def counted_connect(*_args, **_kwargs):
+        nonlocal connect_calls
+        connect_calls += 1
+        raise AssertionError("database connection started after path deadline")
+
+    monkeypatch.setattr(lcm_tools, "VectorStore", OneResultStore)
+    monkeypatch.setattr(lcm_tools, "resolve_provider", lambda _config: MockProvider())
+    monkeypatch.setattr(lcm_tools.Path, "resolve", slow_resolve)
+    monkeypatch.setattr(lcm_tools.sqlite3, "connect", counted_connect)
+
+    payload = json.loads(
+        lcm_tools.lcm_grep(
+            {"query": "deadline", "mode": "semantic"}, engine=semantic_engine
+        )
+    )
+    assert payload["timeout"] is True
+    assert payload["timeout_stage"] == "result_resolution"
+    # The bounded worker may still be finishing Path.resolve. Wait for it to
+    # run the post-resolve deadline gate and prove connect never starts later.
+    time.sleep(0.06)
+    assert connect_calls == 0
 
 
 def test_recall_eval_is_deterministic_and_hybrid_beats_fts_on_paraphrases():
