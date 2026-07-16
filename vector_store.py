@@ -22,6 +22,7 @@ from typing import Any, Iterator, Optional, Sequence
 from .config import LCMConfig
 from .db_bootstrap import (
     configure_connection,
+    embedding_schema_missing,
     ensure_embedding_tables,
     mark_migration_step_complete,
     refuse_schema_version_too_new,
@@ -142,15 +143,34 @@ class VectorStore:
         self._conn.commit()
 
     def _ensure_embedding_schema(self) -> None:
-        """Materialize the opt-in embedding tables lazily on first VectorStore use.
+        """Materialize (and verify) the opt-in embedding tables on VectorStore use.
 
         Constructing a VectorStore means embeddings are in use; the core
         migration path leaves these tables uncreated so a disabled install
         stays at schema_version 5 with none of them. Creation is idempotent
-        (CREATE TABLE IF NOT EXISTS) and recorded via a named migration marker.
+        (CREATE TABLE/INDEX IF NOT EXISTS).
+
+        The ``embeddings_v1`` marker is NOT trusted on its own: it can be set
+        while a table or index is absent (e.g. one was dropped after the marker
+        was written). So the required tables/indexes are re-ensured and then
+        VERIFIED every init — a set marker over a missing table is repaired
+        rather than believed. Only a fully-materialized schema keeps the marker.
         """
         with self._write_lock:
             ensure_embedding_tables(self._conn)
+            missing = embedding_schema_missing(self._conn)
+            if missing:
+                # Should be unreachable: the ensure above is a superset of the
+                # verified set. Re-ensure once more and fail loudly if a
+                # required object still cannot be created, rather than marking a
+                # broken schema complete.
+                ensure_embedding_tables(self._conn)
+                missing = embedding_schema_missing(self._conn)
+                if missing:
+                    raise sqlite3.OperationalError(
+                        "embedding schema incomplete after ensure: "
+                        + ", ".join(sorted(missing))
+                    )
             mark_migration_step_complete(self._conn, "embeddings_v1")
             self._conn.commit()
 
@@ -359,19 +379,39 @@ class VectorStore:
         kind: str,
         model: str,
         vec: Sequence[float],
+        *,
+        identity: str | None = None,
     ) -> None:
         embedded_id = str(embedded_id)
         model = str(model)
         if kind != "summary":
             raise ValueError("embedded kind must be 'summary'")
+        expected_identity = None if identity is None else str(identity)
 
         with self._write_transaction():
-            # Resolve the active profile INSIDE the write transaction so a
-            # concurrent active-provider switch for the same model_name cannot
-            # let us read identity A and then write the vector under B.
-            profile = self._resolve_profile(model)
-            if profile is None:
-                raise ValueError(f"embedding profile is not registered: {model}")
+            # The vector was produced by a SPECIFIC provider identity. When the
+            # caller captured that durable identity at provider-resolution time
+            # (``identity=``), publish under THAT identity and never re-resolve
+            # to whatever is active now: a config switch A->B for the same
+            # model_name between the provider call and this write must not
+            # rebind an A-vector onto B's profile. The lookup + write share this
+            # one write transaction (CAS), so the identity is captured
+            # atomically; a caller-supplied identity that is not (or no longer)
+            # a registered profile is rejected rather than silently rebound.
+            if expected_identity is not None:
+                profile = self._profile_by_identity(expected_identity)
+                if profile is None:
+                    raise ValueError(
+                        f"embedding profile is not registered: {expected_identity}"
+                    )
+            else:
+                # No captured identity: resolve the active profile INSIDE the
+                # write transaction so a concurrent active-provider switch for
+                # the same model_name cannot let us read identity A and then
+                # write the vector under B.
+                profile = self._resolve_profile(model)
+                if profile is None:
+                    raise ValueError(f"embedding profile is not registered: {model}")
             identity = str(profile["identity_hash"])
             normalized = self._normalized(vec, expected_dim=int(profile["dim"]))
             packed = array("f", normalized).tobytes()
@@ -563,26 +603,84 @@ class VectorStore:
             self._matrix_cache[key] = loaded
             return loaded
 
-    def _candidate_ids_by_recency(self, identity_hash: str) -> list[str]:
-        """Return every live embedded id for the identity, most-recent first.
+    def _bounded_candidate_ids(
+        self,
+        identity_hash: str,
+        *,
+        since: float | None,
+        until: float | None,
+        conversation_ids: Sequence[str] | None,
+        source: str | None,
+        limit: int,
+    ) -> list[str]:
+        """Enumerate at most ``limit`` live candidate ids, most-recent first.
 
-        Ordering is served directly by ``idx_lcm_embedding_meta_identity_embedded_at``
-        (identity_hash, embedded_at DESC, WHERE archived = 0) — no temp B-tree
-        over the whole table. Only ids (not vector blobs) are materialized, so
-        the no-numpy path can filter the full candidate set BEFORE applying the
-        recency bound instead of loading vectors first and losing filtered
-        matches that fall outside the most-recent window.
+        The candidate enumeration itself is bounded at the SQL layer: the
+        column filters (recency window, conversation, suppression) are applied
+        in the ``WHERE`` clause and a hard ``LIMIT`` caps the result, so neither
+        the SQL result set nor host memory materializes the whole corpus (a
+        100-row corpus with bound 10 loads ~10 ids, not 100). Ordering is by
+        ``embedded_at DESC`` — served by
+        ``idx_lcm_embedding_meta_identity_embedded_at`` — matching the vector
+        write order rather than rowid.
+
+        Column filters are enforced BEFORE the bound (they are in ``WHERE``), so
+        a filtered match inside the most-recent window is never dropped; only
+        matches beyond the bounded window are out of scope, which is exactly
+        what ``coverage='bounded'`` signals. The source-lineage filter is a
+        recursive descendant walk, so it is applied to the already-bounded id
+        set afterward (and fails closed when provenance is unverifiable).
         """
+        if limit <= 0:
+            return []
+        if conversation_ids is not None and not list(conversation_ids):
+            return []
+        columns = {
+            str(row[1])
+            for row in self._conn.execute("PRAGMA table_info(summary_nodes)").fetchall()
+        }
+        # ``latest_at`` is added by the DAG migration; a DB whose summary_nodes
+        # predates it falls back to created_at rather than raising.
+        recency_expr = (
+            "COALESCE(sn.latest_at, sn.created_at)"
+            if "latest_at" in columns
+            else "sn.created_at"
+        )
+        where = ["m.identity_hash = ?", "m.archived = 0"]
+        args: list[object] = [str(identity_hash)]
+        if "suppressed_at" in columns:
+            where.append("sn.suppressed_at IS NULL")
+        if since is not None:
+            where.append(f"{recency_expr} >= ?")
+            args.append(float(since))
+        if until is not None:
+            where.append(f"{recency_expr} <= ?")
+            args.append(float(until))
+        if conversation_ids is not None:
+            normalized_ids = [str(value) for value in conversation_ids]
+            placeholders = ",".join("?" for _ in normalized_ids)
+            where.append(f"sn.session_id IN ({placeholders})")
+            args.extend(normalized_ids)
+        args.append(int(limit))
         rows = self._conn.execute(
-            """
+            f"""
             SELECT m.embedded_id
             FROM lcm_embedding_meta m
-            WHERE m.identity_hash = ? AND m.archived = 0
-            ORDER BY m.embedded_at DESC
+            JOIN summary_nodes sn ON sn.node_id = CAST(m.embedded_id AS INTEGER)
+            WHERE {' AND '.join(where)}
+            ORDER BY m.embedded_at DESC, m.embedded_id DESC
+            LIMIT ?
             """,
-            (identity_hash,),
+            args,
         ).fetchall()
-        return [str(row[0]) for row in rows]
+        bounded_ids = [str(row[0]) for row in rows]
+        if source and bounded_ids:
+            with self._temp_id_table(bounded_ids) as table:
+                allowed = self._source_allowed_ids(table, source)
+            bounded_ids = [
+                embedded_id for embedded_id in bounded_ids if embedded_id in allowed
+            ]
+        return bounded_ids
 
     def _load_vectors_for_ids(
         self,
@@ -658,18 +756,18 @@ class VectorStore:
 
         # A VectorStore-only worker DB may predate MessageStore's source repair
         # (``_ensure_source_column``) and lack ``messages.source`` entirely.
-        # Rather than crash the KNN with "no such column: source", skip the
-        # source filter (treat every candidate as allowed) so retrieval degrades
-        # instead of failing on a legacy schema.
+        # Provenance is then unverifiable, so the source filter must FAIL CLOSED:
+        # return no allowed ids rather than treating "can't check" as "all
+        # allowed". Failing open let a source-filtered query surface a legacy
+        # summary whose source could not be confirmed; an empty allowed set
+        # instead yields no false-positive hit (and lets the caller degrade to
+        # full_text), which is the safe direction for an unverifiable filter.
         message_columns = {
             str(row[1])
             for row in self._conn.execute("PRAGMA table_info(messages)").fetchall()
         }
         if "source" not in message_columns:
-            return {
-                str(row[0])
-                for row in self._conn.execute(f"SELECT id FROM {table}").fetchall()
-            }
+            return set()
 
         normalized_source = _normalize_source_value(source)
         legacy_blank_clause = _legacy_blank_source_clause("m.source")
@@ -822,21 +920,21 @@ class VectorStore:
             scores = matrix @ query_array
             coverage = "full"
         else:
-            # Filter BEFORE the recency bound: enumerate every candidate id in
-            # recency order, drop the ineligible ones, THEN take the most-recent
-            # bounded_scan_rows survivors and load only their vectors. Bounding
-            # first (the old behavior) silently lost a filtered match that fell
-            # outside the recent window.
-            recency_ids = self._candidate_ids_by_recency(identity)
-            filtered_indexes = self._filtered_candidate_indexes(
-                recency_ids,
+            # Bound the candidate enumeration at the SQL layer: the column
+            # filters + ORDER BY embedded_at DESC + LIMIT run inside SQLite, so
+            # neither the result set nor host memory enumerates the whole
+            # corpus. Filters live in the WHERE clause (applied before the
+            # bound), so a filtered match inside the bounded window is not lost;
+            # only the source-lineage walk runs on the already-bounded set.
+            limit = max(0, self.bounded_scan_rows)
+            bounded_ids = self._bounded_candidate_ids(
+                identity,
                 since=since,
                 until=until,
                 conversation_ids=conversation_ids,
                 source=source,
+                limit=limit,
             )
-            limit = max(0, self.bounded_scan_rows)
-            bounded_ids = [recency_ids[index] for index in filtered_indexes][:limit]
             rowids, embedded_ids, kinds, vectors = self._load_vectors_for_ids(
                 identity,
                 dim,

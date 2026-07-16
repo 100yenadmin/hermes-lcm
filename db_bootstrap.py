@@ -337,6 +337,39 @@ def ensure_embedding_tables(conn: sqlite3.Connection) -> None:
     )
 
 
+# The tables and indexes ``ensure_embedding_tables`` is responsible for. Used to
+# VERIFY the schema on VectorStore init rather than trusting the ``embeddings_v1``
+# marker alone: the named marker can be present while a table/index is absent
+# (e.g. a table was dropped after the marker was written), so init re-ensures and
+# confirms these objects exist rather than assuming the marker implies them.
+_REQUIRED_EMBEDDING_TABLES = (
+    "lcm_embedding_profile",
+    "lcm_embedding_meta",
+    "lcm_embedding_vectors",
+)
+_REQUIRED_EMBEDDING_INDEXES = (
+    "idx_lcm_embedding_profile_model",
+    "idx_lcm_embedding_meta_identity_embedded_at",
+)
+
+
+def embedding_schema_missing(conn: sqlite3.Connection) -> set[str]:
+    """Return the names of required embedding tables/indexes that do not exist.
+
+    An empty set means the embedding schema is fully materialized. A non-empty
+    set means the ``embeddings_v1`` marker cannot be trusted on its own and
+    ``ensure_embedding_tables`` must (re-)run to repair the gap.
+    """
+    present = {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type IN ('table', 'index')"
+        ).fetchall()
+    }
+    required = set(_REQUIRED_EMBEDDING_TABLES) | set(_REQUIRED_EMBEDDING_INDEXES)
+    return required - present
+
+
 def mark_migration_step_complete(conn: sqlite3.Connection, step_name: str) -> None:
     ensure_migration_state_table(conn)
     conn.execute(
