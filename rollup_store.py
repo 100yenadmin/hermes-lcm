@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 import threading
+import uuid
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -45,6 +46,7 @@ class RollupBuildToken(NamedTuple):
 
     rollup_id: int
     generation: int
+    nonce: str = ""
 
 
 class RollupStore:
@@ -178,28 +180,38 @@ class RollupStore:
         with self._write_transaction():
             self._conn.execute(
                 """
-                INSERT INTO lcm_rollups(period_kind, period_start, scope, status, built_at, lease_expires_at)
-                VALUES(?, ?, ?, 'building', ?, ?)
+                INSERT INTO lcm_rollups(
+                    period_kind, period_start, scope, status, built_at,
+                    lease_expires_at, lease_nonce
+                )
+                VALUES(?, ?, ?, 'building', ?, ?, ?)
                 ON CONFLICT(period_kind, period_start, scope) DO UPDATE SET
                     status = 'building',
                     generation = lcm_rollups.generation + 1,
                     built_at = excluded.built_at,
                     lease_expires_at = excluded.lease_expires_at,
+                    lease_nonce = excluded.lease_nonce,
+                    failed_at = NULL,
                     source_fingerprint = NULL,
                     error = NULL
                 """,
-                (period_kind, period_start, scope, self._now(), self._lease_deadline()),
+                (
+                    period_kind, period_start, scope, self._now(),
+                    self._lease_deadline(), uuid.uuid4().hex,
+                ),
             )
             row = self._conn.execute(
                 """
-                SELECT rollup_id, generation
+                SELECT rollup_id, generation, lease_nonce
                 FROM lcm_rollups
                 WHERE period_kind = ? AND period_start = ? AND scope = ?
                 """,
                 (period_kind, period_start, scope),
             ).fetchone()
             rollup_id = int(row["rollup_id"])
-        return RollupBuildToken(rollup_id, int(row["generation"] or 0))
+        return RollupBuildToken(
+            rollup_id, int(row["generation"] or 0), str(row["lease_nonce"] or "")
+        )
 
     def mark_ready(
         self,
@@ -225,12 +237,118 @@ class RollupStore:
         """
         unique_source_ids = list(dict.fromkeys(int(node_id) for node_id in source_node_ids))
         with self._write_transaction():
+            owned = self._conn.execute(
+                """
+                SELECT period_kind, period_start, scope FROM lcm_rollups
+                WHERE rollup_id = ? AND generation = ? AND lease_nonce = ?
+                  AND status = 'building'
+                """,
+                (int(token.rollup_id), int(token.generation), str(token.nonce)),
+            ).fetchone()
+            if owned is None:
+                exists = self._conn.execute(
+                    "SELECT 1 FROM lcm_rollups WHERE rollup_id = ?",
+                    (int(token.rollup_id),),
+                ).fetchone()
+                if exists is None:
+                    raise ValueError(f"unknown rollup_id: {token.rollup_id}")
+                return False
+
+            start_day = date.fromisoformat(str(owned["period_start"]))
+            if str(owned["period_kind"]) == "day":
+                end_day = start_day
+            elif str(owned["period_kind"]) == "week":
+                end_day = start_day + timedelta(days=6)
+            else:
+                next_month = (
+                    start_day.replace(year=start_day.year + 1, month=1, day=1)
+                    if start_day.month == 12
+                    else start_day.replace(month=start_day.month + 1, day=1)
+                )
+                end_day = next_month - timedelta(days=1)
+            window_start = datetime.combine(
+                start_day, datetime.min.time(), tzinfo=timezone.utc
+            ).timestamp()
+            window_end = datetime.combine(
+                end_day + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc
+            ).timestamp()
+            pending_mutation = self._conn.execute(
+                """
+                SELECT 1 FROM lcm_rollup_invalidations
+                WHERE scope = ?
+                  AND covered_start < ?
+                  AND covered_end >= ?
+                LIMIT 1
+                """,
+                (str(owned["scope"]), window_end, window_start),
+            ).fetchone()
+            if pending_mutation is not None:
+                self._conn.execute(
+                    """
+                    UPDATE lcm_rollups
+                    SET status='stale', generation=generation + 1,
+                        error='source mutation pending', lease_expires_at=NULL,
+                        lease_nonce=''
+                    WHERE rollup_id=? AND generation=? AND lease_nonce=?
+                      AND status='building'
+                    """,
+                    (
+                        int(token.rollup_id), int(token.generation),
+                        str(token.nonce),
+                    ),
+                )
+                return False
+
+            # A first build has no prior lcm_rollup_sources lineage for deletion
+            # invalidation to find. Validate the proposed source snapshot in the
+            # publication transaction itself so a deleted source can never be
+            # committed as ready.
+            has_summary_nodes = self._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='summary_nodes'"
+            ).fetchone()
+            if unique_source_ids and has_summary_nodes is not None:
+                self._conn.execute(
+                    "CREATE TEMP TABLE IF NOT EXISTS lcm_rollup_publish_sources "
+                    "(node_id INTEGER PRIMARY KEY) WITHOUT ROWID"
+                )
+                self._conn.execute("DELETE FROM temp.lcm_rollup_publish_sources")
+                self._conn.executemany(
+                    "INSERT INTO temp.lcm_rollup_publish_sources(node_id) VALUES(?)",
+                    ((node_id,) for node_id in unique_source_ids),
+                )
+                missing = self._conn.execute(
+                    """
+                    SELECT 1
+                    FROM temp.lcm_rollup_publish_sources proposed
+                    LEFT JOIN summary_nodes node ON node.node_id = proposed.node_id
+                    WHERE node.node_id IS NULL
+                    LIMIT 1
+                    """
+                ).fetchone()
+                if missing is not None:
+                    self._conn.execute(
+                        """
+                        UPDATE lcm_rollups
+                        SET status='stale', generation=generation + 1,
+                            error='source changed during build',
+                            lease_expires_at=NULL, lease_nonce=''
+                        WHERE rollup_id=? AND generation=? AND lease_nonce=?
+                          AND status='building'
+                        """,
+                        (
+                            int(token.rollup_id), int(token.generation),
+                            str(token.nonce),
+                        ),
+                    )
+                    return False
             cur = self._conn.execute(
                 """
                 UPDATE lcm_rollups
                 SET summary = ?, token_count = ?, status = 'ready', built_at = ?,
-                    source_fingerprint = ?, error = NULL, lease_expires_at = NULL
-                WHERE rollup_id = ? AND generation = ? AND status = 'building'
+                    source_fingerprint = ?, error = NULL, failed_at = NULL,
+                    lease_expires_at = NULL, lease_nonce = ''
+                WHERE rollup_id = ? AND generation = ? AND lease_nonce = ?
+                  AND status = 'building'
                 """,
                 (
                     summary,
@@ -239,6 +357,7 @@ class RollupStore:
                     fingerprint,
                     int(token.rollup_id),
                     int(token.generation),
+                    str(token.nonce),
                 ),
             )
             if cur.rowcount == 0:
@@ -260,41 +379,23 @@ class RollupStore:
             )
         return True
 
-    def mark_failed(
-        self, rollup_id: int, error: str, *, generation: int | None = None
-    ) -> bool:
-        """Record a build failure, optionally guarded by ``generation``.
-
-        When ``generation`` is given the update is a compare-and-set (exactly
-        like :meth:`mark_ready`): a superseded builder's late exception cannot
-        flip a newer ready/stale row to ``failed``. The guarded update also
-        requires ``status = 'building'`` so a late failure cannot flip a row that
-        has already left ``building`` at the SAME generation — e.g. a
-        ``mark_ready`` (which does not advance ``generation``) followed by a
-        stale builder's ``mark_failed`` with the same token (maintainer #387 A1).
-        Returns ``True`` when a row was updated, ``False`` when the build was
-        superseded. An unguarded call (``generation is None``) always writes and
-        is used only to seed a known failure state directly.
-        """
+    def mark_failed(self, token: RollupBuildToken, error: str) -> bool:
+        """Record a build failure only while the caller owns the build lease."""
         with self._write_transaction():
-            if generation is None:
-                cur = self._conn.execute(
-                    """
-                    UPDATE lcm_rollups
-                    SET status = 'failed', error = ?
-                    WHERE rollup_id = ?
-                    """,
-                    (error, int(rollup_id)),
-                )
-            else:
-                cur = self._conn.execute(
-                    """
-                    UPDATE lcm_rollups
-                    SET status = 'failed', error = ?
-                    WHERE rollup_id = ? AND generation = ? AND status = 'building'
-                    """,
-                    (error, int(rollup_id), int(generation)),
-                )
+            now = self._now()
+            cur = self._conn.execute(
+                """
+                UPDATE lcm_rollups
+                SET status = 'failed', error = ?, failed_at = ?,
+                    lease_expires_at = NULL, lease_nonce = ''
+                WHERE rollup_id = ? AND generation = ? AND lease_nonce = ?
+                  AND status = 'building'
+                """,
+                (
+                    error, now, int(token.rollup_id), int(token.generation),
+                    str(token.nonce),
+                ),
+            )
         return int(cur.rowcount or 0) > 0
 
     @staticmethod
@@ -329,7 +430,8 @@ class RollupStore:
                 ON CONFLICT(period_kind, period_start, scope) DO UPDATE SET
                     status = 'stale',
                     generation = lcm_rollups.generation + 1,
-                    lease_expires_at = NULL
+                    lease_expires_at = NULL,
+                    lease_nonce = ''
                 """,
                 (day_start, scope, week_start, scope, month_start, scope),
             )
@@ -354,7 +456,8 @@ class RollupStore:
                 ON CONFLICT(period_kind, period_start, scope) DO UPDATE SET
                     status = 'stale',
                     generation = lcm_rollups.generation + 1,
-                    lease_expires_at = NULL
+                    lease_expires_at = NULL,
+                    lease_nonce = ''
                 """,
                 (week_start, scope, month_start, scope),
             )
@@ -368,20 +471,44 @@ class RollupStore:
         durably ``stale`` (not absent) and get built by later maintenance. Does
         not disturb a row that is currently ``building``.
         """
+        targets = self._expand_stale_targets([(period_kind, period_start, scope)])
         with self._write_transaction():
-            cur = self._conn.execute(
-                """
-                INSERT INTO lcm_rollups(period_kind, period_start, scope, status)
-                VALUES(?, ?, ?, 'stale')
-                ON CONFLICT(period_kind, period_start, scope) DO UPDATE SET
-                    status = 'stale',
-                    generation = lcm_rollups.generation + 1,
-                    lease_expires_at = NULL
-                WHERE lcm_rollups.status != 'building'
-                """,
-                (period_kind, period_start, scope),
-            )
-        return int(cur.rowcount or 0)
+            affected = 0
+            for target_kind, target_start, target_scope in targets:
+                cur = self._conn.execute(
+                    """
+                    INSERT INTO lcm_rollups(period_kind, period_start, scope, status)
+                    VALUES(?, ?, ?, 'stale')
+                    ON CONFLICT(period_kind, period_start, scope) DO UPDATE SET
+                        status = 'stale',
+                        generation = lcm_rollups.generation + 1,
+                        lease_expires_at = NULL,
+                        lease_nonce = ''
+                    WHERE lcm_rollups.status != 'building'
+                    """,
+                    (target_kind, target_start, target_scope),
+                )
+                affected += int(cur.rowcount or 0)
+        return affected
+
+    @classmethod
+    def _expand_stale_targets(
+        cls, targets: Sequence[tuple[str, str, str]]
+    ) -> list[tuple[str, str, str]]:
+        expanded: list[tuple[str, str, str]] = []
+        seen: set[tuple[str, str, str]] = set()
+        for kind, start, scope in targets:
+            values = [(str(kind), str(start), str(scope))]
+            if kind == "day":
+                _day, week, month = cls._period_starts_for_day(start)
+                values.extend(
+                    [("week", week, str(scope)), ("month", month, str(scope))]
+                )
+            for value in values:
+                if value not in seen:
+                    seen.add(value)
+                    expanded.append(value)
+        return expanded
 
     def upsert_stale_many(
         self, targets: Sequence[tuple[str, str, str]]
@@ -398,7 +525,7 @@ class RollupStore:
         a conflicting seed advances ``generation`` to supersede an in-flight
         build.
         """
-        rows = [(str(kind), str(start), str(scope)) for kind, start, scope in targets]
+        rows = self._expand_stale_targets(targets)
         if not rows:
             return 0
         affected = 0
@@ -411,7 +538,8 @@ class RollupStore:
                     ON CONFLICT(period_kind, period_start, scope) DO UPDATE SET
                         status = 'stale',
                         generation = lcm_rollups.generation + 1,
-                        lease_expires_at = NULL
+                        lease_expires_at = NULL,
+                        lease_nonce = ''
                     WHERE lcm_rollups.status != 'building'
                     """,
                     (period_kind, period_start, scope),
@@ -434,10 +562,15 @@ class RollupStore:
             cur = self._conn.execute(
                 """
                 UPDATE lcm_rollups
-                SET status = 'stale', error = ?, lease_expires_at = NULL
-                WHERE rollup_id = ? AND generation = ? AND status = 'building'
+                SET status = 'stale', error = ?, lease_expires_at = NULL,
+                    lease_nonce = ''
+                WHERE rollup_id = ? AND generation = ? AND lease_nonce = ?
+                  AND status = 'building'
                 """,
-                (reason, int(token.rollup_id), int(token.generation)),
+                (
+                    reason, int(token.rollup_id), int(token.generation),
+                    str(token.nonce),
+                ),
             )
         return int(cur.rowcount or 0) > 0
 
@@ -458,8 +591,9 @@ class RollupStore:
         """
         with self._write_transaction():
             cur = self._conn.execute(
-                "DELETE FROM lcm_rollups WHERE rollup_id = ? AND generation = ? AND status = 'building'",
-                (int(token.rollup_id), int(token.generation)),
+                "DELETE FROM lcm_rollups WHERE rollup_id = ? AND generation = ? "
+                "AND lease_nonce = ? AND status = 'building'",
+                (int(token.rollup_id), int(token.generation), str(token.nonce)),
             )
             if int(cur.rowcount or 0) > 0:
                 self._conn.execute(
@@ -468,7 +602,7 @@ class RollupStore:
                 )
         return int(cur.rowcount or 0) > 0
 
-    def reclaim_stale_building(self, now: str | None = None) -> int:
+    def reclaim_stale_building(self, now: str | None = None, *, limit: int = 256) -> int:
         """Flip expired ``building`` rows back to ``stale`` so a crashed build is
         retried. Advances ``generation`` so the crashed builder, if it ever
         returns, cannot publish over the reclaimed (and possibly re-superseded)
@@ -481,14 +615,114 @@ class RollupStore:
                 UPDATE lcm_rollups
                 SET status = 'stale',
                     generation = generation + 1,
-                    lease_expires_at = NULL
-                WHERE status = 'building'
-                  AND lease_expires_at IS NOT NULL
-                  AND lease_expires_at < ?
+                    lease_expires_at = NULL,
+                    lease_nonce = ''
+                WHERE rollup_id IN (
+                    SELECT rollup_id FROM lcm_rollups
+                    WHERE status = 'building'
+                      AND lease_expires_at IS NOT NULL
+                      AND lease_expires_at < ?
+                    ORDER BY lease_expires_at, rollup_id
+                    LIMIT ?
+                )
                 """,
-                (cutoff,),
+                (cutoff, max(0, int(limit))),
             )
         return int(cur.rowcount or 0)
+
+    def has_pending_invalidations(self, scope: str | None = None) -> bool:
+        """Check for durable mutation debt using the pending-event index."""
+        if scope is None:
+            row = self._conn.execute(
+                "SELECT 1 FROM lcm_rollup_invalidations ORDER BY event_id LIMIT 1"
+            ).fetchone()
+        else:
+            row = self._conn.execute(
+                "SELECT 1 FROM lcm_rollup_invalidations WHERE scope=? "
+                "ORDER BY event_id LIMIT 1",
+                (scope,),
+            ).fetchone()
+        return row is not None
+
+    def drain_invalidations(
+        self, *, event_limit: int = 256, day_budget: int = 256
+    ) -> int:
+        """Apply a bounded number of invalidated UTC days, resuming durably.
+
+        ``event_limit`` caps event-row enumeration while ``day_budget`` caps the
+        total calendar expansion across those events. A long-span event stores
+        its next unprocessed day and remains pending until a later pass.
+        """
+        bounded_events = max(0, int(event_limit))
+        remaining_days = max(0, int(day_budget))
+        if bounded_events == 0 or remaining_days == 0:
+            return 0
+        with self._write_transaction():
+            rows = self._conn.execute(
+                """
+                SELECT event_id, scope, covered_start, covered_end, next_day
+                FROM lcm_rollup_invalidations
+                ORDER BY event_id
+                LIMIT ?
+                """,
+                (bounded_events,),
+            ).fetchall()
+            if not rows:
+                return 0
+            processed_days = 0
+            for row in rows:
+                start = datetime.fromtimestamp(
+                    float(row["covered_start"]), tz=timezone.utc
+                ).date()
+                end = datetime.fromtimestamp(
+                    float(row["covered_end"]), tz=timezone.utc
+                ).date()
+                if end < start:
+                    start, end = end, start
+                current = (
+                    date.fromisoformat(str(row["next_day"]))
+                    if row["next_day"]
+                    else start
+                )
+                while current <= end and remaining_days > 0:
+                    day_start, week_start, month_start = self._period_starts_for_day(
+                        current
+                    )
+                    self._conn.execute(
+                        """
+                        INSERT INTO lcm_rollups(
+                            period_kind, period_start, scope, status
+                        ) VALUES
+                            ('day', ?, ?, 'stale'),
+                            ('week', ?, ?, 'stale'),
+                            ('month', ?, ?, 'stale')
+                        ON CONFLICT(period_kind, period_start, scope) DO UPDATE SET
+                            status='stale', generation=lcm_rollups.generation + 1,
+                            lease_expires_at=NULL, lease_nonce=''
+                        """,
+                        (
+                            day_start, str(row["scope"]),
+                            week_start, str(row["scope"]),
+                            month_start, str(row["scope"]),
+                        ),
+                    )
+                    current += timedelta(days=1)
+                    processed_days += 1
+                    remaining_days -= 1
+                if current > end:
+                    self._conn.execute(
+                        "DELETE FROM lcm_rollup_invalidations WHERE event_id=?",
+                        (int(row["event_id"]),),
+                    )
+                else:
+                    self._conn.execute(
+                        "UPDATE lcm_rollup_invalidations SET next_day=? WHERE event_id=?",
+                        (current.isoformat(), int(row["event_id"])),
+                    )
+                    break
+                if remaining_days == 0:
+                    break
+        return processed_days
 
     def ready_rollups_for_window(
         self,
@@ -554,26 +788,18 @@ class RollupStore:
         unique_node_ids = list(dict.fromkeys(int(node_id) for node_id in node_ids))
         if not unique_node_ids:
             return 0
-        placeholders = ",".join("?" for _ in unique_node_ids)
         with self._write_transaction():
-            rows = self._conn.execute(
-                f"""
-                SELECT DISTINCT rollup_id
-                FROM lcm_rollup_sources
-                WHERE node_id IN ({placeholders})
-                """,
-                unique_node_ids,
-            ).fetchall()
-            rollup_ids = [int(row["rollup_id"]) for row in rows]
-            if not rollup_ids:
-                return 0
-            rollup_placeholders = ",".join("?" for _ in rollup_ids)
             self._conn.execute(
-                f"DELETE FROM lcm_rollup_sources WHERE rollup_id IN ({rollup_placeholders})",
-                rollup_ids,
+                "CREATE TEMP TABLE IF NOT EXISTS lcm_rollup_purge_nodes "
+                "(node_id INTEGER PRIMARY KEY) WITHOUT ROWID"
+            )
+            self._conn.execute("DELETE FROM temp.lcm_rollup_purge_nodes")
+            self._conn.executemany(
+                "INSERT INTO temp.lcm_rollup_purge_nodes(node_id) VALUES(?)",
+                ((node_id,) for node_id in unique_node_ids),
             )
             cur = self._conn.execute(
-                f"""
+                """
                 UPDATE lcm_rollups
                 SET status = 'stale',
                     generation = generation + 1,
@@ -581,12 +807,29 @@ class RollupStore:
                     token_count = NULL,
                     source_fingerprint = NULL,
                     error = NULL,
-                    lease_expires_at = NULL
-                WHERE rollup_id IN ({rollup_placeholders})
+                    lease_expires_at = NULL,
+                    lease_nonce = ''
+                WHERE rollup_id IN (
+                    SELECT source.rollup_id
+                    FROM lcm_rollup_sources source
+                    JOIN temp.lcm_rollup_purge_nodes purged
+                      ON purged.node_id = source.node_id
+                )
                 """,
-                rollup_ids,
             )
-        return int(cur.rowcount or 0)
+            affected = int(cur.rowcount or 0)
+            self._conn.execute(
+                """
+                DELETE FROM lcm_rollup_sources
+                WHERE rollup_id IN (
+                    SELECT source.rollup_id
+                    FROM lcm_rollup_sources source
+                    JOIN temp.lcm_rollup_purge_nodes purged
+                      ON purged.node_id = source.node_id
+                )
+                """
+            )
+        return affected
 
     def close(self) -> None:
         conn = getattr(self, "_conn", None)
