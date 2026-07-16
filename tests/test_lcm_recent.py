@@ -12,6 +12,7 @@ from hermes_lcm.rollup_periods import parse_recent_period
 from hermes_lcm.rollup_store import RollupStore
 from hermes_lcm.schemas import LCM_RECENT
 from hermes_lcm.tokens import count_tokens
+from hermes_lcm import tools as tools_module
 from hermes_lcm.tools import (
     _recent_expected_period_starts,
     _recent_has_unready_rollups,
@@ -65,6 +66,23 @@ def test_parse_recent_period_table(period, start, end, kind, subday):
 def test_parse_recent_period_invalid_values_are_clean_errors(period):
     with pytest.raises(ValueError, match="period|day|hour"):
         parse_recent_period(period, now=NOW)
+
+
+@pytest.mark.parametrize("period", ["today", "week", "month", "1d"])
+def test_parse_recent_period_rejects_unrepresentable_upper_day_bounds(period):
+    with pytest.raises(ValueError, match="period.*supported date range"):
+        parse_recent_period(
+            period,
+            now=datetime(9999, 12, 31, 12, tzinfo=timezone.utc),
+        )
+
+
+def test_parse_recent_period_rejects_unrepresentable_lower_day_bounds():
+    with pytest.raises(ValueError, match="period.*supported date range"):
+        parse_recent_period(
+            "yesterday",
+            now=datetime(1, 1, 1, 12, tzinfo=timezone.utc),
+        )
 
 
 @pytest.fixture
@@ -130,6 +148,7 @@ def test_lcm_recent_serves_ready_rollup_with_provenance(recent_parts):
 def test_lcm_recent_stale_rollup_falls_back_to_leaf_summaries(recent_parts):
     engine, store = recent_parts
     _add_leaf(engine._dag, engine.current_session_id, date(2026, 7, 15), "leaf fallback")
+    store.drain_invalidations()
     _ready(store, "day", "2026-07-15", engine.current_session_id)
     store.mark_stale_for_day("2026-07-15", engine.current_session_id)
 
@@ -139,6 +158,30 @@ def test_lcm_recent_stale_rollup_falls_back_to_leaf_summaries(recent_parts):
     assert result["fallback_reason"] == "rollups_unavailable"
     assert result["provenance"] == {"fallback": True, "rollups": []}
     assert [section["content"] for section in result["sections"]] == ["leaf fallback"]
+
+
+def test_lcm_recent_fails_closed_while_invalidation_is_pending(recent_parts):
+    engine, store = recent_parts
+    _ready(store, "day", "2026-07-15", engine.current_session_id)
+
+    # The node insert and durable invalidation event commit together, but no
+    # builder has drained the event yet.  The old ready rollup must not be
+    # visible in that interval during this window.
+    _add_leaf(
+        engine._dag,
+        engine.current_session_id,
+        date(2026, 7, 15),
+        "new content awaiting rollup invalidation",
+    )
+
+    result = json.loads(lcm_recent({"period": "date:2026-07-15"}, engine=engine))
+
+    assert result["mode"] == "leaf_summary_fallback"
+    assert result["fallback_reason"] == "rollups_invalidation_pending"
+    assert result["provenance"] == {"fallback": True, "rollups": []}
+    assert [section["content"] for section in result["sections"]] == [
+        "new content awaiting rollup invalidation"
+    ]
 
 
 def test_recent_window_coverage_requires_every_day_ready(recent_parts):
@@ -163,6 +206,26 @@ def test_recent_window_coverage_requires_every_day_ready(recent_parts):
     assert {row["period_start"] for row in served} == {"2026-07-14", "2026-07-15"}
 
 
+def test_recent_window_period_enumeration_fails_closed_above_work_cap(recent_parts):
+    engine, store = recent_parts
+    window = parse_recent_period(
+        f"{tools_module._LCM_RECENT_FRONTIER_WORK_LIMIT + 1}d", now=NOW
+    )
+    statements: list[str] = []
+    store.connection.set_trace_callback(statements.append)
+    try:
+        assert _recent_expected_period_starts(window) == []
+        assert _recent_has_unready_rollups(
+            store, window, engine.current_session_id
+        ) is True
+    finally:
+        store.connection.set_trace_callback(None)
+
+    # The oversized request is rejected arithmetically; it never enumerates or
+    # queries thousands of expected period IDs.
+    assert not any("FROM lcm_rollups" in statement for statement in statements)
+
+
 def test_lcm_recent_fallback_includes_retained_higher_depth_summary(recent_parts):
     # After rotation, a retained higher-depth (carry-forward) summary in-window
     # must be returned by the leaf fallback, not only depth-0 leaves
@@ -171,6 +234,12 @@ def test_lcm_recent_fallback_includes_retained_higher_depth_summary(recent_parts
     engine._config.temporal_rollups_enabled = False  # force the fallback path
     scope = engine.current_session_id
     content_time = _timestamp(date(2026, 7, 15))
+    source_id = _add_leaf(
+        engine._dag,
+        "retained-source-outside-scope",
+        date(2026, 7, 15),
+        "archived source",
+    )
     retained_id = engine._dag.add_node(
         SummaryNode(
             session_id=scope,
@@ -178,7 +247,7 @@ def test_lcm_recent_fallback_includes_retained_higher_depth_summary(recent_parts
             summary="retained higher-depth carry-forward summary",
             token_count=count_tokens("retained higher-depth carry-forward summary"),
             source_token_count=10,
-            source_ids=[1],
+            source_ids=[source_id],
             source_type="nodes",
             created_at=content_time,
             earliest_at=content_time,
@@ -292,6 +361,16 @@ def test_lcm_recent_argument_validation(recent_parts, args, message):
     assert message in result["error"]
 
 
+def test_lcm_recent_reports_max_date_overflow_as_validation_error(recent_parts):
+    engine, _store = recent_parts
+
+    result = json.loads(
+        lcm_recent({"period": "date:9999-12-31"}, engine=engine)
+    )
+
+    assert result == {"error": "period is outside the supported date range"}
+
+
 def test_recent_rollup_falls_back_when_finalized_session_has_window_content(recent_parts):
     # Rollups are session-scoped, but the leaf fallback spans current +
     # last-finalized session. Rollup mode must not serve current-session-only
@@ -364,6 +443,127 @@ def test_recent_fallback_suppresses_child_covered_by_overlapping_parent(recent_p
     assert child not in returned
 
 
+def test_recent_fallback_suppresses_transitive_child_when_parent_not_selected(
+    recent_parts,
+):
+    engine, _store = recent_parts
+    engine._config.temporal_rollups_enabled = False
+    scope = engine.current_session_id
+    day = date(2026, 7, 15)
+    content_time = _timestamp(day)
+    child = _add_leaf(engine._dag, scope, day, "transitive child content")
+    parent = engine._dag.add_node(
+        SummaryNode(
+            # Deliberately outside the requested session set: it remains a DAG
+            # lineage intermediate but is not a fallback candidate.
+            session_id="lineage-intermediate-outside-scope",
+            depth=1,
+            summary="unselected intermediate parent",
+            token_count=4,
+            source_token_count=6,
+            source_ids=[child],
+            source_type="nodes",
+            created_at=content_time,
+            earliest_at=content_time,
+            latest_at=content_time,
+        )
+    )
+    grandparent = engine._dag.add_node(
+        SummaryNode(
+            session_id=scope,
+            depth=2,
+            summary="canonical grandparent content",
+            token_count=4,
+            source_token_count=8,
+            source_ids=[parent],
+            source_type="nodes",
+            created_at=content_time,
+            earliest_at=content_time,
+            latest_at=content_time,
+        )
+    )
+
+    result = json.loads(
+        lcm_recent({"period": "date:2026-07-15", "limit": 2}, engine=engine)
+    )
+
+    returned = {section["node_id"] for section in result["sections"]}
+    assert returned == {grandparent}
+    assert child not in returned
+
+
+def test_recent_fallback_collapses_identical_sibling_lineage(recent_parts):
+    engine, _store = recent_parts
+    engine._config.temporal_rollups_enabled = False
+    scope = engine.current_session_id
+    day = date(2026, 7, 15)
+    content_time = _timestamp(day)
+    child = _add_leaf(engine._dag, scope, day, "shared child")
+    sibling_ids = []
+    for summary in ("first sibling", "second sibling"):
+        sibling_ids.append(
+            engine._dag.add_node(
+                SummaryNode(
+                    session_id=scope,
+                    depth=1,
+                    summary=summary,
+                    token_count=2,
+                    source_token_count=4,
+                    source_ids=[child],
+                    source_type="nodes",
+                    created_at=content_time,
+                    earliest_at=content_time,
+                    latest_at=content_time,
+                )
+            )
+        )
+
+    result = json.loads(
+        lcm_recent({"period": "date:2026-07-15", "limit": 10}, engine=engine)
+    )
+
+    assert [section["node_id"] for section in result["sections"]] == [
+        min(sibling_ids)
+    ]
+
+
+def test_recent_fallback_fails_closed_on_partial_lineage_overlap(recent_parts):
+    engine, _store = recent_parts
+    engine._config.temporal_rollups_enabled = False
+    scope = engine.current_session_id
+    day = date(2026, 7, 15)
+    content_time = _timestamp(day)
+    leaf_ids = [
+        _add_leaf(engine._dag, scope, day, f"leaf {number}")
+        for number in range(3)
+    ]
+    for source_ids, summary in (
+        (leaf_ids[:2], "left overlap"),
+        (leaf_ids[1:], "right overlap"),
+    ):
+        engine._dag.add_node(
+            SummaryNode(
+                session_id=scope,
+                depth=1,
+                summary=summary,
+                token_count=2,
+                source_token_count=4,
+                source_ids=source_ids,
+                source_type="nodes",
+                created_at=content_time,
+                earliest_at=content_time,
+                latest_at=content_time,
+            )
+        )
+
+    result = json.loads(
+        lcm_recent({"period": "date:2026-07-15", "limit": 10}, engine=engine)
+    )
+
+    assert result["mode"] == "leaf_summary_fallback"
+    assert result["sections"] == []
+
+
 def test_recent_provenance_is_bounded_to_returned_sections(recent_parts):
     # Maintainer #389 C2 repro: 1,000 ready rollups + limit=1 produced a
     # 39,039-char response — all 1,000 provenance rows, zero content sections —
@@ -420,3 +620,67 @@ def test_recent_fallback_includes_summary_overlapping_window_edge(recent_parts):
     result = json.loads(lcm_recent({"period": "date:2026-07-15"}, engine=engine))
     assert result["mode"] == "leaf_summary_fallback"
     assert spanning_id in {section["node_id"] for section in result["sections"]}
+
+
+def test_recent_fallback_candidate_work_is_sql_bounded(recent_parts, monkeypatch):
+    # T-12 repro: limit=1 previously materialized every matching node before
+    # truncating.  The SQL query now fetches at most the work cap plus one
+    # sentinel and returns no potentially non-canonical partial frontier.
+    engine, _store = recent_parts
+    engine._config.temporal_rollups_enabled = False
+    scope = engine.current_session_id
+    content_time = _timestamp(date(2026, 7, 15))
+    rows = [
+        SummaryNode(
+            session_id=scope,
+            depth=0,
+            summary=f"independent summary {index}",
+            token_count=4,
+            source_token_count=4,
+            source_ids=[index],
+            source_type="messages",
+            created_at=content_time,
+            earliest_at=content_time,
+            latest_at=content_time,
+        )
+        for index in range(tools_module._LCM_RECENT_FRONTIER_WORK_LIMIT + 1)
+    ]
+    for node in rows:
+        engine._dag.add_node(node)
+
+    probe_plan = engine._dag.connection.execute(
+        """
+        EXPLAIN QUERY PLAN
+        SELECT node_id
+        FROM summary_nodes
+        WHERE COALESCE(earliest_at, created_at) < ?
+          AND COALESCE(latest_at, created_at) >= ?
+          AND session_id IN (?)
+        LIMIT ?
+        """,
+        (
+            datetime(2026, 7, 16, tzinfo=timezone.utc).timestamp(),
+            datetime(2026, 7, 15, tzinfo=timezone.utc).timestamp(),
+            scope,
+            tools_module._LCM_RECENT_FRONTIER_WORK_LIMIT + 1,
+        ),
+    ).fetchall()
+    plan_text = " ".join(str(row[3]) for row in probe_plan).upper()
+    assert "SEARCH SUMMARY_NODES USING" in plan_text
+    assert "TEMP B-TREE" not in plan_text
+
+    frontier_calls: list[int] = []
+    real_frontier = tools_module.canonical_frontier
+
+    def counted_frontier(candidates):
+        frontier_calls.append(len(candidates))
+        return real_frontier(candidates)
+
+    monkeypatch.setattr(tools_module, "canonical_frontier", counted_frontier)
+    result = json.loads(
+        lcm_recent({"period": "date:2026-07-15", "limit": 1}, engine=engine)
+    )
+
+    assert result["mode"] == "leaf_summary_fallback"
+    assert result["sections"] == []
+    assert frontier_calls == []

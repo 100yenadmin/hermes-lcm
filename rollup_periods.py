@@ -262,6 +262,17 @@ def _day_start(value: date) -> datetime:
     return datetime.combine(value, time.min, tzinfo=timezone.utc)
 
 
+def _checked_date_add(value: date, days: int) -> date:
+    try:
+        return value + timedelta(days=days)
+    except OverflowError as exc:
+        raise ValueError("period is outside the supported date range") from exc
+
+
+def _exclusive_day_end(value: date) -> datetime:
+    return _day_start(_checked_date_add(value, 1))
+
+
 def parse_recent_period(period: str, *, now: datetime | None = None) -> RecentPeriodWindow:
     """Parse an ``lcm_recent`` period into a deterministic UTC window."""
     if not isinstance(period, str) or not period.strip():
@@ -273,21 +284,25 @@ def parse_recent_period(period: str, *, now: datetime | None = None) -> RecentPe
 
     if requested == "today":
         start = _day_start(today)
-        return RecentPeriodWindow(requested, start, start + timedelta(days=1), "day")
+        return RecentPeriodWindow(requested, start, _exclusive_day_end(today), "day")
 
     if requested == "yesterday":
-        start = _day_start(today - timedelta(days=1))
-        return RecentPeriodWindow(requested, start, start + timedelta(days=1), "day")
+        yesterday = _checked_date_add(today, -1)
+        start = _day_start(yesterday)
+        return RecentPeriodWindow(requested, start, _exclusive_day_end(yesterday), "day")
 
     if requested == "week":
-        week_start = today - timedelta(days=today.weekday())
+        week_start = _checked_date_add(today, -today.weekday())
         start = _day_start(week_start)
-        return RecentPeriodWindow(requested, start, start + timedelta(days=7), "week")
+        return RecentPeriodWindow(
+            requested, start, _day_start(_checked_date_add(week_start, 7)), "week"
+        )
 
     if requested == "month":
         month_start = today.replace(day=1)
         start = _day_start(month_start)
-        end = _day_start(month_start.replace(day=monthrange(today.year, today.month)[1])) + timedelta(days=1)
+        month_last = month_start.replace(day=monthrange(today.year, today.month)[1])
+        end = _exclusive_day_end(month_last)
         return RecentPeriodWindow(requested, start, end, "month")
 
     date_match = re.fullmatch(r"date:(\d{4}-\d{2}-\d{2})", requested)
@@ -297,18 +312,17 @@ def parse_recent_period(period: str, *, now: datetime | None = None) -> RecentPe
         except ValueError as exc:
             raise ValueError("period date must be a valid YYYY-MM-DD") from exc
         start = _day_start(parsed_date)
-        return RecentPeriodWindow(requested, start, start + timedelta(days=1), "day")
+        return RecentPeriodWindow(
+            requested, start, _exclusive_day_end(parsed_date), "day"
+        )
 
     days_match = re.fullmatch(r"(\d+)d", requested)
     if days_match:
         days = int(days_match.group(1))
         if days <= 0:
             raise ValueError("day period must be at least 1d")
-        try:
-            start = _day_start(today - timedelta(days=days - 1))
-        except OverflowError as exc:
-            raise ValueError("day period is outside the supported date range") from exc
-        return RecentPeriodWindow(requested, start, _day_start(today) + timedelta(days=1), "day")
+        start = _day_start(_checked_date_add(today, -(days - 1)))
+        return RecentPeriodWindow(requested, start, _exclusive_day_end(today), "day")
 
     hours_match = re.fullmatch(r"last (\d+)h", requested)
     if hours_match:

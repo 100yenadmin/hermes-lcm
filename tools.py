@@ -40,6 +40,7 @@ from .rollup_periods import (
     CoverageNode,
     RecentPeriodWindow,
     canonical_frontier,
+    load_source_lineage,
     parse_recent_period,
 )
 from .rollup_store import RollupStore
@@ -210,6 +211,7 @@ _LCM_GREP_VALID_SCOPES = frozenset({"current", "all", "session"})
 _LCM_GREP_HARD_LIMIT_CAP = 200
 _LCM_RECENT_DEFAULT_LIMIT = 10
 _LCM_RECENT_HARD_LIMIT_CAP = 200
+_LCM_RECENT_FRONTIER_WORK_LIMIT = 4096
 _LCM_LOAD_SESSION_DEFAULT_LIMIT = 100
 _LCM_LOAD_SESSION_HARD_LIMIT_CAP = 200
 _LCM_LOAD_SESSION_DEFAULT_MAX_CONTENT_CHARS = 4000
@@ -1071,6 +1073,9 @@ def _recent_expected_period_starts(window: RecentPeriodWindow) -> list[str]:
     if window.rollup_kind == "day":
         first = window.start.date()
         last = (window.end - timedelta(microseconds=1)).date()
+        day_count = (last - first).days + 1
+        if day_count > _LCM_RECENT_FRONTIER_WORK_LIMIT:
+            return []
         days: list[str] = []
         current = first
         while current <= last:
@@ -1094,13 +1099,18 @@ def _recent_has_unready_rollups(
     connection = store.connection
     if connection is None:
         return True
-    expected = _recent_expected_period_starts(window)
-    if not expected:
+    if window.rollup_kind == "day":
+        first = window.start.date()
+        last = (window.end - timedelta(microseconds=1)).date()
+        expected_count = (last - first).days + 1
+    else:
+        expected_count = 1
+    if expected_count <= 0 or expected_count > _LCM_RECENT_FRONTIER_WORK_LIMIT:
         return True
     start, end = _recent_rollup_bounds(window)
-    ready_rows = connection.execute(
+    ready_row = connection.execute(
         """
-        SELECT period_start
+        SELECT COUNT(*)
         FROM lcm_rollups
         WHERE period_kind = ?
           AND period_start >= ?
@@ -1109,9 +1119,8 @@ def _recent_has_unready_rollups(
           AND status = 'ready'
         """,
         (window.rollup_kind, start, end, scope),
-    ).fetchall()
-    ready_starts = {str(row[0]) for row in ready_rows}
-    return not set(expected).issubset(ready_starts)
+    ).fetchone()
+    return int(ready_row[0] or 0) != expected_count
 
 
 def _session_has_window_content(
@@ -1167,14 +1176,21 @@ def _recent_ready_rollups(
     store: RollupStore | None = None
     try:
         store = RollupStore(engine._dag.db_path)
+        # A summary mutation and its invalidation event commit atomically.  Do
+        # not serve a previously-ready rollup while that durable event is still
+        # waiting for bounded maintenance to reconcile the affected periods.
+        if store.has_pending_invalidations(scope):
+            return [], "rollups_invalidation_pending"
         start, end = _recent_rollup_bounds(window)
+        if _recent_has_unready_rollups(store, window, scope):
+            return [], "rollups_unavailable"
         rollups = store.ready_rollups_for_window(
             window.rollup_kind,
             start,
             end,
             scope,
         )
-        if not rollups or _recent_has_unready_rollups(store, window, scope):
+        if not rollups:
             return [], "rollups_unavailable"
         return rollups, None
     except Exception:
@@ -1239,25 +1255,67 @@ def _recent_leaf_sections(
         placeholders = ",".join("?" for _ in session_ids)
         where.append(f"session_id IN ({placeholders})")
         params.extend(session_ids)
-    # No SQL LIMIT here: the interval-aware canonical frontier is applied first so
-    # a child suppressed by an overlapping higher-depth parent never consumes a
-    # public ``limit`` slot ahead of independent summaries (maintainer #389 C1).
+    # Probe one sentinel row beyond the work cap without an expression ORDER BY.
+    # The session index can stop at the sentinel instead of scanning/sorting the
+    # full matching corpus; ordering happens only after this set is proven small.
+    probe_params = [*params, _LCM_RECENT_FRONTIER_WORK_LIMIT + 1]
     try:
         with engine._dag._db_lock:
-            rows = connection.execute(
+            id_rows = connection.execute(
                 f"""
-                SELECT node_id, session_id, summary, token_count,
-                       depth, source_ids, source_type,
-                       COALESCE(earliest_at, created_at) AS earliest_at,
-                       COALESCE(latest_at, created_at) AS latest_at
+                SELECT node_id
                 FROM summary_nodes
                 WHERE {' AND '.join(where)}
-                ORDER BY COALESCE(latest_at, created_at) DESC, node_id DESC
+                LIMIT ?
                 """,
-                params,
+                probe_params,
             ).fetchall()
+            if len(id_rows) > _LCM_RECENT_FRONTIER_WORK_LIMIT:
+                logger.warning(
+                    "LCM recent fallback exceeded the %d-node canonical frontier "
+                    "bound; returning no partial frontier",
+                    _LCM_RECENT_FRONTIER_WORK_LIMIT,
+                )
+                return []
+            if not id_rows:
+                return []
+
+            connection.execute(
+                "CREATE TEMP TABLE IF NOT EXISTS lcm_recent_frontier_ids "
+                "(node_id INTEGER PRIMARY KEY) WITHOUT ROWID"
+            )
+            connection.execute("DELETE FROM temp.lcm_recent_frontier_ids")
+            try:
+                connection.executemany(
+                    "INSERT INTO temp.lcm_recent_frontier_ids(node_id) VALUES(?)",
+                    ((int(row[0]),) for row in id_rows),
+                )
+                rows = connection.execute(
+                    """
+                    SELECT node.node_id, node.session_id, node.summary,
+                           node.token_count, node.depth, node.source_ids,
+                           node.source_type,
+                           COALESCE(node.earliest_at, node.created_at) AS earliest_at,
+                           COALESCE(node.latest_at, node.created_at) AS latest_at
+                    FROM temp.lcm_recent_frontier_ids wanted
+                    JOIN summary_nodes node ON node.node_id = wanted.node_id
+                    ORDER BY COALESCE(node.latest_at, node.created_at) DESC,
+                             node.node_id DESC
+                    """
+                ).fetchall()
+            finally:
+                connection.execute("DELETE FROM temp.lcm_recent_frontier_ids")
+
+            source_lineage = load_source_lineage(
+                connection,
+                [int(row[0]) for row in rows],
+                limit=_LCM_RECENT_FRONTIER_WORK_LIMIT,
+            )
     except Exception:
-        logger.debug("LCM recent leaf-summary fallback failed", exc_info=True)
+        logger.debug(
+            "LCM recent fallback or transitive lineage read failed closed",
+            exc_info=True,
+        )
         return []
 
     candidates: list[CoverageNode] = []
@@ -1286,7 +1344,16 @@ def _recent_leaf_sections(
     # parent, THEN apply the limit — so duplicated lineage cannot consume the
     # public budget twice (maintainer #389 C1). ``rows`` is already ordered
     # newest-first, and canonical_frontier preserves that order.
-    frontier_rows = [by_id[node.node_id] for node in canonical_frontier(candidates)][:limit]
+    try:
+        frontier_rows = [
+            by_id[node.node_id]
+            for node in canonical_frontier(
+                candidates, source_lineage=source_lineage
+            )
+        ][:limit]
+    except Exception:
+        logger.debug("LCM recent canonical frontier failed closed", exc_info=True)
+        return []
     return [
         {
             "kind": "leaf_summary",
