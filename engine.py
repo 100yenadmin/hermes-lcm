@@ -77,7 +77,7 @@ from .runtime_identity import (
     _plugin_metadata,
 )
 from .rollup_builder import (
-    mark_stale_for_deleted_nodes,
+    initialize_rollup_invalidation_outbox,
     mark_stale_for_published_summary,
     run_rollup_maintenance,
 )
@@ -424,6 +424,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             hermes_home=hermes_home,
         )
         self._dag = SummaryDAG(db_path)
+        if self._config.temporal_rollups_enabled:
+            # Install the transaction-coupled summary mutation triggers before
+            # this engine can publish or delete a DAG node.
+            initialize_rollup_invalidation_outbox(self._dag)
         self._lifecycle = LifecycleStateStore(db_path)
 
     def _close_storage(self) -> None:
@@ -3015,18 +3019,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         #    N  → keep nodes at depth >= N (e.g. 2 keeps d2+)
         retain = self._config.new_session_retain_depth
         if self._session_id and retain != -1:
-            # Capture the COMPLETE deleted-id set (unbounded), not the first 1000
-            # get_session_nodes would return, so rollups referencing any deleted
-            # node past that cap are still staled (maintainer #388 blocker).
-            deleted_node_ids = self._dag.get_session_node_ids_below_depth(
-                self._session_id, None if retain == 0 else retain
-            )
             if retain == 0:
                 self._dag.delete_session_nodes(self._session_id)
             else:
                 self._dag.delete_below_depth(self._session_id, retain)
-            if self._config.temporal_rollups_enabled:
-                mark_stale_for_deleted_nodes(self._dag, deleted_node_ids)
 
     def carry_over_new_session_context(self, old_session_id: str, new_session_id: str) -> int:
         """Move retained summaries from the old session into the new one.

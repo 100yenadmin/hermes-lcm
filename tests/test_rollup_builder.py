@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import json
+import threading
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
 import hermes_lcm.engine as engine_module
 import hermes_lcm.rollup_builder as builder_module
+import hermes_lcm.rollup_periods as periods_module
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.dag import SummaryDAG, SummaryNode
 from hermes_lcm.engine import LCMEngine
@@ -78,6 +81,7 @@ def _ready(
     source_ids: list[int],
     fingerprint: str,
 ) -> int:
+    store.drain_invalidations(event_limit=256, day_budget=256)
     token = store.upsert_building(kind, start, scope)
     store.mark_ready(
         token,
@@ -98,8 +102,7 @@ def test_build_day_uses_newest_source_day_and_mocked_summarizer(rollup_parts):
         dag,
         scope,
         target_day - timedelta(days=1),
-        "condensed fixture summary",
-        depth=1,
+        "second fixture summary",
         latest_day=target_day,
     )
     _add_node(dag, scope, target_day - timedelta(days=1), "older summary")
@@ -116,7 +119,7 @@ def test_build_day_uses_newest_source_day_and_mocked_summarizer(rollup_parts):
     assert result["token_count"] == count_tokens("deterministic daily rollup")
     assert result["source_node_ids"] == [first, second]
     assert "leaf fixture summary" in calls[0][0]
-    assert "condensed fixture summary" in calls[0][0]
+    assert "second fixture summary" in calls[0][0]
     assert "older summary" not in calls[0][0]
     assert calls[0][1]["token_budget"] == config.rollup_daily_target_tokens
     assert calls[0][1]["l3_truncate_tokens"] == config.rollup_daily_max_tokens
@@ -189,8 +192,8 @@ def test_week_requires_all_content_dailies_ready_before_publishing(rollup_parts)
     built = build_week(store, dag, config, scope, monday, summarizer=summarize)
 
     assert built is not None
-    assert "ready monday daily" in seen_text[0]
-    assert "ready tuesday rebuilt" in seen_text[0]
+    assert "monday node" in seen_text[0]
+    assert "tuesday node" in seen_text[0]
     assert built["source_node_ids"] == [monday_node, tuesday_node]
     assert built["status"] == "ready"
 
@@ -224,13 +227,14 @@ def test_month_aggregate_never_queries_dag_when_ready_dailies_exist(rollup_parts
     store, dag, config = rollup_parts
     scope = "session-month"
     month_start = date(2026, 7, 1)
+    node_id = _add_node(dag, scope, month_start, "first source")
     _ready(
         store,
         "day",
         month_start.isoformat(),
         scope,
         summary="first daily",
-        source_ids=[101],
+        source_ids=[node_id],
         fingerprint="day-one",
     )
     monkeypatch.setattr(
@@ -249,7 +253,7 @@ def test_month_aggregate_never_queries_dag_when_ready_dailies_exist(rollup_parts
     )
 
     assert result is not None
-    assert result["source_node_ids"] == [101]
+    assert result["source_node_ids"] == [node_id]
 
 
 def test_builder_failure_is_marked_failed_and_does_not_raise(rollup_parts):
@@ -321,8 +325,9 @@ def test_publication_staleness_and_bounded_bind_maintenance(tmp_path, monkeypatc
                 for kind, start in (("day", today), ("week", week_start), ("month", month_start))
             ] == ["ready", "ready", "ready"]
 
-            # Publishing a summary covering today is the staleness signal.
-            engine._invalidate_rollups_for_published_node(engine._dag.get_node(node_id))
+            # Publishing a later summary covering today is the staleness signal.
+            later_id = _add_node(engine._dag, scope, today, "later source node")
+            engine._invalidate_rollups_for_published_node(engine._dag.get_node(later_id))
             assert [
                 store.get_rollup(kind, start.isoformat(), scope)["status"]
                 for kind, start in (("day", today), ("week", week_start), ("month", month_start))
@@ -372,16 +377,18 @@ def test_failed_rollup_retry_honors_backoff(rollup_parts, monkeypatch):
     recent_day = date(2026, 7, 15)
     _add_node(dag, scope, old_day, "old failed source")
     _add_node(dag, scope, recent_day, "recent failed source")
-    old_id = store.upsert_building("day", old_day.isoformat(), scope).rollup_id
-    recent_id = store.upsert_building("day", recent_day.isoformat(), scope).rollup_id
-    store.mark_failed(old_id, "old failure")
-    store.mark_failed(recent_id, "recent failure")
+    store.drain_invalidations(event_limit=256, day_budget=256)
+    old_token = store.upsert_building("day", old_day.isoformat(), scope)
+    recent_token = store.upsert_building("day", recent_day.isoformat(), scope)
+    old_id = old_token.rollup_id
+    store.mark_failed(old_token, "old failure")
+    store.mark_failed(recent_token, "recent failure")
     store.connection.execute(
-        "UPDATE lcm_rollups SET built_at = ? WHERE rollup_id = ?",
+        "UPDATE lcm_rollups SET failed_at = ? WHERE rollup_id = ?",
         ("2026-07-15T00:00:00+00:00", old_id),
     )
     store.connection.commit()
-    config.rollup_builds_per_pass = 5
+    config.rollup_builds_per_pass = 1
     monkeypatch.setattr(
         builder_module,
         "summarize_with_escalation",
@@ -402,12 +409,12 @@ def test_maintenance_budget_stops_before_starting_next_build(rollup_parts, monke
         store.mark_stale_for_day(target_day, scope)
     config.rollup_builds_per_pass = 2
     config.rollup_maintenance_budget_ms = 5
-    times = iter((0.0, 0.001, 0.006))
-    monkeypatch.setattr(builder_module, "monotonic", lambda: next(times))
+    now = [0.0]
+    monkeypatch.setattr(builder_module, "monotonic", lambda: now[0])
     monkeypatch.setattr(
         builder_module,
         "summarize_with_escalation",
-        lambda _text, **_kwargs: ("budgeted daily", 1),
+        lambda _text, **_kwargs: (now.__setitem__(0, 0.006) or "budgeted daily", 1),
     )
 
     assert run_rollup_maintenance(dag, config, scope) == 1
@@ -424,10 +431,10 @@ def test_pending_maintenance_query_uses_partial_index(rollup_parts):
 
     plan = store.connection.execute(
         "EXPLAIN QUERY PLAN " + _PENDING_ROLLUPS_SQL,
-        ("query-plan", "2026-07-15T00:00:00+00:00", 2),
+        ("query-plan", 2),
     ).fetchall()
 
-    assert any("idx_lcm_rollups_pending" in str(row[3]) for row in plan)
+    assert any("idx_lcm_rollups_stale_day" in str(row[3]) for row in plan)
 
 
 def test_session_reset_stales_rollups_referencing_deleted_nodes(tmp_path):
@@ -457,6 +464,7 @@ def test_session_reset_stales_rollups_referencing_deleted_nodes(tmp_path):
             engine.on_session_reset()
 
             assert engine._dag.get_session_nodes(scope) == []
+            store.drain_invalidations(event_limit=256, day_budget=256)
             assert store.get_rollup("day", "2026-07-15", scope)["status"] == "stale"
         finally:
             store.close()
@@ -525,7 +533,8 @@ def test_engine_invalidates_rollups_when_a_node_is_published(tmp_path):
                 store, "day", target_day.isoformat(), scope,
                 summary="ready day", source_ids=[node_id], fingerprint="day-v1",
             )
-            node = engine._dag.get_node(node_id)
+            later_id = _add_node(engine._dag, scope, target_day, "later published node")
+            node = engine._dag.get_node(later_id)
             engine._invalidate_rollups_for_published_node(node)
             assert store.get_rollup("day", target_day.isoformat(), scope)["status"] == "stale"
         finally:
@@ -622,6 +631,7 @@ def test_deletion_staleness_bumps_generation_and_supersedes_inflight(rollup_part
     scope = "session-del"
     day = date(2026, 7, 15)
     node_id = _add_node(dag, scope, day, "to be deleted")
+    store.drain_invalidations(event_limit=256, day_budget=256)
     token = store.upsert_building("day", day.isoformat(), scope)
     store.connection.execute(
         "INSERT INTO lcm_rollup_sources(rollup_id, node_id) VALUES(?, ?)",
@@ -629,6 +639,8 @@ def test_deletion_staleness_bumps_generation_and_supersedes_inflight(rollup_part
     )
     store.connection.commit()
 
+    dag.connection.execute("DELETE FROM summary_nodes WHERE node_id=?", (node_id,))
+    dag.connection.commit()
     assert builder_module.mark_stale_for_deleted_nodes(dag, [node_id]) == 1
     # The in-flight build cannot publish deleted-node content over the stale row.
     assert store.mark_ready(token, "deleted content", 1, [node_id], "fp") is False
@@ -757,7 +769,7 @@ def test_daily_frontier_does_not_duplicate_multiday_parent_lineage(rollup_parts)
     # source set and the parent in Jul16's, so adjacent dailies duplicated the
     # same covered leaf lineage. The interval-aware canonical frontier must
     # suppress the child (its parent covers it across the day boundary) so the
-    # parent feeds only Jul16 and Jul15 has no duplicate.
+    # parent feeds both intersected days without duplicating the child lineage.
     store, dag, config = rollup_parts
     scope = "session-b1"
     jul15 = date(2026, 7, 15)
@@ -783,15 +795,58 @@ def test_daily_frontier_does_not_duplicate_multiday_parent_lineage(rollup_parts)
     jul15_ids = {source["node_id"] for source in jul15_sources}
     jul16_ids = {source["node_id"] for source in jul16_sources}
 
-    # The child is suppressed everywhere (its parent covers it); the parent feeds
-    # only its representative day (Jul16). Jul15 and Jul16 do NOT both carry the
-    # child's lineage.
+    # The child is suppressed everywhere; the canonical parent participates in
+    # every day its full interval intersects.
     assert child not in jul15_ids and child not in jul16_ids
     assert jul16_ids == {parent}
-    assert jul15_ids == set()
-    # Days-with-content agrees with the frontier so the aggregate gate is not
-    # blocked waiting on a Jul15 daily that legitimately does not exist.
-    assert builder_module._days_with_content(dag, scope, jul15, jul16) == {jul16.isoformat()}
+    assert jul15_ids == {parent}
+    assert builder_module._days_with_content(dag, scope, jul15, jul16) == {
+        jul15.isoformat(), jul16.isoformat()
+    }
+
+
+def test_canonical_frontier_collapses_identical_sibling_lineage_independent_of_order():
+    child = periods_module.CoverageNode(node_id=1, depth=0)
+    higher_id = periods_module.CoverageNode(
+        node_id=3, depth=1, source_node_ids=(1,)
+    )
+    lower_id = periods_module.CoverageNode(
+        node_id=2, depth=1, source_node_ids=(1,)
+    )
+
+    forward = periods_module.canonical_frontier([child, higher_id, lower_id])
+    reverse = periods_module.canonical_frontier([lower_id, higher_id, child])
+
+    assert [node.node_id for node in forward] == [2]
+    assert [node.node_id for node in reverse] == [2]
+
+
+def test_canonical_frontier_uses_transitive_terminal_lineage_and_superset():
+    leaf_one = periods_module.CoverageNode(node_id=1, depth=0)
+    leaf_two = periods_module.CoverageNode(node_id=2, depth=0)
+    grandparent = periods_module.CoverageNode(node_id=4, depth=2)
+    lineage = {4: (3, 2), 3: (1,), 2: (), 1: ()}
+
+    frontier = periods_module.canonical_frontier(
+        [leaf_one, leaf_two, grandparent], source_lineage=lineage
+    )
+
+    assert [node.node_id for node in frontier] == [4]
+
+
+def test_canonical_frontier_rejects_partial_terminal_lineage_overlap():
+    left = periods_module.CoverageNode(
+        node_id=4, depth=1, source_node_ids=(1, 2)
+    )
+    right = periods_module.CoverageNode(
+        node_id=5, depth=1, source_node_ids=(2, 3)
+    )
+
+    with pytest.raises(
+        periods_module.CanonicalFrontierOverlapError,
+        match="partially overlap",
+    ):
+        periods_module.canonical_frontier([left, right])
 
 
 def test_publication_stales_every_day_a_summary_spans(rollup_parts):
@@ -802,7 +857,7 @@ def test_publication_stales_every_day_a_summary_spans(rollup_parts):
     scope = "session-b2"
     jul15 = date(2026, 7, 15)
     jul16 = date(2026, 7, 16)
-    node = _add_node(dag, scope, jul15, "spanning summary", latest_day=jul16)
+    node = _add_node(dag, scope, jul15, "initial summary")
     for kind, start in (
         ("day", jul15),
         ("day", jul16),
@@ -816,7 +871,10 @@ def test_publication_stales_every_day_a_summary_spans(rollup_parts):
 
     from hermes_lcm.rollup_builder import mark_stale_for_published_summary
 
-    published = dag.get_node(node)
+    published_id = _add_node(
+        dag, scope, jul15, "later spanning summary", latest_day=jul16
+    )
+    published = dag.get_node(published_id)
     mark_stale_for_published_summary(
         dag, scope, published.latest_at, published.created_at,
         earliest_at=published.earliest_at,
@@ -841,3 +899,373 @@ def test_deleted_node_staleness_covers_more_than_get_session_nodes_limit(rollup_
     assert len(all_ids) == 1001
     # Depth filtering also returns the complete set unbounded (all are depth 0).
     assert len(dag.get_session_node_ids_below_depth(scope, 1)) == 1001
+
+
+def test_aggregate_uses_one_canonical_parent_child_frontier(rollup_parts):
+    store, dag, config = rollup_parts
+    scope = "aggregate-frontier"
+    jul15 = date(2026, 7, 15)
+    jul16 = date(2026, 7, 16)
+    child = _add_node(dag, scope, jul15, "child content")
+    parent = dag.add_node(
+        SummaryNode(
+            session_id=scope,
+            depth=1,
+            summary="canonical parent content",
+            token_count=3,
+            source_token_count=6,
+            source_ids=[child],
+            source_type="nodes",
+            created_at=_timestamp(jul16, 18),
+            earliest_at=_timestamp(jul15, 8),
+            latest_at=_timestamp(jul16, 22),
+        )
+    )
+    _ready(
+        store, "day", jul15.isoformat(), scope,
+        summary="daily-child", source_ids=[child], fingerprint="child",
+    )
+    _ready(
+        store, "day", jul16.isoformat(), scope,
+        summary="daily-parent", source_ids=[parent], fingerprint="parent",
+    )
+    seen: list[str] = []
+    built = build_week(
+        store, dag, config, scope, date(2026, 7, 13),
+        summarizer=lambda text, **_kwargs: (seen.append(text) or "week", 1),
+    )
+
+    assert built is not None
+    assert built["source_node_ids"] == [parent]
+    assert "canonical parent content" in seen[0]
+    assert "child content" not in seen[0]
+
+
+def test_aggregate_frontier_suppresses_transitive_child_when_parent_absent(
+    rollup_parts,
+):
+    store, dag, config = rollup_parts
+    scope = "aggregate-transitive-frontier"
+    jul15 = date(2026, 7, 15)
+    jul16 = date(2026, 7, 16)
+    child = _add_node(dag, scope, jul15, "transitive child content")
+    parent = dag.add_node(
+        SummaryNode(
+            session_id=scope,
+            depth=1,
+            summary="intermediate parent not selected by any daily",
+            token_count=5,
+            source_token_count=8,
+            source_ids=[child],
+            source_type="nodes",
+            created_at=_timestamp(jul15, 18),
+            earliest_at=_timestamp(jul15, 8),
+            latest_at=_timestamp(jul15, 20),
+        )
+    )
+    grandparent = dag.add_node(
+        SummaryNode(
+            session_id=scope,
+            depth=2,
+            summary="canonical grandparent content",
+            token_count=4,
+            source_token_count=10,
+            source_ids=[parent],
+            source_type="nodes",
+            created_at=_timestamp(jul16, 18),
+            earliest_at=_timestamp(jul15, 8),
+            latest_at=_timestamp(jul16, 22),
+        )
+    )
+    _ready(
+        store, "day", jul15.isoformat(), scope,
+        summary="legacy daily child", source_ids=[child], fingerprint="child",
+    )
+    _ready(
+        store, "day", jul16.isoformat(), scope,
+        summary="daily grandparent", source_ids=[grandparent], fingerprint="grandparent",
+    )
+    seen: list[str] = []
+
+    built = build_week(
+        store, dag, config, scope, date(2026, 7, 13),
+        summarizer=lambda text, **_kwargs: (seen.append(text) or "week", 1),
+    )
+
+    assert built is not None
+    assert built["source_node_ids"] == [grandparent]
+    assert "canonical grandparent content" in seen[0]
+    assert "transitive child content" not in seen[0]
+
+
+def test_aggregate_frontier_fails_closed_on_partial_lineage_overlap(rollup_parts):
+    store, dag, config = rollup_parts
+    scope = "aggregate-partial-overlap"
+    monday = date(2026, 7, 13)
+    leaf_ids = [
+        _add_node(dag, scope, monday, f"leaf {number}")
+        for number in range(3)
+    ]
+    parents = []
+    for source_ids, summary in (
+        (leaf_ids[:2], "left parent"),
+        (leaf_ids[1:], "right parent"),
+    ):
+        parents.append(
+            dag.add_node(
+                SummaryNode(
+                    session_id=scope,
+                    depth=1,
+                    summary=summary,
+                    token_count=2,
+                    source_token_count=4,
+                    source_ids=source_ids,
+                    source_type="nodes",
+                    created_at=_timestamp(monday, 18),
+                    earliest_at=_timestamp(monday, 8),
+                    latest_at=_timestamp(monday, 22),
+                )
+            )
+        )
+    _ready(
+        store,
+        "day",
+        monday.isoformat(),
+        scope,
+        summary="legacy overlapping daily",
+        source_ids=parents,
+        fingerprint="overlap",
+    )
+
+    built = build_week(
+        store,
+        dag,
+        config,
+        scope,
+        monday,
+        summarizer=lambda *_args, **_kwargs: ("must not publish", 3),
+    )
+
+    assert built is None
+    assert store.get_rollup("week", monday.isoformat(), scope)["status"] == "failed"
+
+
+def test_scope_frontier_never_enumerates_a_nodes_centuries_long_interval(
+    rollup_parts,
+):
+    _store, dag, _config = rollup_parts
+    scope = "centuries-long-interval"
+    node_id = dag.add_node(
+        SummaryNode(
+            session_id=scope,
+            depth=0,
+            summary="one long-lived canonical node",
+            token_count=5,
+            source_token_count=5,
+            source_ids=[1],
+            source_type="messages",
+            created_at=datetime(2100, 1, 1, tzinfo=timezone.utc).timestamp(),
+            earliest_at=datetime(1900, 1, 1, tzinfo=timezone.utc).timestamp(),
+            latest_at=datetime(2100, 1, 1, tzinfo=timezone.utc).timestamp(),
+        )
+    )
+    assert not hasattr(periods_module, "covered_days")
+
+    sources = builder_module._daily_sources(dag, scope, date(2026, 7, 15))
+    content_days = builder_module._days_with_content(
+        dag, scope, date(2026, 7, 1), date(2026, 7, 31)
+    )
+
+    assert [source["node_id"] for source in sources] == [node_id]
+    assert len(content_days) == 31
+
+
+def test_source_lineage_walk_stops_near_limit_instead_of_materializing_closure(
+    rollup_parts,
+):
+    _store, dag, _config = rollup_parts
+    child_ids = list(range(1, 1_001))
+    dag.connection.executemany(
+        """
+        INSERT INTO summary_nodes(
+            node_id, session_id, depth, summary, source_ids, source_type,
+            created_at, earliest_at, latest_at
+        ) VALUES(?, 'bounded-lineage', 0, 'child', '[1]', 'messages', 1, 1, 1)
+        """,
+        ((node_id,) for node_id in child_ids),
+    )
+    root_id = 2_000
+    dag.connection.execute(
+        """
+        INSERT INTO summary_nodes(
+            node_id, session_id, depth, summary, source_ids, source_type,
+            created_at, earliest_at, latest_at
+        ) VALUES(?, 'bounded-lineage', 1, 'wide root', ?, 'nodes', 1, 1, 1)
+        """,
+        (root_id, json.dumps(child_ids)),
+    )
+    dag.connection.commit()
+
+    progress_calls = 0
+
+    def progress() -> int:
+        nonlocal progress_calls
+        progress_calls += 1
+        return 0
+
+    dag.connection.set_progress_handler(progress, 1)
+    try:
+        with pytest.raises(RuntimeError, match="bounded work limit"):
+            periods_module.load_source_lineage(
+                dag.connection, [root_id], limit=50
+            )
+    finally:
+        dag.connection.set_progress_handler(None, 0)
+
+    # A full 1,001-node recursive closure takes orders of magnitude more VM
+    # steps. The edge LIMIT stops after the 50th sentinel visit.
+    assert progress_calls < 5_000
+
+
+def test_scope_frontier_fails_closed_at_sql_work_limit(rollup_parts):
+    _store, dag, _config = rollup_parts
+    scope = "bounded-frontier"
+    rows = [
+        (scope, f"node {index}", float(index))
+        for index in range(builder_module._FRONTIER_WORK_LIMIT + 1)
+    ]
+    dag.connection.executemany(
+        """
+        INSERT INTO summary_nodes(session_id, summary, created_at)
+        VALUES(?, ?, ?)
+        """,
+        rows,
+    )
+    dag.connection.commit()
+
+    probe_plan = dag.connection.execute(
+        """
+        EXPLAIN QUERY PLAN
+        SELECT node_id FROM summary_nodes WHERE session_id = ? LIMIT ?
+        """,
+        (scope, builder_module._FRONTIER_WORK_LIMIT + 1),
+    ).fetchall()
+    plan_text = " ".join(str(row[3]) for row in probe_plan).upper()
+    assert "SEARCH SUMMARY_NODES USING" in plan_text
+    assert "TEMP B-TREE" not in plan_text
+
+    with pytest.raises(builder_module.RollupWorkLimitExceeded):
+        builder_module._scope_frontier(dag, scope)
+
+
+def test_scope_frontier_serializes_connection_temp_tables_between_threads(
+    rollup_parts,
+):
+    _store, dag, _config = rollup_parts
+    day = date(2026, 7, 15)
+    node_a = _add_node(dag, "scope-a", day, "A ONLY")
+    node_b = _add_node(dag, "scope-b", day, "B ONLY")
+    real_connection = dag._conn
+    assert real_connection is not None
+
+    a_staged = threading.Event()
+    b_staged = threading.Event()
+    allow_a_to_read = threading.Event()
+    a_done = threading.Event()
+    b_staged_before_a_done: list[bool] = []
+
+    class InterleavingConnection:
+        """Force the old A-stage/B-stage/A-read corruption schedule."""
+
+        def __getattr__(self, name):
+            return getattr(real_connection, name)
+
+        def execute(self, sql, parameters=()):
+            return real_connection.execute(sql, parameters)
+
+        def executemany(self, sql, parameters):
+            result = real_connection.executemany(sql, parameters)
+            if "INSERT INTO temp.lcm_scope_frontier_ids" not in sql:
+                return result
+            if threading.current_thread().name == "frontier-scope-a":
+                a_staged.set()
+                if not allow_a_to_read.wait(timeout=2):
+                    raise AssertionError("scope A was not released by the test")
+            else:
+                b_staged_before_a_done.append(not a_done.is_set())
+                b_staged.set()
+                allow_a_to_read.set()
+                if not a_done.wait(timeout=2):
+                    raise AssertionError("scope A did not finish before scope B read")
+            return result
+
+    results: dict[str, list[dict[str, object]]] = {}
+    errors: dict[str, BaseException] = {}
+
+    def read_scope(label: str, scope: str) -> None:
+        try:
+            results[label] = builder_module._scope_frontier(dag, scope)
+        except BaseException as exc:  # surfaced below with the thread label
+            errors[label] = exc
+        finally:
+            if label == "a":
+                a_done.set()
+
+    dag._conn = InterleavingConnection()
+    thread_a = threading.Thread(
+        target=read_scope,
+        args=("a", "scope-a"),
+        name="frontier-scope-a",
+    )
+    thread_b = threading.Thread(
+        target=read_scope,
+        args=("b", "scope-b"),
+        name="frontier-scope-b",
+    )
+    try:
+        thread_a.start()
+        assert a_staged.wait(timeout=2)
+        thread_b.start()
+        # With the fixed whole-lifecycle lock B cannot stage until A finishes.
+        # Without it B stages immediately and releases A onto B's temp IDs.
+        if not b_staged.wait(timeout=0.2):
+            allow_a_to_read.set()
+        thread_a.join(timeout=2)
+        thread_b.join(timeout=2)
+    finally:
+        allow_a_to_read.set()
+        a_done.set()
+        thread_a.join(timeout=2)
+        thread_b.join(timeout=2)
+        dag._conn = real_connection
+
+    assert not thread_a.is_alive() and not thread_b.is_alive()
+    assert errors == {}
+    assert b_staged_before_a_done == [False]
+    assert [(row["node_id"], row["summary"]) for row in results["a"]] == [
+        (node_a, "A ONLY")
+    ]
+    assert [(row["node_id"], row["summary"]) for row in results["b"]] == [
+        (node_b, "B ONLY")
+    ]
+
+
+def test_committed_mutation_event_survives_hook_gap_and_reconciles(rollup_parts):
+    store, dag, _config = rollup_parts
+    scope = "crash-gap"
+    day = date(2026, 7, 15)
+    original = _add_node(dag, scope, day, "original")
+    _ready(
+        store, "day", day.isoformat(), scope,
+        summary="old ready", source_ids=[original], fingerprint="old",
+    )
+
+    _add_node(dag, scope, day, "committed before process crash")
+    assert store.has_pending_invalidations(scope)
+    store.close()
+    reopened = RollupStore(dag.db_path)
+    try:
+        assert reopened.drain_invalidations(event_limit=256, day_budget=256) == 1
+        assert reopened.get_rollup("day", day.isoformat(), scope)["status"] == "stale"
+    finally:
+        reopened.close()
