@@ -36,7 +36,12 @@ from .ingest_protection import (
 )
 from .model_routing import apply_lcm_model_route
 from .presets import preset_status_payload
-from .rollup_periods import RecentPeriodWindow, parse_recent_period
+from .rollup_periods import (
+    CoverageNode,
+    RecentPeriodWindow,
+    canonical_frontier,
+    parse_recent_period,
+)
 from .rollup_store import RollupStore
 from .search_query import AGE_DECAY_RATE, normalize_search_sort
 from .session_patterns import build_session_match_keys, compile_session_pattern
@@ -1234,36 +1239,66 @@ def _recent_leaf_sections(
         placeholders = ",".join("?" for _ in session_ids)
         where.append(f"session_id IN ({placeholders})")
         params.extend(session_ids)
-    params.append(limit)
+    # No SQL LIMIT here: the interval-aware canonical frontier is applied first so
+    # a child suppressed by an overlapping higher-depth parent never consumes a
+    # public ``limit`` slot ahead of independent summaries (maintainer #389 C1).
     try:
         with engine._dag._db_lock:
             rows = connection.execute(
                 f"""
                 SELECT node_id, session_id, summary, token_count,
+                       depth, source_ids, source_type,
                        COALESCE(earliest_at, created_at) AS earliest_at,
                        COALESCE(latest_at, created_at) AS latest_at
                 FROM summary_nodes
                 WHERE {' AND '.join(where)}
                 ORDER BY COALESCE(latest_at, created_at) DESC, node_id DESC
-                LIMIT ?
                 """,
                 params,
             ).fetchall()
     except Exception:
         logger.debug("LCM recent leaf-summary fallback failed", exc_info=True)
         return []
+
+    candidates: list[CoverageNode] = []
+    by_id: dict[int, "object"] = {}
+    for row in rows:
+        node_id = int(row[0])
+        source_type = str(row[6] or "")
+        source_node_ids: tuple[int, ...] = ()
+        if source_type == "nodes" and row[5]:
+            try:
+                source_node_ids = tuple(int(value) for value in json.loads(row[5]))
+            except (TypeError, ValueError):
+                source_node_ids = ()
+        candidates.append(
+            CoverageNode(
+                node_id=node_id,
+                depth=int(row[4] or 0),
+                source_node_ids=source_node_ids,
+                earliest_at=row[7],
+                latest_at=row[8],
+            )
+        )
+        by_id[node_id] = row
+
+    # Suppress any child whose coverage is contained by an overlapping selected
+    # parent, THEN apply the limit — so duplicated lineage cannot consume the
+    # public budget twice (maintainer #389 C1). ``rows`` is already ordered
+    # newest-first, and canonical_frontier preserves that order.
+    frontier_rows = [by_id[node.node_id] for node in canonical_frontier(candidates)][:limit]
     return [
         {
             "kind": "leaf_summary",
             "node_id": int(row[0]),
             "session_id": str(row[1]),
             "token_count": int(row[3] or 0),
-            "earliest_at": row[4],
-            "latest_at": row[5],
+            "earliest_at": row[7],
+            "latest_at": row[8],
             "content": str(row[2] or ""),
             "content_truncated": False,
         }
-        for row in rows
+        for row in frontier_rows
     ]
 
 
@@ -1291,8 +1326,19 @@ def _bounded_recent_json(response: dict[str, Any], sections: list[dict[str, Any]
     response["total_sections"] = len(sections)
     response["returned_sections"] = 0
     response["truncated"] = False
+    provenance = response.setdefault("provenance", {})
 
     def encode() -> str:
+        # Provenance is bound to the sections actually RETURNED, not to every
+        # candidate rollup: a large ready-rollup set must not serialize thousands
+        # of provenance rows outside the char budget (maintainer #389 C2). Because
+        # this runs inside every fit check, the per-section provenance entry is
+        # counted against the cap in lockstep with its section.
+        provenance["rollups"] = [
+            {"rollup_id": int(section["rollup_id"]), "status": str(section["status"])}
+            for section in response["sections"]
+            if section.get("kind") == "rollup"
+        ]
         return json.dumps(response, ensure_ascii=False)
 
     for section in sections:
@@ -1376,16 +1422,13 @@ def lcm_recent(args: Dict[str, Any], **kwargs) -> str:
         "limit": limit,
         "char_limit": _LCM_RECENT_MAX_RESPONSE_CHARS,
         "mode": "leaf_summary_fallback" if fallback else "rollup",
-        "provenance": {
-            "fallback": fallback,
-            "rollups": [
-                {
-                    "rollup_id": int(rollup["rollup_id"]),
-                    "status": str(rollup["status"]),
-                }
-                for rollup in rollups
-            ],
-        },
+        # ``provenance.rollups`` is filled by _bounded_recent_json from the
+        # sections actually returned (bounded by limit + char cap);
+        # ``rollups_covered`` is the O(1) aggregate count of ready rollups the
+        # window matched, so operators still see "N covered, showing M"
+        # (maintainer #389 C2).
+        "provenance": {"fallback": fallback},
+        "rollups_covered": len(rollups),
     }
     if fallback_reason is not None:
         response["fallback_reason"] = fallback_reason

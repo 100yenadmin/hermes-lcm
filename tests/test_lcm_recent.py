@@ -322,6 +322,78 @@ def test_recent_rollup_falls_back_when_finalized_session_has_window_content(rece
     assert "finalized session leaf" in {section["content"] for section in result["sections"]}
 
 
+def test_recent_fallback_suppresses_child_covered_by_overlapping_parent(recent_parts):
+    # Maintainer #389 C1 repro: the leaf fallback selected every overlapping
+    # summary with no canonical frontier, so a probe returned BOTH parent-content
+    # and child-content — duplicated lineage that consumed the public limit ahead
+    # of independent summaries. The interval-aware canonical frontier must
+    # suppress the child (contained by an overlapping selected parent) so the
+    # limit is not consumed twice.
+    engine, _store = recent_parts
+    engine._config.temporal_rollups_enabled = False  # force the leaf fallback
+    scope = engine.current_session_id
+    day = date(2026, 7, 15)
+    content_time = _timestamp(day)
+    child = _add_leaf(engine._dag, scope, day, "child leaf content")
+    independent = _add_leaf(
+        engine._dag, scope, day, "independent summary", timestamp=_timestamp(day, 6)
+    )
+    parent = engine._dag.add_node(
+        SummaryNode(
+            session_id=scope,
+            depth=1,
+            summary="parent covering the child",
+            token_count=count_tokens("parent covering the child"),
+            source_token_count=10,
+            source_ids=[child],
+            source_type="nodes",
+            created_at=content_time,
+            earliest_at=content_time,
+            latest_at=content_time,
+        )
+    )
+
+    result = json.loads(lcm_recent({"period": "date:2026-07-15", "limit": 2}, engine=engine))
+
+    assert result["mode"] == "leaf_summary_fallback"
+    returned = {section["node_id"] for section in result["sections"]}
+    # Only the canonical node is returned for that lineage; the freed slot goes to
+    # the independent summary rather than the duplicated child.
+    assert parent in returned
+    assert independent in returned
+    assert child not in returned
+
+
+def test_recent_provenance_is_bounded_to_returned_sections(recent_parts):
+    # Maintainer #389 C2 repro: 1,000 ready rollups + limit=1 produced a
+    # 39,039-char response — all 1,000 provenance rows, zero content sections —
+    # blowing the 20,000-char cap because provenance was serialized outside the
+    # section/char budget. Provenance must be bound to the sections RETURNED and
+    # the total response must respect the cap.
+    engine, store = recent_parts
+    scope = engine.current_session_id
+    today = datetime.now(timezone.utc).date()
+    days = [today - timedelta(days=offset) for offset in range(1000)]
+    with store.connection:
+        store.connection.executemany(
+            "INSERT INTO lcm_rollups(period_kind, period_start, scope, summary, "
+            "token_count, status, source_fingerprint) "
+            "VALUES('day', ?, ?, ?, ?, 'ready', ?)",
+            [(d.isoformat(), scope, f"summary for {d}", 5, f"fp-{d}") for d in days],
+        )
+
+    raw = lcm_recent({"period": "1000d", "limit": 1}, engine=engine)
+    result = json.loads(raw)
+
+    assert result["mode"] == "rollup"
+    assert len(raw) <= 20_000
+    # Provenance references only the returned section(s), not all 1,000 rollups.
+    assert len(result["provenance"]["rollups"]) == result["returned_sections"]
+    assert result["returned_sections"] <= 1
+    # The bounded aggregate still records how many rollups covered the window.
+    assert result["rollups_covered"] == 1000
+
+
 def test_recent_fallback_includes_summary_overlapping_window_edge(recent_parts):
     # A summary spanning past midnight (latest_at in the NEXT day) still holds
     # this day's content; overlap-based filtering must return it where the old
