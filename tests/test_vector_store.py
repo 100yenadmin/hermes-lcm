@@ -661,9 +661,12 @@ def test_legacy_db_missing_latest_at_and_source_does_not_crash_knn(tmp_path):
         assert [row[0] for row in in_range] == [str(node_id)]
         assert list(store.knn([1.0, 0.0, 0.0], model="m", since=6.0)) == []
 
-        # source filter is skipped (not crashed) when messages.source is absent.
+        # source filter FAILS CLOSED (not crashed, not fail-open) when
+        # messages.source is absent: provenance is unverifiable, so a
+        # source-filtered query returns nothing rather than surfacing the
+        # legacy summary whose source could not be confirmed.
         with_source = store.knn([1.0, 0.0, 0.0], model="m", source="whatever")
-        assert [row[0] for row in with_source] == [str(node_id)]
+        assert list(with_source) == []
     finally:
         store.close()
 
@@ -840,3 +843,213 @@ def test_concurrent_knn_on_separate_stores_are_correct(tmp_path):
 
     assert errors == []
     assert results and all(rows == [str(node)] for rows in results)
+
+
+def test_record_embedding_publishes_under_captured_identity_not_active(stores):
+    """A1: an A-vector must publish under A's captured identity, never B's.
+
+    Maintainer repro: produce a vector under provider A, switch the same
+    model/dim to provider B (now active) before publication, then record. The
+    provider-A vector must be stored under A's identity — the durable identity
+    captured at provider-resolution time is carried through the write, and
+    record_embedding does not silently rebind onto whatever is active now.
+    """
+    dag, store = stores
+    node = _add_summary(dag, created_at=1.0)
+    identity_a = store.register_profile("shared-model", "provider-a", 3)
+    # Flip the active identity to provider B for the SAME model/dim mid-flight.
+    identity_b = store.register_profile("shared-model", "provider-b", 3)
+    assert identity_a != identity_b
+    active = store._current_profile()["identity_hash"]
+    assert active == identity_b  # B is active; a bare-name resolve would pick B.
+
+    store.record_embedding(
+        node, "summary", "shared-model", [1.0, 0.0, 0.0], identity=identity_a
+    )
+
+    vectors = store.connection.execute(
+        "SELECT identity_hash FROM lcm_embedding_vectors WHERE embedded_id = ?",
+        (str(node),),
+    ).fetchall()
+    meta = store.connection.execute(
+        "SELECT identity_hash FROM lcm_embedding_meta WHERE embedded_id = ?",
+        (str(node),),
+    ).fetchall()
+    assert [row[0] for row in vectors] == [identity_a]
+    assert [row[0] for row in meta] == [identity_a]
+    # Nothing is ever written under B's active identity.
+    assert identity_b not in {row[0] for row in vectors}
+
+
+def test_record_embedding_rejects_unregistered_captured_identity(stores):
+    """A1: a captured identity that is not a registered profile is rejected."""
+    dag, store = stores
+    node = _add_summary(dag, created_at=1.0)
+    store.register_profile("m", "p", 3)
+    with pytest.raises(ValueError, match="profile is not registered"):
+        store.record_embedding(
+            node, "summary", "m", [1.0, 0.0, 0.0], identity="deadbeef"
+        )
+
+
+def test_source_filter_fails_closed_on_legacy_db_without_source_column(tmp_path):
+    """A2: a source filter on a DB whose messages lacks ``source`` returns nothing.
+
+    Maintainer repro: query for a source that definitely did not exist and the
+    legacy summary was returned (fail-open). Provenance being unverifiable must
+    fail CLOSED — no false-positive hit.
+    """
+    db_path = tmp_path / "legacy_source.db"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE summary_nodes (
+            node_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT,
+            depth INTEGER DEFAULT 0,
+            summary TEXT,
+            source_token_count INTEGER,
+            source_ids TEXT NOT NULL DEFAULT '[]',
+            source_type TEXT NOT NULL DEFAULT 'messages',
+            created_at REAL
+        );
+        CREATE TABLE messages (
+            store_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT,
+            role TEXT,
+            content TEXT
+        );
+        """
+    )
+    cur = conn.execute(
+        "INSERT INTO messages(session_id, role, content) VALUES ('s', 'user', 'hi')"
+    )
+    msg_id = cur.lastrowid
+    conn.execute(
+        "INSERT INTO summary_nodes(session_id, summary, source_token_count, "
+        "source_ids, source_type, created_at) VALUES ('s', 'legacy', 10, ?, "
+        "'messages', 5.0)",
+        (json.dumps([msg_id]),),
+    )
+    node_id = conn.execute("SELECT node_id FROM summary_nodes").fetchone()[0]
+    conn.commit()
+    conn.close()
+
+    store = VectorStore(db_path)
+    try:
+        store.register_profile("m", "p", 3)
+        store.record_embedding(node_id, "summary", "m", [1.0, 0.0, 0.0])
+        # Without a source filter the summary is returned (baseline).
+        assert [row[0] for row in store.knn([1.0, 0.0, 0.0], model="m")] == [
+            str(node_id)
+        ]
+        # With a source filter on an unverifiable schema: no false-positive hit,
+        # on BOTH the numpy and the dependency-free bounded paths.
+        assert list(store.knn([1.0, 0.0, 0.0], model="m", source="nope")) == []
+    finally:
+        store.close()
+
+
+def test_source_filter_fails_closed_on_bounded_path(tmp_path, monkeypatch):
+    """A2: fail-closed also holds on the no-numpy bounded path."""
+    db_path = tmp_path / "legacy_source_bounded.db"
+    dag = SummaryDAG(db_path)
+    store = VectorStore(db_path, bounded_scan_rows=50)
+    try:
+        # Drop messages.source: emulate a DB predating the source repair.
+        store.connection.execute(
+            "CREATE TABLE IF NOT EXISTS messages (store_id INTEGER PRIMARY KEY)"
+        )
+        store.connection.commit()
+        node = dag.add_node(
+            SummaryNode(
+                session_id="conversation-a",
+                summary="legacy",
+                source_ids=[1],
+                created_at=1.0,
+            )
+        )
+        store.register_profile("m", "p", 3)
+        store.record_embedding(node, "summary", "m", [1.0, 0.0, 0.0])
+        monkeypatch.setattr(vector_store_module, "_load_numpy", _numpy_unavailable)
+        result = store.knn([1.0, 0.0, 0.0], model="m", source="nope")
+        assert result.coverage == "bounded"
+        assert list(result) == []
+    finally:
+        store.close()
+        dag.close()
+
+
+def test_bounded_candidate_enumeration_is_capped_at_sql_layer(tmp_path, monkeypatch):
+    """A3: enumeration is bounded at the SQL layer, not the whole corpus.
+
+    Maintainer repro: a 100-row corpus with bound 10 still loaded 100 ids. The
+    candidate enumeration must ORDER BY recency + LIMIT at SQL, so only ~bound
+    rows are enumerated.
+    """
+    db_path = tmp_path / "bounded_enum.db"
+    dag = SummaryDAG(db_path)
+    store = VectorStore(db_path, bounded_scan_rows=10)
+    try:
+        identity = store.register_profile("m", "p", 3)
+        for index in range(100):
+            node = _add_summary(dag, created_at=float(index + 1))
+            store.record_embedding(node, "summary", "m", [1.0, 0.0, 0.0])
+
+        # Direct: the enumerator returns exactly the bound from a 100-row corpus.
+        bounded = store._bounded_candidate_ids(
+            identity,
+            since=None,
+            until=None,
+            conversation_ids=None,
+            source=None,
+            limit=10,
+        )
+        assert len(bounded) == 10
+
+        # Spy: the enumeration SQL carries a LIMIT (the bound lives in SQL, not
+        # a host-side slice over the whole corpus).
+        statements: list[str] = []
+        store.connection.set_trace_callback(statements.append)
+        try:
+            monkeypatch.setattr(
+                vector_store_module, "_load_numpy", _numpy_unavailable
+            )
+            result = store.knn([1.0, 0.0, 0.0], k=5, model="m")
+        finally:
+            store.connection.set_trace_callback(None)
+        assert result.coverage == "bounded"
+        assert len(result) == 5
+        enum_stmts = [
+            sql
+            for sql in statements
+            if "FROM lcm_embedding_meta m" in sql and "LIMIT" in sql
+        ]
+        assert enum_stmts, "bounded enumeration query must carry a SQL LIMIT"
+    finally:
+        store.close()
+        dag.close()
+
+
+def test_embedding_schema_repaired_when_marker_set_but_table_dropped(tmp_path):
+    """A4: a set ``embeddings_v1`` marker over a missing table is repaired on init."""
+    db_path = tmp_path / "repair.db"
+    store = VectorStore(db_path)
+    store.close()
+
+    conn = sqlite3.connect(db_path)
+    marker = conn.execute(
+        "SELECT 1 FROM lcm_migration_state WHERE step_name = ?", ("embeddings_v1",)
+    ).fetchone()
+    assert marker is not None  # marker present ...
+    conn.execute("DROP TABLE lcm_embedding_vectors")  # ... but a table is gone.
+    conn.commit()
+    conn.close()
+
+    # Re-opening must VERIFY + repair rather than trust the marker.
+    repaired = VectorStore(db_path)
+    try:
+        assert "lcm_embedding_vectors" in _table_names(repaired.connection)
+        assert db_bootstrap.embedding_schema_missing(repaired.connection) == set()
+    finally:
+        repaired.close()
