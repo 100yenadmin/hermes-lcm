@@ -281,6 +281,36 @@ def test_semantic_missing_provider_degrades_to_fts(semantic_engine, monkeypatch)
     assert "not configured" in payload["degraded_reason"]
 
 
+def test_semantic_capacity_degrades_using_independent_full_text_workers(
+    semantic_engine, monkeypatch
+):
+    semantic_engine._store.append(
+        "session-a",
+        {"role": "user", "content": "capacity fallback marker"},
+    )
+    semantic_slots = threading.BoundedSemaphore(1)
+    assert semantic_slots.acquire(blocking=False)
+    monkeypatch.setattr(lcm_tools, "_lcm_semantic_worker_slots", semantic_slots)
+    monkeypatch.setattr(
+        lcm_tools,
+        "_lcm_full_text_worker_slots",
+        threading.BoundedSemaphore(1),
+    )
+    try:
+        payload = json.loads(
+            lcm_tools.lcm_grep(
+                {"query": "capacity", "mode": "semantic"},
+                engine=semantic_engine,
+            )
+        )
+    finally:
+        semantic_slots.release()
+
+    assert payload["degraded_to_fts"] is True
+    assert "capacity exhausted" in payload["degraded_reason"]
+    assert payload["results"][0]["type"] == "message"
+
+
 @pytest.mark.parametrize("mode", ["semantic", "hybrid"])
 def test_none_vector_coverage_degrades_to_fts(
     semantic_engine,
@@ -357,6 +387,66 @@ def test_semantic_auth_error_is_operator_readable_and_does_not_degrade(
     payload = json.loads(
         lcm_tools.lcm_grep(
             {"query": "anything", "mode": "semantic"},
+            engine=semantic_engine,
+        )
+    )
+
+    assert "authentication failed" in payload["error"].lower()
+    assert "degraded_to_fts" not in payload
+
+
+def test_hybrid_semantic_timeout_keeps_completed_full_text_results(
+    semantic_engine, monkeypatch
+):
+    completed_fts = {
+        "query": "needle",
+        "mode": "hybrid",
+        "results": [{"type": "message", "store_id": 7, "snippet": "fts hit"}],
+        "total_results": 1,
+    }
+    monkeypatch.setattr(
+        lcm_tools,
+        "_lcm_grep_full_text_with_deadline",
+        lambda *_args, **_kwargs: completed_fts,
+    )
+    monkeypatch.setattr(
+        lcm_tools,
+        "_lcm_grep_semantic",
+        lambda *_args, **_kwargs: {
+            "error": "lcm_grep request deadline exceeded",
+            "mode": "hybrid",
+            "timeout": True,
+            "timeout_stage": "provider_resolution",
+        },
+    )
+
+    payload = json.loads(
+        lcm_tools.lcm_grep(
+            {"query": "needle", "mode": "hybrid"},
+            engine=semantic_engine,
+        )
+    )
+
+    assert payload["degraded_to_fts"] is True
+    assert payload["results"] == completed_fts["results"]
+    assert "deadline" in payload["degraded_reason"]
+
+
+def test_hybrid_semantic_auth_error_remains_operator_readable(
+    semantic_engine, monkeypatch
+):
+    semantic_engine._store.append(
+        "session-a", {"role": "user", "content": "authentication marker"}
+    )
+
+    class AuthProvider(MockProvider):
+        def embed_query(self, _text):
+            raise VoyageError("auth", "bad credentials", status_code=401)
+
+    monkeypatch.setattr(lcm_tools, "resolve_provider", lambda _config: AuthProvider())
+    payload = json.loads(
+        lcm_tools.lcm_grep(
+            {"query": "authentication", "mode": "hybrid"},
             engine=semantic_engine,
         )
     )

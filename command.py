@@ -2060,6 +2060,18 @@ def _embedding_warmup_text(engine) -> str:
             store.register_profile(provider.model_id, provider.provider_id, dim)
         finally:
             store.close()
+        # Semantic search caches provider instances by configured provider and
+        # model. Replace any pre-warmup instance (which may have an open
+        # breaker) with the provider that just completed warmup successfully.
+        engine._lcm_embedding_provider_cache = (
+            (
+                str(getattr(engine._config, "embedding_provider", "") or "")
+                .strip()
+                .lower(),
+                str(getattr(engine._config, "embedding_model", "") or "").strip(),
+            ),
+            provider,
+        )
         return "\n".join([
             "LCM embedding warmup",
             "status: ready",
