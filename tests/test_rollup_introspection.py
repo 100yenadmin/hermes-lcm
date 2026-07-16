@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from datetime import datetime, timezone
 
 import pytest
@@ -209,6 +210,67 @@ def test_rollups_rebuild_all_durably_seeds_unattempted_targets(engine, monkeypat
     assert statuses["week"] == "stale"
     assert statuses["month"] == "stale"
     assert "not attempted" in result
+
+
+def test_rollups_rebuild_attempted_failure_is_not_reported_complete(engine, monkeypatch):
+    # Maintainer #391 D1 repro: an attempted daily build that persists
+    # status='failed' was still reported top-level 'status: complete' alongside
+    # '- day ...: failed'. A failed attempted target must downgrade the top-level
+    # status to 'partial' (or error), never 'complete'.
+    scope = engine.current_session_id
+    timestamp = datetime(2026, 7, 15, 12, tzinfo=timezone.utc).timestamp()
+    engine._dag.add_node(
+        SummaryNode(
+            session_id=scope,
+            depth=0,
+            summary="source for a failing daily",
+            token_count=count_tokens("source for a failing daily"),
+            source_token_count=4,
+            source_ids=[1],
+            source_type="messages",
+            created_at=timestamp,
+            earliest_at=timestamp,
+            latest_at=timestamp,
+        )
+    )
+
+    def boom(_text, **_kwargs):
+        raise RuntimeError("summarizer down")
+
+    monkeypatch.setattr(builder_module, "summarize_with_escalation", boom)
+
+    result = handle_lcm_command("rollups rebuild day 2026-07-15", engine)
+
+    assert "status: complete" not in result
+    assert "status: partial" in result
+    assert "- day 2026-07-15: failed" in result
+
+
+def test_rollups_rebuild_multi_target_seed_is_atomic(engine, monkeypatch):
+    # Maintainer #391 D2: the multi-target stale-seed must be transactional. If
+    # seeding fails mid-batch, NO target may be left half-seeded (no missing
+    # month with no row). Force the batch seed to fail and assert nothing seeded.
+    scope = engine.current_session_id
+    import hermes_lcm.rollup_store as rollup_store_module
+
+    def boom(_self, _targets):
+        raise sqlite3.OperationalError("seed boom")
+
+    monkeypatch.setattr(rollup_store_module.RollupStore, "upsert_stale_many", boom)
+
+    result = handle_lcm_command("rollups rebuild all 2026-07-15", engine)
+
+    assert "status: error" in result
+    store = RollupStore(engine._dag.db_path)
+    try:
+        for kind, start in (
+            ("day", "2026-07-15"),
+            ("week", "2026-07-13"),
+            ("month", "2026-07-01"),
+        ):
+            assert store.get_rollup(kind, start, scope) is None
+    finally:
+        store.close()
 
 
 def test_rollups_rebuild_respects_disabled_flag(engine, monkeypatch):
