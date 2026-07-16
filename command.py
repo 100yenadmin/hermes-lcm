@@ -205,14 +205,17 @@ def _ensure_inflight_table(conn: sqlite3.Connection) -> None:
             ).fetchall()
         )
 
-    exists = conn.execute(
-        "SELECT sql FROM sqlite_master WHERE type='table' "
-        "AND name='lcm_embedding_backfill_inflight'"
-    ).fetchone()
     started_transaction = not conn.in_transaction
     try:
         if started_transaction:
             conn.execute("BEGIN IMMEDIATE")
+        # Inspect only after obtaining the DDL write lock. Two first-run
+        # backfills may arrive together; a pre-lock snapshot lets both observe
+        # a missing table and makes the loser execute a stale CREATE TABLE.
+        exists = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' "
+            "AND name='lcm_embedding_backfill_inflight'"
+        ).fetchone()
         if exists is None:
             create_table()
         else:
