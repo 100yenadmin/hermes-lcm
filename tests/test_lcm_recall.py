@@ -213,6 +213,19 @@ def test_embeddings_off_degrades_to_fts_arm(recall_engine, monkeypatch):
     assert all(h["kind"] == "message_excerpt" for h in payload["hits"])
 
 
+def test_summaries_include_degrades_to_fts_when_embeddings_off(recall_engine, monkeypatch):
+    """F4-degrade-to-fts: include='summaries' with embeddings disabled must still
+    run the FTS arm (its only vector arm is dead) rather than returning nothing."""
+    recall_engine._config.embeddings_enabled = False
+    recall_engine._store.append(CURRENT, {"role": "user", "content": "kanban dashboard sprint summaries fallback"})
+
+    payload = _recall(recall_engine, monkeypatch, include="summaries", limit=10)
+
+    assert "fts" in payload["provenance"]["arms_run"]
+    assert payload["hits"]
+    assert all(h["kind"] == "message_excerpt" for h in payload["hits"])
+
+
 def test_empty_vector_corpora_reports_coverage_none(recall_engine, monkeypatch):
     recall_engine._store.append(CURRENT, {"role": "user", "content": "kanban dashboard sprint only fts"})
 
@@ -327,3 +340,254 @@ def test_recall_scans_full_corpus_not_grep_recency_window(recall_engine, monkeyp
 
     # Both vector arms request the large recall bound, never the small grep one.
     assert observed and all(bound == 25_000 for bound in observed)
+
+
+def test_chunk_hydrate_is_batched_not_n_plus_1(recall_engine, monkeypatch):
+    """F4-chunk-hydrate-n-plus-1: hydrate_chunk_hits issues ONE batched JOIN over
+    all ranked chunk ids, not a SELECT per hit, and preserves rank order."""
+    import sqlite3 as _sqlite
+    import hermes_lcm.retrieval_core as rc
+    from hermes_lcm.retrieval_core import hydrate_chunk_hits
+
+    contents = {}
+    for i in range(5):
+        sid = recall_engine._store.append(CURRENT, {"role": "user", "content": f"chunk excerpt number {i} body"})
+        contents[sid] = i
+    ranked = [(f"{sid}:0", 1.0 - 0.01 * n, "chunk") for n, sid in enumerate(contents)]
+    # Seed the chunk meta rows the JOIN reads.
+    _seed_chunk_vectors(recall_engine, [(sid, 0, 0, 15, [1.0, 0.0]) for sid in contents])
+
+    select_count = {"n": 0}
+    real_connect = _sqlite.connect
+
+    class CountingConnection(_sqlite.Connection):
+        def execute(self, sql, *args, **kw):
+            if "lcm_chunk_meta" in sql:
+                select_count["n"] += 1
+            return super().execute(sql, *args, **kw)
+
+    def counting_connect(*a, **k):
+        k["factory"] = CountingConnection
+        return real_connect(*a, **k)
+
+    monkeypatch.setattr(rc.sqlite3, "connect", counting_connect)
+    deadline = __import__("time").monotonic() + 30.0
+    hits = hydrate_chunk_hits(recall_engine, ranked_rows=ranked, knn_limit=50, deadline=deadline, snippet_chars=200)
+
+    assert len(hits) == 5
+    assert select_count["n"] == 1  # single batched JOIN, not 5
+    # Rank order preserved (highest score first).
+    assert [h["store_id"] for h, _ in hits] == list(contents)
+
+
+def test_recall_query_timeout_has_its_own_budget(monkeypatch, tmp_path):
+    """sprint-opt-2: lcm_recall uses recall_query_timeout_s (default 8.0), env
+    LCM_RECALL_QUERY_TIMEOUT_S, distinct from lcm_grep's 3.0s query deadline."""
+    assert LCMConfig(database_path=str(tmp_path / "d.db")).recall_query_timeout_s == 8.0
+    monkeypatch.setenv("LCM_RECALL_QUERY_TIMEOUT_S", "12.5")
+    monkeypatch.setenv("LCM_EMBEDDING_QUERY_TIMEOUT_S", "3.0")
+    cfg = LCMConfig.from_env()
+    assert cfg.recall_query_timeout_s == 12.5
+    assert cfg.embedding_query_timeout_s == 3.0  # grep's deadline untouched
+
+
+def test_recall_uses_recall_timeout_budget(recall_engine, monkeypatch):
+    """lcm_recall builds its deadline from recall_query_timeout_s, not the grep one."""
+    recall_engine._config.recall_query_timeout_s = 8.0
+    recall_engine._config.embedding_query_timeout_s = 0.001  # would insta-timeout if used
+    recall_engine._store.append(CURRENT, {"role": "user", "content": "kanban dashboard sprint budget"})
+
+    payload = _recall(recall_engine, monkeypatch, include="verbatim", limit=5)
+    assert payload.get("timeout") is not True
+    assert payload["hits"]
+
+
+def test_bounded_chunk_coverage_surfaces_as_degraded(recall_engine, monkeypatch):
+    """SCAN-1: a recency-bounded chunk arm reports a degraded_reasons entry naming
+    the arm + scanned/total, instead of silently truncating."""
+    recall_engine._config.recall_scan_rows = 1
+    ids = []
+    for i in range(3):
+        sid = recall_engine._store.append(
+            CURRENT, {"role": "user", "content": f"kanban dashboard sprint chunk {i}"}
+        )
+        ids.append(sid)
+    _seed_chunk_vectors(
+        recall_engine,
+        [(sid, 0, 0, 20, [1.0, 0.0]) for sid in ids],
+    )
+
+    payload = _recall(recall_engine, monkeypatch, include="verbatim", limit=10)
+
+    assert payload["provenance"]["coverage"].get("chunk") == "bounded"
+    assert payload["degraded"] is True
+    assert "chunk arm coverage bounded" in payload["degraded_reason"]
+    assert "of 3 vectors" in payload["degraded_reason"]
+
+
+def test_pooled_vector_store_survives_across_recall_calls(recall_engine, monkeypatch):
+    """F2-matrix-cache-never-persists: back-to-back recalls reuse ONE pooled
+    VectorStore whose matrix cache survives, instead of building+closing a fresh
+    store (and clearing the cache) every call."""
+    import hermes_lcm.retrieval_core as rc
+
+    rc._reset_vector_store_pool()
+    try:
+        node = _add_summary(recall_engine, "kanban pooled cache", session_id="session-a", created_at=5.0)
+        _seed_summary_vectors(recall_engine, [(node, [1.0, 0.0])])
+
+        _recall(recall_engine, monkeypatch, include="summaries", limit=5)
+        key = (str(recall_engine._store.db_path), 25_000)
+        assert key in rc._vector_store_pool
+        pooled = rc._vector_store_pool[key]["store"]
+        # The pooled store's matrix cache is populated (survived the call).
+        assert pooled._matrix_cache
+
+        _recall(recall_engine, monkeypatch, include="summaries", limit=5)
+        # Same instance reused, not rebuilt.
+        assert rc._vector_store_pool[key]["store"] is pooled
+    finally:
+        rc._reset_vector_store_pool()
+
+
+def test_matrix_cache_is_bounded_lru_not_cleared_on_miss():
+    """sprint-opt-6: distinct candidate sets coexist in a bounded LRU rather than
+    each miss clearing the whole cache."""
+    import numpy as np
+
+    import tempfile
+    from hermes_lcm.config import LCMConfig as _Cfg
+
+    with tempfile.TemporaryDirectory() as d:
+        vs = VectorStore(f"{d}/m.db", config=_Cfg(database_path=f"{d}/m.db", embeddings_enabled=True))
+        try:
+            vs.register_profile("mock-model", "mock", 2)
+            identity = vs.capture_identity("mock-model", provider="mock")
+            # Load several distinct candidate sets; all must remain cached (bounded).
+            for i in range(3):
+                vs._numpy_rows(np, identity.identity_hash, 2, [str(i)])
+            assert len(vs._matrix_cache) == 3  # no clear-on-miss; all coexist
+            # A fourth distinct set past the cap evicts the oldest, never all.
+            for i in range(3, vs._MATRIX_CACHE_MAX_ENTRIES + 2):
+                vs._numpy_rows(np, identity.identity_hash, 2, [str(i)])
+            assert len(vs._matrix_cache) == vs._MATRIX_CACHE_MAX_ENTRIES
+        finally:
+            vs.close()
+
+
+def test_json_doctor_surfaces_background_integrity_flag(recall_engine):
+    """F1-json-doctor-background-flag-untested: the JSON lcm_doctor MCP tool (not
+    just the text path) surfaces a pre-recorded background FTS-corruption flag."""
+    from hermes_lcm.db_bootstrap import _record_integrity_failed
+    from hermes_lcm.store import build_message_fts_spec
+
+    # lcm_doctor reaches beyond the recall fixture's attribute set; supply the
+    # few unguarded ones it touches (context-pressure short-circuits at 0).
+    recall_engine.context_length = 0
+    recall_engine.last_prompt_tokens = 0
+    recall_engine.get_runtime_identity = lambda: {}
+
+    conn = recall_engine._store.connection
+    spec = build_message_fts_spec()
+    _record_integrity_failed(conn, spec, detail="messages_fts malformed (background scan)")
+    conn.commit()
+
+    payload = json.loads(lcm_tools.lcm_doctor({}, engine=recall_engine))
+    checks = {c["check"]: c for c in payload["checks"]}
+
+    flag_check = checks.get("messages_fts_integrity_background_flag")
+    assert flag_check is not None
+    assert flag_check["status"] == "fail"
+    assert "background integrity scan flagged" in flag_check["detail"]["guidance"]
+
+
+def test_rrf_fuse_collapses_repeated_identity_within_arm():
+    """RRF-1: a message chunked into several pieces must contribute ONE term per
+    arm at its best rank, not one per chunk occurrence."""
+    from hermes_lcm.retrieval_core import rrf_fuse
+
+    # Arm 0 (chunk): message A appears 3x (ranks 2,3,4); message B once (rank 1).
+    chunk_arm = [
+        {"store_id": "B"},
+        {"store_id": "A"},
+        {"store_id": "A"},
+        {"store_id": "A"},
+    ]
+    fused = rrf_fuse([chunk_arm], k=60)
+    by_id = {entry["hit"]["store_id"]: entry for entry in fused}
+    # A is collapsed to its best (first) rank 2 and counted once; B's genuine
+    # rank-1 hit therefore out-scores it instead of losing to a 3x double-count.
+    assert by_id["A"]["ranks"] == {0: 2}
+    assert by_id["B"]["ranks"] == {0: 1}
+    assert by_id["B"]["rrf_score"] > by_id["A"]["rrf_score"]
+    assert fused[0]["hit"]["store_id"] == "B"
+
+
+def test_chunk_dedupe_keeps_best_ranked_span(recall_engine, monkeypatch):
+    """F1-chunk-dedupe-wrong-span: when one message has several chunks, the merged
+    hit keeps the BEST-ranked chunk's span, not the worst (last) one."""
+    content = "kanban dashboard sprint verbatim detail tail segment here"
+    store_id = recall_engine._store.append(CURRENT, {"role": "user", "content": content})
+    # Chunk 0 (char 0-24) is the strong cosine-1.0 match; chunk 1 (char 33-57) is
+    # a weak near-orthogonal match that must NOT overwrite the strong span.
+    _seed_chunk_vectors(
+        recall_engine,
+        [
+            (store_id, 0, 0, 24, [1.0, 0.0]),
+            (store_id, 1, 33, 57, [0.05, 0.998]),
+        ],
+    )
+
+    payload = _recall(recall_engine, monkeypatch, include="verbatim", limit=10)
+
+    excerpt_hits = [h for h in payload["hits"] if h.get("store_id") == store_id]
+    assert len(excerpt_hits) == 1
+    hit = excerpt_hits[0]
+    assert hit["chunk_span"]["char_start"] == 0 and hit["chunk_span"]["char_end"] == 24
+    assert "content_offset=0" in hit["expand_hint"]
+
+
+def test_chunk_fts_merge_snippet_and_offset_are_consistent(recall_engine, monkeypatch):
+    """DEDUPE-1: the merged hit's snippet and content_offset describe the SAME
+    span (both from the better-ranked chunk arm), never an FTS snippet glued to a
+    chunk offset."""
+    content = "prologue text then kanban dashboard sprint match zone trailing"
+    match_start = content.index("kanban")
+    match_end = match_start + len("kanban dashboard sprint match")
+    store_id = recall_engine._store.append(CURRENT, {"role": "user", "content": content})
+    _seed_chunk_vectors(recall_engine, [(store_id, 0, match_start, match_end, [1.0, 0.0])])
+
+    payload = _recall(recall_engine, monkeypatch, include="verbatim", limit=10)
+
+    hit = next(h for h in payload["hits"] if h.get("store_id") == store_id)
+    assert set(hit["arms"]) == {"fts", "chunk"}
+    # Snippet and expand offset both come from the chunk arm -> consistent.
+    assert hit["snippet"] == content[match_start:match_end]
+    assert f"content_offset={match_start}" in hit["expand_hint"]
+    assert hit["chunk_span"]["char_start"] == match_start
+
+
+def test_rerank_does_not_splice_voyage_score_onto_rrf_scale(recall_engine, monkeypatch):
+    """RERANK-1: rerank only permutes the window; the reported score stays on the
+    RRF scale rather than being replaced by the ~0-1 voyage relevance score."""
+    recall_engine._config.rerank_enabled = True
+    a = _add_summary(recall_engine, "kanban alpha", session_id="session-a", created_at=5.0)
+    b = _add_summary(recall_engine, "kanban beta", session_id="session-b", created_at=5.0)
+    _seed_summary_vectors(recall_engine, [(a, [1.0, 0.0]), (b, [0.95, 0.312])], provider="voyage")
+
+    class RerankProvider(MockProvider):
+        provider_id = "voyage"
+
+        def rerank(self, query, documents, *, top_k=None, timeout, model="rerank-2.5-lite"):
+            # Voyage-shaped scores in the 0..1 range, descending.
+            return sorted(
+                ((i, 0.9 - 0.1 * i) for i in range(len(documents))), key=lambda item: -item[1]
+            )
+
+    payload = _recall(
+        recall_engine, monkeypatch, provider=RerankProvider(), include="summaries", scope_bias=0.0, limit=5
+    )
+    assert payload["provenance"]["rerank"] == "applied"
+    # Had the 0.9 voyage score been spliced onto the RRF scale it would dwarf the
+    # ~0.016 RRF score; the reported score must stay RRF-scaled.
+    assert all(hit["score"] < 0.1 for hit in payload["hits"])

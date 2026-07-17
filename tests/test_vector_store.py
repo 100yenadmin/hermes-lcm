@@ -1435,3 +1435,30 @@ def test_malformed_embedding_constraint_or_default_is_rejected(
         sqlite3.OperationalError, match="malformed (table|constraints)"
     ):
         VectorStore(db_path)
+
+
+def test_marker_write_skipped_when_already_stamped(tmp_path, monkeypatch):
+    """sprint-opt-1: constructing a VectorStore over an already-stamped DB does
+    not re-write the embeddings_v1 / chunk_vectors_v1 markers."""
+    db_path = tmp_path / "markers.db"
+    first = VectorStore(db_path)  # first construction stamps both markers
+    first.ensure_chunk_schema()
+    first.close()
+
+    calls: list[str] = []
+    real_mark = vector_store_module.mark_migration_step_complete
+
+    def counting_mark(conn, step_name):
+        calls.append(step_name)
+        return real_mark(conn, step_name)
+
+    monkeypatch.setattr(vector_store_module, "mark_migration_step_complete", counting_mark)
+    vs = VectorStore(db_path)
+    try:
+        vs.ensure_chunk_schema()
+        # Neither the embedding nor the chunk marker is re-written: both were
+        # already stamped by the first construction.
+        assert "embeddings_v1" not in calls
+        assert "chunk_vectors_v1" not in calls
+    finally:
+        vs.close()

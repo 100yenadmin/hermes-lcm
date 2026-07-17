@@ -20,11 +20,111 @@ import copy
 import sqlite3
 import threading
 import time
+from collections import OrderedDict
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Dict, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .engine import LCMEngine
+
+
+# -- Pooled VectorStore instances -------------------------------------------
+# run_knn / run_chunk_knn used to build a fresh VectorStore per call and close()
+# it in a finally, which cleared both matrix caches every time -- the "cache"
+# never survived the single call that built it, so back-to-back identical recalls
+# re-paid the full candidate-load + matmul (F2-matrix-cache-never-persists). We
+# now keep a small LRU pool of long-lived stores keyed by (db_path, scan_rows).
+# The per-identity/data_version cache keys already invalidate on any committed
+# write (the durable data_version counter is bumped inside every vector write),
+# so a pooled store observes cross-process writes and never serves stale vectors.
+_POOL_MAX_PATHS = 2
+_pool_lock = threading.Lock()
+# (db_path, bounded_scan_rows) -> {"store": VectorStore, "lock": RLock}
+_vector_store_pool: "OrderedDict[tuple[str, int], dict[str, Any]]" = OrderedDict()
+
+
+def _reset_vector_store_pool() -> None:
+    """Close and drop every pooled VectorStore (test hygiene / shutdown)."""
+    with _pool_lock:
+        while _vector_store_pool:
+            _, entry = _vector_store_pool.popitem()
+            try:
+                entry["store"].close()
+            except Exception:  # pragma: no cover - defensive
+                pass
+
+
+def _acquire_vector_store(
+    engine: "LCMEngine", *, vector_store_cls: Any, scan_rows: int | None
+) -> tuple[Any, Any, bool]:
+    """Return ``(store, per_store_lock_or_None, is_transient)``.
+
+    Only the genuine pooling-capable store (``_supports_pooling``) is pooled so
+    its matrix caches survive across calls; injected test doubles are constructed
+    transiently and the caller closes them. The pool is an LRU bounded to
+    ``_POOL_MAX_PATHS`` (db_path, scan_rows) keys and an evicted store is closed.
+    The returned lock MUST be held while querying: a pooled sqlite connection is
+    shared across callers and is not safe for concurrent use.
+    """
+    resolved_scan = int(scan_rows) if scan_rows is not None else -1
+    key = (str(engine._store.db_path), resolved_scan)
+    with _pool_lock:
+        entry = _vector_store_pool.get(key)
+        if entry is not None:
+            _vector_store_pool.move_to_end(key)
+            return entry["store"], entry["lock"], False
+        store = vector_store_cls(
+            engine._store.db_path, config=engine._config, bounded_scan_rows=scan_rows
+        )
+        if not getattr(vector_store_cls, "_supports_pooling", False):
+            return store, None, True  # transient: caller closes it
+        entry = {"store": store, "lock": threading.RLock()}
+        _vector_store_pool[key] = entry
+        while len(_vector_store_pool) > _POOL_MAX_PATHS:
+            _, evicted = _vector_store_pool.popitem(last=False)
+            with evicted["lock"]:  # wait out any in-flight query before closing
+                try:
+                    evicted["store"].close()
+                except Exception:  # pragma: no cover - defensive
+                    pass
+        return store, entry["lock"], False
+
+
+def _run_pooled_knn(
+    engine: "LCMEngine",
+    *,
+    vector_store_cls: Any,
+    scan_rows: int | None,
+    deadline: float,
+    query: Any,
+) -> Any:
+    """Run ``query(store)`` on a pooled/transient store under its deadline guard.
+
+    The per-call progress handler is installed for this deadline and cleared in a
+    finally so a pooled connection never carries a stale/expired deadline into the
+    next caller.
+    """
+    store, store_lock, transient = _acquire_vector_store(
+        engine, vector_store_cls=vector_store_cls, scan_rows=scan_rows
+    )
+    try:
+        with (store_lock if store_lock is not None else nullcontext()):
+            vector_conn = getattr(store, "_conn", None)
+            if vector_conn is not None:
+                vector_conn.set_progress_handler(
+                    lambda: 1 if time.monotonic() >= deadline else 0, 1000
+                )
+            try:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("semantic vector search deadline exhausted")
+                return query(store)
+            finally:
+                if vector_conn is not None:
+                    vector_conn.set_progress_handler(None, 1000)
+    finally:
+        if transient:
+            store.close()
 
 
 def _lcm_grep_confidence(score: float) -> str:
@@ -143,19 +243,12 @@ def run_knn(
     """
     if time.monotonic() >= deadline:
         raise TimeoutError("semantic vector search deadline exhausted")
-    vector_store = vector_store_cls(
-        engine._store.db_path, config=engine._config, bounded_scan_rows=scan_rows
-    )
-    try:
-        vector_conn = getattr(vector_store, "_conn", None)
-        if vector_conn is not None:
-            vector_conn.set_progress_handler(
-                lambda: 1 if time.monotonic() >= deadline else 0,
-                1000,
-            )
-        if time.monotonic() >= deadline:
-            raise TimeoutError("semantic vector search deadline exhausted")
-        return vector_store.knn(
+    return _run_pooled_knn(
+        engine,
+        vector_store_cls=vector_store_cls,
+        scan_rows=scan_rows,
+        deadline=deadline,
+        query=lambda store: store.knn(
             query_vector,
             k=knn_limit,
             model=provider.model_id,
@@ -164,9 +257,8 @@ def run_knn(
             until=until,
             conversation_ids=conversation_ids,
             source=source,
-        )
-    finally:
-        vector_store.close()
+        ),
+    )
 
 
 def run_chunk_knn(
@@ -193,19 +285,12 @@ def run_chunk_knn(
     """
     if time.monotonic() >= deadline:
         raise TimeoutError("chunk vector search deadline exhausted")
-    vector_store = vector_store_cls(
-        engine._store.db_path, config=engine._config, bounded_scan_rows=scan_rows
-    )
-    try:
-        vector_conn = getattr(vector_store, "_conn", None)
-        if vector_conn is not None:
-            vector_conn.set_progress_handler(
-                lambda: 1 if time.monotonic() >= deadline else 0,
-                1000,
-            )
-        if time.monotonic() >= deadline:
-            raise TimeoutError("chunk vector search deadline exhausted")
-        return vector_store.knn_chunks(
+    return _run_pooled_knn(
+        engine,
+        vector_store_cls=vector_store_cls,
+        scan_rows=scan_rows,
+        deadline=deadline,
+        query=lambda store: store.knn_chunks(
             query_vector,
             k=knn_limit,
             model=provider.model_id,
@@ -214,9 +299,8 @@ def run_chunk_knn(
             until=until,
             conversation_ids=conversation_ids,
             source=source,
-        )
-    finally:
-        vector_store.close()
+        ),
+    )
 
 
 def hydrate_chunk_hits(
@@ -261,22 +345,45 @@ def hydrate_chunk_hits(
             lambda: 1 if time.monotonic() >= deadline else 0,
             1000,
         )
-        hydrated: list[tuple[dict[str, Any], float]] = []
+        # Rank-ordered chunk ids (bounded to knn_limit), then ONE batched JOIN
+        # instead of a SELECT per hit (F4-chunk-hydrate-n-plus-1).
+        ordered_ids: list[str] = []
+        scores: dict[str, float] = {}
         for chunk_id, score, kind in ranked_rows:
-            require_remaining("chunk lookup")
             if kind != "chunk":
                 continue
-            row = conn.execute(
-                """
-                SELECT cm.store_id, cm.chunk_index, cm.char_start, cm.char_end,
-                       m.session_id, m.source, m.role, m.timestamp, m.content
+            cid = str(chunk_id)
+            if cid in scores:
+                continue
+            ordered_ids.append(cid)
+            scores[cid] = float(score)
+            if len(ordered_ids) >= knn_limit:
+                break
+        if not ordered_ids:
+            return []
+        rows_by_id: dict[str, sqlite3.Row] = {}
+        # Chunk in bounded batches so the IN(...) placeholder list stays well
+        # under SQLite's variable limit even for a large knn_limit.
+        batch_size = 500
+        for start in range(0, len(ordered_ids), batch_size):
+            require_remaining("chunk lookup")
+            batch = ordered_ids[start:start + batch_size]
+            placeholders = ",".join("?" for _ in batch)
+            for row in conn.execute(
+                f"""
+                SELECT cm.chunk_id, cm.store_id, cm.chunk_index, cm.char_start,
+                       cm.char_end, m.session_id, m.source, m.role, m.timestamp,
+                       m.content
                 FROM lcm_chunk_meta cm
                 JOIN messages m ON m.store_id = cm.store_id
-                WHERE cm.chunk_id = ? AND cm.archived = 0
-                LIMIT 1
+                WHERE cm.chunk_id IN ({placeholders}) AND cm.archived = 0
                 """,
-                (str(chunk_id),),
-            ).fetchone()
+                batch,
+            ):
+                rows_by_id.setdefault(str(row["chunk_id"]), row)
+        hydrated: list[tuple[dict[str, Any], float]] = []
+        for cid in ordered_ids:  # preserve KNN rank order
+            row = rows_by_id.get(cid)
             if row is None:
                 continue
             content = str(row["content"] or "")
@@ -298,9 +405,7 @@ def hydrate_chunk_hits(
                 "content_offset": char_start,
                 "snippet": excerpt[:snippet_chars],
             }
-            hydrated.append((hit, float(score)))
-            if len(hydrated) >= knn_limit:
-                break
+            hydrated.append((hit, scores[cid]))
         return hydrated
     finally:
         if conn is not None:
@@ -386,6 +491,13 @@ def rrf_fuse(arms: list[list[dict[str, Any]]], k: int = 60) -> list[dict[str, An
     ``hit``, the fused score under ``rrf_score``, and each arm's 1-based rank in
     ``ranks`` (keyed by arm index). Callers own arm-specific metadata (which arm
     is FTS vs semantic, confidence, snippet provenance).
+
+    A single identity that appears more than once within the SAME arm (e.g. a
+    message chunked into several pieces, each a separate chunk-arm hit) is
+    collapsed to its best (first, since arms are best-first ordered) rank and
+    contributes exactly one ``1 / (k + rank)`` term for that arm -- otherwise a
+    multi-chunk message double-counts and out-scores a genuine higher-rank match
+    (RRF-1).
     """
     fused: dict[tuple[str, Any], dict[str, Any]] = {}
     for arm_index, arm in enumerate(arms):
@@ -394,6 +506,9 @@ def rrf_fuse(arms: list[list[dict[str, Any]]], k: int = 60) -> list[dict[str, An
             entry = fused.setdefault(
                 key, {"hit": dict(hit), "rrf_score": 0.0, "ranks": {}}
             )
+            if arm_index in entry["ranks"]:
+                # Already scored this identity for this arm at a better rank.
+                continue
             entry["ranks"][arm_index] = rank
             entry["rrf_score"] += 1.0 / (k + rank)
     return sorted(

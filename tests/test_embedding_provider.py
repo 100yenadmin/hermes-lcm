@@ -1105,3 +1105,56 @@ def test_warmup_command_is_inert_when_embeddings_disabled(monkeypatch, tmp_path)
     assert "status: disabled" in result
     assert provider.calls == []
     assert not engine._store.db_path.exists()
+
+
+def _voyage_rerank_response(rows) -> HttpResponse:
+    """rows: iterable of (index, relevance_score)."""
+    return _response(
+        200,
+        {"data": [{"index": index, "relevance_score": score} for index, score in rows]},
+    )
+
+
+def test_voyage_rerank_happy_path_orders_by_relevance(monkeypatch):
+    """F2-voyage-rerank-provider-untested: parses (index, score) and returns them
+    ordered by descending relevance under one transport call."""
+    monkeypatch.setenv("VOYAGE_API_KEY", "test-key")
+    transport = FakeTransport(_voyage_rerank_response([(0, 0.10), (1, 0.90), (2, 0.50)]))
+    provider = VoyageProvider("voyage-test", transport=transport)
+
+    ranked = provider.rerank("q", ["a", "b", "c"], timeout=5.0)
+
+    assert ranked == [(1, 0.90), (2, 0.50), (0, 0.10)]
+    assert len(transport.calls) == 1
+    assert transport.calls[0]["url"].endswith("/v1/rerank")
+
+
+def test_voyage_rerank_drops_out_of_range_index(monkeypatch):
+    """An index outside the documents range is skipped, not returned or crashed."""
+    monkeypatch.setenv("VOYAGE_API_KEY", "test-key")
+    transport = FakeTransport(_voyage_rerank_response([(0, 0.8), (5, 0.99), (1, 0.2)]))
+    provider = VoyageProvider("voyage-test", transport=transport)
+
+    ranked = provider.rerank("q", ["a", "b"], timeout=5.0)
+
+    assert ranked == [(0, 0.8), (1, 0.2)]  # index 5 dropped
+
+
+def test_voyage_rerank_non_2xx_raises(monkeypatch):
+    """A non-2xx response raises a VoyageError (callers treat it as skip-rerank)."""
+    monkeypatch.setenv("VOYAGE_API_KEY", "test-key")
+    transport = FakeTransport(_response(500, {"error": "boom"}))
+    provider = VoyageProvider("voyage-test", transport=transport)
+
+    with pytest.raises(VoyageError):
+        provider.rerank("q", ["a", "b"], timeout=5.0)
+
+
+def test_voyage_rerank_empty_documents_short_circuits(monkeypatch):
+    """No documents => [] with NO transport call (no wasted API request)."""
+    monkeypatch.setenv("VOYAGE_API_KEY", "test-key")
+    transport = FakeTransport()  # no responses queued; must not be called
+    provider = VoyageProvider("voyage-test", transport=transport)
+
+    assert provider.rerank("q", [], timeout=5.0) == []
+    assert transport.calls == []
