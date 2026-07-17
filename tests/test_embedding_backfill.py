@@ -695,46 +695,50 @@ def test_stale_owner_after_provider_call_does_not_publish(monkeypatch, tmp_path)
     assert claim["owner"] == "successor-owner"
 
 
-def test_lease_takeover_between_row_publications_stops_stale_worker(
-    monkeypatch, tmp_path
-):
+def test_lease_takeover_between_batches_stops_stale_worker(monkeypatch, tmp_path):
+    """A lease stolen BETWEEN network batches: the committed batch survives, the
+    next batch publishes nothing.
+
+    Each accepted network batch now publishes under ONE ``BEGIN IMMEDIATE``, so
+    ownership is verified per row via CAS inside one serialized transaction and a
+    takeover is observed at batch boundaries — never mid-transaction (the steal
+    serializes after the batch commit). The contract the previous
+    row-interleaved version asserted is preserved and strengthened: a stale
+    worker can neither clobber successor state nor tear a half-written batch. The
+    first (committed) batch stands; the second, dispatched after the steal, loses
+    the post-provider owner CAS and writes nothing.
+    """
     engine = _engine(tmp_path)
-    node_ids = _seed(engine, 3)
-    provider = FakeProvider()
-    monkeypatch.setattr(command_mod, "resolve_provider", lambda _config, **_kw: provider)
-    original = VectorStore.publish_embedding_under_lease
-    publications = 0
-
-    def takeover_after_first(self, *args, **kwargs):
-        nonlocal publications
-        published = original(self, *args, **kwargs)
-        if published is EmbeddingPublishOutcome.PUBLISHED and publications == 0:
-            publications += 1
-            successor = sqlite3.connect(engine._store.db_path)
-            try:
-                successor.execute(
-                    "UPDATE metadata SET value=? WHERE key=?",
-                    (
-                        json.dumps(
-                            {
-                                "owner": "successor",
-                                "generation": 99,
-                                "heartbeat_at": time.time(),
-                            },
-                            sort_keys=True,
-                        ),
-                        command_mod._EMBEDDING_BACKFILL_CLAIM_KEY,
-                    ),
-                )
-                successor.commit()
-            finally:
-                successor.close()
-        return published
-
-    monkeypatch.setattr(
-        VectorStore, "publish_embedding_under_lease", takeover_after_first
+    node_ids = _seed(engine, 2)
+    successor_claim = json.dumps(
+        {"owner": "successor", "generation": 99, "heartbeat_at": time.time()},
+        sort_keys=True,
     )
+
+    class TakeoverBetweenBatches(FakeProvider):
+        def embed_document_batches(self, texts, *, before_dispatch):
+            before_dispatch((0,))
+            yield EmbeddedDocumentBatch((0,), ((1.0, 0.0),))
+            # The first network batch has COMMITTED. A successor now steals the
+            # lease before the second batch is dispatched/published.
+            steal = sqlite3.connect(engine._store.db_path)
+            try:
+                steal.execute(
+                    "UPDATE metadata SET value=? WHERE key=?",
+                    (successor_claim, command_mod._EMBEDDING_BACKFILL_CLAIM_KEY),
+                )
+                steal.commit()
+            finally:
+                steal.close()
+            before_dispatch((1,))
+            yield EmbeddedDocumentBatch((1,), ((1.0, 0.0),))
+
+    provider = TakeoverBetweenBatches()
+    monkeypatch.setattr(command_mod, "resolve_provider", lambda _config, **_kw: provider)
+
     result = handle_lcm_command("embed backfill --apply", engine)
+
+    # The first batch committed fully; the second published nothing.
     assert "embedded: 1" in result
     assert "stop_reason: lease_lost" in result
     assert _meta_ids(engine) == [str(node_ids[-1])]
@@ -745,7 +749,9 @@ def test_lease_takeover_between_row_publications_stops_stale_worker(
         ).fetchone()[0]
     finally:
         conn.close()
+    # Exactly one committed vector — no stale-worker second write.
     assert version == 1
+    # The successor's claim is intact — the stale worker did NOT overwrite it.
     assert json.loads(_claim_value(engine))["owner"] == "successor"
 
 
