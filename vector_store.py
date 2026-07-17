@@ -355,6 +355,12 @@ class VectorStore:
         vectors. With no ``provider`` the bare-name active identity is used
         (recording targets the operator's current selection).
         """
+        # Task-scoped: summary and chunk profiles coexist for the same
+        # (model, provider) in the shared table. Without the task filter this
+        # lookup returned whichever row registered most recently — registering
+        # the chunk profile silently redirected the SUMMARY knn to the chunk
+        # identity (zero summary meta rows → coverage 'none'). The chunk read
+        # path has its own resolver (_resolve_chunk_profile).
         model_name = str(model_name).strip()
         if provider is not None:
             provider = str(provider).strip().lower()
@@ -363,24 +369,24 @@ class VectorStore:
                 SELECT identity_hash, model_name, provider, revision, dim, dtype,
                        byteorder, task, registered_at, active, archived_at, data_version
                 FROM lcm_embedding_profile
-                WHERE model_name = ? AND provider = ?
+                WHERE model_name = ? AND provider = ? AND task = ?
                 ORDER BY (active = 1 AND archived_at IS NULL) DESC,
                          registered_at DESC, identity_hash DESC
                 LIMIT 1
                 """,
-                (model_name, provider),
+                (model_name, provider, _DEFAULT_TASK),
             ).fetchone()
         return self._conn.execute(
             """
             SELECT identity_hash, model_name, provider, revision, dim, dtype,
                    byteorder, task, registered_at, active, archived_at, data_version
             FROM lcm_embedding_profile
-            WHERE model_name = ?
+            WHERE model_name = ? AND task = ?
             ORDER BY (active = 1 AND archived_at IS NULL) DESC,
                      registered_at DESC, identity_hash DESC
             LIMIT 1
             """,
-            (model_name,),
+            (model_name, _DEFAULT_TASK),
         ).fetchone()
 
     @staticmethod
