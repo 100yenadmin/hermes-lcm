@@ -235,6 +235,24 @@ class TestChunkRawTextConsentGate:
         assert "only applies to the chunk corpus" in out
 
 
+class TestBothCorpusNextHint:
+    def test_both_dry_run_emits_single_coherent_next_hint(self, monkeypatch, tmp_path):
+        engine = _engine(tmp_path)
+        _seed_messages(engine, _user_msgs(2))
+        provider = FakeProvider()
+        monkeypatch.setattr(command_mod, "resolve_provider", lambda _c, **_k: provider)
+
+        out = handle_lcm_command("embed backfill --corpus both", engine)
+
+        # Exactly one next-hint, and it names the actual `--corpus both` command.
+        assert out.count("next: run") == 1
+        assert "next: run `/lcm embed backfill --corpus both --apply`" in out
+        # The two contradictory per-corpus hints are gone.
+        assert "run `/lcm embed backfill --apply`" not in out
+        assert "run `/lcm embed backfill --corpus chunks --apply`" not in out
+        assert provider.calls == []
+
+
 class TestChunkDryRun:
     def test_reports_pending_without_writes(self, monkeypatch, tmp_path):
         engine = _engine(tmp_path)

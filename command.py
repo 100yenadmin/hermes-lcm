@@ -3319,6 +3319,7 @@ def _embedding_backfill_report(
     stop_reason: str | None = None,
     corpus: str | None = None,
     policy: str | None = None,
+    include_next_hint: bool = True,
 ) -> str:
     header = "LCM embedding backfill" if corpus is None else f"LCM {corpus} backfill"
     lines = [header, f"mode: {mode}"]
@@ -3367,12 +3368,15 @@ def _embedding_backfill_report(
     )
     if mode == "dry-run":
         lines.append("note: preview only; no provider calls or database writes were made")
-        apply_hint = (
-            "/lcm embed backfill --apply"
-            if corpus is None
-            else f"/lcm embed backfill --corpus {corpus} --apply"
-        )
-        lines.append(f"next: run `{apply_hint}` to populate embeddings")
+        # In a `--corpus both` preview the caller emits ONE combined next-hint for
+        # the whole run, so the per-corpus reports suppress their own (F6).
+        if include_next_hint:
+            apply_hint = (
+                "/lcm embed backfill --apply"
+                if corpus is None
+                else f"/lcm embed backfill --corpus {corpus} --apply"
+            )
+            lines.append(f"next: run `{apply_hint}` to populate embeddings")
     return "\n".join(lines)
 
 
@@ -3409,21 +3413,33 @@ def _embedding_backfill_text(tokens: list[str], engine) -> str:
         )
     if corpus == "both":
         summary_report = _embedding_backfill_summary_text(
-            engine, apply=apply, limit=limit, retry_uncertain=retry_uncertain
+            engine, apply=apply, limit=limit, retry_uncertain=retry_uncertain,
+            include_next_hint=False,
         )
         chunk_report = _chunk_backfill_text(
             engine, apply=apply, limit=limit,
             retry_uncertain=retry_uncertain, policy=policy,
             confirm_raw_text=confirm_raw_text,
+            include_next_hint=False,
         )
-        return summary_report + "\n\n" + chunk_report
+        combined = summary_report + "\n\n" + chunk_report
+        if not apply:
+            # One coherent next-hint matching the actual `--corpus both` invocation,
+            # instead of the two contradictory per-corpus hints (F6).
+            combined += (
+                "\n\nnext: run `/lcm embed backfill --corpus both --apply` to "
+                "populate both corpora (add `--confirm-raw-text` to authorize the "
+                "chunk corpus on a cloud provider)"
+            )
+        return combined
     return _embedding_backfill_summary_text(
         engine, apply=apply, limit=limit, retry_uncertain=retry_uncertain
     )
 
 
 def _embedding_backfill_summary_text(
-    engine, *, apply: bool, limit: int, retry_uncertain: bool
+    engine, *, apply: bool, limit: int, retry_uncertain: bool,
+    include_next_hint: bool = True,
 ) -> str:
     mode = "apply" if apply else "dry-run"
     started = time.monotonic()
@@ -3507,6 +3523,7 @@ def _embedding_backfill_summary_text(
             remaining=pending,
             duration=time.monotonic() - started,
             consumed_tokens=0,
+            include_next_hint=include_next_hint,
         )
 
     ttl_s = _embedding_backfill_lease_ttl_s()
@@ -4109,7 +4126,7 @@ def _is_local_embedding_provider(provider_name: str) -> bool:
 
 def _chunk_backfill_text(
     engine, *, apply: bool, limit: int, retry_uncertain: bool, policy: str,
-    confirm_raw_text: bool = False,
+    confirm_raw_text: bool = False, include_next_hint: bool = True,
 ) -> str:
     policy = normalize_content_policy(policy or getattr(
         engine._config, "embedding_content_policy", "conversational"
@@ -4197,6 +4214,7 @@ def _chunk_backfill_text(
             consumed_tokens=0,
             corpus="chunks",
             policy=policy,
+            include_next_hint=include_next_hint,
         )
 
     # -- apply --
