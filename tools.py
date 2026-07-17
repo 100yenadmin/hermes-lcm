@@ -2284,6 +2284,44 @@ def _lcm_grep_resolve_provider(
     return provider
 
 
+def _resolve_recall_provider(
+    engine: "LCMEngine",
+    *,
+    deadline: float | None = None,
+    provider_override: str | None = None,
+) -> Any:
+    """Resolve the embedding provider for a recall query.
+
+    ``provider_override`` (SPEC F proactive injection) lets the injection path
+    embed its query with a different provider than interactive search — e.g. a
+    local fastembed provider for the offline path even when search uses voyage.
+    It caches under its own engine slot so it never evicts the main
+    interactive-search provider cache (no per-turn thrash between the two).
+    Empty override falls straight through to the shared resolver, so normal
+    tool calls are byte-identical.
+    """
+    override = str(provider_override or "").strip()
+    if not override:
+        return _lcm_grep_resolve_provider(engine, deadline=deadline)
+    config = engine._config
+    cache_key = (
+        override.lower(),
+        str(getattr(config, "embedding_model", "") or "").strip(),
+    )
+    cached = getattr(engine, "_lcm_proactive_provider_cache", None)
+    if cached is not None and cached[0] == cache_key:
+        return cached[1]
+    if deadline is not None and time.monotonic() >= deadline:
+        raise TimeoutError("provider resolution deadline exhausted")
+    override_config = copy.copy(config)
+    override_config.embedding_provider = override
+    provider = resolve_provider(override_config)
+    if deadline is not None and time.monotonic() >= deadline:
+        raise TimeoutError("provider resolution deadline exhausted")
+    engine._lcm_proactive_provider_cache = (cache_key, provider)
+    return provider
+
+
 def _lcm_grep_semantic(
     args: Dict[str, Any],
     *,
@@ -3072,9 +3110,14 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
             timed_out = True
         else:
             query_vector: list[float] | None = None
+            provider_override = kwargs.get("provider_override")
             try:
                 provider = _run_within_deadline(
-                    lambda: _lcm_grep_resolve_provider(engine, deadline=deadline),
+                    lambda: _resolve_recall_provider(
+                        engine,
+                        deadline=deadline,
+                        provider_override=provider_override,
+                    ),
                     remaining_s=deadline - time.monotonic(),
                     name="lcm-provider-resolution",
                 )
@@ -4546,6 +4589,15 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
             "summary_spend_window_seconds": engine._config.summary_spend_window_seconds,
             "summary_spend_backoff_seconds": engine._config.summary_spend_backoff_seconds,
             "expansion_model": engine._config.expansion_model or "(summary model)",
+        },
+        "proactive_recall": {
+            "enabled": bool(getattr(engine._config, "proactive_recall_enabled", False)),
+            "min_score": getattr(engine._config, "proactive_recall_min_score", 0.0),
+            "budget_tokens": getattr(engine._config, "proactive_recall_budget_tokens", 0),
+            "provider_override": getattr(engine._config, "proactive_recall_provider", "") or "",
+            "injected": int(getattr(engine, "_proactive_recall_injected_count", 0) or 0),
+            "skipped": int(getattr(engine, "_proactive_recall_skipped_count", 0) or 0),
+            "timeout": int(getattr(engine, "_proactive_recall_timeout_count", 0) or 0),
         },
         "config_sources": config_sources,
         "config_source_warnings": config_source_warnings,
