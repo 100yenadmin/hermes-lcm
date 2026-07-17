@@ -28,6 +28,7 @@ from hermes_lcm.db_bootstrap import (
 from hermes_lcm.engine import LCMEngine
 from hermes_lcm.rollup_store import RollupStore
 from hermes_lcm.store import MessageStore
+from hermes_lcm.vector_store import VectorStore
 
 
 def _build_v5_db(path: Path, *, with_features: bool = False) -> None:
@@ -45,6 +46,64 @@ def _build_v5_db(path: Path, *, with_features: bool = False) -> None:
             conn.commit()
         finally:
             conn.close()
+
+
+def _add_early_feature_tables(path: Path) -> None:
+    """Create EARLY-variant feature tables (missing later-added columns/tables).
+
+    Mirrors the real interim operator DB: family-prefixed tables that predate
+    later schema additions (lcm_rollups without generation/lease_nonce/failed_at
+    and no lcm_rollup_invalidations; lcm_embedding_profile keyed on model_name
+    without identity_hash/data_version). These fail the final-shape verifiers.
+    """
+    conn = sqlite3.connect(path)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE lcm_rollups (
+                rollup_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                period_kind TEXT, period_start TEXT, scope TEXT,
+                summary TEXT, token_count INTEGER, status TEXT,
+                built_at TEXT, source_fingerprint TEXT, error TEXT
+            );
+            CREATE TABLE lcm_rollup_sources (
+                rollup_id INTEGER, node_id INTEGER,
+                PRIMARY KEY(rollup_id, node_id)
+            );
+            CREATE TABLE lcm_rollup_state (
+                period_kind TEXT PRIMARY KEY,
+                last_build_cursor TEXT, last_built_at TEXT
+            );
+            CREATE TABLE lcm_embedding_profile (
+                model_name TEXT PRIMARY KEY, provider TEXT, dim INTEGER,
+                registered_at TEXT, active INTEGER DEFAULT 1, archived_at TEXT
+            );
+            CREATE TABLE lcm_embedding_meta (
+                embedded_id TEXT, embedded_kind TEXT, model_name TEXT,
+                embedded_at TEXT, PRIMARY KEY(embedded_id, embedded_kind)
+            );
+            CREATE TABLE lcm_embedding_vectors (
+                embedded_id TEXT PRIMARY KEY, vec BLOB
+            );
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _table_names(path: Path) -> set[str]:
+    conn = sqlite3.connect(path)
+    try:
+        return {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name NOT LIKE 'sqlite_%'"
+            ).fetchall()
+        }
+    finally:
+        conn.close()
 
 
 def _stamp(path: Path, version: int) -> None:
@@ -214,6 +273,65 @@ def test_remediate_refuses_genuinely_newer(tmp_path):
     assert _stored_version(db_path) == stamped
 
 
+def test_early_variant_feature_tables_remediate_end_to_end(tmp_path):
+    """Early-variant feature tables classify as interim and recover after apply.
+
+    This is the real-operator-DB shape: clean v5 core plus family-prefixed
+    tables that are EARLY variants failing the final-shape verifiers.
+    """
+    db_path = tmp_path / "lcm.db"
+    _build_v5_db(db_path)
+    _add_early_feature_tables(db_path)
+    stamped = db_bootstrap.SCHEMA_VERSION + 1
+    _stamp(db_path, stamped)
+
+    # Classification ignores feature-table internal shape → interim_stamp.
+    conn = sqlite3.connect(db_path)
+    try:
+        assert classify_version_mismatch(conn) == db_bootstrap.VERSION_MISMATCH_INTERIM_STAMP
+        dry = remediate_interim_schema_stamp(conn, apply=False)
+    finally:
+        conn.close()
+    assert dry["status"] == "dry-run"
+    would_drop = {t for fam in dry["drop_plan"] for t in fam["tables"]}
+    assert {"lcm_rollups", "lcm_embedding_profile"} <= would_drop
+    # Dry-run mutates nothing.
+    assert _stored_version(db_path) == stamped
+    assert "lcm_rollups" in _table_names(db_path)
+
+    conn = sqlite3.connect(db_path)
+    try:
+        result = remediate_interim_schema_stamp(conn, apply=True)
+    finally:
+        conn.close()
+    assert result["status"] == "ok"
+    dropped = set(result["dropped_tables"])
+    assert {"lcm_rollups", "lcm_rollup_sources", "lcm_rollup_state"} <= dropped
+    assert {"lcm_embedding_profile", "lcm_embedding_meta", "lcm_embedding_vectors"} <= dropped
+    assert _stored_version(db_path) == db_bootstrap.SCHEMA_VERSION
+    # Early feature tables are gone; core tables remain untouched.
+    remaining = _table_names(db_path)
+    assert not any(t.startswith(("lcm_rollup", "lcm_embedding")) for t in remaining)
+    assert {"messages", "summary_nodes"} <= remaining
+
+    # refuse now passes, and each feature store reconstructs the final shape.
+    conn = sqlite3.connect(db_path)
+    try:
+        db_bootstrap.refuse_schema_version_too_new(conn)  # must not raise
+    finally:
+        conn.close()
+    rollups = RollupStore(db_path)
+    try:
+        assert db_bootstrap.verify_temporal_rollup_schema(rollups.connection) == []
+    finally:
+        rollups.close()
+    vectors = VectorStore(db_path)
+    try:
+        assert db_bootstrap.verify_embedding_schema(vectors._conn) == []
+    finally:
+        vectors.close()
+
+
 def test_remediate_noop_when_version_supported(tmp_path):
     db_path = tmp_path / "lcm.db"
     _build_v5_db(db_path)
@@ -237,21 +355,31 @@ def _healthy_engine(tmp_path: Path) -> LCMEngine:
 def test_doctor_repair_schema_stamp_dry_run_and_apply(tmp_path):
     engine = _healthy_engine(tmp_path)
     db_path = Path(engine._store.db_path)
-    # Stamp the underlying file ahead of the ladder to simulate an interim build.
+    # Add early-variant feature tables + stamp ahead of the ladder to simulate
+    # an interim build, then drive the operator-facing command path.
+    _add_early_feature_tables(db_path)
     _stamp(db_path, db_bootstrap.SCHEMA_VERSION + 1)
 
     dry = _doctor_repair_schema_stamp_text(engine)
     assert "status: repair-needed" in dry
     assert "classification: interim_stamp" in dry
+    assert "would_drop: lcm_rollups" in dry
+    assert "/lcm rollups rebuild" in dry
+    assert "would_drop: lcm_embedding_profile" in dry
     assert "no schema changes were made" in dry
-    # Dry-run must not mutate the stamp.
+    # Dry-run must not mutate the stamp or drop anything.
     assert _stored_version(db_path) == db_bootstrap.SCHEMA_VERSION + 1
+    assert "lcm_rollups" in _table_names(db_path)
 
     applied = _doctor_repair_schema_stamp_apply_text(engine)
     assert "status: ok" in applied
     assert "backup_path:" in applied
     assert f"schema_version_reset_to: {db_bootstrap.SCHEMA_VERSION}" in applied
+    assert "dropped: lcm_rollups" in applied
     assert _stored_version(db_path) == db_bootstrap.SCHEMA_VERSION
+    assert not any(
+        t.startswith(("lcm_rollup", "lcm_embedding")) for t in _table_names(db_path)
+    )
 
 
 def test_doctor_repair_schema_stamp_apply_refuses_genuinely_newer(tmp_path):

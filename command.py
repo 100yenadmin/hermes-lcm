@@ -1021,6 +1021,17 @@ def _schema_stamp_note(plan: dict[str, Any]) -> str:
     )
 
 
+def _schema_stamp_drop_lines(plan: dict[str, Any], *, applied: bool) -> list[str]:
+    """Per-early-feature-table lines: what was (or would be) dropped + why."""
+    verb = "dropped" if applied else "would_drop"
+    lines: list[str] = []
+    for family in plan.get("drop_plan") or []:
+        hint = family["rebuild_hint"]
+        for table in family["tables"]:
+            lines.append(f"{verb}: {table} ({hint})")
+    return lines
+
+
 def _doctor_repair_schema_stamp_text(engine) -> str:
     db_path = Path(engine._store.db_path)
     lines = ["LCM doctor repair schema-stamp"]
@@ -1048,6 +1059,7 @@ def _doctor_repair_schema_stamp_text(engine) -> str:
         f"stored_schema_version: {plan['current_version']}",
         f"target_schema_version: {plan['target_version']}",
         f"classification: {plan['classification'] or 'none'}",
+        *_schema_stamp_drop_lines(plan, applied=False),
         "note: read-only scan only — no schema changes were made",
         _schema_stamp_note(plan),
     ])
@@ -1112,6 +1124,7 @@ def _doctor_repair_schema_stamp_apply_text(engine) -> str:
     finally:
         conn.close()
 
+    dropped = result.get("dropped_tables") or []
     return "\n".join([
         *lines,
         f"status: {result['status']}",
@@ -1122,7 +1135,14 @@ def _doctor_repair_schema_stamp_apply_text(engine) -> str:
         f"schema_version_reset_to: {result['target_version']}",
         f"classification: {result['classification']}",
         f"applied: {_fmt_bool(bool(result['applied']))}",
+        f"dropped_feature_tables: {len(dropped)}",
+        *_schema_stamp_drop_lines(result, applied=True),
         "note: backup created before schema-stamp apply",
+        *(
+            ["note: dropped tables are derived caches — rebuild them with the "
+             "commands above; no lossless message/summary data was affected"]
+            if dropped else []
+        ),
     ])
 
 
