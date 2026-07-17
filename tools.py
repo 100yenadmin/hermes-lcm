@@ -2672,6 +2672,27 @@ def _lcm_recall_excerpt_expand_hint(hit: dict[str, Any]) -> str:
     return f"lcm_expand(store_id={hit.get('store_id')}, content_offset={offset})"
 
 
+def _lcm_recall_bounded_reason(
+    arm: str, scanned: int | None, total: int | None
+) -> str:
+    """Degraded-reasons text for a ``coverage='bounded'`` arm (SCAN-1).
+
+    Names the arm and the scanned/total ratio so a caller can see that the arm
+    scored only the most-recent slice of the corpus (older archived vectors were
+    excluded by the recency-bounded candidate scan), rather than the truncation
+    being silent.
+    """
+    if scanned is not None and total is not None:
+        return (
+            f"{arm} arm coverage bounded: scored the {scanned} most-recent of "
+            f"{total} vectors (older vectors excluded)"
+        )
+    return (
+        f"{arm} arm coverage bounded: scored only the most-recent slice of the "
+        "corpus (older vectors excluded)"
+    )
+
+
 def _lcm_recall_fts_arm(
     engine: "LCMEngine", query: str, *, candidate_limit: int, deadline: float
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
@@ -2739,7 +2760,7 @@ def _lcm_recall_summary_arm(
     coverage = knn_results.coverage
     ranked_rows = list(knn_results)
     if coverage == "none" or not ranked_rows:
-        return [], coverage
+        return [], coverage, knn_results.scanned, knn_results.total
     nodes = _run_within_deadline(
         lambda: hydrate_semantic_nodes(
             engine,
@@ -2763,7 +2784,7 @@ def _lcm_recall_summary_arm(
         }
         hit["expand_hint"] = _lcm_recall_summary_expand_hint(hit)
         hits.append(hit)
-    return hits, coverage
+    return hits, coverage, knn_results.scanned, knn_results.total
 
 
 def _lcm_recall_chunk_arm(
@@ -2795,7 +2816,7 @@ def _lcm_recall_chunk_arm(
     coverage = knn_results.coverage
     ranked_rows = list(knn_results)
     if coverage == "none" or not ranked_rows:
-        return [], coverage
+        return [], coverage, knn_results.scanned, knn_results.total
     raw_hits = _run_within_deadline(
         lambda: hydrate_chunk_hits(
             engine,
@@ -2813,7 +2834,7 @@ def _lcm_recall_chunk_arm(
         hit["from_current_session"] = bool(current) and hit.get("session_id") == current
         hit["expand_hint"] = _lcm_recall_excerpt_expand_hint(hit)
         hits.append(hit)
-    return hits, coverage
+    return hits, coverage, knn_results.scanned, knn_results.total
 
 
 def _lcm_recall_rerank(
@@ -2918,10 +2939,14 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
     candidate_limit = min(_LCM_GREP_HYBRID_CANDIDATE_CAP, max(50, limit * 4))
     rerank_window = min(50, max(1, limit * 4))
 
-    run_fts = include in {"all", "verbatim"}
+    embeddings_enabled = bool(getattr(engine._config, "embeddings_enabled", False))
+    # FTS runs for verbatim/all normally, but ALSO whenever embeddings are
+    # disabled -- including for include='summaries', whose only vector arm is dead
+    # in that state. Without this, include='summaries' + embeddings-off returns
+    # zero hits instead of degrading to the full-text arm (F4-degrade-to-fts).
+    run_fts = include in {"all", "verbatim"} or not embeddings_enabled
     run_summary = include in {"all", "summaries"}
     run_chunk = include in {"all", "verbatim"}
-    embeddings_enabled = bool(getattr(engine._config, "embeddings_enabled", False))
 
     arm_hits: dict[str, list[dict[str, Any]]] = {}
     coverage: dict[str, str] = {}
@@ -2982,7 +3007,7 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
             if query_vector is not None:
                 if run_summary:
                     try:
-                        hits, cov = _lcm_recall_summary_arm(
+                        hits, cov, scanned, total = _lcm_recall_summary_arm(
                             engine,
                             query_vector=query_vector,
                             provider=provider,
@@ -2993,6 +3018,10 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
                         coverage["summary"] = cov
                         if cov == "none":
                             degraded_reasons.append("summary vectors are unavailable")
+                        elif cov == "bounded":
+                            degraded_reasons.append(
+                                _lcm_recall_bounded_reason("summary", scanned, total)
+                            )
                     except TimeoutError:
                         timed_out = True
                         coverage["summary"] = "none"
@@ -3001,7 +3030,7 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
                         degraded_reasons.append(f"summary arm failed: {exc}")
                 if run_chunk:
                     try:
-                        hits, cov = _lcm_recall_chunk_arm(
+                        hits, cov, scanned, total = _lcm_recall_chunk_arm(
                             engine,
                             query_vector=query_vector,
                             provider=provider,
@@ -3012,6 +3041,10 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
                         coverage["chunk"] = cov
                         if cov == "none":
                             degraded_reasons.append("chunk vectors are unavailable")
+                        elif cov == "bounded":
+                            degraded_reasons.append(
+                                _lcm_recall_bounded_reason("chunk", scanned, total)
+                            )
                     except TimeoutError:
                         timed_out = True
                         coverage["chunk"] = "none"

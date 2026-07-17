@@ -134,8 +134,10 @@ LCM_RECALL = {
     "description": (
         "Search the agent's entire memory across ALL conversations and all time by meaning. "
         "Returns the most relevant memories — summaries and verbatim excerpts — ranked by relevance, "
-        "recency, and relatedness to the current conversation, each with a handle to expand the exact "
-        "original content (lcm_expand). Not for retrieving exact/verbatim text within a known time range — "
+        "recency, and relatedness to the current conversation, each with an expand_hint handle to the "
+        "original content: verbatim/current-session hits get lcm_expand(...), while cross-session summary "
+        "hits get lcm_load_session(...) (lcm_expand's node_id mode is current-session only, so it cannot "
+        "expand a cross-session summary). Not for retrieving exact/verbatim text within a known time range — "
         "use lcm_grep(mode='full_text') for that. Not for full transcripts — after locating the right "
         "conversation, use lcm_load_session(session_id). Recency and current-conversation preference are soft "
         "ranking boosts, not filters; for hard time bounds use lcm_grep time_from/time_to."

@@ -159,10 +159,17 @@ class KNNResult(list[tuple[str, float, str]]):
         *,
         coverage: str,
         reason: str | None = None,
+        scanned: int | None = None,
+        total: int | None = None,
     ) -> None:
         super().__init__(rows)
         self.coverage = coverage
         self.reason = reason
+        # Bounded-coverage provenance: how many of the corpus's live vectors were
+        # actually scored (``scanned``) out of the total live for the identity
+        # (``total``), so a caller can surface partial-archive coverage (SCAN-1).
+        self.scanned = scanned
+        self.total = total
 
 
 class EmbeddingPublishOutcome(str, Enum):
@@ -922,6 +929,25 @@ class VectorStore:
             )
         return int(cur.rowcount or 0)
 
+    def _count_embedded_vectors(self, identity_hash: str, *, chunk: bool) -> int | None:
+        """Cheap single-table COUNT of embedded vectors for one identity.
+
+        Used only to annotate a ``coverage='bounded'`` result with the total
+        corpus size (SCAN-1); returns ``None`` if the table is absent. Archival
+        is tracked in the meta tables, so this is a total-embedded hint (the
+        scanned/total ratio signals partial-archive coverage, not an exact live
+        count).
+        """
+        table = "lcm_chunk_vectors" if chunk else "lcm_embedding_vectors"
+        try:
+            row = self._conn.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE identity_hash = ?",
+                (str(identity_hash),),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            return None
+        return int(row[0]) if row is not None else None
+
     def _data_version(self, identity_hash: str) -> int:
         row = self._conn.execute(
             "SELECT data_version FROM lcm_embedding_profile WHERE identity_hash = ?",
@@ -1332,7 +1358,11 @@ class VectorStore:
             scores,
             k,
         )
-        return KNNResult(candidates, coverage=coverage)
+        scanned = total = None
+        if coverage == "bounded":
+            scanned = len(bounded_ids)
+            total = self._count_embedded_vectors(identity, chunk=False)
+        return KNNResult(candidates, coverage=coverage, scanned=scanned, total=total)
 
     # -- Chunk corpus ------------------------------------------------------
     #
@@ -1747,7 +1777,11 @@ class VectorStore:
             coverage = "bounded"
 
         candidates = self._ranked(rowids, chunk_ids, kinds, scores, k)
-        return KNNResult(candidates, coverage=coverage)
+        scanned = total = None
+        if coverage == "bounded":
+            scanned = len(bounded_ids)
+            total = self._count_embedded_vectors(identity, chunk=True)
+        return KNNResult(candidates, coverage=coverage, scanned=scanned, total=total)
 
     def _current_chunk_profile(self) -> sqlite3.Row | None:
         """The active profile registered under task='chunk' (most recent)."""

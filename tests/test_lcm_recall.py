@@ -213,6 +213,19 @@ def test_embeddings_off_degrades_to_fts_arm(recall_engine, monkeypatch):
     assert all(h["kind"] == "message_excerpt" for h in payload["hits"])
 
 
+def test_summaries_include_degrades_to_fts_when_embeddings_off(recall_engine, monkeypatch):
+    """F4-degrade-to-fts: include='summaries' with embeddings disabled must still
+    run the FTS arm (its only vector arm is dead) rather than returning nothing."""
+    recall_engine._config.embeddings_enabled = False
+    recall_engine._store.append(CURRENT, {"role": "user", "content": "kanban dashboard sprint summaries fallback"})
+
+    payload = _recall(recall_engine, monkeypatch, include="summaries", limit=10)
+
+    assert "fts" in payload["provenance"]["arms_run"]
+    assert payload["hits"]
+    assert all(h["kind"] == "message_excerpt" for h in payload["hits"])
+
+
 def test_empty_vector_corpora_reports_coverage_none(recall_engine, monkeypatch):
     recall_engine._store.append(CURRENT, {"role": "user", "content": "kanban dashboard sprint only fts"})
 
@@ -327,6 +340,29 @@ def test_recall_scans_full_corpus_not_grep_recency_window(recall_engine, monkeyp
 
     # Both vector arms request the large recall bound, never the small grep one.
     assert observed and all(bound == 25_000 for bound in observed)
+
+
+def test_bounded_chunk_coverage_surfaces_as_degraded(recall_engine, monkeypatch):
+    """SCAN-1: a recency-bounded chunk arm reports a degraded_reasons entry naming
+    the arm + scanned/total, instead of silently truncating."""
+    recall_engine._config.recall_scan_rows = 1
+    ids = []
+    for i in range(3):
+        sid = recall_engine._store.append(
+            CURRENT, {"role": "user", "content": f"kanban dashboard sprint chunk {i}"}
+        )
+        ids.append(sid)
+    _seed_chunk_vectors(
+        recall_engine,
+        [(sid, 0, 0, 20, [1.0, 0.0]) for sid in ids],
+    )
+
+    payload = _recall(recall_engine, monkeypatch, include="verbatim", limit=10)
+
+    assert payload["provenance"]["coverage"].get("chunk") == "bounded"
+    assert payload["degraded"] is True
+    assert "chunk arm coverage bounded" in payload["degraded_reason"]
+    assert "of 3 vectors" in payload["degraded_reason"]
 
 
 def test_pooled_vector_store_survives_across_recall_calls(recall_engine, monkeypatch):
