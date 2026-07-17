@@ -167,3 +167,33 @@ markers are not cleared before discovery or dispatch, and any row not successful
 another explicit decision. The command reports the uncertain count and warning because retrying may
 rebill. Disable everything with `LCM_EMBEDDINGS_ENABLED=false` — data stays, behavior reverts to
 FTS-only instantly.
+
+## The chunk corpus — raw verbatim text, and the consent gate
+
+`/lcm embed backfill` has two corpora, selected with `--corpus`:
+
+- `summary` (default) — embeds the generated **summaries** of your history.
+- `chunks` — embeds **raw, verbatim message text**, chunked by `--policy`
+  (`conversational` | `heads` | `full`), for verbatim/chunk-KNN recall.
+- `both` — runs the summary backfill, then the chunk backfill, in one command.
+
+The distinction matters for privacy. The summary corpus sends only model-generated summaries to the
+embedding provider. **The chunk corpus sends the raw message bytes** — including tool-result output
+and error/traceback content (the `heads`/`full` policies specifically target error signatures) —
+which is exactly the content most likely to carry secrets. When the provider is a **cloud** provider
+(e.g. Voyage), that raw text leaves this machine.
+
+Because of this, `--corpus chunks --apply` and `--corpus both --apply` **refuse** on a cloud provider
+unless you pass an explicit acknowledgment:
+
+```bash
+/lcm embed backfill --corpus chunks --apply --confirm-raw-text
+```
+
+Local providers (**fastembed**, **ollama**) never transmit text off the machine, so the gate is
+waived for them. Dry runs (no `--apply`) never send anything and never require the flag.
+
+> **Redaction caveat.** `LCM_SENSITIVE_PATTERNS_ENABLED` redaction runs at **ingest** time, so it
+> only affects text stored *after* it was enabled. Turning it on does **not** retro-redact history
+> already in the store — that older raw text is still what gets sent to the provider during a chunk
+> backfill. Prefer a local provider for the chunk corpus if the history may contain secrets.

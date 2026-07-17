@@ -620,9 +620,14 @@ Available commands:
 - `/lcm rotate` - read-only preview of an in-place tail-preserving compact of the active session
 - `/lcm rotate apply` - backup-first rotate that advances the lifecycle frontier past pre-tail raw messages
 - `/lcm embed warmup` - explicitly prepare the configured provider/model and register its vector dimension
-- `/lcm embed backfill [--limit N]` - preview pending leaf-summary embeddings, token use, batches, and estimated cost
-- `/lcm embed backfill --apply [--limit N]` - populate a bounded set of pending leaf-summary embeddings
+- `/lcm embed backfill [--limit N] [--corpus summary|chunks|both] [--policy conversational|heads|full]` - preview pending embeddings, token use, batches, and estimated cost for a corpus
+- `/lcm embed backfill --apply [--limit N] [--corpus summary|chunks|both] [--policy ...] [--confirm-raw-text]` - populate a bounded set of pending embeddings for a corpus
 - `/lcm help` - command help
+
+`--corpus` selects which corpus to backfill (default `summary`); `--policy` chooses the chunking
+policy and applies only to the chunk corpus; `--confirm-raw-text` acknowledges that the chunk corpus
+sends raw verbatim text to a cloud provider (required for `--corpus chunks|both --apply` on a cloud
+provider — see *Embedding backfill* below).
 
 Apply paths are intentionally narrow and backup-first. Start with diagnostics
 before cleanup or repair.
@@ -707,6 +712,34 @@ rows and later batches continue; rerun the command to retry anything still
 pending. Documents rejected by a provider token cap are listed under
 `skipped_overcap` and also remain pending. The claim is released on normal,
 provider-error, and row-write-error exit paths.
+
+### Corpora: summary vs chunks
+
+`--corpus` selects what gets embedded:
+
+- `summary` (default) — the generated leaf-summary embeddings described above.
+- `chunks` — the **raw-history chunk corpus**: verbatim message text chunked by
+  `--policy` (`conversational` | `heads` | `full`), used for verbatim/chunk-KNN
+  recall. This is a **separate corpus with its own backfill run** — a
+  summary-only backfill leaves it empty, and verbatim/chunk recall returns
+  nothing beyond FTS until you run `--corpus chunks --apply` as well.
+- `both` — runs the summary backfill, then the chunk backfill, in one command.
+
+```bash
+/lcm embed backfill --corpus chunks              # dry-run preview for the chunk corpus
+/lcm embed backfill --corpus chunks --apply --confirm-raw-text
+/lcm embed backfill --corpus both --apply --confirm-raw-text
+```
+
+**Raw-text consent gate.** Unlike summaries, the chunk corpus sends **raw,
+verbatim message text** — including tool-result and error/traceback content — to
+the embedding provider. When the provider is a cloud provider (e.g. Voyage),
+`--corpus chunks|both --apply` **refuses** unless you also pass
+`--confirm-raw-text`. Local providers (fastembed/ollama) never transmit text
+off-box and are exempt. Note that `LCM_SENSITIVE_PATTERNS_ENABLED` redaction runs
+at **ingest**, so it does not retro-redact history already stored — that older
+raw text is still sent during a chunk backfill. See
+[embeddings-setup.md](embeddings-setup.md) for the full discussion.
 
 ## Import and backfill
 

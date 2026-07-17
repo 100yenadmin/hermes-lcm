@@ -169,6 +169,72 @@ class TestChunkRetryUncertainSpans:
         assert char_end > char_start
 
 
+class TestChunkRawTextConsentGate:
+    def _voyage_engine(self, tmp_path):
+        tmp_path.mkdir(parents=True, exist_ok=True)
+        db_path = tmp_path / "backfill.db"
+        config = LCMConfig(
+            database_path=str(db_path),
+            embeddings_enabled=True,
+            embedding_provider="voyage",
+            embedding_model="voyage-3",
+        )
+        engine = SimpleNamespace(_config=config, _store=SimpleNamespace(db_path=db_path))
+        _seed_messages(engine, _user_msgs(2), register=False)
+        store = VectorStore(db_path, config=config)
+        try:
+            store.register_profile("voyage-3", "voyage", 2, task="chunk")
+        finally:
+            store.close()
+        return engine
+
+    def test_cloud_apply_refused_without_confirm_flag(self, monkeypatch, tmp_path):
+        engine = self._voyage_engine(tmp_path)
+        provider = FakeProvider()
+        monkeypatch.setattr(command_mod, "resolve_provider", lambda _c, **_k: provider)
+
+        out = handle_lcm_command("embed backfill --corpus chunks --apply", engine)
+
+        assert "status: refused" in out
+        assert "RAW, VERBATIM" in out
+        assert "--confirm-raw-text" in out
+        # Nothing was sent to the cloud provider and nothing was written.
+        assert provider.calls == []
+        assert _chunk_meta_ids(engine) == []
+
+    def test_cloud_apply_proceeds_with_confirm_flag(self, monkeypatch, tmp_path):
+        engine = self._voyage_engine(tmp_path)
+        provider = FakeProvider()
+        # Match the registered voyage chunk profile so the apply gets past the
+        # provider/profile consistency check and actually embeds.
+        provider.provider_id = "voyage"
+        provider.model_id = "voyage-3"
+        monkeypatch.setattr(command_mod, "resolve_provider", lambda _c, **_k: provider)
+
+        out = handle_lcm_command(
+            "embed backfill --corpus chunks --apply --confirm-raw-text", engine
+        )
+
+        assert "status: refused" not in out
+        assert _chunk_meta_ids(engine)  # chunks were embedded
+
+    def test_local_provider_exempt_from_gate(self, monkeypatch, tmp_path):
+        engine = _engine(tmp_path)  # ollama (local)
+        _seed_messages(engine, _user_msgs(2))
+        provider = FakeProvider()
+        monkeypatch.setattr(command_mod, "resolve_provider", lambda _c, **_k: provider)
+
+        out = handle_lcm_command("embed backfill --corpus chunks --apply", engine)
+
+        assert "status: refused" not in out
+        assert _chunk_meta_ids(engine)
+
+    def test_confirm_flag_rejected_for_summary_corpus(self, tmp_path):
+        engine = _engine(tmp_path)
+        out = handle_lcm_command("embed backfill --confirm-raw-text", engine)
+        assert "only applies to the chunk corpus" in out
+
+
 class TestChunkDryRun:
     def test_reports_pending_without_writes(self, monkeypatch, tmp_path):
         engine = _engine(tmp_path)

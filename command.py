@@ -3232,12 +3232,13 @@ def _owned_inflight_transition(
 
 def _embedding_backfill_options(
     tokens: list[str],
-) -> tuple[bool, int, bool, str, str] | str:
+) -> tuple[bool, int, bool, str, str, bool] | str:
     apply = False
     limit = 200
     retry_uncertain = False
     corpus = "summary"
     policy = ""
+    confirm_raw_text = False
     seen_corpus = False
     seen_policy = False
     index = 0
@@ -3249,6 +3250,10 @@ def _embedding_backfill_options(
             continue
         if token == "--retry-uncertain" and not retry_uncertain:
             retry_uncertain = True
+            index += 1
+            continue
+        if token == "--confirm-raw-text" and not confirm_raw_text:
+            confirm_raw_text = True
             index += 1
             continue
         if token == "--limit" and index + 1 < len(tokens):
@@ -3276,14 +3281,19 @@ def _embedding_backfill_options(
             continue
         return (
             "`/lcm embed backfill` accepts only `--apply`, `--retry-uncertain`, "
-            "`--limit N`, `--corpus summary|chunks|both`, and "
-            "`--policy conversational|heads|full`."
+            "`--confirm-raw-text`, `--limit N`, `--corpus summary|chunks|both`, "
+            "and `--policy conversational|heads|full`."
         )
     if retry_uncertain and not apply:
         return "`--retry-uncertain` requires `--apply` because it may incur charges."
     if policy and corpus == "summary":
         return "`--policy` only applies to the chunk corpus; add `--corpus chunks`."
-    return apply, limit, retry_uncertain, corpus, policy
+    if confirm_raw_text and corpus == "summary":
+        return (
+            "`--confirm-raw-text` only applies to the chunk corpus; add "
+            "`--corpus chunks` or `--corpus both`."
+        )
+    return apply, limit, retry_uncertain, corpus, policy, confirm_raw_text
 
 
 def _embedding_backfill_report(
@@ -3390,11 +3400,12 @@ def _embedding_backfill_text(tokens: list[str], engine) -> str:
     parsed = _embedding_backfill_options(tokens)
     if isinstance(parsed, str):
         return _help_text(parsed)
-    apply, limit, retry_uncertain, corpus, policy = parsed
+    apply, limit, retry_uncertain, corpus, policy, confirm_raw_text = parsed
     if corpus == "chunks":
         return _chunk_backfill_text(
             engine, apply=apply, limit=limit,
             retry_uncertain=retry_uncertain, policy=policy,
+            confirm_raw_text=confirm_raw_text,
         )
     if corpus == "both":
         summary_report = _embedding_backfill_summary_text(
@@ -3403,6 +3414,7 @@ def _embedding_backfill_text(tokens: list[str], engine) -> str:
         chunk_report = _chunk_backfill_text(
             engine, apply=apply, limit=limit,
             retry_uncertain=retry_uncertain, policy=policy,
+            confirm_raw_text=confirm_raw_text,
         )
         return summary_report + "\n\n" + chunk_report
     return _embedding_backfill_summary_text(
@@ -4086,8 +4098,18 @@ def _chunk_backfill_remaining(
     return remaining, in_flight, uncertain
 
 
+# Providers that embed on this machine and never transmit text off-box. The raw-
+# text consent gate on the chunk corpus is waived for these (F1).
+_LOCAL_EMBEDDING_PROVIDERS = frozenset({"fastembed", "ollama"})
+
+
+def _is_local_embedding_provider(provider_name: str) -> bool:
+    return str(provider_name or "").strip().lower() in _LOCAL_EMBEDDING_PROVIDERS
+
+
 def _chunk_backfill_text(
-    engine, *, apply: bool, limit: int, retry_uncertain: bool, policy: str
+    engine, *, apply: bool, limit: int, retry_uncertain: bool, policy: str,
+    confirm_raw_text: bool = False,
 ) -> str:
     policy = normalize_content_policy(policy or getattr(
         engine._config, "embedding_content_policy", "conversational"
@@ -4182,6 +4204,23 @@ def _chunk_backfill_text(
         return _refused(
             "no chunk embedding profile is registered; register one before "
             "`--corpus chunks --apply`"
+        )
+
+    # Consent gate: unlike the summary corpus (which sends only generated
+    # summaries), the chunk corpus sends RAW, VERBATIM message text — including
+    # tool-result and error/traceback content, exactly the content most likely to
+    # carry secrets — to the embedding provider. Require an explicit
+    # acknowledgment before sending that to a CLOUD provider; local providers
+    # (fastembed/ollama) keep the text on this machine and are exempt (F1).
+    if not _is_local_embedding_provider(provider_name) and not confirm_raw_text:
+        return _refused(
+            f"the chunk corpus sends RAW, VERBATIM message text — including "
+            f"tool-result and error/traceback content that the summary corpus "
+            f"never exposes — to the '{provider_name}' cloud embedding provider. "
+            f"Re-run with `--confirm-raw-text` to acknowledge this, or switch to a "
+            f"local provider (fastembed/ollama). Note: LCM_SENSITIVE_PATTERNS_ENABLED "
+            f"redaction runs at INGEST, so text already stored is not "
+            f"retro-redacted before being sent."
         )
 
     ttl_s = _embedding_backfill_lease_ttl_s()
