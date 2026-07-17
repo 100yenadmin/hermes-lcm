@@ -760,10 +760,10 @@ class VectorStore:
         column filters (recency window, conversation, suppression) are applied
         in the ``WHERE`` clause and a hard ``LIMIT`` caps the result, so neither
         the SQL result set nor host memory materializes the whole corpus (a
-        100-row corpus with bound 10 loads ~10 ids, not 100). Ordering is by
-        ``embedded_at DESC`` — served by
-        ``idx_lcm_embedding_meta_identity_embedded_at`` — matching the vector
-        write order rather than rowid.
+        100-row corpus with bound 10 loads ~10 ids, not 100). Ordering is by the
+        source summary's ``latest_at DESC`` so a newest-first backfill cannot
+        invert the bounded retrieval window when older summaries are embedded
+        later.
 
         Column filters are enforced BEFORE the bound (they are in ``WHERE``), so
         a filtered match inside the most-recent window is never dropped; only
@@ -781,7 +781,7 @@ class VectorStore:
             return []
         if (since is not None or until is not None) and "latest_at" not in columns:
             return []
-        recency_expr = "sn.latest_at"
+        recency_expr = "sn.latest_at" if "latest_at" in columns else "sn.created_at"
         where = ["m.identity_hash = ?", "m.archived = 0"]
         args: list[object] = [str(identity_hash)]
         if "suppressed_at" in columns:
@@ -806,7 +806,7 @@ class VectorStore:
                 JOIN summary_nodes sn ON sn.node_id = CAST(m.embedded_id AS INTEGER)
                 {conversation_join}
                 WHERE {' AND '.join(where)}
-                ORDER BY m.embedded_at DESC, m.embedded_id DESC
+                ORDER BY {recency_expr} DESC, sn.node_id DESC
                 LIMIT ?
                 """,
                 args,
@@ -1087,7 +1087,7 @@ class VectorStore:
             coverage = candidate_coverage
         else:
             # Bound the candidate enumeration at the SQL layer: the column
-            # filters + ORDER BY embedded_at DESC + LIMIT run inside SQLite, so
+            # filters + ORDER BY source latest_at DESC + LIMIT run inside SQLite, so
             # neither the result set nor host memory enumerates the whole
             # corpus. Filters live in the WHERE clause (applied before the
             # bound), so a filtered match inside the bounded window is not lost;
