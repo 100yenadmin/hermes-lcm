@@ -5250,16 +5250,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # hard-filter — the current conversation).
         recall_k = 6
         scope_bias = 0.3
-        min_score = float(getattr(config, "proactive_recall_min_score", 0.02) or 0.0)
+        min_score = float(getattr(config, "proactive_recall_min_score", 0.01) or 0.0)
         budget_tokens = int(getattr(config, "proactive_recall_budget_tokens", 500) or 0)
         if budget_tokens <= 0:
             return None
         provider_override = getattr(config, "proactive_recall_provider", "") or ""
 
         try:
-            from .tools import lcm_recall
-
-            raw = lcm_recall(
+            raw = lcm_tools.lcm_recall(
                 {
                     "query": query,
                     "limit": recall_k,
