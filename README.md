@@ -91,6 +91,17 @@ Core capabilities:
 - **Diagnostics** - runtime health, database checks, optional `/lcm` slash
   commands, backup-first repair/rotate paths
 
+Beyond the core loop, three opt-in (default-off) feature families extend LCM
+from a compression layer into a memory system: **large-output externalization
+and context-budget controls** (giant tool results move to recoverable refs
+instead of crowding the prompt), **temporal memory** (day/week/month rollups
+plus natural-time recall through `lcm_recent`), and **semantic retrieval**
+(embedding-backed `lcm_grep` semantic/hybrid modes with free-tier cloud or
+fully-local providers). See the
+[Feature overview](docs/features-overview.md) for what each family does and
+why, and [Agent configuration profiles](docs/agent-config-profiles.md) for
+copy-paste setups per agent type.
+
 ## LCM vs built-in compression
 
 Hermes core may persist original conversation history in `state.db` before
@@ -691,6 +702,15 @@ exposes retrieval tools that can drill back into exact stored sources.
 
 ## Documentation
 
+- [Feature overview](docs/features-overview.md) — every feature family, what
+  it does, why it exists, and the switch that enables it
+- [Agent configuration profiles](docs/agent-config-profiles.md) — copy-paste
+  env profiles: coding agent, long-horizon assistant, fully-local, cost-guarded
+- [Operator guide](docs/operator-guide.md) — install, activation, full
+  configuration reference, diagnostics
+- [Retrieval tools reference](docs/retrieval-tools.md) — exact tool contracts
+- [Embeddings setup](docs/embeddings-setup.md) — free-tier and local embedding
+  providers, warmup, backfill
 - [LCM paper](https://papers.voltropy.com/LCM)
 - [Architecture diagram](docs/architecture.png)
 - [Standard compression diagram](docs/standard_compression.png)
