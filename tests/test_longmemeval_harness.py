@@ -16,6 +16,8 @@ import pytest
 from benchmarking.longmemeval import (
     ARMS,
     DATASET_REVISION,
+    RERANK_MODE_PLACEHOLDER,
+    RERANK_MODE_VOYAGE,
     Question,
     chunk_sessions,
     deterministic_session_summary,
@@ -27,8 +29,11 @@ from benchmarking.longmemeval import (
     parse_question,
     percentiles,
     recall_at_k,
+    rerank_sessions_voyage,
     rrf_fuse,
     run_harness,
+    turn_ndcg_at_k,
+    turn_recall_at_k,
 )
 
 _SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "lcm_longmemeval.py"
@@ -164,6 +169,37 @@ def test_rrf_fuse_rewards_agreement_across_arms():
     # s1 (ranks 1 and 2) and s3 (ranks 3 and 1) outrank single-arm-only items.
     assert set(fused[:2]) == {"s1", "s3"}
     assert set(fused) == {"s1", "s2", "s3", "s9"}
+
+
+def test_turn_recall_precise_keys():
+    # Two labeled evidence turns; a ranked list of precise (session, turn) keys.
+    evidence = {("s1", 1), ("s2", 0)}
+    ranked = [("s1", 0), ("s1", 1), ("s3", 2), ("s2", 0)]
+    assert turn_recall_at_k(ranked, evidence, 1) == 0.0
+    assert turn_recall_at_k(ranked, evidence, 2) == pytest.approx(0.5)
+    assert turn_recall_at_k(ranked, evidence, 4) == pytest.approx(1.0)
+
+
+def test_turn_recall_summary_marker_covers_session_at_granularity():
+    # A (session, None) summary marker covers ALL evidence turns of its session in
+    # one item — the session-granularity credit an asterisk warns about.
+    evidence = {("s1", 3), ("s1", 7), ("s2", 0)}
+    # One summary marker for s1 at rank 1 recovers both s1 evidence turns.
+    assert turn_recall_at_k([("s1", None)], evidence, 1) == pytest.approx(2 / 3)
+    # A marker for a session with no evidence contributes nothing.
+    assert turn_recall_at_k([("s9", None)], evidence, 1) == 0.0
+    assert turn_recall_at_k([], evidence, 5) == 0.0
+    assert turn_recall_at_k([("s1", 3)], set(), 5) == 0.0
+
+
+def test_turn_ndcg_rewards_ranking_and_credits_summary_markers():
+    evidence = {("s1", 2)}
+    # Precise relevant turn at rank 1 -> perfect NDCG.
+    assert turn_ndcg_at_k([("s1", 2), ("s4", 0)], evidence, 10) == pytest.approx(1.0)
+    # Summary marker for the evidence session counts as relevant at session grain.
+    assert turn_ndcg_at_k([("s1", None)], evidence, 10) == pytest.approx(1.0)
+    # Irrelevant-only ranking scores zero.
+    assert turn_ndcg_at_k([("s7", 0), ("s8", 1)], evidence, 10) == 0.0
 
 
 def test_deterministic_summary_is_stable_and_content_bearing():
@@ -314,8 +350,10 @@ def test_evaluate_question_chunk_arm_recovers_evidence(tmp_path):
             {"role": "assistant", "content": "yes it certainly is a pleasant afternoon outside"},
         ],
         evidence_id: [
-            {"role": "user", "content": long_evidence},
-            {"role": "assistant", "content": "noted, I will keep that safe", "has_answer": True},
+            # The passcode cue and the has_answer marker are the same (user) turn,
+            # so the chunk arm's retrieved turn matches the labeled evidence turn.
+            {"role": "user", "content": long_evidence, "has_answer": True},
+            {"role": "assistant", "content": "noted, I will keep that safe"},
         ],
     }
     question = parse_question(
@@ -338,6 +376,79 @@ def test_evaluate_question_chunk_arm_recovers_evidence(tmp_path):
     assert scored["hybrid_rrf3"]["recall@10"] == pytest.approx(1.0)
     for arm in ARMS:
         assert scored[arm]["latency_ms"] >= 0.0
+        # Every arm now reports a turn-level block alongside the session metrics.
+        turn = scored[arm]["turn"]
+        assert set(turn) >= {"recall@1", "recall@5", "recall@10", "ndcg@10", "session_granularity"}
+    # The chunk arm localizes to the exact evidence turn (store_id -> turn), so its
+    # turn-level recall is exact, not session-granularity.
+    assert scored["chunk_vectors"]["turn"]["recall@1"] == pytest.approx(1.0)
+    assert scored["chunk_vectors"]["turn"]["session_granularity"] is False
+    # Summary-based arms carry the session-granularity asterisk.
+    assert scored["summary_vectors"]["turn"]["session_granularity"] is True
+    assert scored["hybrid_rerank"]["rerank_mode"] == RERANK_MODE_PLACEHOLDER
+
+
+class _FakeReranker:
+    """Records the rerank call and returns a fixed reordering, or raises."""
+
+    def __init__(self, order=None, raise_error=False):
+        self._order = order
+        self._raise = raise_error
+        self.calls = 0
+
+    def rerank(self, query, documents, *, top_k=None, timeout):
+        self.calls += 1
+        if self._raise:
+            raise RuntimeError("provider down")
+        order = self._order if self._order is not None else list(range(len(documents)))
+        return [(index, 1.0 - position * 0.1) for position, index in enumerate(order)]
+
+
+def test_rerank_sessions_voyage_reorders_window_and_appends_tail():
+    reranker = _FakeReranker(order=[2, 0, 1])
+    sessions = ["a", "b", "c", "d", "e"]
+    summaries = {s: f"summary {s}" for s in sessions}
+    out = rerank_sessions_voyage(reranker, "q", sessions, summaries, window=3)
+    assert reranker.calls == 1
+    # Window [a,b,c] reordered to [c,a,b]; tail [d,e] preserved.
+    assert out == ["c", "a", "b", "d", "e"]
+
+
+def test_rerank_sessions_voyage_signals_fallback_on_error_and_empty():
+    reranker = _FakeReranker(raise_error=True)
+    assert rerank_sessions_voyage(reranker, "q", ["a", "b"], {"a": "x", "b": "y"}) is None
+    assert rerank_sessions_voyage(reranker, "q", [], {}) is None
+
+
+class _RerankingEmbedder(_KeyedEmbedder):
+    """A voyage-shaped embedder that also exposes a fake ``rerank``."""
+
+    def rerank(self, query, documents, *, top_k=None, timeout):
+        # Identity order is enough: we only assert the mode label, not the ordering.
+        return [(index, 1.0) for index in range(len(documents))]
+
+
+def test_evaluate_question_real_rerank_path_labels_voyage_mode(tmp_path):
+    # use_rerank + provider voyage + a reranker-bearing embedder takes the real
+    # cross-encoder path and labels it, instead of the placeholder.
+    evidence_id = "s-evidence"
+    sessions = {
+        "s-noise": [{"role": "user", "content": "chatter about the weather"}],
+        evidence_id: [
+            {"role": "user", "content": "my passcode phrase", "has_answer": True},
+        ],
+    }
+    question = parse_question(
+        _make_raw(
+            "q-rr", "single-session-user", sessions=sessions,
+            answer_session_ids=[evidence_id], question="what is my passcode phrase",
+        )
+    )
+    scored = evaluate_question(
+        question, _RerankingEmbedder(), provider_name="voyage",
+        tmp_dir=tmp_path, embeddings_enabled=True, use_rerank=True,
+    )
+    assert scored["hybrid_rerank"]["rerank_mode"] == RERANK_MODE_VOYAGE
 
 
 def test_stub_run_end_to_end_produces_report_and_fts_recovers_evidence(tmp_path):
@@ -356,3 +467,30 @@ def test_stub_run_end_to_end_produces_report_and_fts_recovers_evidence(tmp_path)
     assert report["arms"]["fts"]["recall@10"] == pytest.approx(1.0)
     for arm in ARMS:
         assert report["arms"][arm]["latency_ms"]["p50"] >= 0.0
+        assert "turn" in report["arms"][arm]
+    # F7 provenance is recorded and the placeholder rerank is labeled.
+    assert report["rerank"]["mode"] == RERANK_MODE_PLACEHOLDER
+    assert report["ingest"]["reuse_db_template"] is True
+    assert "per_question_ms" in report["ingest"]
+
+
+def test_db_template_reuse_matches_from_scratch_bootstrap(tmp_path):
+    # Cloning a pre-migrated template must not change any scored output vs a
+    # from-scratch bootstrap per question (F7 is a speed optimization only).
+    dataset = _synthetic_dataset()
+    (tmp_path / "templated").mkdir()
+    templated = run_harness(
+        dataset, provider_name="stub", model="",
+        tmp_dir=tmp_path / "templated", reuse_db_template=True,
+    )
+    (tmp_path / "scratch").mkdir()
+    from_scratch = run_harness(
+        dataset, provider_name="stub", model="",
+        tmp_dir=tmp_path / "scratch", reuse_db_template=False,
+    )
+    for arm in ARMS:
+        for metric in ("recall@1", "recall@5", "recall@10", "ndcg@10"):
+            assert templated["arms"][arm][metric] == from_scratch["arms"][arm][metric]
+            assert templated["arms"][arm]["turn"][metric] == from_scratch["arms"][arm]["turn"][metric]
+    assert templated["ingest"]["reuse_db_template"] is True
+    assert from_scratch["ingest"]["reuse_db_template"] is False

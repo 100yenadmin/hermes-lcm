@@ -25,6 +25,7 @@ import importlib.util
 import json
 import math
 import re
+import shutil
 import sys
 import time
 from dataclasses import dataclass, field
@@ -38,6 +39,12 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 BENCHMARK_VERSION = 1
 SCHEMA_VERSION = 1
 RRF_K = 60
+
+# F7: embed a question's session summaries in one batched ``embed_documents`` call
+# instead of one call per session. Sub-batching only guards against a pathologically
+# large haystack tripping the provider's per-call deadline; for a typical LongMemEval
+# question (tens of sessions) this collapses to the single call the F7 item asks for.
+EMBED_BATCH_SIZE = 64
 
 # Canonical LongMemEval dataset coordinates. The revision is PINNED so a run is
 # reproducible: `longmemeval_s` has been byte-stable since it was introduced;
@@ -142,7 +149,7 @@ def _fastembed_cache_dir() -> str | None:
     return override or None
 
 
-def resolve_harness_provider(provider: str, model: str, *, timeout: float = 120.0):
+def resolve_harness_provider(provider: str, model: str, *, timeout: float = 300.0):
     """Return a WARMED embedder for ``provider``. ``stub`` stays fully offline.
 
     Non-stub providers are warmed up once here so ``.dim`` is populated (FastEmbed
@@ -304,6 +311,75 @@ def ndcg_at_k(retrieved: Sequence[str], relevant: Iterable[str], k: int) -> floa
     return dcg / idcg
 
 
+# Turn-level relevance is coverage-based: each retrieved item covers a
+# ``(session, turn_index)`` range, and a hit is an item whose range intersects the
+# labeled evidence turns. Precise items (raw-message FTS rows, raw chunks) cover a
+# single turn ``(session, index)``; a summary item cannot localize a turn, so it is
+# a session-granularity marker ``(session, None)`` that covers *every* evidence turn
+# of its session at once. Callers surface that coarseness with an asterisk in output.
+TurnKey = tuple[str, "int | None"]
+
+
+def _evidence_turns_by_session(evidence_turns: Iterable[TurnKey]) -> dict[str, set[TurnKey]]:
+    by_session: dict[str, set[TurnKey]] = {}
+    for key in evidence_turns:
+        by_session.setdefault(key[0], set()).add(key)
+    return by_session
+
+
+def turn_recall_at_k(turn_keys: Sequence[TurnKey], relevant: Iterable[TurnKey], k: int) -> float:
+    """Coverage recall@k over turn keys.
+
+    Top-k is a budget of ranked *items*. A precise ``(session, index)`` item covers
+    itself; a ``(session, None)`` summary marker covers all of that session's
+    evidence turns (session granularity). Returns covered-evidence / total-evidence.
+    """
+    relevant_set = set(relevant)
+    if not relevant_set:
+        return 0.0
+    by_session = _evidence_turns_by_session(relevant_set)
+    covered: set[TurnKey] = set()
+    seen = 0
+    for key in dict.fromkeys(turn_keys):
+        if seen >= k:
+            break
+        seen += 1
+        session, index = key
+        if index is None:
+            covered |= by_session.get(session, set())
+        elif key in relevant_set:
+            covered.add(key)
+    return len(covered) / len(relevant_set)
+
+
+def turn_ndcg_at_k(turn_keys: Sequence[TurnKey], relevant: Iterable[TurnKey], k: int) -> float:
+    """Binary-relevance NDCG@k over a deduplicated ranked list of turn keys.
+
+    An item is relevant if it is a labeled evidence turn, or a summary marker for a
+    session that contains any evidence turn. IDCG assumes the relevant items in the
+    list are ranked first.
+    """
+    relevant_set = set(relevant)
+    if not relevant_set:
+        return 0.0
+    sessions_with_evidence = {key[0] for key in relevant_set}
+
+    def is_relevant(key: TurnKey) -> bool:
+        session, index = key
+        if index is None:
+            return session in sessions_with_evidence
+        return key in relevant_set
+
+    deduped = list(dict.fromkeys(turn_keys))
+    top_k = deduped[:k]
+    dcg = sum(1.0 / math.log2(rank + 1) for rank, key in enumerate(top_k, start=1) if is_relevant(key))
+    ideal_hits = min(sum(1 for key in deduped if is_relevant(key)), k)
+    idcg = sum(1.0 / math.log2(rank + 1) for rank in range(1, ideal_hits + 1))
+    if idcg == 0.0:
+        return 0.0
+    return dcg / idcg
+
+
 def percentiles(values: Sequence[float], points: Sequence[int] = (50, 90, 99)) -> dict[str, float]:
     """Nearest-rank percentiles for latency reporting."""
     ordered = sorted(values)
@@ -369,13 +445,28 @@ def build_fts_query(question: str) -> str:
     return " OR ".join(dict.fromkeys(barewords))
 
 
-def fts_sessions(store, query: str, fetch: int) -> list[str]:
-    """Rank evidence sessions by the raw-message FTS arm (``store.search``)."""
+def fts_hits(store, query: str, fetch: int) -> list[tuple[str, int]]:
+    """Raw FTS arm: ranked ``(session_id, store_id)`` message hits (no dedup).
+
+    The ``store_id`` localizes each hit to a single turn for turn-level scoring;
+    :func:`fts_sessions` collapses it to the session ranking.
+    """
     match_query = build_fts_query(query)
     if not match_query:
         return []
     rows = store.search(match_query, session_id=None, limit=fetch)
-    return _dedup_sessions(str(row.get("session_id", "")) for row in rows)
+    hits: list[tuple[str, int]] = []
+    for row in rows:
+        store_id = row.get("store_id")
+        if store_id is None:
+            continue
+        hits.append((str(row.get("session_id", "")), int(store_id)))
+    return hits
+
+
+def fts_sessions(store, query: str, fetch: int) -> list[str]:
+    """Rank evidence sessions by the raw-message FTS arm (``store.search``)."""
+    return _dedup_sessions(session for session, _ in fts_hits(store, query, fetch))
 
 
 def vector_sessions(vector_store, dag, query_vec, model, provider, fetch: int) -> list[str]:
@@ -397,6 +488,21 @@ def _chunk_store_id(chunk_id) -> int | None:
         return None
 
 
+def chunk_hits(vector_store, query_vec, model, provider, fetch: int) -> list:
+    """Raw chunk arm: the ranked ``knn_chunks`` result (``store_id:chunk_index`` ids)."""
+    return list(vector_store.knn_chunks(query_vec, k=fetch, model=model, provider=provider))
+
+
+def _map_chunk_sessions(result, store_id_to_session: dict[int, str]) -> list[str]:
+    sessions: list[str] = []
+    for chunk_id, _score, _kind in result:
+        store_id = _chunk_store_id(chunk_id)
+        session_id = None if store_id is None else store_id_to_session.get(store_id)
+        if session_id is not None:
+            sessions.append(str(session_id))
+    return _dedup_sessions(sessions)
+
+
 def chunk_sessions(
     vector_store, query_vec, model, provider, fetch: int,
     store_id_to_session: dict[int, str],
@@ -406,14 +512,49 @@ def chunk_sessions(
     Each chunk id is ``store_id:chunk_index``; its store_id maps back to the
     session that owns the source message, so a chunk hit votes for its session.
     """
-    result = vector_store.knn_chunks(query_vec, k=fetch, model=model, provider=provider)
-    sessions: list[str] = []
+    result = chunk_hits(vector_store, query_vec, model, provider, fetch)
+    return _map_chunk_sessions(result, store_id_to_session)
+
+
+# --------------------------------------------------------------------------- #
+# Turn-key projections (parallel to the session rankings above).
+# --------------------------------------------------------------------------- #
+
+
+def fts_turn_keys(hits: Sequence[tuple[str, int]], store_id_to_turn: dict[int, TurnKey]) -> list[TurnKey]:
+    """Project raw FTS message hits to precise ``(session, turn_index)`` keys."""
+    keys: list[TurnKey] = []
+    for _session, store_id in hits:
+        key = store_id_to_turn.get(int(store_id))
+        if key is not None:
+            keys.append(key)
+    return keys
+
+
+def chunk_turn_keys(result, store_id_to_turn: dict[int, TurnKey]) -> list[TurnKey]:
+    """Project raw chunk hits to precise ``(session, turn_index)`` keys via store_id."""
+    keys: list[TurnKey] = []
     for chunk_id, _score, _kind in result:
         store_id = _chunk_store_id(chunk_id)
-        session_id = None if store_id is None else store_id_to_session.get(store_id)
-        if session_id is not None:
-            sessions.append(str(session_id))
-    return _dedup_sessions(sessions)
+        key = None if store_id is None else store_id_to_turn.get(store_id)
+        if key is not None:
+            keys.append(key)
+    return keys
+
+
+def summary_turn_keys(session_ranked: Sequence[str]) -> list[TurnKey]:
+    """A summary covers a whole session, so it localizes only to ``(session, None)``."""
+    return [(session, None) for session in session_ranked]
+
+
+def reorder_turn_keys_by_session(turn_keys: Sequence[TurnKey], session_order: Sequence[str]) -> list[TurnKey]:
+    """Stably reorder turn keys to follow a reranked session order.
+
+    Keeps turn-level output of the rerank arm consistent with its session ranking
+    (whether the session ranking came from the real reranker or the placeholder).
+    """
+    rank = {session: index for index, session in enumerate(session_order)}
+    return sorted(turn_keys, key=lambda key: rank.get(key[0], len(rank)))
 
 
 def rrf_fuse(*ranked_lists: Sequence[str]) -> list[str]:
@@ -448,6 +589,48 @@ def rerank_by_cosine(
     return sorted(sessions, key=lambda sid: (-score(sid), sid))
 
 
+# The real rerank arm reranks a bounded candidate window (top fused sessions) in a
+# single cross-encoder call under an absolute per-question budget; the rest of the
+# fused ranking is appended unchanged. These bound live-provider cost/latency.
+RERANK_CANDIDATE_WINDOW = 20
+RERANK_TIMEOUT_S = 10.0
+RERANK_MODE_PLACEHOLDER = "placeholder-cosine"
+RERANK_MODE_VOYAGE = "voyage:rerank-2.5-lite"
+
+
+def rerank_sessions_voyage(
+    reranker,
+    query: str,
+    sessions: Sequence[str],
+    session_summaries: dict[str, str],
+    *,
+    window: int = RERANK_CANDIDATE_WINDOW,
+    timeout: float = RERANK_TIMEOUT_S,
+) -> list[str] | None:
+    """Rerank the top-``window`` fused sessions with a real cross-encoder.
+
+    Uses ``VoyageProvider.rerank`` (rerank-2.5-lite) over each candidate session's
+    deterministic summary in one API call. Returns the reordered candidate window
+    followed by the untouched fused tail, or ``None`` to signal the caller should
+    fall back to the deterministic placeholder (empty window or any provider error).
+    """
+    candidates = list(sessions[:window])
+    if not candidates:
+        return None
+    documents = [session_summaries.get(session, "") for session in candidates]
+    try:
+        ranked = reranker.rerank(query, documents, top_k=len(documents), timeout=timeout)
+    except Exception:
+        return None
+    reordered = [candidates[index] for index, _score in ranked if 0 <= index < len(candidates)]
+    seen = set(reordered)
+    for session in sessions:
+        if session not in seen:
+            reordered.append(session)
+            seen.add(session)
+    return reordered
+
+
 # --------------------------------------------------------------------------- #
 # Per-question ingest + evaluation.
 # --------------------------------------------------------------------------- #
@@ -458,10 +641,35 @@ class ArmSamples:
     recalls: dict[int, list[float]] = field(default_factory=lambda: {1: [], 5: [], 10: []})
     ndcg10: list[float] = field(default_factory=list)
     latency_ms: list[float] = field(default_factory=list)
+    turn_recalls: dict[int, list[float]] = field(default_factory=lambda: {1: [], 5: [], 10: []})
+    turn_ndcg10: list[float] = field(default_factory=list)
+    # True when the arm's turn ranking includes summary (session-granularity) items,
+    # so its turn-level numbers carry the coarse-localization asterisk.
+    session_granularity: bool = False
 
 
 def _new_arm_samples() -> dict[str, ArmSamples]:
     return {arm: ArmSamples() for arm in ARMS}
+
+
+def _bootstrap_db_template(template_path: Path, config) -> None:
+    """Create one fully-migrated empty LCM DB to clone per question.
+
+    Opening ``MessageStore``/``SummaryDAG``/``VectorStore`` runs the schema
+    bootstrap + FTS/migration DDL once; each subsequent question copies this file
+    (idempotent re-open, no migrations) instead of paying that cost 500x.
+    """
+    _ensure_hermes_lcm_package()
+    from hermes_lcm.dag import SummaryDAG
+    from hermes_lcm.store import MessageStore
+    from hermes_lcm.vector_store import VectorStore
+
+    store = MessageStore(str(template_path), ingest_protection_config=config)
+    dag = SummaryDAG(str(template_path))
+    vector_store = VectorStore(str(template_path), config=config)
+    vector_store.close()
+    dag.close()
+    store.close()
 
 
 def evaluate_question(
@@ -472,10 +680,15 @@ def evaluate_question(
     tmp_dir: Path,
     embeddings_enabled: bool,
     top_k: int = 10,
-) -> dict[str, dict[str, float]]:
+    use_rerank: bool = False,
+    db_template: Path | None = None,
+) -> dict[str, Any]:
     """Ingest one question into a fresh store and score every retrieval arm.
 
-    Returns ``{arm: {"recall@1", "recall@5", "recall@10", "ndcg@10", "latency_ms"}}``.
+    Each arm reports session-level ``recall@1/5/10`` + ``ndcg@10`` + ``latency_ms``
+    and a nested ``turn`` block with the same recall/NDCG at turn granularity plus a
+    ``session_granularity`` flag. ``ingest_ms`` (per-question ingest wall time) and,
+    for ``hybrid_rerank``, ``rerank_mode`` ride alongside for aggregation.
     """
     _ensure_hermes_lcm_package()
     from hermes_lcm.chunking import iter_message_chunks
@@ -493,13 +706,25 @@ def evaluate_question(
         embedding_provider=provider_name,
         embedding_model=model,
     )
+    ingest_start = time.perf_counter()
+    # F7: clone a pre-migrated template instead of re-running schema bootstrap.
+    if db_template is not None and db_template.is_file():
+        shutil.copyfile(db_template, db_path)
     store = MessageStore(str(db_path), ingest_protection_config=config)
     dag = SummaryDAG(str(db_path))
     vector_store = VectorStore(str(db_path), config=config)
     session_vectors: dict[str, list[float]] = {}
-    # store_id -> owning session, so a chunk KNN hit votes for its session.
+    session_summaries: dict[str, str] = {}
+    # store_id -> owning session (chunk vote) and -> (session, turn) (turn scoring).
     store_id_to_session: dict[int, str] = {}
+    store_id_to_turn: dict[int, TurnKey] = {}
     chunk_identity = None
+    # F7: collect every session summary, then embed the whole corpus in one batched
+    # ``embed_documents`` call instead of one call per session. (Raw chunks stay
+    # per-item: for local ONNX providers, batching pads every text to the batch's
+    # longest, so per-chunk embedding is actually faster; the summary-call collapse
+    # is the win that matters for network/live providers.)
+    summary_specs: list[tuple[str, int, str]] = []  # (session_id, node_id, summary_text)
     try:
         if embeddings_enabled:
             vector_store.register_profile(model, provider_name, dim)
@@ -510,7 +735,9 @@ def evaluate_question(
                 provider_name, model, "", dim, "float32", "little", "chunk"
             )
 
-        for session_id, session in zip(question.haystack_session_ids, question.haystack_sessions):
+        for order, (session_id, session) in enumerate(
+            zip(question.haystack_session_ids, question.haystack_sessions), start=1
+        ):
             messages = [
                 {
                     "role": str(turn.get("role", "user")) if isinstance(turn, dict) else "user",
@@ -522,6 +749,10 @@ def evaluate_question(
                 store_ids = store.append_batch(
                     session_id, messages, source="benchmark", conversation_id=session_id
                 )
+                # Message i is turn index i (1:1 with the haystack turns), so its
+                # store_id resolves to (session, turn) for turn-level scoring.
+                for turn_index, store_id in enumerate(store_ids):
+                    store_id_to_turn[int(store_id)] = (session_id, turn_index)
                 if embeddings_enabled and chunk_identity is not None:
                     for store_id in store_ids:
                         store_id_to_session[int(store_id)] = session_id
@@ -538,6 +769,7 @@ def evaluate_question(
                             token_estimate=chunk.token_estimate, identity=chunk_identity,
                         )
             summary_text = deterministic_session_summary(session)
+            session_summaries[session_id] = summary_text
             node_id = dag.add_node(
                 SummaryNode(
                     session_id=session_id,
@@ -546,69 +778,125 @@ def evaluate_question(
                     token_count=len(summary_text.split()),
                     source_token_count=sum(len(m["content"].split()) for m in messages),
                     source_type="messages",
-                    created_at=float(len(session_vectors) + 1),
+                    created_at=float(order),
                 )
             )
-            if embeddings_enabled:
-                vector = provider_embedder.embed_documents([summary_text])[0]
+            summary_specs.append((session_id, node_id, summary_text))
+
+        if embeddings_enabled and summary_specs:
+            summary_vectors = _embed_in_batches(
+                provider_embedder, [text for _session, _node, text in summary_specs]
+            )
+            for (session_id, node_id, _text), vector in zip(summary_specs, summary_vectors):
                 vector_store.record_embedding(
                     str(node_id), "summary", model, vector, identity=identity
                 )
                 session_vectors[session_id] = _unit(list(vector))
+        ingest_ms = (time.perf_counter() - ingest_start) * 1000.0
 
         relevant = evidence_sessions(question)
+        relevant_turns = evidence_turns(question)
         query_vec = provider_embedder.embed_query(question.question) if embeddings_enabled else None
         fetch = max(top_k * 5, 50)
 
-        fts_ranked = _timed(lambda: fts_sessions(store, question.question, fetch))
+        # Session rankings + parallel turn-key projections for every arm.
+        fts_raw, fts_ms = _timed(lambda: fts_hits(store, question.question, fetch))
+        fts_ranked = _dedup_sessions(session for session, _ in fts_raw)
+        fts_turns = fts_turn_keys(fts_raw, store_id_to_turn)
+
         if embeddings_enabled:
-            vector_ranked = _timed(
+            vector_ranked, vector_ms = _timed(
                 lambda: vector_sessions(vector_store, dag, query_vec, model, provider_name, fetch)
             )
         else:
-            vector_ranked = ([], 0.0)
+            vector_ranked, vector_ms = [], 0.0
+        summary_turns = summary_turn_keys(vector_ranked)
 
-        hybrid_ranked = _timed(lambda: rrf_fuse(fts_ranked[0], vector_ranked[0]))
-        rerank_ranked = _timed(
-            lambda: rerank_by_cosine(hybrid_ranked[0], query_vec, session_vectors)
-            if embeddings_enabled
-            else list(hybrid_ranked[0])
-        )
+        hybrid_ranked, hybrid_ms = _timed(lambda: rrf_fuse(fts_ranked, vector_ranked))
+        hybrid_turns = rrf_fuse(fts_turns, summary_turns)
+
+        rerank_mode = RERANK_MODE_PLACEHOLDER
+        rerank_start = time.perf_counter()
+        rerank_ranked: list[str]
+        if (
+            use_rerank
+            and embeddings_enabled
+            and provider_name == "voyage"
+            and hasattr(provider_embedder, "rerank")
+        ):
+            real = rerank_sessions_voyage(
+                provider_embedder, question.question, hybrid_ranked, session_summaries
+            )
+            if real is not None:
+                rerank_ranked = real
+                rerank_mode = RERANK_MODE_VOYAGE
+            else:
+                rerank_ranked = rerank_by_cosine(hybrid_ranked, query_vec, session_vectors)
+        elif embeddings_enabled:
+            rerank_ranked = rerank_by_cosine(hybrid_ranked, query_vec, session_vectors)
+        else:
+            rerank_ranked = list(hybrid_ranked)
+        rerank_ms = (time.perf_counter() - rerank_start) * 1000.0
+        rerank_turns = reorder_turn_keys_by_session(hybrid_turns, rerank_ranked)
+
         if embeddings_enabled:
-            chunk_ranked = _timed(
-                lambda: chunk_sessions(
-                    vector_store, query_vec, model, provider_name, fetch,
-                    store_id_to_session,
-                )
+            chunk_raw, chunk_ms = _timed(
+                lambda: chunk_hits(vector_store, query_vec, model, provider_name, fetch)
             )
         else:
-            chunk_ranked = ([], 0.0)
-        hybrid_rrf3_ranked = _timed(
-            lambda: rrf_fuse(fts_ranked[0], vector_ranked[0], chunk_ranked[0])
-        )
+            chunk_raw, chunk_ms = [], 0.0
+        chunk_ranked = _map_chunk_sessions(chunk_raw, store_id_to_session)
+        chunk_turns = chunk_turn_keys(chunk_raw, store_id_to_turn)
 
-        ranked_by_arm = {
-            "fts": fts_ranked,
-            "summary_vectors": vector_ranked,
-            "hybrid_rrf": hybrid_ranked,
-            "hybrid_rerank": rerank_ranked,
-            "chunk_vectors": chunk_ranked,
-            "hybrid_rrf3": hybrid_rrf3_ranked,
+        hybrid_rrf3_ranked, rrf3_ms = _timed(
+            lambda: rrf_fuse(fts_ranked, vector_ranked, chunk_ranked)
+        )
+        rrf3_turns = rrf_fuse(fts_turns, summary_turns, chunk_turns)
+
+        # arm -> (session ranking, latency, turn keys, session_granularity asterisk).
+        ranked_by_arm: dict[str, tuple[list[str], float, list[TurnKey], bool]] = {
+            "fts": (fts_ranked, fts_ms, fts_turns, False),
+            "summary_vectors": (vector_ranked, vector_ms, summary_turns, True),
+            "hybrid_rrf": (hybrid_ranked, hybrid_ms, hybrid_turns, True),
+            "hybrid_rerank": (rerank_ranked, rerank_ms, rerank_turns, True),
+            "chunk_vectors": (chunk_ranked, chunk_ms, chunk_turns, False),
+            "hybrid_rrf3": (hybrid_rrf3_ranked, rrf3_ms, rrf3_turns, True),
         }
-        scored: dict[str, dict[str, float]] = {}
-        for arm, (ranked, elapsed_ms) in ranked_by_arm.items():
+        scored: dict[str, Any] = {"ingest_ms": ingest_ms}
+        for arm, (ranked, elapsed_ms, turn_keys, session_granularity) in ranked_by_arm.items():
             scored[arm] = {
                 "recall@1": recall_at_k(ranked, relevant, 1),
                 "recall@5": recall_at_k(ranked, relevant, 5),
                 "recall@10": recall_at_k(ranked, relevant, 10),
                 "ndcg@10": ndcg_at_k(ranked, relevant, 10),
                 "latency_ms": elapsed_ms,
+                "turn": {
+                    "recall@1": turn_recall_at_k(turn_keys, relevant_turns, 1),
+                    "recall@5": turn_recall_at_k(turn_keys, relevant_turns, 5),
+                    "recall@10": turn_recall_at_k(turn_keys, relevant_turns, 10),
+                    "ndcg@10": turn_ndcg_at_k(turn_keys, relevant_turns, 10),
+                    "session_granularity": session_granularity,
+                },
             }
+        scored["hybrid_rerank"]["rerank_mode"] = rerank_mode
         return scored
     finally:
         vector_store.close()
         dag.close()
         store.close()
+
+
+def _embed_in_batches(embedder, texts: Sequence[str], batch_size: int = EMBED_BATCH_SIZE) -> list:
+    """Embed ``texts`` in ``batch_size`` sub-batches, concatenating the results.
+
+    One ``embed_documents`` call per sub-batch (F7 amortization) while each call
+    stays inside the provider's per-call deadline. Per-text vectors are identical to
+    embedding one text at a time for the deterministic/independent providers used here.
+    """
+    vectors: list = []
+    for start in range(0, len(texts), max(1, batch_size)):
+        vectors.extend(embedder.embed_documents(list(texts[start:start + batch_size])))
+    return vectors
 
 
 def _timed(fn):
@@ -637,16 +925,36 @@ def run_harness(
     model: str,
     tmp_dir: Path,
     embeddings_enabled: bool | None = None,
+    use_rerank: bool = False,
+    reuse_db_template: bool = True,
 ) -> dict[str, Any]:
     """Run every arm over every question and return an aggregate-only report."""
     if embeddings_enabled is None:
         embeddings_enabled = provider_name != "none"
     embedder = resolve_harness_provider(provider_name, model)
 
+    db_template: Path | None = None
+    if reuse_db_template:
+        _ensure_hermes_lcm_package()
+        from hermes_lcm.config import LCMConfig
+
+        db_template = Path(tmp_dir) / "_template.db"
+        _bootstrap_db_template(
+            db_template,
+            LCMConfig(
+                database_path=str(db_template),
+                embeddings_enabled=embeddings_enabled,
+                embedding_provider=provider_name,
+                embedding_model=embedder.model_id,
+            ),
+        )
+
     by_category: dict[str, dict[str, ArmSamples]] = {}
     overall = _new_arm_samples()
     scored_count = 0
     abstention_count = 0
+    ingest_samples: list[float] = []
+    rerank_mode = RERANK_MODE_VOYAGE if use_rerank and provider_name == "voyage" else RERANK_MODE_PLACEHOLDER
 
     for question in questions:
         if question.is_abstention:
@@ -658,18 +966,30 @@ def run_harness(
             provider_name=provider_name,
             tmp_dir=tmp_dir,
             embeddings_enabled=embeddings_enabled,
+            use_rerank=use_rerank,
+            db_template=db_template,
         )
         scored_count += 1
+        ingest_samples.append(scored.pop("ingest_ms", 0.0))
+        rerank_mode = scored["hybrid_rerank"].pop("rerank_mode", rerank_mode)
         category = question.category
         bucket = by_category.setdefault(category, _new_arm_samples())
         for arm, metrics in scored.items():
+            turn = metrics["turn"]
             for k in (1, 5, 10):
                 bucket[arm].recalls[k].append(metrics[f"recall@{k}"])
                 overall[arm].recalls[k].append(metrics[f"recall@{k}"])
+                bucket[arm].turn_recalls[k].append(turn[f"recall@{k}"])
+                overall[arm].turn_recalls[k].append(turn[f"recall@{k}"])
             bucket[arm].ndcg10.append(metrics["ndcg@10"])
             overall[arm].ndcg10.append(metrics["ndcg@10"])
+            bucket[arm].turn_ndcg10.append(turn["ndcg@10"])
+            overall[arm].turn_ndcg10.append(turn["ndcg@10"])
             bucket[arm].latency_ms.append(metrics["latency_ms"])
             overall[arm].latency_ms.append(metrics["latency_ms"])
+            if turn["session_granularity"]:
+                bucket[arm].session_granularity = True
+                overall[arm].session_granularity = True
 
     return {
         "schema_version": SCHEMA_VERSION,
@@ -688,6 +1008,16 @@ def run_harness(
         "question_count": len(questions),
         "scored_count": scored_count,
         "abstention_excluded": abstention_count,
+        "rerank": {
+            "mode": rerank_mode,
+            "candidate_window": RERANK_CANDIDATE_WINDOW,
+            "timeout_s": RERANK_TIMEOUT_S,
+        },
+        "ingest": {
+            "batched_embeddings": embeddings_enabled,
+            "reuse_db_template": reuse_db_template,
+            "per_question_ms": percentiles(ingest_samples),
+        },
         "arms": {
             arm: _arm_report(overall[arm]) for arm in ARMS
         },
@@ -706,26 +1036,54 @@ def _arm_report(samples: ArmSamples) -> dict[str, Any]:
         "ndcg@10": _mean(samples.ndcg10),
         "n": len(samples.ndcg10),
         "latency_ms": percentiles(samples.latency_ms),
+        "turn": {
+            "recall@1": _mean(samples.turn_recalls[1]),
+            "recall@5": _mean(samples.turn_recalls[5]),
+            "recall@10": _mean(samples.turn_recalls[10]),
+            "ndcg@10": _mean(samples.turn_ndcg10),
+            "session_granularity": samples.session_granularity,
+        },
     }
 
 
 def render_markdown(report: dict[str, Any]) -> str:
-    """Aggregate-only markdown table of overall per-arm recall/NDCG."""
+    """Aggregate-only markdown table of overall per-arm session + turn recall/NDCG.
+
+    ``*`` on an arm name marks turn-level numbers that are session-granularity: the
+    arm retrieves summaries, which localize only to a whole session, so a hit credits
+    every evidence turn of that session at once.
+    """
+    rerank = report.get("rerank", {})
+    ingest = report.get("ingest", {})
+    per_q = ingest.get("per_question_ms", {})
     lines = [
         f"# LongMemEval_S retrieval — provider={report['provider']} "
         f"model={report['model'] or 'n/a'}",
         "",
         f"scored={report['scored_count']} abstention_excluded={report['abstention_excluded']} "
         f"dataset={report['dataset']['repo_id']}@{report['dataset']['revision'][:7]}",
+        f"rerank={rerank.get('mode', 'n/a')} (window={rerank.get('candidate_window', 'n/a')}) "
+        f"ingest_p50={per_q.get('p50', 0.0):.1f}ms "
+        f"batched_embeddings={ingest.get('batched_embeddings', False)} "
+        f"reuse_db_template={ingest.get('reuse_db_template', False)}",
         "",
-        "| Arm | R@1 | R@5 | R@10 | NDCG@10 | p50 ms | p90 ms |",
-        "|---|---:|---:|---:|---:|---:|---:|",
+        "| Arm | R@1 | R@5 | R@10 | NDCG@10 | tR@1 | tR@5 | tR@10 | tNDCG@10 | p50 ms | p90 ms |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for arm in ARMS:
         row = report["arms"][arm]
+        turn = row["turn"]
+        label = f"{arm}*" if turn.get("session_granularity") else arm
         lines.append(
-            f"| {arm} | {row['recall@1']:.3f} | {row['recall@5']:.3f} | "
+            f"| {label} | {row['recall@1']:.3f} | {row['recall@5']:.3f} | "
             f"{row['recall@10']:.3f} | {row['ndcg@10']:.3f} | "
+            f"{turn['recall@1']:.3f} | {turn['recall@5']:.3f} | "
+            f"{turn['recall@10']:.3f} | {turn['ndcg@10']:.3f} | "
             f"{row['latency_ms']['p50']:.1f} | {row['latency_ms']['p90']:.1f} |"
         )
+    lines.append("")
+    lines.append(
+        "`t*` columns are turn-level. `*` = session-granularity turn scoring "
+        "(summary arms cannot localize to a turn)."
+    )
     return "\n".join(lines)
