@@ -1036,7 +1036,7 @@ def test_lcm_help_on_unknown_subcommand(engine):
 def test_lcm_doctor_clean_rejects_unknown_extra_args(engine):
     result = handle_lcm_command("doctor clean foo", engine)
 
-    assert "currently supports `clean`, `clean apply`, `clean lifecycle`, `clean lifecycle apply`, `repair`, `repair apply`, `source`, `source apply`, and `retention`" in result
+    assert "currently supports `clean`, `clean apply`, `clean lifecycle`, `clean lifecycle apply`, `repair`, `repair apply`, `repair schema-stamp`, `repair schema-stamp apply`, `source`, `source apply`, and `retention`" in result
     assert "/lcm doctor clean apply" in result
     assert "/lcm doctor clean lifecycle" in result
     assert "/lcm doctor clean lifecycle apply" in result

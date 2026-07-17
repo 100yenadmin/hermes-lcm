@@ -1,0 +1,273 @@
+"""Tests for interim-build schema-stamp detection and guided remediation (fix #7).
+
+A database touched by an interim development build can carry a numeric
+``schema_version`` ahead of this build's ladder while its actual schema is the
+v5 shape plus named feature markers. These tests cover classification of that
+condition, the refusal-message guidance, and the explicit backup-first repair.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+from pathlib import Path
+
+import pytest
+
+from hermes_lcm import db_bootstrap
+from hermes_lcm.command import (
+    _doctor_repair_schema_stamp_apply_text,
+    _doctor_repair_schema_stamp_text,
+)
+from hermes_lcm.config import LCMConfig
+from hermes_lcm.dag import SummaryDAG
+from hermes_lcm.db_bootstrap import (
+    SchemaVersionTooNewError,
+    classify_version_mismatch,
+    remediate_interim_schema_stamp,
+)
+from hermes_lcm.engine import LCMEngine
+from hermes_lcm.rollup_store import RollupStore
+from hermes_lcm.store import MessageStore
+
+
+def _build_v5_db(path: Path, *, with_features: bool = False) -> None:
+    """Materialize a genuine v5-shaped DB (core tables + both FTS indexes)."""
+    store = MessageStore(path)
+    store.close()
+    dag = SummaryDAG(path)
+    dag.close()
+    if with_features:
+        rollups = RollupStore(path)
+        rollups.close()
+        conn = sqlite3.connect(path)
+        try:
+            db_bootstrap.ensure_embedding_tables(conn)
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def _stamp(path: Path, version: int) -> None:
+    conn = sqlite3.connect(path)
+    try:
+        db_bootstrap.set_schema_version(conn, version)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _stored_version(path: Path) -> int:
+    conn = sqlite3.connect(path)
+    try:
+        return db_bootstrap.read_existing_schema_version(conn)
+    finally:
+        conn.close()
+
+
+# --- classification --------------------------------------------------------
+
+
+def test_classify_interim_stamp_on_v5_shape(tmp_path):
+    db_path = tmp_path / "lcm.db"
+    _build_v5_db(db_path)
+    _stamp(db_path, db_bootstrap.SCHEMA_VERSION + 1)
+    conn = sqlite3.connect(db_path)
+    try:
+        assert classify_version_mismatch(conn) == db_bootstrap.VERSION_MISMATCH_INTERIM_STAMP
+    finally:
+        conn.close()
+
+
+def test_classify_interim_stamp_with_feature_marker_tables(tmp_path):
+    db_path = tmp_path / "lcm.db"
+    _build_v5_db(db_path, with_features=True)
+    _stamp(db_path, db_bootstrap.SCHEMA_VERSION + 1)
+    conn = sqlite3.connect(db_path)
+    try:
+        # temporal-rollup + embedding tables are known feature markers, so the
+        # DB is still classified as an interim stamp, not a genuinely newer DB.
+        assert classify_version_mismatch(conn) == db_bootstrap.VERSION_MISMATCH_INTERIM_STAMP
+    finally:
+        conn.close()
+
+
+def test_classify_genuinely_newer_on_unknown_table(tmp_path):
+    db_path = tmp_path / "lcm.db"
+    _build_v5_db(db_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("CREATE TABLE lcm_future_widgets (id INTEGER PRIMARY KEY)")
+        conn.commit()
+    finally:
+        conn.close()
+    _stamp(db_path, db_bootstrap.SCHEMA_VERSION + 1)
+    conn = sqlite3.connect(db_path)
+    try:
+        assert classify_version_mismatch(conn) == db_bootstrap.VERSION_MISMATCH_GENUINELY_NEWER
+    finally:
+        conn.close()
+
+
+def test_classify_genuinely_newer_on_unknown_core_column(tmp_path):
+    db_path = tmp_path / "lcm.db"
+    _build_v5_db(db_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("ALTER TABLE messages ADD COLUMN future_flag INTEGER DEFAULT 0")
+        conn.commit()
+    finally:
+        conn.close()
+    _stamp(db_path, db_bootstrap.SCHEMA_VERSION + 1)
+    conn = sqlite3.connect(db_path)
+    try:
+        assert classify_version_mismatch(conn) == db_bootstrap.VERSION_MISMATCH_GENUINELY_NEWER
+    finally:
+        conn.close()
+
+
+# --- refusal-message guidance ---------------------------------------------
+
+
+def test_refuse_message_points_at_remediation_for_interim_stamp(tmp_path):
+    db_path = tmp_path / "lcm.db"
+    _build_v5_db(db_path)
+    _stamp(db_path, db_bootstrap.SCHEMA_VERSION + 1)
+    with pytest.raises(SchemaVersionTooNewError) as excinfo:
+        MessageStore(db_path)
+    message = str(excinfo.value)
+    assert "schema-stamp" in message
+    assert "do NOT upgrade" in message
+
+
+def test_refuse_message_stays_generic_for_genuinely_newer(tmp_path):
+    db_path = tmp_path / "lcm.db"
+    _build_v5_db(db_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("CREATE TABLE lcm_future_widgets (id INTEGER PRIMARY KEY)")
+        conn.commit()
+    finally:
+        conn.close()
+    _stamp(db_path, db_bootstrap.SCHEMA_VERSION + 1)
+    with pytest.raises(SchemaVersionTooNewError) as excinfo:
+        MessageStore(db_path)
+    message = str(excinfo.value)
+    assert "restore a pre-upgrade backup" in message
+    assert "schema-stamp" not in message
+
+
+# --- remediation helper ----------------------------------------------------
+
+
+def test_remediate_dry_run_reports_without_mutating(tmp_path):
+    db_path = tmp_path / "lcm.db"
+    _build_v5_db(db_path)
+    stamped = db_bootstrap.SCHEMA_VERSION + 1
+    _stamp(db_path, stamped)
+    conn = sqlite3.connect(db_path)
+    try:
+        result = remediate_interim_schema_stamp(conn, apply=False)
+    finally:
+        conn.close()
+    assert result["status"] == "dry-run"
+    assert result["classification"] == db_bootstrap.VERSION_MISMATCH_INTERIM_STAMP
+    assert result["applied"] is False
+    assert _stored_version(db_path) == stamped
+
+
+def test_remediate_apply_resets_stamp_and_db_reopens(tmp_path):
+    db_path = tmp_path / "lcm.db"
+    _build_v5_db(db_path)
+    _stamp(db_path, db_bootstrap.SCHEMA_VERSION + 1)
+    conn = sqlite3.connect(db_path)
+    try:
+        result = remediate_interim_schema_stamp(conn, apply=True)
+    finally:
+        conn.close()
+    assert result["status"] == "ok"
+    assert result["applied"] is True
+    assert _stored_version(db_path) == db_bootstrap.SCHEMA_VERSION
+    # After the reset the store opens again without refusing.
+    store = MessageStore(db_path)
+    store.close()
+
+
+def test_remediate_refuses_genuinely_newer(tmp_path):
+    db_path = tmp_path / "lcm.db"
+    _build_v5_db(db_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("CREATE TABLE lcm_future_widgets (id INTEGER PRIMARY KEY)")
+        conn.commit()
+    finally:
+        conn.close()
+    stamped = db_bootstrap.SCHEMA_VERSION + 1
+    _stamp(db_path, stamped)
+    conn = sqlite3.connect(db_path)
+    try:
+        result = remediate_interim_schema_stamp(conn, apply=True)
+    finally:
+        conn.close()
+    assert result["status"] == "refused"
+    assert result["classification"] == db_bootstrap.VERSION_MISMATCH_GENUINELY_NEWER
+    assert result["applied"] is False
+    assert _stored_version(db_path) == stamped
+
+
+def test_remediate_noop_when_version_supported(tmp_path):
+    db_path = tmp_path / "lcm.db"
+    _build_v5_db(db_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        result = remediate_interim_schema_stamp(conn, apply=True)
+    finally:
+        conn.close()
+    assert result["status"] == "noop"
+    assert result["applied"] is False
+
+
+# --- /lcm doctor repair schema-stamp command path --------------------------
+
+
+def _healthy_engine(tmp_path: Path) -> LCMEngine:
+    config = LCMConfig(database_path=str(tmp_path / "lcm.db"))
+    return LCMEngine(config=config, hermes_home=str(tmp_path / "home"))
+
+
+def test_doctor_repair_schema_stamp_dry_run_and_apply(tmp_path):
+    engine = _healthy_engine(tmp_path)
+    db_path = Path(engine._store.db_path)
+    # Stamp the underlying file ahead of the ladder to simulate an interim build.
+    _stamp(db_path, db_bootstrap.SCHEMA_VERSION + 1)
+
+    dry = _doctor_repair_schema_stamp_text(engine)
+    assert "status: repair-needed" in dry
+    assert "classification: interim_stamp" in dry
+    assert "no schema changes were made" in dry
+    # Dry-run must not mutate the stamp.
+    assert _stored_version(db_path) == db_bootstrap.SCHEMA_VERSION + 1
+
+    applied = _doctor_repair_schema_stamp_apply_text(engine)
+    assert "status: ok" in applied
+    assert "backup_path:" in applied
+    assert f"schema_version_reset_to: {db_bootstrap.SCHEMA_VERSION}" in applied
+    assert _stored_version(db_path) == db_bootstrap.SCHEMA_VERSION
+
+
+def test_doctor_repair_schema_stamp_apply_refuses_genuinely_newer(tmp_path):
+    engine = _healthy_engine(tmp_path)
+    db_path = Path(engine._store.db_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("CREATE TABLE lcm_future_widgets (id INTEGER PRIMARY KEY)")
+        conn.commit()
+    finally:
+        conn.close()
+    _stamp(db_path, db_bootstrap.SCHEMA_VERSION + 1)
+
+    applied = _doctor_repair_schema_stamp_apply_text(engine)
+    assert "status: refused" in applied
+    assert "classification: genuinely_newer" in applied
+    # No backup and no mutation on the refused path.
+    assert "backup_path:" not in applied
+    assert _stored_version(db_path) == db_bootstrap.SCHEMA_VERSION + 1
