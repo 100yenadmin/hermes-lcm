@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from enum import Enum
 from pathlib import Path
+import dataclasses
 import json
 import math
 import os
@@ -49,17 +50,19 @@ from . import rollup_builder
 from .rollup_store import RollupStore
 from .session_patterns import build_session_match_keys, matches_session_pattern
 from .store import build_message_fts_spec
+from .chunking import VALID_CONTENT_POLICIES, chunk_message, normalize_content_policy
 from .embedding_provider import (
     EmbeddedDocumentBatch,
     EmbeddingProviderError,
     FastembedProvider,
     ProviderPreDispatchError,
     VoyageError,
+    default_chunk_model,
     fastembed_download_size_note,
     resolve_provider,
 )
 from .tokens import count_tokens
-from .vector_store import EmbeddingPublishOutcome, VectorStore
+from .vector_store import EmbeddingIdentity, EmbeddingPublishOutcome, VectorStore
 
 
 _EMBEDDING_BACKFILL_CLAIM_KEY = "lcm_embedding_backfill_claim"
@@ -3001,10 +3004,16 @@ def _owned_inflight_transition(
         raise
 
 
-def _embedding_backfill_options(tokens: list[str]) -> tuple[bool, int, bool] | str:
+def _embedding_backfill_options(
+    tokens: list[str],
+) -> tuple[bool, int, bool, str, str] | str:
     apply = False
     limit = 200
     retry_uncertain = False
+    corpus = "summary"
+    policy = ""
+    seen_corpus = False
+    seen_policy = False
     index = 0
     while index < len(tokens):
         token = tokens[index].lower()
@@ -3025,13 +3034,30 @@ def _embedding_backfill_options(tokens: list[str]) -> tuple[bool, int, bool] | s
                 return "`--limit` must be a positive integer."
             index += 2
             continue
+        if token == "--corpus" and index + 1 < len(tokens) and not seen_corpus:
+            corpus = tokens[index + 1].lower()
+            if corpus not in {"summary", "chunks", "both"}:
+                return "`--corpus` must be one of `summary`, `chunks`, or `both`."
+            seen_corpus = True
+            index += 2
+            continue
+        if token == "--policy" and index + 1 < len(tokens) and not seen_policy:
+            policy = tokens[index + 1].lower()
+            if policy not in VALID_CONTENT_POLICIES:
+                return "`--policy` must be one of `conversational`, `heads`, or `full`."
+            seen_policy = True
+            index += 2
+            continue
         return (
-            "`/lcm embed backfill` accepts only `--apply`, "
-            "`--retry-uncertain`, and `--limit N`."
+            "`/lcm embed backfill` accepts only `--apply`, `--retry-uncertain`, "
+            "`--limit N`, `--corpus summary|chunks|both`, and "
+            "`--policy conversational|heads|full`."
         )
     if retry_uncertain and not apply:
         return "`--retry-uncertain` requires `--apply` because it may incur charges."
-    return apply, limit, retry_uncertain
+    if policy and corpus == "summary":
+        return "`--policy` only applies to the chunk corpus; add `--corpus chunks`."
+    return apply, limit, retry_uncertain, corpus, policy
 
 
 def _embedding_backfill_report(
@@ -3055,10 +3081,16 @@ def _embedding_backfill_report(
     in_flight: int = 0,
     uncertain: int = 0,
     stop_reason: str | None = None,
+    corpus: str | None = None,
+    policy: str | None = None,
 ) -> str:
-    lines = [
-        "LCM embedding backfill",
-        f"mode: {mode}",
+    header = "LCM embedding backfill" if corpus is None else f"LCM {corpus} backfill"
+    lines = [header, f"mode: {mode}"]
+    if corpus is not None:
+        lines.append(f"corpus: {corpus}")
+    if policy is not None:
+        lines.append(f"policy: {policy}")
+    lines += [
         f"status: {status}",
         f"provider: {provider}",
         f"model: {model}",
@@ -3099,7 +3131,12 @@ def _embedding_backfill_report(
     )
     if mode == "dry-run":
         lines.append("note: preview only; no provider calls or database writes were made")
-        lines.append("next: run `/lcm embed backfill --apply` to populate embeddings")
+        apply_hint = (
+            "/lcm embed backfill --apply"
+            if corpus is None
+            else f"/lcm embed backfill --corpus {corpus} --apply"
+        )
+        lines.append(f"next: run `{apply_hint}` to populate embeddings")
     return "\n".join(lines)
 
 
@@ -3127,7 +3164,29 @@ def _embedding_backfill_text(tokens: list[str], engine) -> str:
     parsed = _embedding_backfill_options(tokens)
     if isinstance(parsed, str):
         return _help_text(parsed)
-    apply, limit, retry_uncertain = parsed
+    apply, limit, retry_uncertain, corpus, policy = parsed
+    if corpus == "chunks":
+        return _chunk_backfill_text(
+            engine, apply=apply, limit=limit,
+            retry_uncertain=retry_uncertain, policy=policy,
+        )
+    if corpus == "both":
+        summary_report = _embedding_backfill_summary_text(
+            engine, apply=apply, limit=limit, retry_uncertain=retry_uncertain
+        )
+        chunk_report = _chunk_backfill_text(
+            engine, apply=apply, limit=limit,
+            retry_uncertain=retry_uncertain, policy=policy,
+        )
+        return summary_report + "\n\n" + chunk_report
+    return _embedding_backfill_summary_text(
+        engine, apply=apply, limit=limit, retry_uncertain=retry_uncertain
+    )
+
+
+def _embedding_backfill_summary_text(
+    engine, *, apply: bool, limit: int, retry_uncertain: bool
+) -> str:
     mode = "apply" if apply else "dry-run"
     started = time.monotonic()
 
@@ -3589,6 +3648,589 @@ def _embedding_backfill_remaining(
         in_flight = 0
         uncertain = 0
     return remaining, in_flight, uncertain
+
+
+# -- Chunk corpus backfill -------------------------------------------------
+#
+# The chunk corpus reuses the shipped lease/inflight/uncertain MACHINERY
+# unchanged (``_ensure_inflight_table``, ``_acquire_embedding_backfill_lease``,
+# ``_prepare_inflight_for_lease``, ``_mark_inflight``, ``_mark_dispatched``,
+# ``_owned_inflight_transition``, ``_provider_document_batches``) — those
+# functions key on ``(embedded_id, identity_hash)`` and are corpus-agnostic, so
+# a chunk's ``store_id:chunk_index`` id and its distinct task='chunk' identity
+# share the one inflight table with summaries without collision. Only discovery
+# (policy-chunked messages vs summary_nodes) and the publish call differ.
+
+
+def _chunk_current_profile(conn: sqlite3.Connection) -> sqlite3.Row | None:
+    try:
+        return conn.execute(
+            """
+            SELECT identity_hash, model_name, provider, dim, registered_at
+            FROM lcm_embedding_profile
+            WHERE active = 1 AND archived_at IS NULL AND task = 'chunk'
+            ORDER BY registered_at DESC, identity_hash DESC
+            LIMIT 1
+            """
+        ).fetchone()
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            return None
+        raise
+
+
+def _chunk_embedded_ids(conn: sqlite3.Connection, identity_hash: str | None) -> set[str]:
+    if not identity_hash:
+        return set()
+    exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='lcm_chunk_meta'"
+    ).fetchone()
+    if exists is None:
+        return set()
+    return {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT chunk_id FROM lcm_chunk_meta WHERE identity_hash = ?",
+            (identity_hash,),
+        ).fetchall()
+    }
+
+
+def _chunk_inflight_ids(conn: sqlite3.Connection, identity_hash: str | None) -> set[str]:
+    if not identity_hash:
+        return set()
+    exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name='lcm_embedding_backfill_inflight'"
+    ).fetchone()
+    if exists is None:
+        return set()
+    return {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT embedded_id FROM lcm_embedding_backfill_inflight "
+            "WHERE identity_hash = ?",
+            (identity_hash,),
+        ).fetchall()
+    }
+
+
+def _chunk_pending_rows(
+    conn: sqlite3.Connection,
+    identity_hash: str | None,
+    policy: str,
+    limit: int,
+) -> tuple[int, list[tuple[str, str, int]], dict[str, tuple[int, int, int, int]]]:
+    """Discover policy-chunked messages whose chunks are not yet embedded.
+
+    Streams messages most-recent-first (so ``--limit`` selects recent chunks,
+    mirroring the summary path's ``latest_at DESC``), chunks each under the
+    active policy, and excludes chunk ids already embedded under the identity or
+    held in-flight. Returns the total pending count, up to ``limit`` documents
+    as ``(chunk_id, text, tokens)``, and a metadata map for the selected chunks.
+    """
+    already = _chunk_embedded_ids(conn, identity_hash)
+    inflight = _chunk_inflight_ids(conn, identity_hash)
+    total = 0
+    documents: list[tuple[str, str, int]] = []
+    meta: dict[str, tuple[int, int, int, int]] = {}
+    for row in conn.execute(
+        "SELECT store_id, role, content FROM messages ORDER BY store_id DESC"
+    ):
+        for chunk in chunk_message(row[0], row[1], row[2], policy=policy):
+            chunk_id = chunk.chunk_id
+            if chunk_id in already or chunk_id in inflight:
+                continue
+            total += 1
+            if len(documents) < limit:
+                documents.append((chunk_id, chunk.text, chunk.token_estimate))
+                meta[chunk_id] = (
+                    chunk.store_id,
+                    chunk.chunk_index,
+                    chunk.char_start,
+                    chunk.char_end,
+                )
+    return total, documents, meta
+
+
+def _rebuild_chunk_document(
+    conn: sqlite3.Connection, chunk_id: str, policy: str
+) -> tuple[str, int] | None:
+    """Reconstruct one chunk's text/tokens by re-chunking its source message.
+
+    Returns ``(text, token_estimate)`` for the chunk whose index matches
+    ``chunk_id`` (``store_id:chunk_index``), or None if the message is gone or no
+    longer produces that chunk under ``policy`` (content changed).
+    """
+    try:
+        store_id_str, index_str = chunk_id.split(":", 1)
+        store_id = int(store_id_str)
+        chunk_index = int(index_str)
+    except (ValueError, AttributeError):
+        return None
+    row = conn.execute(
+        "SELECT role, content FROM messages WHERE store_id = ?", (store_id,)
+    ).fetchone()
+    if row is None:
+        return None
+    for chunk in chunk_message(store_id, row[0], row[1], policy=policy):
+        if chunk.chunk_index == chunk_index:
+            return chunk.text, chunk.token_estimate
+    return None
+
+
+def _chunk_authorized_uncertain_rows(
+    conn: sqlite3.Connection,
+    identity_hash: str,
+    policy: str,
+    limit: int,
+) -> tuple[int, list[tuple[str, str, int]], dict[str, tuple[int, int, int, int]]]:
+    """Select uncertain chunk rows without consuming their durable markers."""
+    rows = conn.execute(
+        """
+        SELECT f.embedded_id
+        FROM lcm_embedding_backfill_inflight AS f
+        WHERE f.identity_hash = ?
+          AND f.state = 'uncertain'
+          AND NOT EXISTS (
+              SELECT 1 FROM lcm_chunk_meta AS m
+              WHERE m.chunk_id = f.embedded_id
+                AND m.identity_hash = f.identity_hash
+          )
+        ORDER BY f.updated_at, f.embedded_id
+        LIMIT ?
+        """,
+        (identity_hash, max(0, int(limit))),
+    ).fetchall()
+    documents: list[tuple[str, str, int]] = []
+    meta: dict[str, tuple[int, int, int, int]] = {}
+    for row in rows:
+        chunk_id = str(row[0])
+        rebuilt = _rebuild_chunk_document(conn, chunk_id, policy)
+        if rebuilt is None:
+            continue
+        text, tokens = rebuilt
+        store_id_str, index_str = chunk_id.split(":", 1)
+        documents.append((chunk_id, text, tokens))
+        meta[chunk_id] = (int(store_id_str), int(index_str), 0, 0)
+    return len(documents), documents, meta
+
+
+def _chunk_backfill_remaining(
+    db_path, identity_hash: str | None, policy: str, pending: int, embedded: int
+) -> tuple[int, int, int]:
+    try:
+        check_conn = _embedding_read_connection(db_path)
+        try:
+            remaining, _, _ = _chunk_pending_rows(check_conn, identity_hash, policy, 1)
+            if identity_hash:
+                try:
+                    in_flight = int(check_conn.execute(
+                        "SELECT COUNT(*) FROM lcm_embedding_backfill_inflight "
+                        "WHERE identity_hash = ?",
+                        (identity_hash,),
+                    ).fetchone()[0])
+                    uncertain = int(check_conn.execute(
+                        "SELECT COUNT(*) FROM lcm_embedding_backfill_inflight "
+                        "WHERE identity_hash = ? AND state IN ('dispatched', 'uncertain')",
+                        (identity_hash,),
+                    ).fetchone()[0])
+                except sqlite3.OperationalError:
+                    in_flight = 0
+                    uncertain = 0
+            else:
+                in_flight = 0
+                uncertain = 0
+        finally:
+            check_conn.close()
+    except sqlite3.Error:
+        remaining = max(0, pending - embedded)
+        in_flight = 0
+        uncertain = 0
+    return remaining, in_flight, uncertain
+
+
+def _chunk_backfill_text(
+    engine, *, apply: bool, limit: int, retry_uncertain: bool, policy: str
+) -> str:
+    policy = normalize_content_policy(policy or getattr(
+        engine._config, "embedding_content_policy", "conversational"
+    ))
+    mode = "apply" if apply else "dry-run"
+    started = time.monotonic()
+
+    def _refused(message: str) -> str:
+        return "\n".join([
+            "LCM chunk backfill",
+            f"mode: {mode}",
+            "corpus: chunks",
+            f"policy: {policy}",
+            "status: refused",
+            f"error: {message}",
+        ])
+
+    if not bool(getattr(engine._config, "embeddings_enabled", False)):
+        return _refused(
+            "embeddings are disabled; set LCM_EMBEDDINGS_ENABLED=true, then run "
+            "`/lcm embed warmup`"
+        )
+
+    db_path = engine._store.db_path
+    configured_provider = str(
+        getattr(engine._config, "embedding_provider", "") or ""
+    ).strip().lower()
+    configured_model = str(getattr(engine._config, "embedding_model", "") or "").strip()
+
+    try:
+        read_conn = _embedding_read_connection(db_path)
+    except sqlite3.Error as exc:
+        return _refused(f"embedding database is unavailable ({exc})")
+    try:
+        profile = _chunk_current_profile(read_conn)
+        if profile is not None:
+            identity = str(profile["identity_hash"])
+            model = str(profile["model_name"])
+            provider_name = str(profile["provider"])
+            profile_dim = int(profile["dim"])
+        else:
+            # No chunk profile yet: a dry-run can still estimate pending/tokens/
+            # cost using the default chunk model for the configured provider.
+            identity = None
+            provider_name = configured_provider
+            model = default_chunk_model(configured_provider, configured_model)
+            profile_dim = 0
+        if not apply:
+            pending, rows, _ = _chunk_pending_rows(read_conn, identity, policy, limit)
+    except sqlite3.Error as exc:
+        return _refused(f"could not discover pending chunks ({exc})")
+    finally:
+        read_conn.close()
+
+    def _estimates(documents: list[tuple[str, str, int]]) -> tuple[int, int, int]:
+        est_tokens = sum(document[2] for document in documents)
+        est_cost_tokens = sum(
+            document[2]
+            for document in documents
+            if provider_name.lower() != "voyage"
+            or document[2] <= _VOYAGE_MAX_DOCUMENT_TOKENS
+        )
+        est_batches = _embedding_batch_estimate(
+            provider_name, [document[2] for document in documents]
+        )
+        return est_tokens, est_cost_tokens, est_batches
+
+    if not apply:
+        estimated_tokens, estimated_cost_tokens, estimated_batches = _estimates(rows)
+        return _embedding_backfill_report(
+            mode=mode,
+            status="dry-run",
+            provider=provider_name,
+            model=model,
+            pending=pending,
+            selected=len(rows),
+            estimated_tokens=estimated_tokens,
+            estimated_cost_tokens=estimated_cost_tokens,
+            estimated_batches=estimated_batches,
+            embedded=0,
+            skipped=[],
+            failed=[],
+            remaining=pending,
+            duration=time.monotonic() - started,
+            consumed_tokens=0,
+            corpus="chunks",
+            policy=policy,
+        )
+
+    # -- apply --
+    if profile is None:
+        return _refused(
+            "no chunk embedding profile is registered; register one before "
+            "`--corpus chunks --apply`"
+        )
+
+    ttl_s = _embedding_backfill_lease_ttl_s()
+    heartbeat_s = _embedding_backfill_heartbeat_s()
+    budget_s = _embedding_backfill_budget_s()
+
+    store: VectorStore | None = None
+    lease: _BackfillLease | None = None
+    documents: list[tuple[str, str, int]] = []
+    chunk_meta: dict[str, tuple[int, int, int, int]] = {}
+    pending = 0
+    embedded = 0
+    skipped: list[tuple[str, str]] = []
+    failed: list[tuple[str, str]] = []
+    consumed_tokens = 0
+    error: str | None = None
+    stop_reason: str | None = None
+    lease_lost = False
+    identity_superseded = False
+    budget_exhausted = False
+    try:
+        store = VectorStore(db_path, config=engine._config)
+        store.ensure_chunk_schema()
+        conn = store.connection
+        _ensure_inflight_table(conn)
+        lease = _acquire_embedding_backfill_lease(
+            conn, ttl_s=ttl_s, heartbeat_s=heartbeat_s
+        )
+        if lease is None:
+            store.close()
+            return _refused(
+                "another embedding backfill holds the lease; retry after it exits "
+                "or after the lease TTL expires"
+            )
+        _prepare_inflight_for_lease(conn, identity, lease)
+        captured_identity = EmbeddingIdentity.canonical(
+            provider_name, model, "", profile_dim, "float32", "little", "chunk"
+        )
+        if captured_identity.identity_hash != identity:
+            raise ValueError(
+                "active chunk embedding identity changed before backfill dispatch"
+            )
+        if retry_uncertain:
+            pending, rows, chunk_meta = _chunk_authorized_uncertain_rows(
+                conn, identity, policy, limit
+            )
+            authorized_uncertain_ids = {row[0] for row in rows}
+        else:
+            pending, rows, chunk_meta = _chunk_pending_rows(
+                conn, identity, policy, limit
+            )
+            authorized_uncertain_ids = set()
+        documents = rows
+
+        chunk_provider_config = dataclasses.replace(
+            engine._config, embedding_model=model
+        )
+        provider = resolve_provider(chunk_provider_config, for_backfill=True)
+        if provider is None:
+            error = "embedding provider is not configured; run `/lcm embed warmup`"
+        elif (
+            provider.model_id != model
+            or str(provider.provider_id).lower() != provider_name.lower()
+        ):
+            error = "configured provider does not match the chunk profile; run `/lcm embed warmup`"
+        else:
+            for offset in range(0, len(documents), _EMBEDDING_BACKFILL_BATCH_SIZE):
+                if not lease.renew():
+                    lease_lost = True
+                    stop_reason = "lease_lost"
+                    break
+                if budget_s > 0 and (time.monotonic() - started) > budget_s:
+                    budget_exhausted = True
+                    stop_reason = "op_budget_exhausted"
+                    break
+                batch = documents[offset:offset + _EMBEDDING_BACKFILL_BATCH_SIZE]
+                batch_authorized_ids = {
+                    item[0] for item in batch if item[0] in authorized_uncertain_ids
+                }
+                _mark_inflight(
+                    conn, identity, lease, [item[0] for item in batch],
+                    authorized_uncertain_ids=batch_authorized_ids,
+                )
+                request_by_index: dict[int, str] = {}
+                indexes_by_request: dict[str, set[int]] = {}
+                transitioned_requests: set[str] = set()
+                latest_request_id: str | None = None
+
+                def before_dispatch(indexes: tuple[int, ...]) -> None:
+                    nonlocal latest_request_id
+                    normalized = tuple(int(index) for index in indexes)
+                    if (
+                        not normalized
+                        or len(set(normalized)) != len(normalized)
+                        or any(index < 0 or index >= len(batch) for index in normalized)
+                        or any(index in request_by_index for index in normalized)
+                    ):
+                        raise EmbeddingProviderError(
+                            "provider dispatched invalid or duplicate document indexes"
+                        )
+                    request_id = uuid.uuid4().hex
+                    ids = [batch[index][0] for index in normalized]
+                    if _mark_dispatched(
+                        conn, identity, lease, ids, request_id,
+                        authorized_uncertain_ids=batch_authorized_ids,
+                    ) != len(ids):
+                        raise EmbeddingProviderError(
+                            "embedding lease lost before provider dispatch"
+                        )
+                    indexes_by_request[request_id] = set(normalized)
+                    request_by_index.update(
+                        (index, request_id) for index in normalized
+                    )
+                    latest_request_id = request_id
+
+                try:
+                    accepted_indexes: set[int] = set()
+                    for accepted_batch in _provider_document_batches(
+                        provider, [item[1] for item in batch],
+                        before_dispatch=before_dispatch,
+                    ):
+                        if len(accepted_batch.indexes) != len(accepted_batch.vectors):
+                            raise EmbeddingProviderError(
+                                "provider returned a different number of indexes and embeddings"
+                            )
+                        for batch_index, vector in zip(
+                            accepted_batch.indexes, accepted_batch.vectors
+                        ):
+                            index = int(batch_index)
+                            if index < 0 or index >= len(batch) or index in accepted_indexes:
+                                raise EmbeddingProviderError(
+                                    "provider returned an invalid accepted document index"
+                                )
+                            accepted_indexes.add(index)
+                            item = batch[index]
+                            request_id = request_by_index.get(index)
+                            if request_id is None:
+                                raise EmbeddingProviderError(
+                                    "provider returned an embedding before durable dispatch"
+                                )
+                            store_id, chunk_index, char_start, char_end = chunk_meta[item[0]]
+                            try:
+                                publish_outcome = store.publish_chunk_embedding_under_lease(
+                                    item[0], model, vector,
+                                    store_id=store_id, chunk_index=chunk_index,
+                                    char_start=char_start, char_end=char_end,
+                                    token_estimate=item[2], identity=captured_identity,
+                                    claim_key=_EMBEDDING_BACKFILL_CLAIM_KEY,
+                                    lease_id=lease.lease_id, generation=lease.generation,
+                                    request_id=request_id,
+                                )
+                            except Exception as exc:
+                                failed.append((item[0], f"record_error:{exc}"))
+                                if not _owned_inflight_transition(
+                                    conn, identity, lease, request_id,
+                                    error=f"accepted remotely; local publish failed: {exc}",
+                                    authorized_uncertain_ids=batch_authorized_ids,
+                                ):
+                                    lease_lost = True
+                                    stop_reason = "lease_lost"
+                                else:
+                                    transitioned_requests.add(request_id)
+                                    raise EmbeddingProviderError(
+                                        "accepted remotely; local publication failed"
+                                    ) from exc
+                                break
+                            if publish_outcome is EmbeddingPublishOutcome.OWNERSHIP_LOST:
+                                lease_lost = True
+                                stop_reason = "lease_lost"
+                                break
+                            if publish_outcome is EmbeddingPublishOutcome.IDENTITY_SUPERSEDED:
+                                identity_superseded = True
+                                stop_reason = "identity_superseded"
+                                failed.append(
+                                    (item[0], "identity_superseded_after_remote_acceptance")
+                                )
+                                transitioned_requests.add(request_id)
+                                break
+                            embedded += 1
+                            consumed_tokens += item[2]
+                        if lease_lost or identity_superseded:
+                            break
+                    if lease_lost or identity_superseded:
+                        break
+                    skipped_indexes = {
+                        int(index)
+                        for index in getattr(provider, "last_skipped_documents", [])
+                        if 0 <= int(index) < len(batch)
+                    }
+                    for index in sorted(skipped_indexes):
+                        skipped.append((batch[index][0], "provider_document_token_cap"))
+                        request_id = request_by_index.get(index)
+                        if not _owned_inflight_transition(
+                            conn, identity, lease, request_id,
+                            embedded_id=batch[index][0],
+                            error="provider document token cap",
+                            authorized_uncertain_ids=batch_authorized_ids,
+                        ):
+                            lease_lost = True
+                            stop_reason = "lease_lost"
+                            break
+                    unresolved = set(range(len(batch))) - accepted_indexes - skipped_indexes
+                    if unresolved:
+                        raise EmbeddingProviderError(
+                            "provider did not resolve every dispatched document"
+                        )
+                except Exception as exc:
+                    reason = (
+                        f"provider_{exc.kind}:{exc}"
+                        if isinstance(exc, VoyageError)
+                        else f"provider_error:{exc}"
+                    )
+                    definitive_rejection = (
+                        isinstance(exc, ProviderPreDispatchError)
+                        or (
+                            isinstance(exc, VoyageError)
+                            and exc.kind in {"auth", "bad_request", "rate_limit"}
+                        )
+                    )
+                    if latest_request_id is not None:
+                        failed_indexes = indexes_by_request[latest_request_id] - accepted_indexes
+                        failed.extend((batch[index][0], reason) for index in failed_indexes)
+                        if (
+                            not lease_lost
+                            and latest_request_id not in transitioned_requests
+                            and not _owned_inflight_transition(
+                                conn, identity, lease, latest_request_id,
+                                error=reason, retryable=definitive_rejection,
+                                authorized_uncertain_ids=batch_authorized_ids,
+                            )
+                        ):
+                            lease_lost = True
+                            stop_reason = "lease_lost"
+                    if not lease_lost:
+                        for index, item in enumerate(batch):
+                            if index in request_by_index:
+                                continue
+                            if not _owned_inflight_transition(
+                                conn, identity, lease, None,
+                                embedded_id=item[0],
+                                authorized_uncertain_ids=batch_authorized_ids,
+                            ):
+                                lease_lost = True
+                                stop_reason = "lease_lost"
+                                break
+                    if isinstance(exc, VoyageError) and exc.kind == "auth":
+                        error = f"provider authentication failed; {exc}"
+                        break
+    except _BackfillLeaseLost:
+        lease_lost = True
+        stop_reason = "lease_lost"
+    except Exception as exc:
+        error = str(exc)
+    finally:
+        if store is not None:
+            if lease is not None and not lease_lost and not identity_superseded:
+                try:
+                    lease.release()
+                except Exception as exc:
+                    error = (
+                        f"{error}; lease release failed: {exc}"
+                        if error else f"lease release failed: {exc}"
+                    )
+            store.close()
+
+    remaining, in_flight_count, uncertain_count = _chunk_backfill_remaining(
+        db_path, identity, policy, pending, embedded
+    )
+    selected_embeddable = len(documents) - len(skipped)
+    status = _embedding_backfill_status(
+        error=error, lease_lost=lease_lost, budget_exhausted=budget_exhausted,
+        embedded=embedded, selected_embeddable=selected_embeddable,
+        failed=failed, uncertain=uncertain_count,
+    )
+    estimated_tokens, estimated_cost_tokens, estimated_batches = _estimates(documents)
+    return _embedding_backfill_report(
+        mode=mode, status=status, provider=provider_name, model=model,
+        pending=pending, selected=len(documents),
+        estimated_tokens=estimated_tokens, estimated_cost_tokens=estimated_cost_tokens,
+        estimated_batches=estimated_batches, embedded=embedded, skipped=skipped,
+        failed=failed, remaining=remaining, duration=time.monotonic() - started,
+        consumed_tokens=consumed_tokens, error=error, in_flight=in_flight_count,
+        uncertain=uncertain_count, stop_reason=stop_reason,
+        corpus="chunks", policy=policy,
+    )
 
 
 def _embedding_backfill_status(

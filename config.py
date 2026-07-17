@@ -301,6 +301,7 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("embedding_bounded_scan_rows", "LCM_EMBEDDING_BOUNDED_SCAN_ROWS", int),
     _EnvFieldSpec("embedding_provider", "LCM_EMBEDDING_PROVIDER", str),
     _EnvFieldSpec("embedding_model", "LCM_EMBEDDING_MODEL", str),
+    _EnvFieldSpec("embedding_content_policy", "LCM_EMBED_CONTENT_POLICY", str),
     _EnvFieldSpec("ollama_base_url", "LCM_OLLAMA_BASE_URL", str),
     _EnvFieldSpec("embedding_query_timeout_s", "LCM_EMBEDDING_QUERY_TIMEOUT_S", float),
     _EnvFieldSpec("embedding_backfill_timeout_s", "LCM_EMBEDDING_BACKFILL_TIMEOUT_S", float),
@@ -493,6 +494,10 @@ class LCMConfig:
     embedding_bounded_scan_rows: int = 2_000
     embedding_provider: str = ""
     embedding_model: str = ""
+    # Content-aware chunk policy for the raw-history chunk corpus:
+    # conversational (default) | heads | full. Unknown values degrade to the
+    # default in the chunker's normalize_content_policy.
+    embedding_content_policy: str = "conversational"
     ollama_base_url: str = "http://localhost:11434"
     embedding_query_timeout_s: float = 3.0
     # Per-provider-operation deadline for bulk document embedding. This is
