@@ -351,26 +351,29 @@ def test_numpy_absent_uses_bounded_scan_with_same_top_k(stores, monkeypatch):
     )
 
 
-def test_bounded_scan_only_scores_most_recent_rows(tmp_path, monkeypatch):
+def test_bounded_scan_uses_source_recency_after_newest_first_backfill(
+    tmp_path, monkeypatch
+):
     db_path = tmp_path / "bounded.db"
     dag = SummaryDAG(db_path)
-    store = VectorStore(db_path, bounded_scan_rows=2)
+    store = VectorStore(db_path, bounded_scan_rows=1)
     try:
         oldest = _add_summary(dag, created_at=1.0)
-        recent_a = _add_summary(dag, created_at=2.0)
-        recent_b = _add_summary(dag, created_at=3.0)
+        middle = _add_summary(dag, created_at=2.0)
+        newest = _add_summary(dag, created_at=3.0)
         store.register_profile("bounded", "local", 3)
-        # Backfill writes newest content first, so recent content can have the
-        # lowest vector rowids. The bounded window must use embedded_at instead.
-        _record_embedding(store, recent_a, "summary", "bounded", [0.0, 1.0, 0.0])
-        _record_embedding(store, recent_b, "summary", "bounded", [0.0, 0.0, 1.0])
+        # Backfill discovers newest summaries first. That makes the oldest source
+        # the most recently embedded row, but the bounded retrieval window must
+        # still follow source chronology rather than vector write chronology.
+        _record_embedding(store, newest, "summary", "bounded", [0.0, 0.0, 1.0])
+        _record_embedding(store, middle, "summary", "bounded", [0.0, 1.0, 0.0])
         _record_embedding(store, oldest, "summary", "bounded", [1.0, 0.0, 0.0])
         store.connection.executemany(
             "UPDATE lcm_embedding_meta SET embedded_at = ? WHERE embedded_id = ?",
             [
-                ("2026-07-15T03:00:00+00:00", str(recent_b)),
-                ("2026-07-15T02:00:00+00:00", str(recent_a)),
-                ("2026-07-15T01:00:00+00:00", str(oldest)),
+                ("2026-07-15T01:00:00+00:00", str(newest)),
+                ("2026-07-15T02:00:00+00:00", str(middle)),
+                ("2026-07-15T03:00:00+00:00", str(oldest)),
             ],
         )
         store.connection.commit()
@@ -382,8 +385,7 @@ def test_bounded_scan_only_scores_most_recent_rows(tmp_path, monkeypatch):
         result = store.knn([1.0, 0.0, 0.0], k=3, model="bounded")
 
         assert result.coverage == "bounded"
-        assert {row[0] for row in result} == {str(recent_a), str(recent_b)}
-        assert str(oldest) not in {row[0] for row in result}
+        assert [row[0] for row in result] == [str(newest)]
     finally:
         store.close()
         dag.close()
