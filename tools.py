@@ -2933,7 +2933,9 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
     if include not in _LCM_RECALL_VALID_INCLUDE:
         return json.dumps({"error": "include must be one of: all, summaries, verbatim"})
 
-    timeout_s = max(0.001, float(getattr(engine._config, "embedding_query_timeout_s", 3.0)))
+    # lcm_recall fans out three arms + fusion/hydration/rerank, so it uses its own
+    # (larger) budget rather than lcm_grep's single-arm query deadline (sprint-opt-2).
+    timeout_s = max(0.001, float(getattr(engine._config, "recall_query_timeout_s", 8.0)))
     deadline = request_started + timeout_s
 
     candidate_limit = min(_LCM_GREP_HYBRID_CANDIDATE_CAP, max(50, limit * 4))

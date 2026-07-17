@@ -342,6 +342,28 @@ def test_recall_scans_full_corpus_not_grep_recency_window(recall_engine, monkeyp
     assert observed and all(bound == 25_000 for bound in observed)
 
 
+def test_recall_query_timeout_has_its_own_budget(monkeypatch, tmp_path):
+    """sprint-opt-2: lcm_recall uses recall_query_timeout_s (default 8.0), env
+    LCM_RECALL_QUERY_TIMEOUT_S, distinct from lcm_grep's 3.0s query deadline."""
+    assert LCMConfig(database_path=str(tmp_path / "d.db")).recall_query_timeout_s == 8.0
+    monkeypatch.setenv("LCM_RECALL_QUERY_TIMEOUT_S", "12.5")
+    monkeypatch.setenv("LCM_EMBEDDING_QUERY_TIMEOUT_S", "3.0")
+    cfg = LCMConfig.from_env()
+    assert cfg.recall_query_timeout_s == 12.5
+    assert cfg.embedding_query_timeout_s == 3.0  # grep's deadline untouched
+
+
+def test_recall_uses_recall_timeout_budget(recall_engine, monkeypatch):
+    """lcm_recall builds its deadline from recall_query_timeout_s, not the grep one."""
+    recall_engine._config.recall_query_timeout_s = 8.0
+    recall_engine._config.embedding_query_timeout_s = 0.001  # would insta-timeout if used
+    recall_engine._store.append(CURRENT, {"role": "user", "content": "kanban dashboard sprint budget"})
+
+    payload = _recall(recall_engine, monkeypatch, include="verbatim", limit=5)
+    assert payload.get("timeout") is not True
+    assert payload["hits"]
+
+
 def test_bounded_chunk_coverage_surfaces_as_degraded(recall_engine, monkeypatch):
     """SCAN-1: a recency-bounded chunk arm reports a degraded_reasons entry naming
     the arm + scanned/total, instead of silently truncating."""

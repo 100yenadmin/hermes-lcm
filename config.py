@@ -306,6 +306,7 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("embedding_content_policy", "LCM_EMBED_CONTENT_POLICY", str),
     _EnvFieldSpec("ollama_base_url", "LCM_OLLAMA_BASE_URL", str),
     _EnvFieldSpec("embedding_query_timeout_s", "LCM_EMBEDDING_QUERY_TIMEOUT_S", float),
+    _EnvFieldSpec("recall_query_timeout_s", "LCM_RECALL_QUERY_TIMEOUT_S", float),
     _EnvFieldSpec("embedding_backfill_timeout_s", "LCM_EMBEDDING_BACKFILL_TIMEOUT_S", float),
     _EnvFieldSpec("embedding_max_batch_items", "LCM_EMBEDDING_MAX_BATCH_ITEMS", int),
     _EnvFieldSpec("new_session_retain_depth", "LCM_NEW_SESSION_RETAIN_DEPTH", int),
@@ -512,6 +513,11 @@ class LCMConfig:
     embedding_content_policy: str = "conversational"
     ollama_base_url: str = "http://localhost:11434"
     embedding_query_timeout_s: float = 3.0
+    # Dedicated deadline for lcm_recall. It fans out three sequential arms (FTS +
+    # summary KNN + chunk KNN) plus fusion, hydration, and an optional rerank, so
+    # it needs more headroom than lcm_grep's single-arm query deadline above
+    # (which stays 3.0s). sprint-opt-2.
+    recall_query_timeout_s: float = 8.0
     # Per-provider-operation deadline for bulk document embedding. This is
     # deliberately separate from the latency-sensitive query deadline; the
     # whole backfill invocation is additionally governed by
