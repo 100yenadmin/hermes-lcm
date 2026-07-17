@@ -19,7 +19,7 @@ import types
 
 import pytest
 
-from hermes_lcm import db_bootstrap
+from hermes_lcm import command, db_bootstrap
 from hermes_lcm.db_bootstrap import (
     ExternalContentFtsSpec,
     ensure_external_content_fts,
@@ -294,6 +294,88 @@ def test_repair_without_rebuild_still_clears_integrity_failed_flag(tmp_path, mon
     assert repaired["rebuilt"] is False
     assert db_bootstrap.load_integrity_failed(conn, spec) is None
     conn.close()
+
+
+class _RaisingConn:
+    """Delegates to a real connection but raises on the integrity-check INSERT."""
+
+    def __init__(self, real, exc):
+        self._real = real
+        self._exc = exc
+
+    def execute(self, sql, *args):
+        if "integrity-check" in sql:
+            raise self._exc
+        return self._real.execute(sql, *args)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def test_is_fts_corruption_error_classification():
+    """Only real corruption signatures classify as corruption (F3)."""
+    assert db_bootstrap._is_fts_corruption_error("database disk image is malformed")
+    assert db_bootstrap._is_fts_corruption_error("malformed database schema")
+    assert db_bootstrap._is_fts_corruption_error("file is not a database")
+    assert not db_bootstrap._is_fts_corruption_error("database is locked")
+    assert not db_bootstrap._is_fts_corruption_error("database table is locked")
+    assert not db_bootstrap._is_fts_corruption_error("query timeout expired")
+
+
+def test_integrity_check_lock_error_is_unchecked_not_corruption(tmp_path, monkeypatch):
+    """A transient lock/busy error classifies as 'unchecked', never 'fail' (F3).
+
+    Reclassifying a lock-timeout as corruption would wedge a false
+    fts_integrity_failed flag (the same stuck false-positive as F1, via a race).
+    """
+    conn = _make_conn(tmp_path)
+    spec = _spec()
+    ensure_external_content_fts(conn, spec)
+    monkeypatch.setattr(db_bootstrap, "_fts_needs_rebuild_structural", lambda *a, **k: False)
+
+    fake = _RaisingConn(conn, sqlite3.OperationalError("database is locked"))
+    result = db_bootstrap.check_external_content_fts_integrity(fake, spec)
+    assert result["status"] == "unchecked"
+    conn.close()
+
+
+def test_integrity_check_malformed_error_is_fail(tmp_path, monkeypatch):
+    """A genuine corruption signature still classifies as 'fail' (F3)."""
+    conn = _make_conn(tmp_path)
+    spec = _spec()
+    ensure_external_content_fts(conn, spec)
+    monkeypatch.setattr(db_bootstrap, "_fts_needs_rebuild_structural", lambda *a, **k: False)
+
+    fake = _RaisingConn(conn, sqlite3.DatabaseError("database disk image is malformed"))
+    result = db_bootstrap.check_external_content_fts_integrity(fake, spec)
+    assert result["status"] == "fail"
+    conn.close()
+
+
+def test_doctor_repair_apply_joins_background_scans_first(tmp_path, monkeypatch):
+    """Explicit repair joins in-flight background scans before repairing (F3)."""
+    from hermes_lcm.config import LCMConfig
+    from hermes_lcm.engine import LCMEngine
+
+    engine = LCMEngine(
+        config=LCMConfig(database_path=str(tmp_path / "lcm.db")),
+        hermes_home=str(tmp_path / "home"),
+    )
+    order: list[str] = []
+    monkeypatch.setattr(
+        command, "join_background_integrity_scans",
+        lambda *a, **k: order.append("join"),
+    )
+    real_repair = command.repair_external_content_fts
+
+    def spy_repair(conn, spec, **kwargs):
+        order.append("repair")
+        return real_repair(conn, spec, **kwargs)
+
+    monkeypatch.setattr(command, "repair_external_content_fts", spy_repair)
+    command._doctor_repair_apply_text(engine)
+    assert order[0] == "join"
+    assert "repair" in order
 
 
 def test_startup_throttle_still_skips_explicitly(tmp_path, monkeypatch, integrity_calls):

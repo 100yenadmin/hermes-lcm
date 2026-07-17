@@ -2098,6 +2098,23 @@ def _fts_needs_rebuild(
     return result["status"] == "fail"
 
 
+# SQLite/FTS5 error substrings that denote genuine on-disk corruption (SQLITE_
+# CORRUPT / SQLITE_NOTADB). Everything else a writable integrity-check can raise
+# — SQLITE_BUSY / SQLITE_LOCKED "database is locked", timeouts — is transient and
+# must classify as ``unchecked``, never ``fail`` (which records a corruption flag).
+_FTS_CORRUPTION_SIGNATURES = (
+    "malformed",
+    "disk image",
+    "not a database",
+    "corrupt",
+)
+
+
+def _is_fts_corruption_error(detail: str) -> bool:
+    lowered = detail.lower()
+    return any(signature in lowered for signature in _FTS_CORRUPTION_SIGNATURES)
+
+
 def check_external_content_fts_integrity(
     conn: sqlite3.Connection,
     spec: ExternalContentFtsSpec,
@@ -2129,7 +2146,13 @@ def check_external_content_fts_integrity(
         lowered = detail.lower()
         if "readonly" in lowered or "read-only" in lowered:
             return {"status": "unchecked", "detail": detail}
-        return {"status": "fail", "detail": detail}
+        if _is_fts_corruption_error(detail):
+            return {"status": "fail", "detail": detail}
+        # A transient lock/busy/timeout — or any other non-corruption error — must
+        # NOT be reported as corruption: the background scan would otherwise wedge
+        # a false ``fts_integrity_failed`` flag (F3). Only an actual corruption
+        # signature (malformed / disk image / not-a-database) fails the check.
+        return {"status": "unchecked", "detail": detail}
 
     try:
         conn.execute(f"ROLLBACK TO {savepoint_sql}")

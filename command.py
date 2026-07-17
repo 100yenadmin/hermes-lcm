@@ -20,6 +20,7 @@ from .db_bootstrap import (
     check_external_content_fts_integrity,
     external_content_fts_needs_repair,
     inspect_lcm_schema_health,
+    join_background_integrity_scans,
     load_integrity_failed,
     remediate_interim_schema_stamp,
     repair_external_content_fts,
@@ -964,6 +965,12 @@ def _doctor_repair_apply_text(engine) -> str:
             f"error: backup failed: {backup['error']}",
             "note: repair apply aborted before any FTS tables were repaired",
         ])
+
+    # Join any in-flight background integrity scan first: otherwise a scan still
+    # mid-flight can error out (or re-check) after the repair commits and re-write
+    # a fresh fts_integrity_failed marker, reproducing F1's stuck false-positive
+    # via a race (F3).
+    join_background_integrity_scans()
 
     conn = engine._store.connection
     try:
