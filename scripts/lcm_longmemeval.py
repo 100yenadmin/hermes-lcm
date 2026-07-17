@@ -53,6 +53,20 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     )
     run.add_argument("--model", default="", help="Embedding model id (required for non-stub).")
     run.add_argument("--limit", type=int, default=None, help="Score only the first N questions.")
+    run.add_argument(
+        "--rerank",
+        action="store_true",
+        help="Use the real cross-encoder rerank arm (VoyageProvider.rerank, "
+        "rerank-2.5-lite) when --provider voyage; otherwise the deterministic "
+        "placeholder cosine reranker is used and labeled as such.",
+    )
+    run.add_argument(
+        "--no-db-template",
+        dest="reuse_db_template",
+        action="store_false",
+        help="Disable the reused pre-migrated DB template (bootstrap each question "
+        "from scratch). Mainly for measuring the F7 ingest speedup.",
+    )
     run.add_argument("--json", action="store_true", help="Print the metrics JSON to stdout.")
     run.add_argument(
         "--allow-external-output",
@@ -114,6 +128,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
             provider_name=args.provider,
             model=args.model,
             tmp_dir=tmp_dir,
+            use_rerank=args.rerank,
+            reuse_db_template=args.reuse_db_template,
         )
 
     metrics_path = output_dir / "longmemeval_metrics.json"

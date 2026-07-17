@@ -281,14 +281,60 @@ Hard gates for promoting a preset: no replay failures, no raw transcript leakage
 `scripts/lcm_longmemeval.py` measures retrieval quality (recall@k / NDCG@10)
 on **LongMemEval_S** (Wu et al., ICLR 2025) for the LCM retrieval arms —
 `fts` (raw-message FTS5), `summary_vectors` (summary embeddings), `hybrid_rrf`
-(reciprocal-rank fusion, k=60), and `hybrid_rerank` (a deterministic
-embedding-cosine reranker over the fused pool, a placeholder for a real
-cross-encoder). Chunk-vectors are future work. There is **no LLM judge**: the
-dataset labels the evidence session(s) per question (`answer_session_ids`), so
-recall is computable offline. It ingests each question's history into a fresh
-temporary LCM store (reusing the `store`/`dag`/`vector_store` APIs directly, no
-live Hermes host), builds one deterministic summary per session, optionally
-backfills embeddings, then scores each arm against the labeled evidence.
+(reciprocal-rank fusion, k=60), `hybrid_rerank` (a reranker over the fused pool,
+see below), `chunk_vectors` (raw-chunk KNN), and `hybrid_rrf3` (FTS + summary +
+chunk fusion). There is **no LLM judge**: the dataset labels the evidence
+session(s) per question (`answer_session_ids`), so recall is computable offline.
+It ingests each question's history into a fresh temporary LCM store (reusing the
+`store`/`dag`/`vector_store` APIs directly, no live Hermes host), builds one
+deterministic summary per session, optionally backfills embeddings, then scores
+each arm against the labeled evidence.
+
+### Session-level and turn-level scoring
+
+Every arm reports metrics at **two granularities**. Session-level recall/NDCG ask
+"did the arm retrieve the evidence *session*?" Turn-level recall/NDCG ask "did it
+retrieve the evidence *turns*?" — a hit is a retrieved item whose `(session,
+turn-range)` intersects the labeled evidence turns (`has_answer` markers). Raw
+FTS message hits and raw chunk hits localize to a single turn via `store_id →
+(session, turn_index)`. A **summary** covers a whole session and cannot localize a
+turn, so summary hits score at **session granularity** — a retrieved evidence-
+session summary credits every evidence turn of that session at once. Arms whose
+ranking contains summary items are flagged with an asterisk (`*`) in the markdown
+table and `session_granularity: true` in the JSON, so the coarse turn-level number
+is never mistaken for exact localization. The `t*` columns in the table are the
+turn-level metrics.
+
+### The rerank arm (`hybrid_rerank`)
+
+By default the rerank arm is a **deterministic embedding-cosine reranker** over
+the fused candidate pool (`rerank_mode: "placeholder-cosine"`) — clearly labeled
+as a placeholder for a real cross-encoder, and safe offline. With `--provider
+voyage --rerank`, the arm instead calls **`VoyageProvider.rerank`
+(rerank-2.5-lite)** on the top `RERANK_CANDIDATE_WINDOW` (=20) fused sessions in a
+single API call under an absolute `RERANK_TIMEOUT_S` (=10s) budget; the remaining
+fused tail is appended unchanged. Any provider error falls back to the placeholder.
+The mode actually used is recorded in the JSON (`rerank.mode`) and the markdown
+header so no one mistakes a placeholder run for a real-reranker run.
+
+### Ingest batching (F7)
+
+Two ingest optimizations (measured per-question in `ingest.per_question_ms`):
+each question's session summaries are embedded in **one** batched `embed_documents`
+call instead of one call per session (sub-batched at `EMBED_BATCH_SIZE`=64 only to
+guard against a pathologically large haystack), and a single pre-migrated SQLite
+**template DB is cloned per question** rather than re-running the schema bootstrap
+500×. Pass `--no-db-template` to disable template reuse (for A/B measurement).
+
+The summary-call collapse is the win that matters for **network/live providers**
+(e.g. Voyage), where per-call round-trip latency dominates: tens of summary calls
+per question become one, and a full-haystack run's embed round-trips drop by the
+session count — comfortably past the ≥3× F7 target on the live path. Raw chunks
+are deliberately **not** batched: for a **local** ONNX provider (fastembed),
+`embed_documents` pads every text in a batch to the batch's longest sequence, so
+batching hundreds of variable-length chunks is *slower* than embedding them one at
+a time (measured ~0.4× on `bge-small`). Local ONNX ingest is compute-bound, so the
+portable local win is the DB-template reuse, not embed batching.
 
 The dataset is downloaded **once** by an explicit operator command, never during
 a run. The canonical source is the Hugging Face dataset `xiaowu0162/longmemeval`,
@@ -325,13 +371,16 @@ LCM_LONGMEMEVAL_FASTEMBED_CACHE=/path/to/fastembed-cache \
 ```
 
 `--provider voyage --model <voyage-model>` is allowed for an explicit
-live-provider run (network + spend). Use `--limit N` to bound cost; the full
-500-question run over all four arms with `bge-small` takes on the order of
-minutes on a laptop.
+live-provider run (network + spend); add `--rerank` to exercise the real
+`VoyageProvider.rerank` arm (see "The rerank arm" above). Use `--limit N` to bound
+cost; the full 500-question run over all six arms with `bge-small` takes on the
+order of minutes on a laptop.
 
 Output is **aggregate-only**, matching the export hygiene of
 `scripts/lcm_benchmark.py`: `longmemeval_metrics.json` (per-arm and per-category
-recall@1/5/10, NDCG@10, and per-arm latency percentiles) plus a
+recall@1/5/10, NDCG@10 at both session and turn granularity — the latter under a
+`turn` block with a `session_granularity` flag — per-arm latency percentiles, plus
+top-level `rerank` mode/window/budget and `ingest` timing/provenance) plus a
 `longmemeval_metrics.md` table. It contains no transcript content, session ids,
 or local paths. Abstention questions (`question_id` ending in `_abs`) have no
 evidence session and are excluded from recall (`abstention_excluded` counts
