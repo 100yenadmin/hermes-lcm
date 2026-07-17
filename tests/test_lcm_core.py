@@ -1674,6 +1674,48 @@ class TestMessageStore:
         assert rewritten is False
         assert store.get(store_id)["content"] == "raw payload blob should stay"
 
+    def test_gc_before_commit_hook_runs_atomically_with_rewrite(self, store):
+        """before_commit runs after the rewrite, before the single commit (F2).
+
+        The chunk archive must be atomic with the content rewrite: at hook time
+        the content is already the placeholder and the connection is still in the
+        rewrite's open transaction, so the hook's writes commit together with it.
+        """
+        placeholder = "[GC'd externalized tool output: tool_call_id=call_gc; ref=payload.json]"
+        store_id = store.append(
+            "sess1",
+            {"role": "tool", "tool_call_id": "call_gc", "content": "raw payload blob"},
+            token_estimate=50,
+        )
+
+        observed = {}
+
+        def hook(conn, sid):
+            row = conn.execute(
+                "SELECT content FROM messages WHERE store_id = ?", (sid,)
+            ).fetchone()
+            observed["content_at_hook"] = row[0]
+            observed["in_transaction"] = conn.in_transaction
+            conn.execute(
+                "INSERT INTO metadata(key, value) VALUES('gc_hook_marker', ?)",
+                (str(sid),),
+            )
+
+        rewritten = store.gc_externalized_tool_result(
+            store_id, placeholder, before_commit=hook
+        )
+
+        assert rewritten is True
+        # The rewrite was already applied when the hook ran, in the same open txn.
+        assert observed["content_at_hook"] == placeholder
+        assert observed["in_transaction"] is True
+        # The hook's sibling write committed atomically with the rewrite.
+        assert store.get(store_id)["content"] == placeholder
+        marker = store.connection.execute(
+            "SELECT value FROM metadata WHERE key = 'gc_hook_marker'"
+        ).fetchone()
+        assert marker is not None and marker[0] == str(store_id)
+
     def test_init_repairs_malformed_message_fts_and_sets_schema_version(self, tmp_path):
         db_path = tmp_path / "legacy-store.db"
         conn = sqlite3.connect(db_path)

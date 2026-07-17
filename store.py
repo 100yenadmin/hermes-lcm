@@ -15,7 +15,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from .db_bootstrap import (
     ExternalContentFtsSpec,
@@ -430,8 +430,22 @@ class MessageStore:
             deleted = cur.rowcount if cur.rowcount is not None else 0
             return deleted
 
-    def gc_externalized_tool_result(self, store_id: int, placeholder: str) -> bool:
-        """Rewrite one unpinned tool-result row to a compact GC placeholder."""
+    def gc_externalized_tool_result(
+        self,
+        store_id: int,
+        placeholder: str,
+        *,
+        before_commit: "Callable[[sqlite3.Connection, int], None] | None" = None,
+    ) -> bool:
+        """Rewrite one unpinned tool-result row to a compact GC placeholder.
+
+        When ``before_commit`` is given it runs on this store's connection AFTER
+        the content rewrite and BEFORE the single commit, so a caller can archive
+        the row's now-stale chunks in the SAME transaction as the rewrite. Without
+        that atomicity a recall landing between the content-rewrite commit and a
+        later batch archive would slice the new (short) content at the old chunk
+        offsets, returning a garbled fragment (F2).
+        """
         with self._write_lock:
             row = self._conn.execute(
                 "SELECT role, pinned, content, tool_call_id FROM messages WHERE store_id = ?",
@@ -453,6 +467,8 @@ class MessageStore:
                 "UPDATE messages SET content = ?, token_estimate = ? WHERE store_id = ?",
                 (placeholder, placeholder_tokens, store_id),
             )
+            if before_commit is not None:
+                before_commit(self._conn, store_id)
             self._conn.commit()
             return True
 

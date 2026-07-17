@@ -4421,7 +4421,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             return
 
         stored_by_id = self._store.get_batch(source_store_ids)
-        gc_rewritten: list[int] = []
+
+        def _archive_in_rewrite_txn(conn: "sqlite3.Connection", sid: int) -> None:
+            # Runs inside gc_externalized_tool_result's write transaction, right
+            # after the content rewrite and before its commit: archive this row's
+            # now-stale chunks ATOMICALLY with the rewrite so a recall can never
+            # slice the new (short) content at the old chunk offsets (F2).
+            self._archive_chunks_for_messages([sid], connection=conn)
+
         for store_id in source_store_ids:
             stored = stored_by_id.get(store_id)
             if not stored or stored.get("session_id") != self._session_id:
@@ -4448,8 +4455,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 )
                 if externalized is not None and externalized.get("kind", "tool_result") == "tool_result":
                     placeholder = build_transcript_gc_placeholder(externalized)
-                    if self._store.gc_externalized_tool_result(store_id, placeholder):
-                        gc_rewritten.append(store_id)
+                    self._store.gc_externalized_tool_result(
+                        store_id, placeholder, before_commit=_archive_in_rewrite_txn
+                    )
                     continue
 
             lookup_candidates = []
@@ -4473,12 +4481,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 continue
 
             placeholder = build_transcript_gc_placeholder(externalized)
-            if self._store.gc_externalized_tool_result(store_id, placeholder):
-                gc_rewritten.append(store_id)
-
-        # GC rewrote these tool results' content to a compact placeholder, so
-        # any chunks embedded from the old content are now stale — archive them.
-        self._archive_chunks_for_messages(gc_rewritten)
+            self._store.gc_externalized_tool_result(
+                store_id, placeholder, before_commit=_archive_in_rewrite_txn
+            )
 
     def _serialize_messages(self, messages: List[Dict[str, Any]]) -> str:
         """Serialize messages into labeled text for the summarizer."""
