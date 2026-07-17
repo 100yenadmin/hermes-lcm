@@ -273,8 +273,14 @@ class VectorStore:
                         "embedding schema incompatible after ensure: "
                         + "; ".join(errors)
                     )
-            mark_migration_step_complete(self._conn, "embeddings_v1")
-            self._conn.commit()
+            # Skip the marker write + commit when it is already stamped and the
+            # schema verified clean -- re-writing it every construction is an
+            # otherwise-needless write-transaction contending with real writers
+            # (sprint-opt-1). CREATE-IF-NOT-EXISTS and verify above are read-only
+            # no-ops on an already-materialized schema.
+            if not self._migration_step_present("embeddings_v1"):
+                mark_migration_step_complete(self._conn, "embeddings_v1")
+                self._conn.commit()
 
     @contextmanager
     def _write_transaction(self) -> Iterator[None]:
@@ -929,6 +935,22 @@ class VectorStore:
             )
         return int(cur.rowcount or 0)
 
+    def _migration_step_present(self, step_name: str) -> bool:
+        """Read-before-write probe: is this migration marker already stamped?
+
+        Lets schema-ensure skip an otherwise-needless marker re-write + commit on
+        every construction (sprint-opt-1); returns False if the state table is
+        absent (nothing stamped yet).
+        """
+        try:
+            row = self._conn.execute(
+                "SELECT 1 FROM lcm_migration_state WHERE step_name = ? LIMIT 1",
+                (str(step_name),),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            return False
+        return row is not None
+
     def _count_embedded_vectors(self, identity_hash: str, *, chunk: bool) -> int | None:
         """Cheap single-table COUNT of embedded vectors for one identity.
 
@@ -1393,8 +1415,11 @@ class VectorStore:
                     raise sqlite3.OperationalError(
                         "chunk schema incompatible after ensure: " + "; ".join(errors)
                     )
-            mark_migration_step_complete(self._conn, "chunk_vectors_v1")
-            self._conn.commit()
+            # Read-before-write: skip the needless marker re-write + commit when
+            # already stamped and verified clean (sprint-opt-1).
+            if not self._migration_step_present("chunk_vectors_v1"):
+                mark_migration_step_complete(self._conn, "chunk_vectors_v1")
+                self._conn.commit()
         self._chunk_schema_ready = True
 
     def _write_chunk_row(
