@@ -249,6 +249,53 @@ def test_explicit_repair_fixes_same_count_corruption_despite_fresh_marker(tmp_pa
     conn.close()
 
 
+def test_explicit_repair_clears_stuck_integrity_failed_flag(tmp_path, monkeypatch):
+    """A successful repair clears a prior background-scan corruption flag (F1).
+
+    Regression for F1: `repair_external_content_fts` never cleared
+    `fts_integrity_failed:<table>`, so after `/lcm doctor repair apply` succeeded
+    `/lcm doctor` kept reporting issues-found forever and the next self-healing
+    scan was pushed out a full interval.
+    """
+    monkeypatch.setenv(INTERVAL_ENV, "24")
+    conn = _make_conn(tmp_path)
+    spec = _spec()
+    ensure_external_content_fts(conn, spec)  # build + fresh marker
+
+    # A background scan flagged the index as corrupt.
+    db_bootstrap._record_integrity_failed(conn, spec, detail="synthetic corruption")
+    conn.commit()
+    assert db_bootstrap.load_integrity_failed(conn, spec) is not None
+
+    # Drive a same-count stale-drift corruption so the explicit repair rebuilds.
+    conn.execute(
+        "UPDATE messages SET content = 'completely different searchable text' WHERE store_id = 1"
+    )
+    repaired = db_bootstrap.repair_external_content_fts(conn, spec)
+    assert repaired["rebuilt"] is True
+    # The flag is cleared in the same transaction as the rebuild.
+    assert db_bootstrap.load_integrity_failed(conn, spec) is None
+    conn.close()
+
+
+def test_repair_without_rebuild_still_clears_integrity_failed_flag(tmp_path, monkeypatch):
+    """Even a no-op repair (nothing to rebuild) clears a stale corruption flag."""
+    monkeypatch.setenv(INTERVAL_ENV, "24")
+    conn = _make_conn(tmp_path)
+    spec = _spec()
+    ensure_external_content_fts(conn, spec)
+
+    db_bootstrap._record_integrity_failed(conn, spec, detail="stale flag")
+    conn.commit()
+    assert db_bootstrap.load_integrity_failed(conn, spec) is not None
+
+    # Index is healthy: repair makes no rebuild but must still clear the flag.
+    repaired = db_bootstrap.repair_external_content_fts(conn, spec, throttle=True)
+    assert repaired["rebuilt"] is False
+    assert db_bootstrap.load_integrity_failed(conn, spec) is None
+    conn.close()
+
+
 def test_startup_throttle_still_skips_explicitly(tmp_path, monkeypatch, integrity_calls):
     """The throttle remains available on the startup path via throttle=True."""
     monkeypatch.setenv(INTERVAL_ENV, "24")

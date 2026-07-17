@@ -2218,6 +2218,10 @@ def repair_external_content_fts(
                     _MIN_DISK_SPACE_BYTES // (1024 * 1024),
                 )
                 _drop_fts_artifacts(conn, spec)
+                # The corrupt index is gone (degraded to LIKE search); a stale
+                # integrity-failed flag would otherwise keep `/lcm doctor`
+                # reporting issues-found for an index that no longer exists.
+                _clear_integrity_failed(conn, spec)
                 conn.commit()
                 return {"rebuilt": False, "degraded": True, "triggers_recreated": False}
         _drop_fts_table(conn, spec.table_name)
@@ -2242,6 +2246,11 @@ def repair_external_content_fts(
         # A freshly rebuilt index is known-consistent; record the marker so the
         # next startup can skip the deep integrity-check within the interval.
         _record_integrity_checked(conn, spec, now=now)
+    # A completed repair resolves any prior background-scan corruption flag: clear
+    # it in the SAME transaction that commits the rebuild so `/lcm doctor` stops
+    # reporting issues-found (and the next self-healing scan is not pushed out a
+    # full interval). Without this an explicit `repair apply` left the flag stuck.
+    _clear_integrity_failed(conn, spec)
     conn.commit()
     return {"rebuilt": rebuilt, "degraded": degraded, "triggers_recreated": triggers_were_missing}
 
