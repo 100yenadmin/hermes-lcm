@@ -961,11 +961,22 @@ def test_recall_eval_is_deterministic_and_hybrid_beats_fts_on_paraphrases():
     assert metrics["hybrid"]["paraphrase"]["recall@10"] >= metrics["full_text"]["paraphrase"]["recall@10"]
 
 
-def test_semantic_content_scope_degrades_to_full_text(semantic_engine, monkeypatch):
+def test_semantic_content_scope_degrades_to_full_text(semantic_engine, monkeypatch, tmp_path):
     """content_scope beyond 'history' is a payload-search dimension owned by
     the full-text arm; payloads are never embedded, so the semantic arm must
     degrade rather than silently return history-only semantic hits (combined
     contract with the externalized-payload-search train)."""
+    # On a combined head the degraded full-text arm actually runs the payload
+    # scan, which requires externalization to be enabled (disabled -> honest
+    # error instead of degrade markers). Enable it so the degrade contract is
+    # what gets asserted on every head this test runs against.
+    monkeypatch.setattr(
+        semantic_engine._config, "large_output_externalization_enabled", True
+    )
+    # The payload scan resolves its directory from the engine home; the
+    # lightweight fixture engine needs one on combined heads (real engines
+    # always have it).
+    monkeypatch.setattr(semantic_engine, "_hermes_home", tmp_path, raising=False)
     semantic_engine._store.append("session-a", {"role": "user", "content": "payload marker"})
     node = _add_summary(semantic_engine, "an embedded summary", created_at=1.0)
     _seed_vectors(semantic_engine, [(node, [1.0, 0.0])])
@@ -984,10 +995,17 @@ def test_semantic_content_scope_degrades_to_full_text(semantic_engine, monkeypat
         assert all(hit.get("type") != "summary" for hit in payload["results"]), scope
 
 
-def test_hybrid_content_scope_degrades_to_full_text_arm(semantic_engine, monkeypatch):
+def test_hybrid_content_scope_degrades_to_full_text_arm(semantic_engine, monkeypatch, tmp_path):
     """In hybrid mode the semantic arm's content_scope degrade must surface as
     the full-text-arm result (which owns payload scanning) plus the explicit
     degraded marker — never fused history-only semantic hits."""
+    monkeypatch.setattr(
+        semantic_engine._config, "large_output_externalization_enabled", True
+    )
+    # The payload scan resolves its directory from the engine home; the
+    # lightweight fixture engine needs one on combined heads (real engines
+    # always have it).
+    monkeypatch.setattr(semantic_engine, "_hermes_home", tmp_path, raising=False)
     semantic_engine._store.append("session-a", {"role": "user", "content": "payload marker"})
     node = _add_summary(semantic_engine, "an embedded summary", created_at=1.0)
     _seed_vectors(semantic_engine, [(node, [1.0, 0.0])])
