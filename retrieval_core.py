@@ -131,15 +131,21 @@ def run_knn(
     conversation_ids: list[str] | None,
     source: str | None,
     vector_store_cls: Any,
+    scan_rows: int | None = None,
 ) -> Any:
     """Run the vector KNN query inside the operation's absolute deadline.
 
     ``vector_store_cls`` is injected so callers (and their tests) keep resolving
-    the VectorStore binding through the ``tools`` module namespace.
+    the VectorStore binding through the ``tools`` module namespace. ``scan_rows``
+    overrides the candidate-scan bound when set (``None`` keeps the configured
+    ``embedding_bounded_scan_rows`` — the lcm_grep contract is unchanged); a
+    cross-conversation caller passes a larger bound so "all time" is real.
     """
     if time.monotonic() >= deadline:
         raise TimeoutError("semantic vector search deadline exhausted")
-    vector_store = vector_store_cls(engine._store.db_path, config=engine._config)
+    vector_store = vector_store_cls(
+        engine._store.db_path, config=engine._config, bounded_scan_rows=scan_rows
+    )
     try:
         vector_conn = getattr(vector_store, "_conn", None)
         if vector_conn is not None:
@@ -175,17 +181,21 @@ def run_chunk_knn(
     conversation_ids: list[str] | None,
     source: str | None,
     vector_store_cls: Any,
+    scan_rows: int | None = None,
 ) -> Any:
     """Run the chunk-corpus KNN query inside the operation's absolute deadline.
 
     Mirrors ``run_knn`` for the second (chunk) corpus: the same injected
-    ``vector_store_cls`` binding and progress-handler deadline guard, calling
-    ``knn_chunks`` instead of ``knn``. Returns the store's coverage contract
-    (full|bounded|none) so the caller degrades identically to the summary arm.
+    ``vector_store_cls`` binding, ``scan_rows`` candidate-bound override, and
+    progress-handler deadline guard, calling ``knn_chunks`` instead of ``knn``.
+    Returns the store's coverage contract (full|bounded|none) so the caller
+    degrades identically to the summary arm.
     """
     if time.monotonic() >= deadline:
         raise TimeoutError("chunk vector search deadline exhausted")
-    vector_store = vector_store_cls(engine._store.db_path, config=engine._config)
+    vector_store = vector_store_cls(
+        engine._store.db_path, config=engine._config, bounded_scan_rows=scan_rows
+    )
     try:
         vector_conn = getattr(vector_store, "_conn", None)
         if vector_conn is not None:

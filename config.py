@@ -299,6 +299,7 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("database_path", "LCM_DATABASE_PATH", str),
     _EnvFieldSpec("embeddings_enabled", "LCM_EMBEDDINGS_ENABLED", bool),
     _EnvFieldSpec("rerank_enabled", "LCM_RERANK_ENABLED", bool),
+    _EnvFieldSpec("recall_scan_rows", "LCM_RECALL_SCAN_ROWS", int),
     _EnvFieldSpec("embedding_bounded_scan_rows", "LCM_EMBEDDING_BOUNDED_SCAN_ROWS", int),
     _EnvFieldSpec("embedding_provider", "LCM_EMBEDDING_PROVIDER", str),
     _EnvFieldSpec("embedding_model", "LCM_EMBEDDING_MODEL", str),
@@ -497,6 +498,12 @@ class LCMConfig:
     # rerank is one extra billable API call the operator opts into.
     rerank_enabled: bool = False
     embedding_bounded_scan_rows: int = 2_000
+    # lcm_recall candidate-scan bound. lcm_recall promises "all conversations,
+    # all time", so it must NOT inherit the small recency-truncating grep bound
+    # above (that structurally hides the oldest memories). This larger bound
+    # (still deadline-guarded) lets recall cover a realistic forever-memory
+    # corpus while capping worst-case cost on a very large one.
+    recall_scan_rows: int = 25_000
     embedding_provider: str = ""
     embedding_model: str = ""
     # Content-aware chunk policy for the raw-history chunk corpus:
