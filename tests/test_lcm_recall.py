@@ -297,3 +297,33 @@ def test_limit_is_capped_and_reported(recall_engine, monkeypatch):
 def test_missing_query_is_rejected(recall_engine):
     payload = json.loads(lcm_tools.lcm_recall({"query": "   "}, engine=recall_engine))
     assert "error" in payload
+
+
+def test_recall_scans_full_corpus_not_grep_recency_window(recall_engine, monkeypatch):
+    """Recall must NOT inherit grep's 2000-recent bound, or 'all time' truncates."""
+    recall_engine._config.recall_scan_rows = 25_000
+    recall_engine._config.embedding_bounded_scan_rows = 2_000
+    observed: list[int] = []
+
+    from hermes_lcm.vector_store import KNNResult
+
+    class BoundCapturingStore:
+        def __init__(self, *_args, bounded_scan_rows=None, **_kwargs):
+            observed.append(bounded_scan_rows)
+
+        def knn(self, *_args, **_kwargs):
+            return KNNResult(coverage="none")
+
+        def knn_chunks(self, *_args, **_kwargs):
+            return KNNResult(coverage="none")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(lcm_tools, "VectorStore", BoundCapturingStore)
+    monkeypatch.setattr(lcm_tools, "resolve_provider", lambda _config: MockProvider())
+
+    json.loads(lcm_tools.lcm_recall({"query": "anything", "include": "all"}, engine=recall_engine))
+
+    # Both vector arms request the large recall bound, never the small grep one.
+    assert observed and all(bound == 25_000 for bound in observed)
