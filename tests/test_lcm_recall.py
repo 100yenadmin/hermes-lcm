@@ -342,6 +342,44 @@ def test_recall_scans_full_corpus_not_grep_recency_window(recall_engine, monkeyp
     assert observed and all(bound == 25_000 for bound in observed)
 
 
+def test_chunk_hydrate_is_batched_not_n_plus_1(recall_engine, monkeypatch):
+    """F4-chunk-hydrate-n-plus-1: hydrate_chunk_hits issues ONE batched JOIN over
+    all ranked chunk ids, not a SELECT per hit, and preserves rank order."""
+    import sqlite3 as _sqlite
+    import hermes_lcm.retrieval_core as rc
+    from hermes_lcm.retrieval_core import hydrate_chunk_hits
+
+    contents = {}
+    for i in range(5):
+        sid = recall_engine._store.append(CURRENT, {"role": "user", "content": f"chunk excerpt number {i} body"})
+        contents[sid] = i
+    ranked = [(f"{sid}:0", 1.0 - 0.01 * n, "chunk") for n, sid in enumerate(contents)]
+    # Seed the chunk meta rows the JOIN reads.
+    _seed_chunk_vectors(recall_engine, [(sid, 0, 0, 15, [1.0, 0.0]) for sid in contents])
+
+    select_count = {"n": 0}
+    real_connect = _sqlite.connect
+
+    class CountingConnection(_sqlite.Connection):
+        def execute(self, sql, *args, **kw):
+            if "lcm_chunk_meta" in sql:
+                select_count["n"] += 1
+            return super().execute(sql, *args, **kw)
+
+    def counting_connect(*a, **k):
+        k["factory"] = CountingConnection
+        return real_connect(*a, **k)
+
+    monkeypatch.setattr(rc.sqlite3, "connect", counting_connect)
+    deadline = __import__("time").monotonic() + 30.0
+    hits = hydrate_chunk_hits(recall_engine, ranked_rows=ranked, knn_limit=50, deadline=deadline, snippet_chars=200)
+
+    assert len(hits) == 5
+    assert select_count["n"] == 1  # single batched JOIN, not 5
+    # Rank order preserved (highest score first).
+    assert [h["store_id"] for h, _ in hits] == list(contents)
+
+
 def test_recall_query_timeout_has_its_own_budget(monkeypatch, tmp_path):
     """sprint-opt-2: lcm_recall uses recall_query_timeout_s (default 8.0), env
     LCM_RECALL_QUERY_TIMEOUT_S, distinct from lcm_grep's 3.0s query deadline."""

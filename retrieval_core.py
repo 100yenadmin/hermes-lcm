@@ -345,22 +345,45 @@ def hydrate_chunk_hits(
             lambda: 1 if time.monotonic() >= deadline else 0,
             1000,
         )
-        hydrated: list[tuple[dict[str, Any], float]] = []
+        # Rank-ordered chunk ids (bounded to knn_limit), then ONE batched JOIN
+        # instead of a SELECT per hit (F4-chunk-hydrate-n-plus-1).
+        ordered_ids: list[str] = []
+        scores: dict[str, float] = {}
         for chunk_id, score, kind in ranked_rows:
-            require_remaining("chunk lookup")
             if kind != "chunk":
                 continue
-            row = conn.execute(
-                """
-                SELECT cm.store_id, cm.chunk_index, cm.char_start, cm.char_end,
-                       m.session_id, m.source, m.role, m.timestamp, m.content
+            cid = str(chunk_id)
+            if cid in scores:
+                continue
+            ordered_ids.append(cid)
+            scores[cid] = float(score)
+            if len(ordered_ids) >= knn_limit:
+                break
+        if not ordered_ids:
+            return []
+        rows_by_id: dict[str, sqlite3.Row] = {}
+        # Chunk in bounded batches so the IN(...) placeholder list stays well
+        # under SQLite's variable limit even for a large knn_limit.
+        batch_size = 500
+        for start in range(0, len(ordered_ids), batch_size):
+            require_remaining("chunk lookup")
+            batch = ordered_ids[start:start + batch_size]
+            placeholders = ",".join("?" for _ in batch)
+            for row in conn.execute(
+                f"""
+                SELECT cm.chunk_id, cm.store_id, cm.chunk_index, cm.char_start,
+                       cm.char_end, m.session_id, m.source, m.role, m.timestamp,
+                       m.content
                 FROM lcm_chunk_meta cm
                 JOIN messages m ON m.store_id = cm.store_id
-                WHERE cm.chunk_id = ? AND cm.archived = 0
-                LIMIT 1
+                WHERE cm.chunk_id IN ({placeholders}) AND cm.archived = 0
                 """,
-                (str(chunk_id),),
-            ).fetchone()
+                batch,
+            ):
+                rows_by_id.setdefault(str(row["chunk_id"]), row)
+        hydrated: list[tuple[dict[str, Any], float]] = []
+        for cid in ordered_ids:  # preserve KNN rank order
+            row = rows_by_id.get(cid)
             if row is None:
                 continue
             content = str(row["content"] or "")
@@ -382,9 +405,7 @@ def hydrate_chunk_hits(
                 "content_offset": char_start,
                 "snippet": excerpt[:snippet_chars],
             }
-            hydrated.append((hit, float(score)))
-            if len(hydrated) >= knn_limit:
-                break
+            hydrated.append((hit, scores[cid]))
         return hydrated
     finally:
         if conn is not None:
