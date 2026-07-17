@@ -17,7 +17,9 @@ from benchmarking.longmemeval import (
     ARMS,
     DATASET_REVISION,
     Question,
+    chunk_sessions,
     deterministic_session_summary,
+    evaluate_question,
     evidence_sessions,
     evidence_turns,
     load_questions,
@@ -254,6 +256,88 @@ def _synthetic_dataset() -> list[Question]:
             )
         )
     return questions
+
+
+class _FakeChunkStore:
+    """Minimal stand-in exposing only ``knn_chunks`` for the chunk arm."""
+
+    def __init__(self, hits):
+        self._hits = hits
+
+    def knn_chunks(self, query_vec, k, model, provider):
+        return list(self._hits)
+
+
+def test_chunk_sessions_maps_hits_to_sessions_and_dedups():
+    # Chunk ids are ``store_id:chunk_index``; each votes for its owning session,
+    # first-seen order wins, and an unmapped store_id is dropped.
+    hits = [("10:0", 0.9, "chunk"), ("11:2", 0.8, "chunk"),
+            ("10:1", 0.7, "chunk"), ("99:0", 0.6, "chunk")]
+    store_id_to_session = {10: "sess-a", 11: "sess-b"}
+    ranked = chunk_sessions(
+        _FakeChunkStore(hits), [1.0, 0.0], "model", "provider", 10, store_id_to_session
+    )
+    assert ranked == ["sess-a", "sess-b"]
+
+
+class _KeyedEmbedder:
+    """Deterministic embedder: text mentioning the passcode maps to one axis.
+
+    This makes the chunk KNN arm resolvable offline — the evidence chunk and the
+    query share the ``passcode`` axis, so the evidence session ranks first.
+    """
+
+    model_id = "keyed"
+    dim = 2
+
+    def _vec(self, text: str) -> list[float]:
+        return [1.0, 0.0] if "passcode" in text.lower() else [0.0, 1.0]
+
+    def embed_documents(self, texts):
+        return [self._vec(str(text)) for text in texts]
+
+    def embed_query(self, text):
+        return self._vec(str(text))
+
+
+def test_evaluate_question_chunk_arm_recovers_evidence(tmp_path):
+    evidence_id = "s-evidence"
+    long_evidence = (
+        "please remember for later reference that my personal locker passcode "
+        "phrase is the northern lighthouse keeper, and that this detail matters "
+        "quite a lot to me because I keep forgetting it every single time I try "
+        "to open the locker at the gym after my afternoon workout session"
+    )
+    sessions = {
+        "s-noise": [
+            {"role": "user", "content": "unrelated small talk about the sunny weather today"},
+            {"role": "assistant", "content": "yes it certainly is a pleasant afternoon outside"},
+        ],
+        evidence_id: [
+            {"role": "user", "content": long_evidence},
+            {"role": "assistant", "content": "noted, I will keep that safe", "has_answer": True},
+        ],
+    }
+    question = parse_question(
+        _make_raw(
+            "q-chunk", "single-session-user", sessions=sessions,
+            answer_session_ids=[evidence_id],
+            question="what is my locker passcode phrase",
+        )
+    )
+
+    scored = evaluate_question(
+        question, _KeyedEmbedder(), provider_name="stub",
+        tmp_dir=tmp_path, embeddings_enabled=True,
+    )
+
+    assert "chunk_vectors" in scored and "hybrid_rrf3" in scored
+    # The chunk arm recovers the evidence session via the shared passcode axis.
+    assert scored["chunk_vectors"]["recall@1"] == pytest.approx(1.0)
+    # The three-arm fusion keeps the evidence session in its top-k.
+    assert scored["hybrid_rrf3"]["recall@10"] == pytest.approx(1.0)
+    for arm in ARMS:
+        assert scored[arm]["latency_ms"] >= 0.0
 
 
 def test_stub_run_end_to_end_produces_report_and_fts_recovers_evidence(tmp_path):

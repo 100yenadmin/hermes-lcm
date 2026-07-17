@@ -47,7 +47,17 @@ DATASET_REVISION = "2ec2a557f339b6c0369619b1ed5793734cc87533"
 DATASET_FILENAME = "longmemeval_s"
 
 PROVIDERS = ("stub", "fastembed", "voyage", "ollama")
-ARMS = ("fts", "summary_vectors", "hybrid_rrf", "hybrid_rerank")
+# ``chunk_vectors`` scores the raw-chunk KNN corpus; ``hybrid_rrf3`` fuses it as a
+# third arm alongside FTS + summary vectors. Both are appended so the existing
+# arms keep byte-identical outputs and report ordering.
+ARMS = (
+    "fts",
+    "summary_vectors",
+    "hybrid_rrf",
+    "hybrid_rerank",
+    "chunk_vectors",
+    "hybrid_rrf3",
+)
 
 # LongMemEval `question_type` -> reported category label. Abstention questions
 # (``question_id`` ends with ``_abs``) are excluded from recall scoring and
@@ -379,6 +389,33 @@ def vector_sessions(vector_store, dag, query_vec, model, provider, fetch: int) -
     return _dedup_sessions(sessions)
 
 
+def _chunk_store_id(chunk_id) -> int | None:
+    """Extract the source ``store_id`` from a ``store_id:chunk_index`` chunk id."""
+    try:
+        return int(str(chunk_id).split(":", 1)[0])
+    except (TypeError, ValueError):
+        return None
+
+
+def chunk_sessions(
+    vector_store, query_vec, model, provider, fetch: int,
+    store_id_to_session: dict[int, str],
+) -> list[str]:
+    """Rank evidence sessions by the raw-chunk KNN arm (``knn_chunks``).
+
+    Each chunk id is ``store_id:chunk_index``; its store_id maps back to the
+    session that owns the source message, so a chunk hit votes for its session.
+    """
+    result = vector_store.knn_chunks(query_vec, k=fetch, model=model, provider=provider)
+    sessions: list[str] = []
+    for chunk_id, _score, _kind in result:
+        store_id = _chunk_store_id(chunk_id)
+        session_id = None if store_id is None else store_id_to_session.get(store_id)
+        if session_id is not None:
+            sessions.append(str(session_id))
+    return _dedup_sessions(sessions)
+
+
 def rrf_fuse(*ranked_lists: Sequence[str]) -> list[str]:
     """Reciprocal-rank fusion over per-arm session rankings (``RRF_K`` = 60)."""
     scores: dict[str, float] = {}
@@ -441,10 +478,11 @@ def evaluate_question(
     Returns ``{arm: {"recall@1", "recall@5", "recall@10", "ndcg@10", "latency_ms"}}``.
     """
     _ensure_hermes_lcm_package()
+    from hermes_lcm.chunking import iter_message_chunks
     from hermes_lcm.config import LCMConfig
     from hermes_lcm.dag import SummaryDAG, SummaryNode
     from hermes_lcm.store import MessageStore
-    from hermes_lcm.vector_store import VectorStore
+    from hermes_lcm.vector_store import EmbeddingIdentity, VectorStore
 
     db_path = tmp_dir / f"{_safe(question.question_id)}.db"
     model = provider_embedder.model_id
@@ -459,10 +497,18 @@ def evaluate_question(
     dag = SummaryDAG(str(db_path))
     vector_store = VectorStore(str(db_path), config=config)
     session_vectors: dict[str, list[float]] = {}
+    # store_id -> owning session, so a chunk KNN hit votes for its session.
+    store_id_to_session: dict[int, str] = {}
+    chunk_identity = None
     try:
         if embeddings_enabled:
             vector_store.register_profile(model, provider_name, dim)
             identity = vector_store.capture_identity(model, provider=provider_name)
+            # The raw-chunk corpus is a distinct task='chunk' profile/identity.
+            vector_store.register_profile(model, provider_name, dim, task="chunk")
+            chunk_identity = EmbeddingIdentity.canonical(
+                provider_name, model, "", dim, "float32", "little", "chunk"
+            )
 
         for session_id, session in zip(question.haystack_session_ids, question.haystack_sessions):
             messages = [
@@ -473,9 +519,24 @@ def evaluate_question(
                 for turn in session
             ]
             if messages:
-                store.append_batch(
+                store_ids = store.append_batch(
                     session_id, messages, source="benchmark", conversation_id=session_id
                 )
+                if embeddings_enabled and chunk_identity is not None:
+                    for store_id in store_ids:
+                        store_id_to_session[int(store_id)] = session_id
+                    rows = [
+                        {"store_id": sid, "role": m["role"], "content": m["content"]}
+                        for sid, m in zip(store_ids, messages)
+                    ]
+                    for chunk in iter_message_chunks(rows, policy="conversational"):
+                        chunk_vector = provider_embedder.embed_documents([chunk.text])[0]
+                        vector_store.record_chunk_embedding(
+                            chunk.chunk_id, model, chunk_vector,
+                            store_id=chunk.store_id, chunk_index=chunk.chunk_index,
+                            char_start=chunk.char_start, char_end=chunk.char_end,
+                            token_estimate=chunk.token_estimate, identity=chunk_identity,
+                        )
             summary_text = deterministic_session_summary(session)
             node_id = dag.add_node(
                 SummaryNode(
@@ -513,12 +574,26 @@ def evaluate_question(
             if embeddings_enabled
             else list(hybrid_ranked[0])
         )
+        if embeddings_enabled:
+            chunk_ranked = _timed(
+                lambda: chunk_sessions(
+                    vector_store, query_vec, model, provider_name, fetch,
+                    store_id_to_session,
+                )
+            )
+        else:
+            chunk_ranked = ([], 0.0)
+        hybrid_rrf3_ranked = _timed(
+            lambda: rrf_fuse(fts_ranked[0], vector_ranked[0], chunk_ranked[0])
+        )
 
         ranked_by_arm = {
             "fts": fts_ranked,
             "summary_vectors": vector_ranked,
             "hybrid_rrf": hybrid_ranked,
             "hybrid_rerank": rerank_ranked,
+            "chunk_vectors": chunk_ranked,
+            "hybrid_rrf3": hybrid_rrf3_ranked,
         }
         scored: dict[str, dict[str, float]] = {}
         for arm, (ranked, elapsed_ms) in ranked_by_arm.items():
