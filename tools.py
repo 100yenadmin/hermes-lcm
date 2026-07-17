@@ -55,8 +55,10 @@ from .retrieval_core import (
     _resolve_semantic_conversation_scope,
     _shape_message_hit,
     _shape_summary_hit,
+    hydrate_chunk_hits,
     hydrate_semantic_nodes,
     rrf_fuse,
+    run_chunk_knn,
     run_knn,
 )
 from .rollup_store import RollupStore
@@ -249,6 +251,19 @@ _LCM_RECENT_FRONTIER_WORK_LIMIT = 4096
 _LCM_GREP_HYBRID_CANDIDATE_CAP = 500
 _LCM_GREP_SEMANTIC_SNIPPET_CHARS = 300
 _LCM_GREP_RRF_K = 60
+# -- lcm_recall (cross-conversation forever-memory recall) --
+_LCM_RECALL_DEFAULT_LIMIT = 8
+_LCM_RECALL_LIMIT_CAP = 25
+_LCM_RECALL_DEFAULT_SCOPE_BIAS = 0.5
+_LCM_RECALL_SNIPPET_CHARS = 300
+_LCM_RECALL_RESPONSE_CHAR_CAP = 64_000
+_LCM_RECALL_VALID_INCLUDE = frozenset({"all", "summaries", "verbatim"})
+# Recency boost half-life (30 days) and its floor: a memory's rank_score is
+# multiplied by 2**(-age/half_life), clamped so age never zeroes an otherwise
+# strong hit — it only nudges toward newer memories.
+_LCM_RECALL_RECENCY_HALF_LIFE_S = 30 * 24 * 3600.0
+_LCM_RECALL_RECENCY_FLOOR = 0.5
+_LCM_RECALL_RRF_K = 60
 _LCM_LOAD_SESSION_DEFAULT_LIMIT = 100
 _LCM_LOAD_SESSION_HARD_LIMIT_CAP = 200
 _LCM_LOAD_SESSION_DEFAULT_MAX_CONTENT_CHARS = 4000
@@ -2624,6 +2639,466 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
     return json.dumps({
         "error": "mode must be one of: full_text, semantic, hybrid",
     })
+
+
+def _lcm_recall_recency_boost(timestamp: Any, *, now: float) -> float:
+    """Half-life recency multiplier in ``[floor, 1.0]`` (newer => closer to 1)."""
+    try:
+        ts = float(timestamp or 0.0)
+    except (TypeError, ValueError):
+        ts = 0.0
+    if ts <= 0:
+        return _LCM_RECALL_RECENCY_FLOOR
+    age = max(0.0, now - ts)
+    boost = 2.0 ** (-(age / _LCM_RECALL_RECENCY_HALF_LIFE_S))
+    return max(_LCM_RECALL_RECENCY_FLOOR, boost)
+
+
+def _lcm_recall_summary_expand_hint(hit: dict[str, Any]) -> str:
+    # Cross-session summary/DAG expansion is deferred (lcm_expand node_id is
+    # current-session only), so a cross-session summary points at the session
+    # loader instead of a node handle it cannot expand.
+    if hit.get("from_current_session"):
+        return f"lcm_expand(node_id={hit.get('node_id')})"
+    return f"lcm_load_session(session_id='{hit.get('session_id') or ''}')"
+
+
+def _lcm_recall_excerpt_expand_hint(hit: dict[str, Any]) -> str:
+    offset = int(hit.get("content_offset") or 0)
+    return f"lcm_expand(store_id={hit.get('store_id')}, content_offset={offset})"
+
+
+def _lcm_recall_fts_arm(
+    engine: "LCMEngine", query: str, *, candidate_limit: int, deadline: float
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    """FTS arm: raw messages across ALL sessions (no conversation filter)."""
+    payload = _lcm_grep_full_text_with_deadline(
+        {
+            "query": query,
+            "mode": "recall",
+            "session_scope": "all",
+            "limit": candidate_limit,
+        },
+        engine=engine,
+        deadline=deadline,
+        limit_cap=_LCM_GREP_HYBRID_CANDIDATE_CAP,
+    )
+    if "error" in payload:
+        return [], payload
+    hits: list[dict[str, Any]] = []
+    for row in payload.get("results", []):
+        store_id = row.get("store_id")
+        if store_id is None:
+            continue
+        hit = {
+            "kind": "message_excerpt",
+            "store_id": store_id,
+            "session_id": row.get("session_id"),
+            "source": row.get("source") or "",
+            "role": row.get("role"),
+            "timestamp": row.get("timestamp") or 0,
+            "content_offset": 0,
+            "snippet": (row.get("snippet") or "")[:_LCM_RECALL_SNIPPET_CHARS],
+            "from_current_session": bool(row.get("from_current_session")),
+        }
+        hit["expand_hint"] = _lcm_recall_excerpt_expand_hint(hit)
+        hits.append(hit)
+    return hits, None
+
+
+def _lcm_recall_summary_arm(
+    engine: "LCMEngine",
+    *,
+    query_vector: list[float],
+    provider: Any,
+    candidate_limit: int,
+    deadline: float,
+) -> tuple[list[dict[str, Any]], str]:
+    """Summary KNN arm: embedded summaries across ALL sessions (no filter)."""
+    knn_results = _run_within_deadline(
+        lambda: run_knn(
+            engine,
+            query_vector=query_vector,
+            provider=provider,
+            knn_limit=candidate_limit,
+            deadline=deadline,
+            since=None,
+            until=None,
+            conversation_ids=None,
+            source=None,
+            vector_store_cls=VectorStore,
+        ),
+        remaining_s=deadline - time.monotonic(),
+        name="lcm-recall-summary-knn",
+    )
+    coverage = knn_results.coverage
+    ranked_rows = list(knn_results)
+    if coverage == "none" or not ranked_rows:
+        return [], coverage
+    nodes = _run_within_deadline(
+        lambda: hydrate_semantic_nodes(
+            engine,
+            ranked_rows=ranked_rows,
+            knn_limit=candidate_limit,
+            deadline=deadline,
+        ),
+        remaining_s=deadline - time.monotonic(),
+        name="lcm-recall-summary-hydrate",
+    )
+    current = engine.current_session_id
+    hits: list[dict[str, Any]] = []
+    for node, _score in nodes:
+        hit = {
+            "kind": "summary",
+            "node_id": node.node_id,
+            "session_id": node.session_id,
+            "timestamp": node.latest_at or node.created_at or 0,
+            "snippet": (node.summary or "")[:_LCM_RECALL_SNIPPET_CHARS],
+            "from_current_session": bool(current) and node.session_id == current,
+        }
+        hit["expand_hint"] = _lcm_recall_summary_expand_hint(hit)
+        hits.append(hit)
+    return hits, coverage
+
+
+def _lcm_recall_chunk_arm(
+    engine: "LCMEngine",
+    *,
+    query_vector: list[float],
+    provider: Any,
+    candidate_limit: int,
+    deadline: float,
+) -> tuple[list[dict[str, Any]], str]:
+    """Chunk KNN arm: verbatim chunk vectors across ALL sessions (no filter)."""
+    knn_results = _run_within_deadline(
+        lambda: run_chunk_knn(
+            engine,
+            query_vector=query_vector,
+            provider=provider,
+            knn_limit=candidate_limit,
+            deadline=deadline,
+            since=None,
+            until=None,
+            conversation_ids=None,
+            source=None,
+            vector_store_cls=VectorStore,
+        ),
+        remaining_s=deadline - time.monotonic(),
+        name="lcm-recall-chunk-knn",
+    )
+    coverage = knn_results.coverage
+    ranked_rows = list(knn_results)
+    if coverage == "none" or not ranked_rows:
+        return [], coverage
+    raw_hits = _run_within_deadline(
+        lambda: hydrate_chunk_hits(
+            engine,
+            ranked_rows=ranked_rows,
+            knn_limit=candidate_limit,
+            deadline=deadline,
+            snippet_chars=_LCM_RECALL_SNIPPET_CHARS,
+        ),
+        remaining_s=deadline - time.monotonic(),
+        name="lcm-recall-chunk-hydrate",
+    )
+    current = engine.current_session_id
+    hits: list[dict[str, Any]] = []
+    for hit, _score in raw_hits:
+        hit["from_current_session"] = bool(current) and hit.get("session_id") == current
+        hit["expand_hint"] = _lcm_recall_excerpt_expand_hint(hit)
+        hits.append(hit)
+    return hits, coverage
+
+
+def _lcm_recall_rerank(
+    provider: Any,
+    query: str,
+    ordered: list[dict[str, Any]],
+    *,
+    window: int,
+    deadline: float,
+    config: Any,
+) -> tuple[list[dict[str, Any]], str]:
+    """Optionally rerank the top ``window`` fused candidates in ONE API call.
+
+    Default OFF. Any failure (no provider, non-voyage, network, deadline) skips
+    silently back to the RRF order with a ``skipped: <reason>`` status.
+    """
+    if not bool(getattr(config, "rerank_enabled", False)):
+        return ordered, "disabled"
+    if (
+        provider is None
+        or getattr(provider, "provider_id", "") != "voyage"
+        or not hasattr(provider, "rerank")
+    ):
+        return ordered, "skipped: rerank requires the voyage provider"
+    head = ordered[:window]
+    if not head:
+        return ordered, "skipped: no candidates to rerank"
+    documents = [str(entry["hit"].get("snippet") or "") for entry in head]
+    try:
+        ranked = _run_within_deadline(
+            lambda: provider.rerank(
+                query,
+                documents,
+                top_k=len(documents),
+                timeout=max(0.001, deadline - time.monotonic()),
+            ),
+            remaining_s=deadline - time.monotonic(),
+            name="lcm-recall-rerank",
+        )
+    except Exception as exc:  # noqa: BLE001 - any failure => skip rerank
+        return ordered, f"skipped: {exc}"
+    if not ranked:
+        return ordered, "skipped: empty rerank result"
+    reordered: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for index, relevance in ranked:
+        if 0 <= index < len(head):
+            entry = head[index]
+            entry["_rerank_score"] = float(relevance)
+            reordered.append(entry)
+            seen.add(index)
+    for index, entry in enumerate(head):
+        if index not in seen:
+            reordered.append(entry)
+    reordered.extend(ordered[window:])
+    return reordered, "applied"
+
+
+def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
+    """Search the agent's entire memory (all conversations, all time) by meaning.
+
+    Fuses three arms over the whole local database — FTS raw messages, embedded
+    summary KNN, and verbatim chunk KNN — with RRF, then applies a soft
+    scope/recency prior and (optionally) a cross-encoder rerank. The current
+    conversation is only ever a ranking BOOST, never a hard filter.
+    """
+    request_started = time.monotonic()
+    engine = _require_engine(kwargs)
+    if engine is None:
+        return json.dumps({"error": "LCM engine not initialized"})
+
+    query = str(args.get("query", "")).strip()
+    if not query:
+        return json.dumps({"error": "No query provided"})
+
+    parsed_limit = _parse_int_value(args.get("limit", _LCM_RECALL_DEFAULT_LIMIT), _LCM_RECALL_DEFAULT_LIMIT)
+    if parsed_limit <= 0:
+        return json.dumps({"error": "limit must be a positive integer"})
+    requested_limit = parsed_limit
+    limit = min(requested_limit, _LCM_RECALL_LIMIT_CAP)
+
+    scope_bias, scope_bias_error = _parse_optional_float(args.get("scope_bias"), "scope_bias")
+    if scope_bias_error:
+        return json.dumps({"error": scope_bias_error})
+    if scope_bias is None:
+        scope_bias = _LCM_RECALL_DEFAULT_SCOPE_BIAS
+    scope_bias = max(0.0, min(1.0, float(scope_bias)))
+
+    include = str(args.get("include") or "all").strip().lower()
+    if include not in _LCM_RECALL_VALID_INCLUDE:
+        return json.dumps({"error": "include must be one of: all, summaries, verbatim"})
+
+    timeout_s = max(0.001, float(getattr(engine._config, "embedding_query_timeout_s", 3.0)))
+    deadline = request_started + timeout_s
+
+    candidate_limit = min(_LCM_GREP_HYBRID_CANDIDATE_CAP, max(50, limit * 4))
+    rerank_window = min(50, max(1, limit * 4))
+
+    run_fts = include in {"all", "verbatim"}
+    run_summary = include in {"all", "summaries"}
+    run_chunk = include in {"all", "verbatim"}
+    embeddings_enabled = bool(getattr(engine._config, "embeddings_enabled", False))
+
+    arm_hits: dict[str, list[dict[str, Any]]] = {}
+    coverage: dict[str, str] = {}
+    degraded_reasons: list[str] = []
+    timed_out = False
+    provider: Any = None
+
+    # -- FTS arm (the default-on value: works with embeddings disabled) --
+    if run_fts:
+        try:
+            hits, fts_error = _lcm_recall_fts_arm(
+                engine, query, candidate_limit=candidate_limit, deadline=deadline
+            )
+        except (_WorkerCapacityError, TimeoutError) as exc:
+            hits, fts_error = [], {"error": str(exc)}
+        if fts_error is not None:
+            coverage["fts"] = "none"
+            degraded_reasons.append("full-text arm unavailable")
+            timed_out = timed_out or bool(fts_error.get("timeout"))
+        else:
+            arm_hits["fts"] = hits
+            coverage["fts"] = "ok"
+
+    # -- Vector arms (summary + chunk) share one provider + query embedding --
+    if run_summary or run_chunk:
+        if not embeddings_enabled:
+            degraded_reasons.append("semantic retrieval is disabled")
+            if run_summary:
+                coverage["summary"] = "disabled"
+            if run_chunk:
+                coverage["chunk"] = "disabled"
+        elif time.monotonic() >= deadline:
+            timed_out = True
+        else:
+            query_vector: list[float] | None = None
+            try:
+                provider = _run_within_deadline(
+                    lambda: _lcm_grep_resolve_provider(engine, deadline=deadline),
+                    remaining_s=deadline - time.monotonic(),
+                    name="lcm-provider-resolution",
+                )
+                if provider is None:
+                    degraded_reasons.append("embedding provider is not configured")
+                else:
+                    query_vector = _lcm_grep_embed_query(
+                        provider, query, remaining_s=deadline - time.monotonic()
+                    )
+            except VoyageError as exc:
+                provider = None
+                degraded_reasons.append(f"query embedding failed: {exc}")
+            except TimeoutError:
+                provider = None
+                timed_out = True
+            except Exception as exc:  # noqa: BLE001 - degrade, never bare-error the whole tool
+                provider = None
+                degraded_reasons.append(f"embedding provider unavailable: {exc}")
+
+            if query_vector is not None:
+                if run_summary:
+                    try:
+                        hits, cov = _lcm_recall_summary_arm(
+                            engine,
+                            query_vector=query_vector,
+                            provider=provider,
+                            candidate_limit=candidate_limit,
+                            deadline=deadline,
+                        )
+                        arm_hits["summary"] = hits
+                        coverage["summary"] = cov
+                        if cov == "none":
+                            degraded_reasons.append("summary vectors are unavailable")
+                    except TimeoutError:
+                        timed_out = True
+                        coverage["summary"] = "none"
+                    except Exception as exc:  # noqa: BLE001
+                        coverage["summary"] = "none"
+                        degraded_reasons.append(f"summary arm failed: {exc}")
+                if run_chunk:
+                    try:
+                        hits, cov = _lcm_recall_chunk_arm(
+                            engine,
+                            query_vector=query_vector,
+                            provider=provider,
+                            candidate_limit=candidate_limit,
+                            deadline=deadline,
+                        )
+                        arm_hits["chunk"] = hits
+                        coverage["chunk"] = cov
+                        if cov == "none":
+                            degraded_reasons.append("chunk vectors are unavailable")
+                    except TimeoutError:
+                        timed_out = True
+                        coverage["chunk"] = "none"
+                    except Exception as exc:  # noqa: BLE001
+                        coverage["chunk"] = "none"
+                        degraded_reasons.append(f"chunk arm failed: {exc}")
+
+    # -- RRF fusion over the arms that produced hits (order fixes base-hit win) --
+    arm_order = [name for name in ("fts", "summary", "chunk") if arm_hits.get(name)]
+    ordered = rrf_fuse([arm_hits[name] for name in arm_order], k=_LCM_RECALL_RRF_K)
+
+    # Merge a chunk span onto a message whose store_id also surfaced via FTS so
+    # its expand handle points at the exact excerpt (dedupe keeps the fused,
+    # higher-ranked entry; provenance from both arms is preserved via ranks).
+    chunk_by_store = {
+        hit.get("store_id"): hit for hit in arm_hits.get("chunk", [])
+    }
+    for entry in ordered:
+        hit = entry["hit"]
+        if hit.get("kind") == "message_excerpt" and not hit.get("chunk_span"):
+            chunk_hit = chunk_by_store.get(hit.get("store_id"))
+            if chunk_hit is not None:
+                hit["chunk_span"] = chunk_hit.get("chunk_span")
+                hit["content_offset"] = chunk_hit.get("content_offset", 0)
+                hit["expand_hint"] = _lcm_recall_excerpt_expand_hint(hit)
+
+    # -- Optional rerank stage (default OFF) --
+    ordered, rerank_status = _lcm_recall_rerank(
+        provider, query, ordered, window=rerank_window, deadline=deadline, config=engine._config
+    )
+
+    # -- Scope-prior + recency rescoring --
+    now = time.time()
+    for entry in ordered:
+        hit = entry["hit"]
+        rank_score = float(entry.get("_rerank_score", entry.get("rrf_score", 0.0)))
+        is_current = 1.0 if hit.get("from_current_session") else 0.0
+        recency = _lcm_recall_recency_boost(hit.get("timestamp"), now=now)
+        entry["_final_score"] = rank_score * (1.0 + scope_bias * is_current) * recency
+    ordered.sort(
+        key=lambda entry: (
+            -float(entry["_final_score"]),
+            -float(entry.get("_rerank_score", entry.get("rrf_score", 0.0))),
+            _hit_identity(entry["hit"]),
+        )
+    )
+
+    # -- Response shaping (char-capped) --
+    hits_out: list[dict[str, Any]] = []
+    response_chars = 0
+    for entry in ordered:
+        hit = entry["hit"]
+        arms = sorted({arm_order[index] for index in entry["ranks"].keys()})
+        item: dict[str, Any] = {
+            "kind": hit.get("kind"),
+            "session_id": hit.get("session_id"),
+            "timestamp": hit.get("timestamp") or 0,
+            "snippet": (hit.get("snippet") or "")[:_LCM_RECALL_SNIPPET_CHARS],
+            "score": round(float(entry["_final_score"]), 6),
+            "expand_hint": hit.get("expand_hint"),
+            "from_current_session": bool(hit.get("from_current_session")),
+            "arms": arms,
+        }
+        if hit.get("kind") == "summary":
+            item["node_id"] = hit.get("node_id")
+        else:
+            item["store_id"] = hit.get("store_id")
+            if hit.get("chunk_span"):
+                item["chunk_span"] = hit["chunk_span"]
+        item_chars = len(json.dumps(item, ensure_ascii=False))
+        if hits_out and response_chars + item_chars > _LCM_RECALL_RESPONSE_CHAR_CAP:
+            break
+        response_chars += item_chars
+        hits_out.append(item)
+        if len(hits_out) >= limit:
+            break
+
+    degraded = bool(degraded_reasons)
+    response: dict[str, Any] = {
+        "query": query,
+        "limit": limit,
+        "scope_bias": scope_bias,
+        "include": include,
+        "total_results": len(hits_out),
+        "hits": hits_out,
+        "provenance": {
+            "arms_run": arm_order,
+            "coverage": coverage,
+            "rerank": rerank_status,
+        },
+        "degraded": degraded,
+    }
+    if degraded:
+        response["degraded_reason"] = "; ".join(dict.fromkeys(degraded_reasons))
+    if timed_out:
+        response["timeout"] = True
+    if requested_limit > _LCM_RECALL_LIMIT_CAP:
+        response["limit_clamped_from"] = requested_limit
+    return json.dumps(response)
 
 
 def lcm_describe(args: Dict[str, Any], **kwargs) -> str:

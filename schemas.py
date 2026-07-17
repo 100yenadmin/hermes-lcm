@@ -10,7 +10,8 @@ LCM_GREP = {
         "such as openclaw-lcm:* . In broader scopes only raw-message hits are returned; cross-session summary "
         "node expansion is intentionally deferred. Use lcm_expand(store_id=...) on a cross-session message hit "
         "to drill into its full content. Set content_scope='externalized' or 'both' to opt into bounded, active-session "
-        "search over recoverable payload sidecars. For Hermes-tracked session history outside the LCM database, use session_search."
+        "search over recoverable payload sidecars. For Hermes-tracked session history outside the LCM database, use session_search. "
+        "For open-ended cross-conversation recall by meaning ('have we ever discussed…'), prefer lcm_recall."
     ),
     "parameters": {
         "type": "object",
@@ -122,6 +123,56 @@ LCM_GREP = {
                     "Optional inclusive maximum raw-message timestamp. Accepts Unix seconds or timezone-aware ISO 8601; "
                     "naive ISO timestamps are rejected. When supplied, lcm_grep returns raw message hits only."
                 ),
+            },
+        },
+        "required": ["query"],
+    },
+}
+
+LCM_RECALL = {
+    "name": "lcm_recall",
+    "description": (
+        "Search the agent's entire memory across ALL conversations and all time by meaning. "
+        "Returns the most relevant memories — summaries and verbatim excerpts — ranked by relevance, "
+        "recency, and relatedness to the current conversation, each with a handle to expand the exact "
+        "original content (lcm_expand). Not for retrieving exact/verbatim text within a known time range — "
+        "use lcm_grep(mode='full_text') for that. Not for full transcripts — after locating the right "
+        "conversation, use lcm_load_session(session_id). Recency and current-conversation preference are soft "
+        "ranking boosts, not filters; for hard time bounds use lcm_grep time_from/time_to."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": (
+                    "Natural-language description of what to recall. Searched by meaning across every "
+                    "conversation and keyword-matched over raw history; distinctive phrasing recalls best."
+                ),
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Max memories to return (default 8, hard upper bound 25).",
+                "default": 8,
+            },
+            "scope_bias": {
+                "type": "number",
+                "description": (
+                    "Soft preference for the current conversation, 0..1 (default 0.5). 0 = global-neutral, "
+                    "1 = strongly prefer memories from the current conversation. This is a ranking boost, "
+                    "never a hard filter — cross-conversation memories always remain eligible."
+                ),
+                "default": 0.5,
+            },
+            "include": {
+                "type": "string",
+                "enum": ["all", "summaries", "verbatim"],
+                "description": (
+                    "Which memory kinds to return. 'all' (default) mixes summaries and verbatim excerpts, "
+                    "'summaries' returns compacted summary memories only, 'verbatim' returns raw message "
+                    "excerpts only."
+                ),
+                "default": "all",
             },
         },
         "required": ["query"],
