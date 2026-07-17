@@ -113,6 +113,36 @@ usable result before the deadline, the semantic arm is not started and an
 explicit timeout is returned. Fusion expiry also returns an explicit timeout.
 No external reranker is called.
 
+### Weighted RRF fusion (lcm_recall)
+
+`lcm_recall` fuses three arms — full-text raw messages, summary-vector KNN, and
+chunk-vector KNN — with reciprocal-rank fusion, but each arm carries a tunable
+weight so the fused ranking is never dragged below its best arm:
+
+```text
+rrf_score = sum(weight_arm / (60 + rank))
+```
+
+Naive equal-weight fusion measured **−21 R@5** against pure summary vectors on
+LongMemEval: the weak FTS arm got equal say and pulled strong vector matches
+down. Down-weighting FTS restores the vector-best identity to the top of a
+strong-vector/weak-FTS corpus.
+
+Weights come from `LCM_RECALL_ARM_WEIGHTS`, a lenient `arm=weight` list:
+
+```bash
+LCM_RECALL_ARM_WEIGHTS="fts=0.5,summary=1.0,chunk=1.0"
+```
+
+Defaults are `fts=0.5, summary=1.0, chunk=1.0` (conservative; the LongMemEval
+harness tunes from here). Unknown arm names, malformed pairs, and
+non-finite/non-numeric weights are ignored, and any arm left unspecified keeps
+its default — a fully unparsable value falls back to the defaults rather than
+erroring the tool. `lcm_grep`'s hybrid RRF is unaffected: it keeps implicit
+`1.0` weights (byte-identical to the unweighted formula above). The weights
+actually applied to the arms that ran are echoed back under
+`provenance.arm_weights`.
+
 ### Deterministic recall smoke evaluation
 
 The committed offline harness builds a fixed-seed, 60-summary synthetic corpus

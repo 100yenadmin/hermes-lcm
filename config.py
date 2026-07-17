@@ -14,6 +14,42 @@ def _parse_pattern_list(raw: str) -> list[str]:
     return [part.strip() for part in raw.split(",") if part.strip()]
 
 
+# Default lcm_recall RRF arm weights. Conservative down-weight of the weak FTS
+# arm (the LongMemEval harness will tune from here); summary/chunk vector arms
+# keep full say. See docs/retrieval-tools.md.
+_DEFAULT_RECALL_ARM_WEIGHTS: dict[str, float] = {
+    "fts": 0.5,
+    "summary": 1.0,
+    "chunk": 1.0,
+}
+
+
+def _parse_arm_weights(raw: str, defaults: dict[str, float]) -> dict[str, float]:
+    """Leniently parse ``arm=weight`` pairs (e.g. ``fts=0.5,summary=1.0``).
+
+    Unknown arm names, malformed pairs, and non-finite/non-numeric weights are
+    skipped; any arm not overridden keeps its default. A wholly unparsable value
+    therefore degrades to the defaults rather than erroring the tool.
+    """
+    weights = dict(defaults)
+    for part in raw.split(","):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        name, _, value = part.partition("=")
+        name = name.strip().lower()
+        if name not in defaults:
+            continue
+        try:
+            parsed = float(value.strip())
+        except (TypeError, ValueError):
+            continue
+        if parsed != parsed or parsed in (float("inf"), float("-inf")):
+            continue
+        weights[name] = parsed
+    return weights
+
+
 def _parse_int_env(key: str, default: int) -> int:
     raw = os.environ.get(key)
     if raw is None:
@@ -505,6 +541,13 @@ class LCMConfig:
     # (still deadline-guarded) lets recall cover a realistic forever-memory
     # corpus while capping worst-case cost on a very large one.
     recall_scan_rows: int = 25_000
+    # Per-arm RRF fusion weights for lcm_recall's 3-arm hybrid (fts/summary/chunk).
+    # Down-weighting the weak FTS arm keeps naive equal-weight fusion from dragging
+    # fused recall below its best (vector) arm — measured −21 R@5 on LongMemEval.
+    # Override via LCM_RECALL_ARM_WEIGHTS ("fts=0.5,summary=1.0,chunk=1.0").
+    recall_arm_weights: dict[str, float] = field(
+        default_factory=lambda: dict(_DEFAULT_RECALL_ARM_WEIGHTS)
+    )
     embedding_provider: str = ""
     embedding_model: str = ""
     # Content-aware chunk policy for the raw-history chunk corpus:
@@ -653,6 +696,12 @@ class LCMConfig:
                 c.empty_lifecycle_gc_max_age_hours = float(raw_max_age)
             except (TypeError, ValueError):
                 pass
+
+        raw_arm_weights = os.environ.get("LCM_RECALL_ARM_WEIGHTS")
+        if raw_arm_weights is not None:
+            c.recall_arm_weights = _parse_arm_weights(
+                raw_arm_weights, _DEFAULT_RECALL_ARM_WEIGHTS
+            )
 
         raw_ignore = os.environ.get("LCM_IGNORE_SESSION_PATTERNS")
         if raw_ignore is not None:

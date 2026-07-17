@@ -391,6 +391,33 @@ def test_recall_query_timeout_has_its_own_budget(monkeypatch, tmp_path):
     assert cfg.embedding_query_timeout_s == 3.0  # grep's deadline untouched
 
 
+def test_recall_arm_weights_default_and_env_lenient(monkeypatch, tmp_path):
+    """B2: recall_arm_weights default to fts=0.5,summary=1,chunk=1 and the env
+    override parses leniently -- unknown arms, malformed pairs, and non-numeric
+    weights are dropped while unspecified arms keep their default."""
+    assert LCMConfig(database_path=str(tmp_path / "d.db")).recall_arm_weights == {
+        "fts": 0.5,
+        "summary": 1.0,
+        "chunk": 1.0,
+    }
+    monkeypatch.setenv("LCM_RECALL_ARM_WEIGHTS", "fts=0.7, chunk=0.9 ,bogus=1,summary=x,,junk")
+    cfg = LCMConfig.from_env()
+    assert cfg.recall_arm_weights == {"fts": 0.7, "summary": 1.0, "chunk": 0.9}
+
+
+def test_recall_echoes_arm_weights_in_provenance(recall_engine, monkeypatch):
+    """B2: the weights actually applied to the arms that ran are echoed back
+    under provenance.arm_weights."""
+    recall_engine._config.recall_arm_weights = {"fts": 0.5, "summary": 1.0, "chunk": 1.0}
+    node = _add_summary(recall_engine, "kanban board dashboard sprint plan", session_id="session-a", created_at=10.0)
+    _seed_summary_vectors(recall_engine, [(node, [1.0, 0.0])])
+
+    payload = _recall(recall_engine, monkeypatch, include="summaries", limit=5)
+
+    assert payload["provenance"]["arms_run"] == ["summary"]
+    assert payload["provenance"]["arm_weights"] == {"summary": 1.0}
+
+
 def test_recall_uses_recall_timeout_budget(recall_engine, monkeypatch):
     """lcm_recall builds its deadline from recall_query_timeout_s, not the grep one."""
     recall_engine._config.recall_query_timeout_s = 8.0
@@ -521,6 +548,50 @@ def test_rrf_fuse_collapses_repeated_identity_within_arm():
     assert by_id["B"]["ranks"] == {0: 1}
     assert by_id["B"]["rrf_score"] > by_id["A"]["rrf_score"]
     assert fused[0]["hit"]["store_id"] == "B"
+
+
+def test_rrf_fuse_default_weights_are_byte_identical_to_unweighted():
+    """B2: passing explicit 1.0 weights must reproduce unweighted RRF bit-for-bit
+    so lcm_grep's hybrid (which keeps 1.0 weights) is unchanged."""
+    from hermes_lcm.retrieval_core import rrf_fuse
+
+    fts_arm = [{"store_id": "A"}, {"store_id": "B"}]
+    vec_arm = [{"store_id": "B"}, {"store_id": "C"}]
+    arms = [fts_arm, vec_arm]
+
+    unweighted = rrf_fuse(arms, k=60)
+    weighted_ones = rrf_fuse(arms, k=60, weights=[1.0, 1.0])
+    # A missing/short weights list falls back to 1.0 for every unspecified arm.
+    weighted_short = rrf_fuse(arms, k=60, weights=[])
+
+    def _scores(fused):
+        return [(e["hit"].get("store_id"), e["rrf_score"], tuple(sorted(e["ranks"].items()))) for e in fused]
+
+    assert _scores(weighted_ones) == _scores(unweighted)
+    assert _scores(weighted_short) == _scores(unweighted)
+
+
+def test_rrf_weights_rank_vector_best_first_on_weak_fts_corpus():
+    """B2: on a strong-vector/weak-FTS shape, naive equal-weight RRF ranks a
+    noise identity (that the weak FTS arm loves) above the vector-best one; the
+    (0.5, 1, 1) arm weights restore the vector-best identity to the top --
+    mirroring the −21 R@5 LongMemEval regression. k is shrunk so short arms
+    spread rank terms far enough to exercise the flip cleanly."""
+    from hermes_lcm.retrieval_core import rrf_fuse
+
+    # Arm order is fts(0), summary(1), chunk(2) -- as lcm_recall builds it.
+    # Noise N: FTS rank 1 (weak arm loves it) but only rank 5 in each vector arm.
+    # Vector-best V: rank 1 in both vector arms, absent from FTS.
+    fts_arm = [{"store_id": "N"}, {"store_id": "x1"}, {"store_id": "x2"}, {"store_id": "x3"}, {"store_id": "x4"}]
+    summary_arm = [{"store_id": "V"}, {"store_id": "y1"}, {"store_id": "y2"}, {"store_id": "y3"}, {"store_id": "N"}]
+    chunk_arm = [{"store_id": "V"}, {"store_id": "z1"}, {"store_id": "z2"}, {"store_id": "z3"}, {"store_id": "N"}]
+    arms = [fts_arm, summary_arm, chunk_arm]
+
+    naive = rrf_fuse(arms, k=10)
+    assert naive[0]["hit"]["store_id"] == "N"  # equal weights get it wrong
+
+    weighted = rrf_fuse(arms, k=10, weights=[0.5, 1.0, 1.0])
+    assert weighted[0]["hit"]["store_id"] == "V"  # down-weighting FTS fixes it
 
 
 def test_chunk_dedupe_keeps_best_ranked_span(recall_engine, monkeypatch):

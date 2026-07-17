@@ -483,24 +483,50 @@ def _hit_identity(hit: dict[str, Any]) -> tuple[str, Any]:
     return ("message", hit.get("store_id"))
 
 
-def rrf_fuse(arms: list[list[dict[str, Any]]], k: int = 60) -> list[dict[str, Any]]:
+def rrf_fuse(
+    arms: list[list[dict[str, Any]]],
+    k: int = 60,
+    weights: list[float] | None = None,
+) -> list[dict[str, Any]]:
     """Reciprocal-rank fusion over ranked hit arms, keyed by hit identity.
 
-    Each entry accumulates ``1 / (k + rank)`` across the arms it appears in.
-    Returns entries ordered by descending RRF score with the source hit under
+    Each entry accumulates ``weight_arm / (k + rank)`` across the arms it appears
+    in. Returns entries ordered by descending RRF score with the source hit under
     ``hit``, the fused score under ``rrf_score``, and each arm's 1-based rank in
     ``ranks`` (keyed by arm index). Callers own arm-specific metadata (which arm
     is FTS vs semantic, confidence, snippet provenance).
 
+    ``weights`` optionally scales each arm's per-rank contribution (positional,
+    aligned to ``arms``). It defaults to ``1.0`` for every arm, which is
+    byte-identical to unweighted RRF -- a weak arm can then be down-weighted so a
+    3-arm hybrid is never dragged below its best arm (measured on LongMemEval:
+    naive equal-weight fusion cost 21 R@5 points versus pure vectors because the
+    weak FTS arm got equal say). A ``weights`` shorter than ``arms`` (or with a
+    missing/non-finite entry) falls back to ``1.0`` for the unspecified arms.
+
     A single identity that appears more than once within the SAME arm (e.g. a
     message chunked into several pieces, each a separate chunk-arm hit) is
     collapsed to its best (first, since arms are best-first ordered) rank and
-    contributes exactly one ``1 / (k + rank)`` term for that arm -- otherwise a
-    multi-chunk message double-counts and out-scores a genuine higher-rank match
-    (RRF-1).
+    contributes exactly one ``weight_arm / (k + rank)`` term for that arm --
+    otherwise a multi-chunk message double-counts and out-scores a genuine
+    higher-rank match (RRF-1).
     """
+
+    def _arm_weight(arm_index: int) -> float:
+        if weights is None or arm_index >= len(weights):
+            return 1.0
+        raw = weights[arm_index]
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return 1.0
+        if value != value or value in (float("inf"), float("-inf")):
+            return 1.0
+        return value
+
     fused: dict[tuple[str, Any], dict[str, Any]] = {}
     for arm_index, arm in enumerate(arms):
+        weight = _arm_weight(arm_index)
         for rank, hit in enumerate(arm, start=1):
             key = _hit_identity(hit)
             entry = fused.setdefault(
@@ -510,7 +536,7 @@ def rrf_fuse(arms: list[list[dict[str, Any]]], k: int = 60) -> list[dict[str, An
                 # Already scored this identity for this arm at a better rank.
                 continue
             entry["ranks"][arm_index] = rank
-            entry["rrf_score"] += 1.0 / (k + rank)
+            entry["rrf_score"] += weight / (k + rank)
     return sorted(
         fused.values(),
         key=lambda entry: (

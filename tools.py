@@ -3055,8 +3055,17 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
                         degraded_reasons.append(f"chunk arm failed: {exc}")
 
     # -- RRF fusion over the arms that produced hits (order fixes base-hit win) --
+    # Per-arm weights down-weight the weak FTS arm so the 3-arm hybrid is never
+    # dragged below its best arm (measured −21 R@5 on LongMemEval for naive
+    # equal-weight fusion). Weights echo into provenance below.
     arm_order = [name for name in ("fts", "summary", "chunk") if arm_hits.get(name)]
-    ordered = rrf_fuse([arm_hits[name] for name in arm_order], k=_LCM_RECALL_RRF_K)
+    configured_arm_weights = getattr(engine._config, "recall_arm_weights", None) or {}
+    arm_weights = [float(configured_arm_weights.get(name, 1.0)) for name in arm_order]
+    ordered = rrf_fuse(
+        [arm_hits[name] for name in arm_order],
+        k=_LCM_RECALL_RRF_K,
+        weights=arm_weights,
+    )
 
     # Merge chunk-arm provenance onto a message whose store_id also surfaced via
     # FTS. The chunk list is best-first, so keep the BEST-ranked chunk per store
@@ -3162,6 +3171,7 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
         "hits": hits_out,
         "provenance": {
             "arms_run": arm_order,
+            "arm_weights": {name: arm_weights[i] for i, name in enumerate(arm_order)},
             "coverage": coverage,
             "rerank": rerank_status,
             "ordering": (
