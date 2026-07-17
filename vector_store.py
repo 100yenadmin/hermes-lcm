@@ -24,10 +24,12 @@ from typing import Any, Iterator, Optional, Sequence
 from .config import LCMConfig
 from .db_bootstrap import (
     configure_connection,
+    ensure_chunk_tables,
     ensure_embedding_tables,
     mark_migration_step_complete,
     refuse_schema_version_too_new,
     run_versioned_migrations,
+    verify_chunk_schema,
     verify_embedding_schema,
 )
 from .sqlite_util import _is_sqlite_locked_error
@@ -40,6 +42,11 @@ logger = logging.getLogger(__name__)
 _VECTOR_DTYPE = "float32"
 _VECTOR_BYTEORDER = "little"
 _DEFAULT_TASK = "summary"
+_CHUNK_TASK = "chunk"
+# Tasks this store can encode. Summary and chunk corpora coexist in the shared
+# profile table, each keyed by its own canonical identity (task is part of the
+# identity hash), so their vectors never collide.
+_SUPPORTED_TASKS = frozenset({_DEFAULT_TASK, _CHUNK_TASK})
 
 # SQLite caps host parameters per statement (SQLITE_MAX_VARIABLE_NUMBER); a
 # single ``WHERE id IN (?, ?, ...)`` over tens of thousands of ids overflows it
@@ -60,13 +67,13 @@ def _require_supported_identity(identity: "EmbeddingIdentity") -> None:
         unsupported.append(f"dtype={identity.dtype!r}")
     if identity.byteorder != _VECTOR_BYTEORDER:
         unsupported.append(f"byteorder={identity.byteorder!r}")
-    if identity.task != _DEFAULT_TASK:
+    if identity.task not in _SUPPORTED_TASKS:
         unsupported.append(f"task={identity.task!r}")
     if unsupported:
         raise ValueError(
             "unsupported embedding representation: "
             + ", ".join(unsupported)
-            + "; supported representation is float32/little/summary"
+            + "; supported representation is float32/little/summary|chunk"
         )
 
 
@@ -194,6 +201,15 @@ class VectorStore:
             tuple[str, int, tuple[str, ...]],
             tuple[list[int], list[str], list[str], Any],
         ] = {}
+        # Separate cache for chunk-corpus matrices: chunk identities never
+        # collide with summary identities (task is part of the hash), but the
+        # loaders differ (chunk vectors join messages, summary vectors join
+        # summary_nodes), so the two corpora keep independent matrix caches.
+        self._chunk_matrix_cache: dict[
+            tuple[str, int, tuple[str, ...]],
+            tuple[list[int], list[str], list[str], Any],
+        ] = {}
+        self._chunk_schema_ready = False
         self._init_db()
 
     def _init_db(self) -> None:
@@ -370,15 +386,40 @@ class VectorStore:
         }
 
     def _current_profile(self) -> sqlite3.Row | None:
+        # The current SUMMARY profile. Task-scoped so a coexisting active chunk
+        # profile can never be mistaken for the summary corpus's current profile.
         return self._conn.execute(
             """
             SELECT identity_hash, model_name, provider, revision, dim, dtype,
                    byteorder, task, registered_at, active, archived_at, data_version
             FROM lcm_embedding_profile
-            WHERE active = 1 AND archived_at IS NULL
+            WHERE active = 1 AND archived_at IS NULL AND task = ?
             ORDER BY registered_at DESC, identity_hash DESC
             LIMIT 1
-            """
+            """,
+            (_DEFAULT_TASK,),
+        ).fetchone()
+
+    def _resolve_chunk_profile(
+        self, model_name: str, *, provider: str | None = None
+    ) -> sqlite3.Row | None:
+        """Resolve a profile by model (+optional provider) within task='chunk'."""
+        base = (
+            "SELECT identity_hash, model_name, provider, revision, dim, dtype, "
+            "byteorder, task, registered_at, active, archived_at, data_version "
+            "FROM lcm_embedding_profile WHERE model_name = ? AND task = ?"
+        )
+        order = (
+            " ORDER BY (active = 1 AND archived_at IS NULL) DESC, "
+            "registered_at DESC, identity_hash DESC LIMIT 1"
+        )
+        if provider is not None:
+            return self._conn.execute(
+                base + " AND provider = ?" + order,
+                (str(model_name), _CHUNK_TASK, str(provider).strip().lower()),
+            ).fetchone()
+        return self._conn.execute(
+            base + order, (str(model_name), _CHUNK_TASK)
         ).fetchone()
 
     @staticmethod
@@ -479,12 +520,16 @@ class VectorStore:
                     """,
                     (identity,),
                 )
-            # Selection of the "current" profile is by identity: only the
-            # just-registered identity stays active; every other profile is
-            # deactivated but retained so its vectors survive a later switch back.
+            # Selection of the "current" profile is by identity WITHIN A TASK:
+            # only the just-registered identity stays active for its task; other
+            # profiles of the SAME task are deactivated (retained so their
+            # vectors survive a later switch back). Profiles of a DIFFERENT task
+            # are untouched, so the summary and chunk corpora coexist — each has
+            # its own active profile.
             self._conn.execute(
-                "UPDATE lcm_embedding_profile SET active = 0 WHERE identity_hash != ?",
-                (identity,),
+                "UPDATE lcm_embedding_profile SET active = 0 "
+                "WHERE identity_hash != ? AND task = ?",
+                (identity, canonical.task),
             )
         return identity
 
@@ -516,12 +561,43 @@ class VectorStore:
         generation: int,
         request_id: str,
     ) -> EmbeddingPublishOutcome:
-        """Atomically revalidate ownership and publish one accepted vector.
+        """Atomically revalidate ownership and publish one accepted summary vector."""
+        embedded_id = str(embedded_id)
+        return self._publish_under_lease(
+            embedded_id,
+            model=model,
+            identity=identity,
+            claim_key=claim_key,
+            lease_id=lease_id,
+            generation=generation,
+            request_id=request_id,
+            write_row=lambda profile: self._write_embedding_row(
+                embedded_id, kind, vec, identity=identity, profile=profile
+            ),
+        )
+
+    def _publish_under_lease(
+        self,
+        embedded_id: str,
+        *,
+        model: str,
+        identity: EmbeddingIdentity,
+        claim_key: str,
+        lease_id: str,
+        generation: int,
+        request_id: str,
+        write_row,
+    ) -> EmbeddingPublishOutcome:
+        """Corpus-agnostic lease publication CAS shared by summary and chunk.
 
         The metadata owner/generation check, active captured identity check,
-        matching dispatched-row check, vector/meta write, data-version bump,
-        and in-flight clear all share one ``BEGIN IMMEDIATE`` transaction. A
-        superseded worker therefore performs none of these mutations.
+        matching dispatched-row check, corpus-specific vector/meta write (via
+        ``write_row``), data-version bump, and in-flight clear all share one
+        ``BEGIN IMMEDIATE`` transaction. A superseded worker therefore performs
+        none of these mutations. Summary and chunk publications share the one
+        ``lcm_embedding_backfill_inflight`` table because their embedded_ids are
+        disjoint (numeric node ids vs ``store_id:chunk_index``) and their
+        identity hashes differ (task is part of the hash).
         """
         embedded_id = str(embedded_id)
         with self._write_transaction():
@@ -587,9 +663,7 @@ class VectorStore:
                         "identity supersession lost lease release ownership"
                     )
                 return EmbeddingPublishOutcome.IDENTITY_SUPERSEDED
-            self._write_embedding_row(
-                embedded_id, kind, vec, identity=identity, profile=profile
-            )
+            write_row(profile)
             cleared = self._conn.execute(
                 """
                 DELETE FROM lcm_embedding_backfill_inflight
@@ -1246,6 +1320,433 @@ class VectorStore:
         )
         return KNNResult(candidates, coverage=coverage)
 
+    # -- Chunk corpus ------------------------------------------------------
+    #
+    # The chunk corpus mirrors the summary corpus exactly: identity-hashed
+    # profiles (task='chunk') in the shared lcm_embedding_profile table, the
+    # same bounded-candidate KNN + coverage contract, the same lease publication
+    # CAS. It differs only in its source table (raw messages, keyed by store_id)
+    # and its own meta/vectors tables. Chunk schema is materialized lazily on
+    # first chunk-corpus use so a summary-only install never creates it.
+
+    def ensure_chunk_schema(self) -> None:
+        """Materialize (and verify) the opt-in chunk tables on first chunk use.
+
+        Same discipline as ``_ensure_embedding_schema``: the ``chunk_vectors_v1``
+        marker is not trusted on its own; the tables/indexes are re-ensured and
+        VERIFIED, and only a fully-materialized schema keeps the marker.
+        """
+        if self._chunk_schema_ready:
+            return
+        with self._write_lock:
+            ensure_embedding_tables(self._conn)
+            ensure_chunk_tables(self._conn)
+            errors = verify_chunk_schema(self._conn)
+            if errors:
+                ensure_chunk_tables(self._conn)
+                errors = verify_chunk_schema(self._conn)
+                if errors:
+                    raise sqlite3.OperationalError(
+                        "chunk schema incompatible after ensure: " + "; ".join(errors)
+                    )
+            mark_migration_step_complete(self._conn, "chunk_vectors_v1")
+            self._conn.commit()
+        self._chunk_schema_ready = True
+
+    def _write_chunk_row(
+        self,
+        chunk_id: str,
+        *,
+        store_id: int,
+        chunk_index: int,
+        char_start: int,
+        char_end: int,
+        token_estimate: int,
+        vec: Sequence[float],
+        identity: EmbeddingIdentity,
+        profile: sqlite3.Row,
+    ) -> None:
+        identity_hash = identity.identity_hash
+        normalized = self._normalized(vec, expected_dim=int(profile["dim"]))
+        packed = struct.pack(f"<{len(normalized)}f", *normalized)
+        embedded_at = self._now()
+        self._conn.execute(
+            "DELETE FROM lcm_chunk_vectors WHERE chunk_id = ? AND identity_hash = ?",
+            (chunk_id, identity_hash),
+        )
+        self._conn.execute(
+            "DELETE FROM lcm_chunk_meta WHERE chunk_id = ? AND identity_hash = ?",
+            (chunk_id, identity_hash),
+        )
+        self._conn.execute(
+            "INSERT INTO lcm_chunk_vectors(chunk_id, identity_hash, vec) VALUES(?, ?, ?)",
+            (chunk_id, identity_hash, packed),
+        )
+        self._conn.execute(
+            """
+            INSERT INTO lcm_chunk_meta(
+                chunk_id, identity_hash, store_id, chunk_index, char_start,
+                char_end, token_estimate, embedded_at, archived
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, 0)
+            """,
+            (
+                chunk_id,
+                identity_hash,
+                int(store_id),
+                int(chunk_index),
+                int(char_start),
+                int(char_end),
+                int(token_estimate),
+                embedded_at,
+            ),
+        )
+        self._bump_data_version(identity_hash)
+
+    def record_chunk_embedding(
+        self,
+        chunk_id: str,
+        model: str,
+        vec: Sequence[float],
+        *,
+        store_id: int,
+        chunk_index: int,
+        char_start: int,
+        char_end: int,
+        token_estimate: int,
+        identity: EmbeddingIdentity,
+    ) -> None:
+        self.ensure_chunk_schema()
+        with self._write_transaction():
+            profile = self._validate_embedding_write(identity, model=model)
+            self._write_chunk_row(
+                str(chunk_id),
+                store_id=store_id,
+                chunk_index=chunk_index,
+                char_start=char_start,
+                char_end=char_end,
+                token_estimate=token_estimate,
+                vec=vec,
+                identity=identity,
+                profile=profile,
+            )
+
+    def publish_chunk_embedding_under_lease(
+        self,
+        chunk_id: str,
+        model: str,
+        vec: Sequence[float],
+        *,
+        store_id: int,
+        chunk_index: int,
+        char_start: int,
+        char_end: int,
+        token_estimate: int,
+        identity: EmbeddingIdentity,
+        claim_key: str,
+        lease_id: str,
+        generation: int,
+        request_id: str,
+    ) -> EmbeddingPublishOutcome:
+        """Atomically revalidate ownership and publish one accepted chunk vector."""
+        chunk_id = str(chunk_id)
+        return self._publish_under_lease(
+            chunk_id,
+            model=model,
+            identity=identity,
+            claim_key=claim_key,
+            lease_id=lease_id,
+            generation=generation,
+            request_id=request_id,
+            write_row=lambda profile: self._write_chunk_row(
+                chunk_id,
+                store_id=store_id,
+                chunk_index=chunk_index,
+                char_start=char_start,
+                char_end=char_end,
+                token_estimate=token_estimate,
+                vec=vec,
+                identity=identity,
+                profile=profile,
+            ),
+        )
+
+    def archive_chunks_for_messages(self, store_ids: Sequence[int | str]) -> int:
+        """Soft-archive chunks whose source messages were purged/GC'd.
+
+        Mirrors ``purge_embeddings_for_nodes`` but ARCHIVES (archived=1) rather
+        than deletes, matching the meta.archived contract KNN filters on: an
+        archived chunk is dropped from ranking but its row survives for bounded
+        recovery. No-op (0) when the chunk schema was never materialized.
+        """
+        if not self._chunk_tables_exist():
+            return 0
+        unique_ids = list(dict.fromkeys(int(store_id) for store_id in store_ids))
+        if not unique_ids:
+            return 0
+        with self._write_transaction():
+            with self._temp_id_table([str(value) for value in unique_ids]) as table:
+                cur = self._conn.execute(
+                    f"UPDATE lcm_chunk_meta SET archived = 1 "
+                    f"WHERE archived = 0 AND store_id IN "
+                    f"(SELECT CAST(id AS INTEGER) FROM {table})"
+                )
+            if cur.rowcount:
+                self._bump_all_data_versions()
+        return int(cur.rowcount or 0)
+
+    @staticmethod
+    def archive_chunks_for_messages_on_connection(
+        conn: sqlite3.Connection, store_ids: Sequence[int | str]
+    ) -> int:
+        """Archive one already-bounded message batch in the caller's transaction."""
+        unique_ids = list(dict.fromkeys(int(store_id) for store_id in store_ids))
+        if not unique_ids:
+            return 0
+        if len(unique_ids) > 256:
+            raise ValueError("chunk archive batch exceeds 256 rows")
+        tables = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name IN ("
+                "'lcm_chunk_meta','lcm_embedding_profile')"
+            ).fetchall()
+        }
+        if not {"lcm_chunk_meta", "lcm_embedding_profile"} <= tables:
+            return 0
+        placeholders = ",".join("?" for _ in unique_ids)
+        cur = conn.execute(
+            f"UPDATE lcm_chunk_meta SET archived = 1 "
+            f"WHERE archived = 0 AND store_id IN ({placeholders})",
+            unique_ids,
+        )
+        if cur.rowcount:
+            conn.execute(
+                "UPDATE lcm_embedding_profile SET data_version = data_version + 1"
+            )
+        return int(cur.rowcount or 0)
+
+    def _chunk_tables_exist(self) -> bool:
+        return self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='lcm_chunk_meta'"
+        ).fetchone() is not None
+
+    def _bounded_chunk_candidate_ids(
+        self,
+        identity_hash: str,
+        *,
+        since: float | None,
+        until: float | None,
+        conversation_ids: Sequence[str] | None,
+        source: str | None,
+        limit: int,
+    ) -> list[str]:
+        """Enumerate at most ``limit`` live chunk ids, most-recent-message first.
+
+        The candidate enumeration is bounded at the SQL layer exactly like the
+        summary path: recency (message timestamp), conversation (message
+        session_id), and source (message source) filters live in the WHERE
+        clause and a hard LIMIT caps the result. Unlike the summary corpus a
+        chunk maps DIRECTLY to one raw message, so the source filter is a plain
+        indexed column match (no recursive lineage walk) and needs no
+        fail-open/closed budget.
+        """
+        if limit <= 0:
+            return []
+        if conversation_ids is not None and not list(conversation_ids):
+            return []
+        message_columns = self._table_columns("messages")
+        if not message_columns:
+            return []
+        where = ["cm.identity_hash = ?", "cm.archived = 0"]
+        args: list[object] = [str(identity_hash)]
+        if since is not None:
+            where.append("m.timestamp >= ?")
+            args.append(float(since))
+        if until is not None:
+            where.append("m.timestamp <= ?")
+            args.append(float(until))
+        if source is not None:
+            where.append("m.source = ?")
+            args.append(str(source))
+        args.append(int(limit))
+        with self._optional_temp_id_table(conversation_ids) as conversation_table:
+            conversation_join = (
+                f"JOIN {conversation_table} c ON c.id = m.session_id"
+                if conversation_table is not None
+                else ""
+            )
+            rows = self._conn.execute(
+                f"""
+                SELECT cm.chunk_id
+                FROM lcm_chunk_meta cm
+                JOIN messages m ON m.store_id = cm.store_id
+                {conversation_join}
+                WHERE {' AND '.join(where)}
+                ORDER BY m.timestamp DESC, cm.chunk_id DESC
+                LIMIT ?
+                """,
+                args,
+            ).fetchall()
+        return [str(row[0]) for row in rows]
+
+    def _load_chunk_vectors_for_ids(
+        self,
+        identity_hash: str,
+        dim: int,
+        chunk_ids: Sequence[str],
+    ) -> tuple[list[int], list[str], list[str], list[list[float]]]:
+        rowids: list[int] = []
+        out_ids: list[str] = []
+        kinds: list[str] = []
+        vectors: list[list[float]] = []
+        if not chunk_ids:
+            return rowids, out_ids, kinds, vectors
+        with self._temp_id_table(chunk_ids) as table:
+            rows = self._conn.execute(
+                f"""
+                SELECT v.rowid, v.chunk_id, v.vec
+                FROM {table} t
+                JOIN lcm_chunk_vectors v
+                  ON v.chunk_id = t.id AND v.identity_hash = ?
+                JOIN lcm_chunk_meta m
+                  ON m.chunk_id = v.chunk_id AND m.identity_hash = v.identity_hash
+                WHERE m.archived = 0
+                """,
+                (identity_hash,),
+            ).fetchall()
+        for row in rows:
+            try:
+                blob = bytes(row["vec"])
+                if len(blob) != dim * 4:
+                    continue
+                vector = struct.unpack(f"<{dim}f", blob)
+            except (TypeError, ValueError, struct.error):
+                continue
+            rowids.append(int(row["rowid"]))
+            out_ids.append(str(row["chunk_id"]))
+            kinds.append("chunk")
+            vectors.append(list(vector))
+        return rowids, out_ids, kinds, vectors
+
+    def _numpy_chunk_rows(
+        self,
+        numpy: Any,
+        identity_hash: str,
+        dim: int,
+        chunk_ids: Sequence[str],
+    ) -> tuple[list[int], list[str], list[str], Any]:
+        with self._cache_lock:
+            data_version = self._data_version(identity_hash)
+            key = (identity_hash, data_version, tuple(str(value) for value in chunk_ids))
+            cached = self._chunk_matrix_cache.get(key)
+            if cached is not None:
+                return cached
+            rowids, loaded_ids, kinds, raw_vectors = self._load_chunk_vectors_for_ids(
+                identity_hash, dim, chunk_ids
+            )
+            matrix = (
+                numpy.asarray(raw_vectors, dtype=numpy.float32)
+                if raw_vectors
+                else numpy.empty((0, dim), dtype=numpy.float32)
+            )
+            loaded = (rowids, loaded_ids, kinds, matrix)
+            self._chunk_matrix_cache.clear()
+            self._chunk_matrix_cache[key] = loaded
+            return loaded
+
+    def knn_chunks(
+        self,
+        query_vec: Sequence[float],
+        k: int = 50,
+        model: str | None = None,
+        since: float | None = None,
+        until: float | None = None,
+        conversation_ids: Sequence[str] | None = None,
+        source: str | None = None,
+        provider: str | None = None,
+    ) -> KNNResult:
+        """Bounded-candidate chunk KNN with the summary coverage contract.
+
+        Coverage is full|bounded|none exactly as for summaries: ``none`` when
+        the corpus/identity is unbackfilled or a requested filter is
+        unverifiable (missing message column), ``bounded`` when more candidates
+        exist than the scan bound, ``full`` otherwise.
+        """
+        k = int(k)
+        if k <= 0:
+            return KNNResult(coverage="none")
+        if not self._chunk_tables_exist():
+            return KNNResult(coverage="none")
+        message_columns = self._table_columns("messages")
+        if conversation_ids is not None and "session_id" not in message_columns:
+            return KNNResult(coverage="none", reason="unverifiable_provenance")
+        if (since is not None or until is not None) and "timestamp" not in message_columns:
+            return KNNResult(coverage="none", reason="unverifiable_provenance")
+        if source is not None and "source" not in message_columns:
+            return KNNResult(coverage="none", reason="unverifiable_provenance")
+        profile = (
+            self._resolve_chunk_profile(str(model), provider=provider)
+            if model is not None
+            else self._current_chunk_profile()
+        )
+        if profile is None:
+            return KNNResult(coverage="none")
+        identity = str(profile["identity_hash"])
+        dim = int(profile["dim"])
+        query = self._normalized(query_vec, expected_dim=dim)
+        try:
+            numpy = _load_numpy()
+        except ImportError:
+            numpy = None
+
+        limit = max(0, self.bounded_scan_rows)
+        probed_ids = self._bounded_chunk_candidate_ids(
+            identity,
+            since=since,
+            until=until,
+            conversation_ids=conversation_ids,
+            source=source,
+            limit=limit + 1,
+        )
+        if not probed_ids:
+            return KNNResult(coverage="none")
+        bounded_ids = probed_ids[:limit]
+        candidate_coverage = "bounded" if len(probed_ids) > limit else "full"
+
+        if numpy is not None:
+            rowids, chunk_ids, kinds, matrix = self._numpy_chunk_rows(
+                numpy, identity, dim, bounded_ids
+            )
+            query_array = numpy.asarray(query, dtype=numpy.float32)
+            scores = matrix @ query_array
+            coverage = candidate_coverage
+        else:
+            rowids, chunk_ids, kinds, vectors = self._load_chunk_vectors_for_ids(
+                identity, dim, bounded_ids
+            )
+            scores = [
+                sum(value * query_value for value, query_value in zip(vector, query))
+                for vector in vectors
+            ]
+            coverage = "bounded"
+
+        candidates = self._ranked(rowids, chunk_ids, kinds, scores, k)
+        return KNNResult(candidates, coverage=coverage)
+
+    def _current_chunk_profile(self) -> sqlite3.Row | None:
+        """The active profile registered under task='chunk' (most recent)."""
+        return self._conn.execute(
+            """
+            SELECT identity_hash, model_name, provider, revision, dim, dtype,
+                   byteorder, task, registered_at, active, archived_at, data_version
+            FROM lcm_embedding_profile
+            WHERE active = 1 AND archived_at IS NULL AND task = ?
+            ORDER BY registered_at DESC, identity_hash DESC
+            LIMIT 1
+            """,
+            (_CHUNK_TASK,),
+        ).fetchone()
+
     def close(self) -> None:
         conn = getattr(self, "_conn", None)
         if conn is not None:
@@ -1257,6 +1758,7 @@ class VectorStore:
             self._conn = None
         with self._cache_lock:
             self._matrix_cache.clear()
+            self._chunk_matrix_cache.clear()
 
     def __del__(self) -> None:  # pragma: no cover - defensive resource cleanup
         try:
