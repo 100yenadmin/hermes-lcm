@@ -48,6 +48,17 @@ from .rollup_periods import (
     load_source_lineage,
     parse_recent_period,
 )
+from .retrieval_core import (
+    _hit_identity,
+    _lcm_grep_confidence,
+    _lcm_grep_deadline_error,
+    _resolve_semantic_conversation_scope,
+    _shape_message_hit,
+    _shape_summary_hit,
+    hydrate_semantic_nodes,
+    rrf_fuse,
+    run_knn,
+)
 from .rollup_store import RollupStore
 from .search_query import AGE_DECAY_RATE, normalize_search_sort
 from .session_patterns import build_session_match_keys, compile_session_pattern
@@ -1780,24 +1791,12 @@ def _lcm_grep_full_text(args: Dict[str, Any], **kwargs) -> str:
                 time_to=time_to,
             )
             for hit in msg_hits:
-                timestamp_value = hit.get("timestamp", 0) or 0
                 results.append(
-                    {
-                        "type": "message",
-                        "depth": "raw",
-                        "store_id": hit["store_id"],
-                        "session_id": hit["session_id"],
-                        "source": hit.get("source") or "",
-                        "conversation_id": hit.get("conversation_id") or "",
-                        "role": hit["role"],
-                        "timestamp": timestamp_value,
-                        "snippet": hit.get("snippet", hit.get("content", "")[:200]),
-                        "from_current_session": has_current_session
-                        and hit["session_id"] == current_session_id,
-                        "_sort_ts": timestamp_value,
-                        "_sort_rank": hit.get("search_rank"),
-                        "_sort_directness": hit.get("_directness_score") or 0.0,
-                    }
+                    _shape_message_hit(
+                        hit,
+                        current_session_id=current_session_id,
+                        has_current_session=has_current_session,
+                    )
                 )
         except Exception as exc:
             logger.warning("Message search failed: %s", exc)
@@ -1817,23 +1816,7 @@ def _lcm_grep_full_text(args: Dict[str, Any], **kwargs) -> str:
                 source=source,
             )
             for node in node_hits:
-                results.append(
-                    {
-                        "type": "summary",
-                        "depth": f"d{node.depth}",
-                        "node_id": node.node_id,
-                        "session_id": node.session_id,
-                        "snippet": node.summary[:300],
-                        "token_count": node.token_count,
-                        "expand_hint": node.expand_hint,
-                        "earliest_at": node.earliest_at,
-                        "latest_at": node.latest_at,
-                        "from_current_session": True,
-                        "_sort_ts": node.latest_at or node.created_at,
-                        "_sort_rank": node.search_rank,
-                        "_sort_directness": node.search_directness or 0.0,
-                    }
-                )
+                results.append(_shape_summary_hit(node))
         except Exception as exc:
             logger.warning("Node search failed: %s", exc)
 
@@ -2010,16 +1993,6 @@ def _lcm_grep_full_text(args: Dict[str, Any], **kwargs) -> str:
     return json.dumps(response)
 
 
-def _lcm_grep_confidence(score: float) -> str:
-    if score >= 0.65:
-        return "high"
-    if score >= 0.5:
-        return "medium"
-    if score >= 0.35:
-        return "low"
-    return "noise"
-
-
 # A hard-timed semantic operation cannot kill the worker thread it abandons
 # (Python has no thread cancellation), so bound how many can be live at once.
 # A worker releases its slot when it eventually finishes; once every slot is
@@ -2079,15 +2052,6 @@ def _run_within_deadline(
     if not succeeded:
         raise value
     return value
-
-
-def _lcm_grep_deadline_error(mode: str, stage: str) -> dict[str, Any]:
-    return {
-        "error": "lcm_grep request deadline exceeded",
-        "mode": mode,
-        "timeout": True,
-        "timeout_stage": stage,
-    }
 
 
 def _lcm_grep_full_text_with_deadline(
@@ -2227,34 +2191,6 @@ def _lcm_grep_resolve_provider(
         raise TimeoutError("provider resolution deadline exhausted")
     engine._lcm_embedding_provider_cache = (cache_key, provider)
     return provider
-
-
-def _resolve_semantic_conversation_scope(
-    engine: "LCMEngine",
-    *,
-    search_session_id: str | None,
-    conversation_id: str | None,
-) -> list[str] | None:
-    """Resolve the conversation filter to the session_ids KNN should allow.
-
-    Summaries are keyed by session_id, so a message-level ``conversation_id`` is
-    enforced by resolving it to the sessions that carry it (intersected with the
-    active scope). Returns ``None`` for "no session constraint", or a possibly
-    empty list when a conversation matches no sessions (which then degrades).
-    """
-    if not conversation_id:
-        return [search_session_id] if search_session_id is not None else None
-    try:
-        rows = engine._store.connection.execute(
-            "SELECT DISTINCT session_id FROM messages WHERE conversation_id = ?",
-            (conversation_id,),
-        ).fetchall()
-        conv_sessions = {str(row[0]) for row in rows if row and row[0] is not None}
-    except Exception:  # pragma: no cover - defensive; degrade on any store error
-        conv_sessions = set()
-    if search_session_id is not None:
-        return sorted(conv_sessions & {search_session_id})
-    return sorted(conv_sessions)
 
 
 def _lcm_grep_semantic(
@@ -2423,30 +2359,20 @@ def _lcm_grep_semantic(
         return degraded(f"query embedding failed: {exc}")
 
     def _run_knn() -> Any:
-        if time.monotonic() >= deadline:
-            raise TimeoutError("semantic vector search deadline exhausted")
-        vector_store = VectorStore(engine._store.db_path, config=engine._config)
-        try:
-            vector_conn = getattr(vector_store, "_conn", None)
-            if vector_conn is not None:
-                vector_conn.set_progress_handler(
-                    lambda: 1 if time.monotonic() >= deadline else 0,
-                    1000,
-                )
-            if time.monotonic() >= deadline:
-                raise TimeoutError("semantic vector search deadline exhausted")
-            return vector_store.knn(
-                query_vector,
-                k=knn_limit,
-                model=provider.model_id,
-                provider=provider.provider_id,
-                since=time_from,
-                until=time_to,
-                conversation_ids=knn_conversation_ids,
-                source=source,
-            )
-        finally:
-            vector_store.close()
+        # VectorStore is resolved through this module's namespace so tests that
+        # monkeypatch ``tools.VectorStore`` continue to govern the KNN backend.
+        return run_knn(
+            engine,
+            query_vector=query_vector,
+            provider=provider,
+            knn_limit=knn_limit,
+            deadline=deadline,
+            since=time_from,
+            until=time_to,
+            conversation_ids=knn_conversation_ids,
+            source=source,
+            vector_store_cls=VectorStore,
+        )
 
     try:
         knn_results = _run_within_deadline(
@@ -2468,66 +2394,14 @@ def _lcm_grep_semantic(
     if not ranked_rows:
         return degraded("semantic retrieval returned no vector candidates")
 
-    def hydrate_nodes() -> list[tuple[Any, float]]:
-        conn: sqlite3.Connection | None = None
-
-        def require_remaining(stage: str) -> float:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError(
-                    f"semantic result hydration deadline exhausted before {stage}"
-                )
-            return remaining
-
-        try:
-            require_remaining("database path resolution")
-            db_path = Path(engine._store.db_path).resolve()
-            require_remaining("database path resolution")
-            uri = f"{db_path.as_uri()}?mode=ro"
-            require_remaining("database URI construction")
-            conn = sqlite3.connect(
-                uri,
-                uri=True,
-                timeout=max(0.001, require_remaining("database connection")),
-            )
-            require_remaining("database connection")
-            conn.row_factory = sqlite3.Row
-            require_remaining("connection setup")
-            conn.execute("PRAGMA query_only=ON")
-            require_remaining("connection setup")
-            conn.set_progress_handler(
-                lambda: 1 if time.monotonic() >= deadline else 0,
-                1000,
-            )
-            require_remaining("DAG setup")
-            read_dag = copy.copy(engine._dag)
-            read_dag._conn = conn
-            read_dag._db_lock = threading.RLock()
-            require_remaining("DAG setup")
-            hydrated: list[tuple[Any, float]] = []
-            for embedded_id, score, kind in ranked_rows:
-                require_remaining("node lookup")
-                if kind != "summary":
-                    continue
-                try:
-                    node_id = int(embedded_id)
-                except (TypeError, ValueError):
-                    continue
-                require_remaining("node lookup")
-                node = read_dag.get_node(node_id)
-                require_remaining("node lookup")
-                if node is not None:
-                    hydrated.append((node, float(score)))
-                if len(hydrated) >= knn_limit:
-                    break
-            return hydrated
-        finally:
-            if conn is not None:
-                conn.close()
-
     try:
         hydrated_nodes = _run_within_deadline(
-            hydrate_nodes,
+            lambda: hydrate_semantic_nodes(
+                engine,
+                ranked_rows=ranked_rows,
+                knn_limit=knn_limit,
+                deadline=deadline,
+            ),
             remaining_s=deadline - time.monotonic(),
             name="lcm-result-hydration",
         )
@@ -2672,67 +2546,48 @@ def _lcm_grep_hybrid(
             coverage=str(semantic.get("coverage", "none")),
         )
 
-    fused: dict[tuple[str, Any], dict[str, Any]] = {}
-
-    def identity(hit: dict[str, Any]) -> tuple[str, Any]:
-        if hit.get("node_id") is not None:
-            return ("node", hit.get("node_id"))
-        return ("message", hit.get("store_id"))
-
-    for rank, hit in enumerate(fts.get("results", []), start=1):
-        if time.monotonic() >= deadline:
-            return _lcm_grep_deadline_error("hybrid", "fusion")
-        key = identity(hit)
-        entry = fused.setdefault(key, {"hit": dict(hit), "rrf_score": 0.0})
-        entry["fts_rank"] = rank
-        entry["rrf_score"] += 1.0 / (_LCM_GREP_RRF_K + rank)
-
-    for rank, hit in enumerate(semantic.get("results", []), start=1):
-        if time.monotonic() >= deadline:
-            return _lcm_grep_deadline_error("hybrid", "fusion")
-        key = identity(hit)
-        entry = fused.setdefault(key, {"hit": dict(hit), "rrf_score": 0.0})
-        entry["semantic_rank"] = rank
-        entry["rrf_score"] += 1.0 / (_LCM_GREP_RRF_K + rank)
-        entry["semantic_score"] = hit.get("score")
-        entry["confidence"] = hit.get("confidence")
-        entry["confidence_band"] = hit.get("confidence_band")
-        if "fts_rank" in entry:
-            # The semantic form carries score/confidence while the FTS form carries
-            # its exact house snippet/provenance. Preserve the latter as the base.
-            entry["hit"].setdefault("semantic_snippet", hit.get("snippet", ""))
-
     if time.monotonic() >= deadline:
         return _lcm_grep_deadline_error("hybrid", "fusion")
-    ordered = sorted(
-        fused.values(),
-        key=lambda entry: (
-            -float(entry["rrf_score"]),
-            int(entry.get("fts_rank", 10**9)),
-            int(entry.get("semantic_rank", 10**9)),
-            identity(entry["hit"]),
-        ),
+    # FTS is arm 0, semantic is arm 1; rrf_fuse merges by hit identity and
+    # accumulates 1/(k+rank). Arm-specific metadata (which arm, confidence,
+    # snippet provenance) is grep-presentation and stays here.
+    ordered = rrf_fuse(
+        [fts.get("results", []), semantic.get("results", [])],
+        k=_LCM_GREP_RRF_K,
     )
+    semantic_by_identity = {
+        _hit_identity(hit): hit for hit in semantic.get("results", [])
+    }
+    for entry in ordered:
+        ranks = entry["ranks"]
+        if 0 in ranks and 1 in ranks:
+            # The semantic form carries score/confidence while the FTS form carries
+            # its exact house snippet/provenance. Preserve the latter as the base.
+            sem_hit = semantic_by_identity[_hit_identity(entry["hit"])]
+            entry["hit"].setdefault("semantic_snippet", sem_hit.get("snippet", ""))
+
     results: list[dict[str, Any]] = []
     for entry in ordered[:limit]:
         if time.monotonic() >= deadline:
             return _lcm_grep_deadline_error("hybrid", "fusion")
+        ranks = entry["ranks"]
         hit = dict(entry["hit"])
         hit["score"] = float(entry["rrf_score"])
         hit["rrf_score"] = float(entry["rrf_score"])
-        if "fts_rank" in entry:
-            hit["fts_rank"] = entry["fts_rank"]
-        if "semantic_rank" in entry:
-            hit["semantic_rank"] = entry["semantic_rank"]
-            hit["semantic_score"] = entry["semantic_score"]
-            hit["confidence"] = entry["confidence"]
-            hit["confidence_band"] = entry["confidence_band"]
+        if 0 in ranks:
+            hit["fts_rank"] = ranks[0]
+        if 1 in ranks:
+            sem_hit = semantic_by_identity[_hit_identity(entry["hit"])]
+            hit["semantic_rank"] = ranks[1]
+            hit["semantic_score"] = sem_hit.get("score")
+            hit["confidence"] = sem_hit.get("confidence")
+            hit["confidence_band"] = sem_hit.get("confidence_band")
         results.append(hit)
 
     response = dict(fts)
     response["mode"] = "hybrid"
     response["limit"] = limit
-    response["total_results"] = len(fused)
+    response["total_results"] = len(ordered)
     response["results"] = results
     response["coverage"] = semantic.get("coverage", "none")
     response["degraded_to_fts"] = False
