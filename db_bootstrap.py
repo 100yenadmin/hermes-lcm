@@ -2120,15 +2120,18 @@ def _fts_needs_rebuild(
     return result["status"] == "fail"
 
 
-# SQLite/FTS5 error substrings that denote genuine on-disk corruption (SQLITE_
-# CORRUPT / SQLITE_NOTADB). Everything else a writable integrity-check can raise
-# — SQLITE_BUSY / SQLITE_LOCKED "database is locked", timeouts — is transient and
-# must classify as ``unchecked``, never ``fail`` (which records a corruption flag).
+# SQLite/FTS5 error substrings that denote genuine corruption or index drift
+# (SQLITE_CORRUPT / SQLITE_NOTADB, and the FTS5 integrity-check's own
+# ``checksum mismatch`` for same-row-count stale drift). Everything else a
+# writable integrity-check can raise — SQLITE_BUSY / SQLITE_LOCKED "database is
+# locked", timeouts — is transient and must classify as ``unchecked``, never
+# ``fail`` (which records a corruption flag).
 _FTS_CORRUPTION_SIGNATURES = (
     "malformed",
     "disk image",
     "not a database",
     "corrupt",
+    "checksum mismatch",
 )
 
 

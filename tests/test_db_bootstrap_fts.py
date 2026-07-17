@@ -317,6 +317,9 @@ def test_is_fts_corruption_error_classification():
     assert db_bootstrap._is_fts_corruption_error("database disk image is malformed")
     assert db_bootstrap._is_fts_corruption_error("malformed database schema")
     assert db_bootstrap._is_fts_corruption_error("file is not a database")
+    assert db_bootstrap._is_fts_corruption_error(
+        'fts5: checksum mismatch for table "messages_fts"'
+    )
     assert not db_bootstrap._is_fts_corruption_error("database is locked")
     assert not db_bootstrap._is_fts_corruption_error("database table is locked")
     assert not db_bootstrap._is_fts_corruption_error("query timeout expired")
