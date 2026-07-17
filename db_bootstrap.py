@@ -263,6 +263,11 @@ _INTERIM_FEATURE_FAMILIES: tuple[dict[str, str], ...] = (
         "prefix": "lcm_embedding",
         "rebuild_hint": "derived embedding cache — re-run `/lcm embed backfill --apply`",
     },
+    {
+        "name": "chunk",
+        "prefix": "lcm_chunk",
+        "rebuild_hint": "derived chunk cache — re-run `/lcm embed backfill --corpus chunks --apply`",
+    },
 )
 
 
@@ -274,6 +279,8 @@ def _family_verifier(prefix: str):
         return verify_temporal_rollup_schema
     if prefix == "lcm_embedding":
         return verify_embedding_schema
+    if prefix == "lcm_chunk":
+        return verify_chunk_schema
     return None
 
 

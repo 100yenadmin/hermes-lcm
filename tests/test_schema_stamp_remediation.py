@@ -92,6 +92,33 @@ def _add_early_feature_tables(path: Path) -> None:
         conn.close()
 
 
+def _add_early_chunk_tables(path: Path) -> None:
+    """Create an EARLY-variant chunk schema (missing later-added columns/indexes).
+
+    Mirrors a DB whose chunk corpus predates char-span columns and the required
+    partial index — it fails ``verify_chunk_schema`` with missing-object /
+    malformed-table findings (never an unexpected-column one).
+    """
+    conn = sqlite3.connect(path)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE lcm_chunk_meta (
+                chunk_id TEXT, identity_hash TEXT, store_id INTEGER,
+                chunk_index INTEGER, embedded_at TEXT, archived INTEGER DEFAULT 0,
+                PRIMARY KEY(chunk_id, identity_hash)
+            );
+            CREATE TABLE lcm_chunk_vectors (
+                chunk_id TEXT, identity_hash TEXT, vec BLOB NOT NULL,
+                PRIMARY KEY(chunk_id, identity_hash)
+            );
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _table_names(path: Path) -> set[str]:
     conn = sqlite3.connect(path)
     try:
@@ -410,6 +437,50 @@ def test_early_variant_feature_tables_remediate_end_to_end(tmp_path):
         assert db_bootstrap.verify_embedding_schema(vectors._conn) == []
     finally:
         vectors.close()
+
+
+def test_early_variant_chunk_family_remediates(tmp_path):
+    """A broken chunk schema is dropped by remediation, not silently kept.
+
+    Reproduces F2-schema-stamp-chunk-family-missing / F4-chunk-family-verifier-
+    missing: with no ``lcm_chunk`` entry in the interim feature families the
+    remediator reported ``status: ok, dropped_tables: []`` while leaving a broken
+    ``lcm_chunk_meta``/``lcm_chunk_vectors`` in place. The family must now be
+    verified and dropped so its marker-gated init rebuilds the final shape.
+    """
+    db_path = tmp_path / "lcm.db"
+    _build_v5_db(db_path, with_features=True)
+    _add_early_chunk_tables(db_path)
+    _stamp(db_path, db_bootstrap.SCHEMA_VERSION + 1)
+
+    conn = sqlite3.connect(db_path)
+    try:
+        assert (
+            classify_version_mismatch(conn)
+            == db_bootstrap.VERSION_MISMATCH_INTERIM_STAMP
+        )
+        # The broken chunk schema fails its verifier (missing pieces, not extra).
+        assert db_bootstrap.verify_chunk_schema(conn) != []
+        assert not db_bootstrap._family_reports_newer_shape(
+            db_bootstrap.verify_chunk_schema(conn)
+        )
+        result = remediate_interim_schema_stamp(conn, apply=True)
+    finally:
+        conn.close()
+    assert result["status"] == "ok"
+    dropped = set(result["dropped_tables"])
+    assert {"lcm_chunk_meta", "lcm_chunk_vectors"} <= dropped
+    assert not any(t.startswith("lcm_chunk") for t in _table_names(db_path))
+
+    # The chunk feature's own init recreates the final, verifier-clean shape.
+    conn = sqlite3.connect(db_path)
+    try:
+        db_bootstrap.ensure_embedding_tables(conn)
+        db_bootstrap.ensure_chunk_tables(conn)
+        conn.commit()
+        assert db_bootstrap.verify_chunk_schema(conn) == []
+    finally:
+        conn.close()
 
 
 def test_remediate_noop_when_version_supported(tmp_path):
