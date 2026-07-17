@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import re
+import stat
 import time
 from pathlib import Path
 from typing import Any, Dict
@@ -21,6 +22,9 @@ DEFAULT_LARGE_OUTPUT_DIRNAME = "lcm-large-outputs"
 _EXTERNALIZED_REF_RE = re.compile(
     r"\[(?:Externalized|GC'd externalized) (?:tool output|payload):.*?;\s*ref=([^;\]\s]+)\]"
 )
+_EXTERNALIZED_SEARCH_HEADER_BYTES = 64 * 1024
+_EXTERNALIZED_SEARCH_TAIL_BYTES = 64 * 1024
+_JSON_STRING_FIELD_RE_TEMPLATE = rb'"%s"\s*:\s*("(?:\\.|[^"\\])*")'
 
 
 def _placeholder_metadata(value: Any) -> str:
@@ -602,6 +606,145 @@ def load_externalized_payload(ref: str, *, config, hermes_home: str = "") -> Dic
     summary = _externalized_summary(path, payload)
     summary["content"] = payload.get("content", "")
     return summary
+
+
+def _decode_json_string_field(data: bytes, field: str) -> str:
+    pattern = re.compile(_JSON_STRING_FIELD_RE_TEMPLATE % re.escape(field.encode("ascii")))
+    match = pattern.search(data)
+    if match is None:
+        return ""
+    try:
+        value = json.loads(match.group(1).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return ""
+    return value if isinstance(value, str) else ""
+
+
+def _decode_json_string_fragment(raw: bytes) -> str:
+    """Decode a possibly truncated JSON string without reading beyond its bound."""
+    candidate = raw
+    while candidate:
+        try:
+            value = json.loads(b'"' + candidate + b'"')
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            candidate = candidate[:-1]
+            continue
+        return value if isinstance(value, str) else ""
+    return ""
+
+
+def _numeric_json_field(data: bytes, field: str) -> int | float | None:
+    pattern = re.compile(rb'"' + re.escape(field.encode("ascii")) + rb'"\s*:\s*(-?[0-9]+(?:\.[0-9]+)?)')
+    match = pattern.search(data)
+    if match is None:
+        return None
+    text = match.group(1).decode("ascii")
+    try:
+        return float(text) if "." in text else int(text)
+    except ValueError:
+        return None
+
+
+def read_externalized_payload_search_prefix(
+    ref: str,
+    *,
+    config,
+    hermes_home: str = "",
+    max_content_bytes: int = 512_000,
+) -> Dict[str, Any]:
+    """Read bounded metadata and the first bytes of one payload's content.
+
+    This deliberately does not deserialize the full sidecar. It reads at most a
+    small header, ``max_content_bytes`` from the JSON content string, and a
+    small tail for size metadata.
+    """
+    if (
+        not ref
+        or Path(ref).name != ref
+        or "/" in ref
+        or "\\" in ref
+        or not ref.endswith(".json")
+    ):
+        return {"status": "invalid_ref", "ref": ref}
+    storage_dir = get_large_output_storage_dir(config, hermes_home=hermes_home, create=False)
+    path = storage_dir / ref
+    try:
+        expected_stat = os.lstat(path)
+    except FileNotFoundError:
+        return {"status": "missing", "ref": ref}
+    except OSError:
+        return {"status": "unreadable", "ref": ref}
+    if stat.S_ISLNK(expected_stat.st_mode):
+        return {"status": "symlink", "ref": ref}
+    if not stat.S_ISREG(expected_stat.st_mode):
+        return {"status": "missing", "ref": ref}
+
+    content_limit = max(1, min(int(max_content_bytes), 512_000))
+    fd = -1
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        flags |= getattr(os, "O_BINARY", 0)
+        fd = os.open(path, flags)
+        opened_stat = os.fstat(fd)
+        if (
+            not stat.S_ISREG(opened_stat.st_mode)
+            or (opened_stat.st_dev, opened_stat.st_ino)
+            != (expected_stat.st_dev, expected_stat.st_ino)
+        ):
+            return {"status": "unreadable", "ref": ref}
+        file_size = opened_stat.st_size
+        with os.fdopen(fd, "rb") as handle:
+            fd = -1
+            header = handle.read(_EXTERNALIZED_SEARCH_HEADER_BYTES)
+            marker = re.search(rb'"content"\s*:\s*"', header)
+            if marker is None:
+                return {"status": "unsupported_payload", "ref": ref}
+            handle.seek(marker.end())
+            raw = bytearray()
+            escaped = False
+            closed = False
+            while len(raw) < content_limit:
+                chunk = handle.read(min(64 * 1024, content_limit - len(raw)))
+                if not chunk:
+                    break
+                for byte in chunk:
+                    if not escaped and byte == 0x22:
+                        closed = True
+                        break
+                    raw.append(byte)
+                    if escaped:
+                        escaped = False
+                    elif byte == 0x5C:
+                        escaped = True
+                if closed:
+                    break
+            handle.seek(max(0, file_size - _EXTERNALIZED_SEARCH_TAIL_BYTES))
+            tail = handle.read(_EXTERNALIZED_SEARCH_TAIL_BYTES)
+    except OSError:
+        return {"status": "unreadable", "ref": ref}
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+    metadata = header[: marker.start()]
+    content = _decode_json_string_fragment(bytes(raw))
+    original_bytes = _numeric_json_field(tail, "content_bytes")
+    original_chars = _numeric_json_field(tail, "content_chars")
+    created_at = _numeric_json_field(tail, "created_at")
+    return {
+        "status": "ok",
+        "ref": ref,
+        "kind": _decode_json_string_field(metadata, "kind") or "tool_result",
+        "tool_call_id": _decode_json_string_field(metadata, "tool_call_id"),
+        "role": _decode_json_string_field(metadata, "role"),
+        "session_id": _decode_json_string_field(metadata, "session_id"),
+        "content": content,
+        "content_scanned_bytes": len(raw),
+        "original_content_bytes": int(original_bytes) if original_bytes is not None else None,
+        "original_content_chars": int(original_chars) if original_chars is not None else None,
+        "created_at": float(created_at or 0),
+        "scan_truncated": not closed,
+    }
 
 
 def externalized_tool_result_has_persisted_output_marker(ref: str, *, config, hermes_home: str = "") -> bool:

@@ -41,6 +41,22 @@ def engine(tmp_path):
         e.shutdown()
 
 
+@pytest.fixture
+def externalized_search_engine(tmp_path):
+    home = tmp_path / "hermes-search"
+    config = LCMConfig(
+        database_path=str(tmp_path / "lcm_externalized_search.db"),
+        large_output_externalization_enabled=True,
+        large_output_externalization_threshold_chars=200,
+    )
+    instance = LCMEngine(config=config, hermes_home=str(home))
+    instance._session_id = "test-session"
+    try:
+        yield instance
+    finally:
+        instance.shutdown()
+
+
 def test_shutdown_closes_lifecycle_store(tmp_path):
     config = LCMConfig(database_path=str(tmp_path / "shutdown-lifecycle.db"))
     engine = LCMEngine(config=config)
@@ -25652,6 +25668,258 @@ class TestHandleGrepCrossSession:
         assert result["session_scope"] == "current"
         sessions_seen = {hit["session_id"] for hit in result["results"]}
         assert sessions_seen == {"test-session"}
+
+
+class TestHandleGrepExternalizedPayloads:
+    def _externalize(self, engine, content, tool_call_id="call-search"):
+        before = set(Path(engine._hermes_home, "lcm-large-outputs").glob("*.json"))
+        engine._serialize_messages([
+            {"role": "tool", "tool_call_id": tool_call_id, "content": content}
+        ])
+        created = set(Path(engine._hermes_home, "lcm-large-outputs").glob("*.json")) - before
+        return next(path.name for path in created)
+
+    def test_default_history_scope_does_not_scan_sidecars(self, externalized_search_engine):
+        self._externalize(externalized_search_engine, "private external needle " * 20)
+
+        result = json.loads(externalized_search_engine.handle_tool_call("lcm_grep", {"query": "needle"}))
+
+        assert result["content_scope"] == "history"
+        assert result["total_results"] == 0
+        assert "externalized_scan" not in result
+
+    def test_externalized_scope_returns_bounded_recoverable_match(self, externalized_search_engine):
+        content = "first line\nsecond needle line\n" + ("tail " * 100)
+        ref = self._externalize(externalized_search_engine, content)
+
+        result = json.loads(
+            externalized_search_engine.handle_tool_call(
+                "lcm_grep", {"query": "needle", "content_scope": "externalized"}
+            )
+        )
+
+        assert result["total_results"] == 1
+        hit = result["results"][0]
+        assert hit["type"] == "externalized"
+        assert hit["ref"] == ref
+        assert hit["tool_call_id"] == "call-search"
+        assert hit["line"] == 2
+        assert hit["byte_position"] == len("first line\nsecond ".encode("utf-8"))
+        assert hit["original_content_bytes"] == len(content.encode("utf-8"))
+        assert hit["scan_truncated"] is False
+        recovered = json.loads(
+            externalized_search_engine.handle_tool_call(
+                "lcm_expand", {"externalized_ref": ref, "max_tokens": 100_000}
+            )
+        )
+        assert recovered["content"] == content
+
+    def test_both_scope_combines_history_and_payload_hits(self, externalized_search_engine):
+        externalized_search_engine._store.append(
+            "test-session", {"role": "user", "content": "combined needle in history"}
+        )
+        self._externalize(externalized_search_engine, "combined needle in payload " * 20)
+
+        result = json.loads(
+            externalized_search_engine.handle_tool_call(
+                "lcm_grep", {"query": "needle", "content_scope": "both"}
+            )
+        )
+
+        assert {item["type"] for item in result["results"]} == {"message", "externalized"}
+
+    @pytest.mark.parametrize("sort", ["relevance", "hybrid"])
+    def test_both_scope_preserves_message_only_ordering(self, externalized_search_engine, sort):
+        for role, content in (
+            ("user", "needle alpha"),
+            ("assistant", "needle needle beta"),
+            ("tool", "needle gamma"),
+        ):
+            externalized_search_engine._store.append(
+                "test-session",
+                {"role": role, "content": content},
+            )
+
+        history = json.loads(
+            externalized_search_engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "needle", "content_scope": "history", "sort": sort},
+            )
+        )
+        self._externalize(externalized_search_engine, "needle in payload " * 20)
+        combined = json.loads(
+            externalized_search_engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "needle", "content_scope": "both", "sort": sort},
+            )
+        )
+
+        combined_messages = [item for item in combined["results"] if item["type"] == "message"]
+        assert json.dumps(combined_messages, ensure_ascii=False) == json.dumps(
+            history["results"],
+            ensure_ascii=False,
+        )
+
+    @pytest.mark.parametrize("sort", ["relevance", "hybrid"])
+    def test_combined_sort_tiers_externalized_native_rank(self, sort):
+        message = {
+            "type": "message",
+            "role": "user",
+            "_sort_rank": 50.0,
+            "_sort_ts": 1.0,
+        }
+        externalized = {
+            "type": "externalized",
+            "_sort_rank": 0,
+            "_sort_ts": 1.0,
+        }
+
+        ordered = sorted(
+            [externalized, message],
+            key=lambda item: lcm_tools._combined_result_sort_key(item, sort),
+        )
+
+        assert ordered == [message, externalized]
+
+    def test_auto_discovery_filters_session_before_candidate_cap(self, externalized_search_engine):
+        owned_refs = {
+            self._externalize(
+                externalized_search_engine,
+                f"owned needle {index} " * 20,
+                f"call-owned-{index}",
+            )
+            for index in range(2)
+        }
+        storage = Path(externalized_search_engine._hermes_home, "lcm-large-outputs")
+        foreign_payload = {
+            "kind": "tool_result",
+            "role": "tool",
+            "session_id": "foreign-session",
+            "tool_call_id": "call-foreign",
+            "content": "foreign needle",
+            "content_chars": len("foreign needle"),
+            "content_bytes": len("foreign needle".encode()),
+            "created_at": 1.0,
+        }
+        for index in range(257):
+            (storage / f"zzzz-foreign-{index:03d}.json").write_text(
+                json.dumps(foreign_payload),
+                encoding="utf-8",
+            )
+        first_256 = sorted(
+            (path.name for path in storage.glob("*.json")),
+            reverse=True,
+        )[:256]
+        assert owned_refs.isdisjoint(first_256)
+
+        result = json.loads(
+            externalized_search_engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "needle", "content_scope": "externalized"},
+            )
+        )
+
+        assert {item["ref"] for item in result["results"]} == owned_refs
+        assert result["externalized_scan"]["candidate_files"] == len(owned_refs)
+        assert result["externalized_scan"]["rejected_session_mismatch"] == 257
+
+    def test_explicit_refs_filter_and_rejects_cross_session_payload(self, externalized_search_engine):
+        current_ref = self._externalize(externalized_search_engine, "current needle " * 20, "call-current")
+        externalized_search_engine._session_id = "other-session"
+        other_ref = self._externalize(externalized_search_engine, "other needle " * 20, "call-other")
+        externalized_search_engine._session_id = "test-session"
+
+        filtered = json.loads(
+            externalized_search_engine.handle_tool_call(
+                "lcm_grep",
+                {
+                    "query": "needle",
+                    "content_scope": "externalized",
+                    "externalized_refs": [current_ref],
+                },
+            )
+        )
+        rejected = json.loads(
+            externalized_search_engine.handle_tool_call(
+                "lcm_grep",
+                {
+                    "query": "needle",
+                    "content_scope": "externalized",
+                    "externalized_refs": [other_ref],
+                },
+            )
+        )
+
+        assert [item["ref"] for item in filtered["results"]] == [current_ref]
+        assert "not owned by the active session" in rejected["error"]
+
+    def test_explicit_refs_reject_invalid_and_symlink_refs(self, externalized_search_engine):
+        invalid = json.loads(
+            externalized_search_engine.handle_tool_call(
+                "lcm_grep",
+                {
+                    "query": "needle",
+                    "content_scope": "externalized",
+                    "externalized_refs": ["../escape.json"],
+                },
+            )
+        )
+        ref = self._externalize(externalized_search_engine, "needle target " * 20)
+        storage = Path(externalized_search_engine._hermes_home, "lcm-large-outputs")
+        link = storage / "linked.json"
+        link.symlink_to(storage / ref)
+        symlink = json.loads(
+            externalized_search_engine.handle_tool_call(
+                "lcm_grep",
+                {
+                    "query": "needle",
+                    "content_scope": "externalized",
+                    "externalized_refs": [link.name],
+                },
+            )
+        )
+
+        assert "Invalid externalized ref" in invalid["error"]
+        assert "symlink" in symlink["error"]
+
+    def test_scan_never_reaches_content_after_512000_encoded_bytes(self, externalized_search_engine):
+        content = ("a" * 520_000) + " unreachable-needle"
+        ref = self._externalize(externalized_search_engine, content)
+
+        missed = json.loads(
+            externalized_search_engine.handle_tool_call(
+                "lcm_grep",
+                {
+                    "query": "unreachable-needle",
+                    "content_scope": "externalized",
+                    "externalized_refs": [ref],
+                },
+            )
+        )
+        bounded_hit = json.loads(
+            externalized_search_engine.handle_tool_call(
+                "lcm_grep",
+                {
+                    "query": "aaaa",
+                    "content_scope": "externalized",
+                    "externalized_refs": [ref],
+                },
+            )
+        )
+
+        assert missed["total_results"] == 0
+        assert bounded_hit["results"][0]["scan_truncated"] is True
+        assert bounded_hit["results"][0]["content_scanned_bytes"] == 512_000
+
+    def test_externalized_scope_rejects_cross_session_search(self, externalized_search_engine):
+        result = json.loads(
+            externalized_search_engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "needle", "content_scope": "externalized", "session_scope": "all"},
+            )
+        )
+
+        assert "session_scope=current only" in result["error"]
 
 
 class TestHandleExpandStoreId:

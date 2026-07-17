@@ -242,6 +242,16 @@ def test_lcm_grep_time_filters_use_anyof_not_union_type_arrays():
         assert "type" not in field
 
 
+def test_lcm_grep_declares_opt_in_externalized_content_scope():
+    engine = _register_plugin_engine("hermes_lcm_externalized_search_schema")
+    schema = next(item for item in engine.get_tool_schemas() if item["name"] == "lcm_grep")
+    properties = schema["parameters"]["properties"]
+
+    assert properties["content_scope"]["default"] == "history"
+    assert properties["content_scope"]["enum"] == ["history", "externalized", "both"]
+    assert properties["externalized_refs"]["maxItems"] == 256
+
+
 def test_plugin_entrypoint_registers_lcm_context_engine():
     engine = _register_plugin_engine("hermes_lcm_packaging_entrypoint")
 

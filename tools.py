@@ -17,6 +17,7 @@ from .externalize import (
     find_externalized_payload_for_message,
     get_large_output_storage_dir,
     load_externalized_payload,
+    read_externalized_payload_search_prefix,
 )
 from .diagnostics import (
     _has_lifecycle_fragmentation,
@@ -53,6 +54,10 @@ def _combined_result_sort_key(result: dict[str, Any], sort: str) -> tuple:
     rank_value = float(rank) if rank is not None else float("inf")
     directness = float(result.get("_sort_directness") or 0.0)
     type_bias = 0 if result.get("type") == "message" else 1
+    # BM25 ranks and payload byte offsets are incomparable. Keep the existing
+    # history ordering in tier 0; sidecars follow in tier 1 and use byte offset
+    # only as their native in-tier tie-break.
+    rank_tier = 1 if result.get("type") == "externalized" else 0
     role = result.get("role")
     if role == "user":
         role_bias = 0
@@ -66,13 +71,21 @@ def _combined_result_sort_key(result: dict[str, Any], sort: str) -> tuple:
     effective_directness = directness if result.get("type") == "message" else (directness * 0.8)
 
     if sort == "relevance":
-        return (rank_value, -effective_directness, role_bias, -sort_timestamp, type_bias)
+        return (rank_tier, rank_value, -effective_directness, role_bias, -sort_timestamp, type_bias)
 
     if sort == "hybrid":
         age_hours = max(0.0, (time.time() - sort_timestamp) / 3600.0)
         blended = rank_value / (1 + (age_hours * AGE_DECAY_RATE)) if rank is not None else float("inf")
         summary_override = int(result.get("_hybrid_summary_override") or 0)
-        return (-summary_override, blended, -effective_directness, role_bias, -sort_timestamp, type_bias)
+        return (
+            -summary_override,
+            rank_tier,
+            blended,
+            -effective_directness,
+            role_bias,
+            -sort_timestamp,
+            type_bias,
+        )
 
     if result.get("type") == "message":
         return (-sort_timestamp, type_bias, role_bias, rank_value, 0.0, float("inf"))
@@ -200,7 +213,12 @@ def _parse_strict_int(value: Any, name: str) -> tuple[int | None, str | None]:
 
 
 _LCM_GREP_VALID_SCOPES = frozenset({"current", "all", "session"})
+_LCM_GREP_VALID_CONTENT_SCOPES = frozenset({"history", "externalized", "both"})
 _LCM_GREP_HARD_LIMIT_CAP = 200
+_LCM_GREP_EXTERNALIZED_FILE_CAP = 256
+_LCM_GREP_EXTERNALIZED_DISCOVERY_CAP = 4096
+_LCM_GREP_EXTERNALIZED_CONTENT_BYTES = 512_000
+_LCM_GREP_RESPONSE_CHAR_CAP = 64_000
 _LCM_LOAD_SESSION_DEFAULT_LIMIT = 100
 _LCM_LOAD_SESSION_HARD_LIMIT_CAP = 200
 _LCM_LOAD_SESSION_DEFAULT_MAX_CONTENT_CHARS = 4000
@@ -1069,6 +1087,32 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
     sort = normalize_search_sort(args.get("sort"))
     source_limit = max(limit * 4, limit, 20)
 
+    content_scope = str(args.get("content_scope") or "history").strip().lower()
+    if content_scope not in _LCM_GREP_VALID_CONTENT_SCOPES:
+        return json.dumps({"error": "content_scope must be one of: history, externalized, both"})
+    raw_externalized_refs = args.get("externalized_refs")
+    if raw_externalized_refs is not None and content_scope == "history":
+        return json.dumps({"error": "externalized_refs requires content_scope=externalized or both"})
+    externalized_refs: list[str] | None = None
+    if raw_externalized_refs is not None:
+        if not isinstance(raw_externalized_refs, list):
+            return json.dumps({"error": "externalized_refs must be an array of ref filenames"})
+        if len(raw_externalized_refs) > _LCM_GREP_EXTERNALIZED_FILE_CAP:
+            return json.dumps({"error": f"externalized_refs is limited to {_LCM_GREP_EXTERNALIZED_FILE_CAP} refs"})
+        externalized_refs = []
+        for value in raw_externalized_refs:
+            ref = str(value or "").strip()
+            if (
+                not ref
+                or Path(ref).name != ref
+                or "/" in ref
+                or "\\" in ref
+                or not ref.endswith(".json")
+            ):
+                return json.dumps({"error": f"Invalid externalized ref: {ref or '<empty>'}"})
+            if ref not in externalized_refs:
+                externalized_refs.append(ref)
+
     requested_session_scope = str(args.get("session_scope", "current")).lower()
     raw_session_id_arg = args.get("session_id")
     explicit_session_id = (
@@ -1133,50 +1177,60 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
             requested_session_scope,
         )
 
+    searches_externalized = content_scope in {"externalized", "both"}
+    if searches_externalized and session_scope != "current":
+        return json.dumps({
+            "error": "Externalized payload search supports session_scope=current only",
+        })
+    if searches_externalized and not engine.current_session_id:
+        return json.dumps({"error": "Externalized payload search requires an active session"})
+
     current_session_id = engine.current_session_id
     has_current_session = bool(current_session_id)
     results: list[Dict[str, Any]] = []
 
-    try:
-        msg_hits = engine._store.search(
-            query,
-            session_id=search_session_id,
-            limit=source_limit,
-            sort=sort,
-            source=source,
-            conversation_id=conversation_id,
-            role=role,
-            time_from=time_from,
-            time_to=time_to,
-        )
-        for hit in msg_hits:
-            timestamp_value = hit.get("timestamp", 0) or 0
-            results.append(
-                {
-                    "type": "message",
-                    "depth": "raw",
-                    "store_id": hit["store_id"],
-                    "session_id": hit["session_id"],
-                    "source": hit.get("source") or "",
-                    "conversation_id": hit.get("conversation_id") or "",
-                    "role": hit["role"],
-                    "timestamp": timestamp_value,
-                    "snippet": hit.get("snippet", hit.get("content", "")[:200]),
-                    "from_current_session": has_current_session and hit["session_id"] == current_session_id,
-                    "_sort_ts": timestamp_value,
-                    "_sort_rank": hit.get("search_rank"),
-                    "_sort_directness": hit.get("_directness_score") or 0.0,
-                }
+    if content_scope in {"history", "both"}:
+        try:
+            msg_hits = engine._store.search(
+                query,
+                session_id=search_session_id,
+                limit=source_limit,
+                sort=sort,
+                source=source,
+                conversation_id=conversation_id,
+                role=role,
+                time_from=time_from,
+                time_to=time_to,
             )
-    except Exception as exc:
-        logger.warning("Message search failed: %s", exc)
+            for hit in msg_hits:
+                timestamp_value = hit.get("timestamp", 0) or 0
+                results.append(
+                    {
+                        "type": "message",
+                        "depth": "raw",
+                        "store_id": hit["store_id"],
+                        "session_id": hit["session_id"],
+                        "source": hit.get("source") or "",
+                        "conversation_id": hit.get("conversation_id") or "",
+                        "role": hit["role"],
+                        "timestamp": timestamp_value,
+                        "snippet": hit.get("snippet", hit.get("content", "")[:200]),
+                        "from_current_session": has_current_session
+                        and hit["session_id"] == current_session_id,
+                        "_sort_ts": timestamp_value,
+                        "_sort_rank": hit.get("search_rank"),
+                        "_sort_directness": hit.get("_directness_score") or 0.0,
+                    }
+                )
+        except Exception as exc:
+            logger.warning("Message search failed: %s", exc)
 
     # Summary-node search is intentionally current-session only. Cross-session
     # DAG expansion is deferred; returning summary hits without an expansion
     # contract would push this tool toward a memory-system shape rather than
     # a plugin-local archive search. Raw-message hits remain expandable across
     # sessions via lcm_expand(store_id=...).
-    if session_scope == "current" and not raw_message_filter_active:
+    if content_scope in {"history", "both"} and session_scope == "current" and not raw_message_filter_active:
         try:
             node_hits = engine._dag.search(
                 query,
@@ -1206,6 +1260,127 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
         except Exception as exc:
             logger.warning("Node search failed: %s", exc)
 
+    externalized_scan: dict[str, Any] | None = None
+    if searches_externalized:
+        storage_dir = get_large_output_storage_dir(
+            engine._config,
+            hermes_home=engine._hermes_home,
+            create=False,
+        )
+        scan_counts = {
+            "candidate_files": 0,
+            "discovery_files": 0,
+            "discovery_truncated": False,
+            "scanned_files": 0,
+            "matched_files": 0,
+            "rejected_symlink": 0,
+            "rejected_invalid_or_unreadable": 0,
+            "rejected_session_mismatch": 0,
+        }
+        if externalized_refs is None:
+            try:
+                discovered_refs = sorted(
+                    (path.name for path in storage_dir.iterdir() if path.name.endswith(".json")),
+                    reverse=True,
+                )
+            except OSError:
+                discovered_refs = []
+            # Directory enumeration is cheap, but metadata probes may stat/open
+            # files. Bound those probes separately, then cap owned candidates.
+            scan_counts["discovery_truncated"] = (
+                len(discovered_refs) > _LCM_GREP_EXTERNALIZED_DISCOVERY_CAP
+            )
+            candidate_refs = []
+            for ref in discovered_refs[:_LCM_GREP_EXTERNALIZED_DISCOVERY_CAP]:
+                scan_counts["discovery_files"] += 1
+                path = storage_dir / ref
+                if path.is_symlink():
+                    scan_counts["rejected_symlink"] += 1
+                    continue
+                metadata = _inspect_externalized_payload_metadata(
+                    engine,
+                    ref,
+                    engine.current_session_id,
+                )
+                if metadata.get("readable"):
+                    candidate_refs.append(ref)
+                    if len(candidate_refs) >= _LCM_GREP_EXTERNALIZED_FILE_CAP:
+                        break
+                elif metadata.get("error") == "session_mismatch":
+                    scan_counts["rejected_session_mismatch"] += 1
+                else:
+                    scan_counts["rejected_invalid_or_unreadable"] += 1
+        else:
+            candidate_refs = externalized_refs
+        scan_counts["candidate_files"] = len(candidate_refs)
+
+        response_chars = 0
+        for ref in candidate_refs:
+            payload = read_externalized_payload_search_prefix(
+                ref,
+                config=engine._config,
+                hermes_home=engine._hermes_home,
+                max_content_bytes=_LCM_GREP_EXTERNALIZED_CONTENT_BYTES,
+            )
+            status = payload.get("status")
+            if status == "symlink":
+                scan_counts["rejected_symlink"] += 1
+                if externalized_refs is not None:
+                    return json.dumps({"error": f"Externalized ref is a symlink: {ref}"})
+                continue
+            if status != "ok":
+                scan_counts["rejected_invalid_or_unreadable"] += 1
+                if externalized_refs is not None:
+                    return json.dumps({"error": f"Externalized ref is not readable: {ref}"})
+                continue
+            scan_counts["scanned_files"] += 1
+            if payload.get("session_id") != engine.current_session_id:
+                scan_counts["rejected_session_mismatch"] += 1
+                if externalized_refs is not None:
+                    return json.dumps({"error": f"Externalized ref is not owned by the active session: {ref}"})
+                continue
+            content = str(payload.get("content") or "")
+            match = re.search(re.escape(query), content, flags=re.IGNORECASE)
+            if match is None:
+                continue
+            byte_position = len(content[: match.start()].encode("utf-8"))
+            line = content.count("\n", 0, match.start()) + 1
+            snippet_start = max(0, match.start() - 120)
+            snippet_end = min(len(content), match.end() + 180)
+            item = {
+                "type": "externalized",
+                "depth": "payload",
+                "ref": ref,
+                "tool_call_id": payload.get("tool_call_id") or "",
+                "snippet": content[snippet_start:snippet_end],
+                "line": line,
+                "byte_position": byte_position,
+                "original_content_bytes": payload.get("original_content_bytes"),
+                "original_content_chars": payload.get("original_content_chars"),
+                "scan_truncated": bool(payload.get("scan_truncated")),
+                "content_scanned_bytes": payload.get("content_scanned_bytes", 0),
+                "from_current_session": True,
+                "_sort_ts": payload.get("created_at") or 0,
+                "_sort_rank": byte_position,
+                "_sort_directness": 10.0,
+            }
+            item_chars = len(json.dumps(item, ensure_ascii=False))
+            if response_chars + item_chars > _LCM_GREP_RESPONSE_CHAR_CAP:
+                break
+            response_chars += item_chars
+            results.append(item)
+            scan_counts["matched_files"] += 1
+            if scan_counts["matched_files"] >= limit:
+                break
+        externalized_scan = {
+            **scan_counts,
+            "file_limit": _LCM_GREP_EXTERNALIZED_FILE_CAP,
+            "discovery_limit": _LCM_GREP_EXTERNALIZED_DISCOVERY_CAP,
+            "content_bytes_per_file": _LCM_GREP_EXTERNALIZED_CONTENT_BYTES,
+            "response_char_limit": _LCM_GREP_RESPONSE_CHAR_CAP,
+            "active_session_only": True,
+        }
+
     if sort == "hybrid":
         max_message_directness = max(
             (float(result.get("_sort_directness") or 0.0) for result in results if result.get("type") == "message"),
@@ -1226,6 +1401,7 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
         "query": query,
         "sort": sort,
         "session_scope": session_scope,
+        "content_scope": content_scope,
         "source": source,
         "conversation_id": conversation_id,
         "limit": limit,
@@ -1250,6 +1426,10 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
             "Unsupported session_scope; stayed on current. "
             "Valid values: current, all, session."
         )
+    if externalized_refs is not None:
+        response["externalized_refs"] = externalized_refs
+    if externalized_scan is not None:
+        response["externalized_scan"] = externalized_scan
     return json.dumps(response)
 
 
