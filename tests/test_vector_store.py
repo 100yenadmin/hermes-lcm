@@ -391,6 +391,39 @@ def test_bounded_scan_uses_source_recency_after_newest_first_backfill(
         dag.close()
 
 
+
+def test_bounded_scan_keeps_null_latest_at_legacy_rows_by_created_at(
+    tmp_path, monkeypatch
+):
+    """The DAG migration adds latest_at without backfilling legacy rows; the
+    bounded window must fall back to created_at per-row so upgraded databases
+    do not silently lose legacy summaries from candidate enumeration."""
+    db_path = tmp_path / "bounded_null.db"
+    dag = SummaryDAG(db_path)
+    store = VectorStore(db_path, bounded_scan_rows=1)
+    try:
+        older = _add_summary(dag, created_at=1.0)
+        legacy_newest = _add_summary(dag, created_at=5.0)
+        store.register_profile("bounded", "local", 3)
+        _record_embedding(store, older, "summary", "bounded", [1.0, 0.0, 0.0])
+        _record_embedding(store, legacy_newest, "summary", "bounded", [0.0, 1.0, 0.0])
+        # Simulate a legacy row: migration added the column, no backfill.
+        store.connection.execute(
+            "UPDATE summary_nodes SET latest_at = NULL WHERE node_id = ?",
+            (legacy_newest,),
+        )
+        store.connection.commit()
+
+        result = store.knn([0.0, 1.0, 0.0], k=2, model="bounded")
+
+        assert result.coverage == "bounded"
+        # The legacy row is the chronologically newest by created_at, so the
+        # bound-1 window must contain it — not drop it for having NULL latest_at.
+        assert [row[0] for row in result] == [str(legacy_newest)]
+    finally:
+        store.close()
+        dag.close()
+
 def test_suppressed_summaries_are_filtered_and_purge_removes_embeddings(stores):
     dag, store = stores
     suppressed = _add_summary(dag, created_at=1.0)
