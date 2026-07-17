@@ -90,6 +90,7 @@ from .schemas import (
     LCM_GREP,
     LCM_INSPECT,
     LCM_LOAD_SESSION,
+    LCM_RECALL,
     LCM_RECENT,
     LCM_STATUS,
 )
@@ -3271,6 +3272,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return [
             LCM_GREP,
+            LCM_RECALL,
             LCM_RECENT,
             LCM_LOAD_SESSION,
             LCM_DESCRIBE,
@@ -3300,6 +3302,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
         handlers = {
             "lcm_grep": lcm_tools.lcm_grep,
+            "lcm_recall": lcm_tools.lcm_recall,
             "lcm_recent": lcm_tools.lcm_recent,
             "lcm_load_session": lcm_tools.lcm_load_session,
             "lcm_describe": lcm_tools.lcm_describe,
