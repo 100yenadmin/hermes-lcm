@@ -582,6 +582,46 @@ known-good `*-rotate-latest.sqlite3` snapshot survives idempotent retries.
 
 ## Import and backfill
 
+### Historical tool-output sidecars
+
+`scripts/backfill_externalized_tool_outputs.py` pre-creates Hermes-native
+externalized-payload sidecars for large textual tool rows already in an LCM
+database. It opens SQLite read-only and never rewrites messages or summaries.
+The default is a dry run:
+
+```bash
+python scripts/backfill_externalized_tool_outputs.py \
+  --database ~/.hermes/lcm.db \
+  --hermes-home ~/.hermes \
+  --manifest ./externalization-backfill.json
+
+# Create only eligible sidecars after reviewing the scrubbed manifest.
+python scripts/backfill_externalized_tool_outputs.py \
+  --database ~/.hermes/lcm.db \
+  --hermes-home ~/.hermes \
+  --manifest ./externalization-backfill.json \
+  --apply
+```
+
+The manifest contains references, digests, counts, sizes, and token estimates,
+not raw payload content, session ids, or tool-call ids. Repeated apply runs are
+idempotent. Rollback is also dry-run by default and accepts only an applied
+manifest; `--apply` deletes a manifest-owned sidecar only when its content still
+matches the recorded digest and neither a message nor a summary references it:
+
+```bash
+python scripts/backfill_externalized_tool_outputs.py \
+  --database ~/.hermes/lcm.db \
+  --hermes-home ~/.hermes \
+  --rollback ./externalization-backfill.json
+```
+
+Stop the profile that owns the target database before an operator apply or
+rollback. Sidecar creation is additive, but a quiescent profile makes the
+reviewed manifest and reference checks a stable operator boundary.
+
+### OpenClaw/lossless-claw history
+
 `scripts/import_lossless_claw.py` is the local, dry-run-by-default operator path
 for moving OpenClaw history into a Hermes-LCM `lcm.db`. It supports two source
 families:
