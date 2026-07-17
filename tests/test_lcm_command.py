@@ -1114,6 +1114,33 @@ def test_lcm_doctor_json_preserves_unchecked_fts_detail_for_guidance(engine, mon
     assert "/lcm doctor repair" not in guidance["messages_fts_integrity"]["operator_action"]
 
 
+def test_lcm_doctor_surfaces_background_fts_integrity_failed_flag(engine, monkeypatch):
+    """A background integrity scan's persisted corruption flag (issue #6) must
+    surface in `/lcm doctor`, even when this run's live deep check reports clean."""
+    from hermes_lcm import db_bootstrap
+
+    db_bootstrap._record_integrity_failed(
+        engine._store._conn,
+        build_message_fts_spec(),
+        detail="fts5: index integrity-check failed",
+    )
+    engine._store._conn.commit()
+
+    # Live deep check reports clean so the persisted flag is the sole signal.
+    monkeypatch.setattr(
+        command_mod,
+        "check_external_content_fts_integrity",
+        lambda _conn, _spec: {"status": "pass", "detail": "ok"},
+    )
+
+    text_result = handle_lcm_command("doctor", engine)
+
+    assert "status: issues-found" in text_result
+    assert "issues: " in text_result and "messages_fts" in text_result
+    assert "background integrity scan flagged corruption" in text_result
+    assert "/lcm doctor repair apply" in text_result
+
+
 def test_lcm_doctor_repair_reports_fts_drift_without_mutating(tmp_path):
     config = LCMConfig(database_path=str(tmp_path / "lcm_repair_drift.db"))
     engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes_home"))

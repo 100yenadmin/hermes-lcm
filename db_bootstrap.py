@@ -6,12 +6,14 @@ same schema-version marker, PRAGMA settings, and FTS repair behavior.
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import os
 import re
 import shutil
 import sqlite3
+import threading
 import time
 from typing import Iterable, Sequence
 
@@ -1331,6 +1333,256 @@ def _should_run_integrity_check(
     return (current - last) >= hours * 3600.0
 
 
+# --- Non-blocking startup integrity scan (issue #6 / #235) -----------------
+#
+# Even throttled, the O(index-size) FTS5 deep integrity-check still blocked the
+# bind on every cache-miss (first bind + each interval expiry): ~2min on a cold
+# production DB. When a deep check is due on the startup path we now run only the
+# cheap structural check synchronously and dispatch the deep scan to a daemon
+# thread that opens its OWN sqlite connection (never the store's — that
+# connection is not safe to drive from another thread). The background scan does
+# NOT rebuild: on corruption it records a ``fts_integrity_failed:<table>`` marker
+# that ``/lcm doctor`` surfaces, pointing operators at the explicit repair path.
+
+BACKGROUND_INTEGRITY_ENV = "LCM_FTS_INTEGRITY_BACKGROUND"
+
+# A ``fts_integrity_scan_started_at`` metadata stamp older than this (seconds) is
+# treated as a crashed scan, so a later bind re-dispatches instead of wedging
+# forever behind a stamp no live thread will ever clear.
+INTEGRITY_SCAN_STALE_SECONDS = 15 * 60.0
+
+# Guards the in-process registry and the one-scan-at-a-time decision below.
+_integrity_scan_lock = threading.Lock()
+# (db_path, table_name) -> daemon Thread. Exposed so tests can join a dispatched
+# scan deterministically; entries are removed when the scan thread exits.
+_integrity_scan_threads: dict[tuple[str, str], threading.Thread] = {}
+
+
+def _background_integrity_enabled() -> bool:
+    """Kill-switch: ``LCM_FTS_INTEGRITY_BACKGROUND=false`` restores the exact old
+    synchronous integrity-check behavior on the startup path."""
+    raw = os.environ.get(BACKGROUND_INTEGRITY_ENV)
+    if raw is None:
+        return True
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def _integrity_failed_key(spec: ExternalContentFtsSpec) -> str:
+    return f"fts_integrity_failed:{spec.table_name}"
+
+
+def _integrity_scan_started_key(spec: ExternalContentFtsSpec) -> str:
+    return f"fts_integrity_scan_started_at:{spec.table_name}"
+
+
+def _record_integrity_failed(
+    conn: sqlite3.Connection,
+    spec: ExternalContentFtsSpec,
+    *,
+    detail: str,
+    now: float | None = None,
+) -> None:
+    ensure_metadata_table(conn)
+    current = time.time() if now is None else now
+    payload = json.dumps({"at": current, "detail": str(detail)[:2000]})
+    conn.execute(
+        """
+        INSERT INTO metadata(key, value)
+        VALUES(?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """,
+        (_integrity_failed_key(spec), payload),
+    )
+
+
+def _clear_integrity_failed(conn: sqlite3.Connection, spec: ExternalContentFtsSpec) -> None:
+    ensure_metadata_table(conn)
+    conn.execute("DELETE FROM metadata WHERE key = ?", (_integrity_failed_key(spec),))
+
+
+def load_integrity_failed(
+    conn: sqlite3.Connection, spec: ExternalContentFtsSpec
+) -> dict[str, object] | None:
+    """Return ``{'at': float, 'detail': str}`` when a background scan flagged the
+    index as corrupt, else ``None``. Used by ``/lcm doctor`` to surface the flag."""
+    ensure_metadata_table(conn)
+    row = conn.execute(
+        "SELECT value FROM metadata WHERE key = ?",
+        (_integrity_failed_key(spec),),
+    ).fetchone()
+    if not row or row[0] is None:
+        return None
+    try:
+        data = json.loads(row[0])
+        if isinstance(data, dict):
+            return {"at": float(data.get("at") or 0.0), "detail": str(data.get("detail") or "")}
+    except (TypeError, ValueError):
+        pass
+    return {"at": 0.0, "detail": str(row[0])}
+
+
+def _load_scan_started_at(
+    conn: sqlite3.Connection, spec: ExternalContentFtsSpec
+) -> float | None:
+    ensure_metadata_table(conn)
+    row = conn.execute(
+        "SELECT value FROM metadata WHERE key = ?",
+        (_integrity_scan_started_key(spec),),
+    ).fetchone()
+    if not row or row[0] is None:
+        return None
+    try:
+        return float(row[0])
+    except (TypeError, ValueError):
+        return None
+
+
+def _record_scan_started(
+    conn: sqlite3.Connection, spec: ExternalContentFtsSpec, *, now: float
+) -> None:
+    ensure_metadata_table(conn)
+    conn.execute(
+        """
+        INSERT INTO metadata(key, value)
+        VALUES(?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """,
+        (_integrity_scan_started_key(spec), str(now)),
+    )
+
+
+def _clear_scan_started(
+    conn: sqlite3.Connection,
+    spec: ExternalContentFtsSpec,
+    *,
+    expected: float | None = None,
+) -> None:
+    ensure_metadata_table(conn)
+    if expected is None:
+        conn.execute(
+            "DELETE FROM metadata WHERE key = ?", (_integrity_scan_started_key(spec),)
+        )
+    else:
+        # Only clear our own stamp so a newer scan's stamp survives.
+        conn.execute(
+            "DELETE FROM metadata WHERE key = ? AND value = ?",
+            (_integrity_scan_started_key(spec), str(expected)),
+        )
+
+
+def _run_background_integrity_scan(
+    db_path: str, spec: ExternalContentFtsSpec, started_at: float
+) -> None:
+    """Daemon-thread body: deep-check ``spec`` on a private connection.
+
+    Opens its own read/write connection for the scan (the FTS5 integrity-check is
+    issued as an INSERT command that rolls back inside a savepoint, so it never
+    mutates data, but it does require a writable handle) and a separate brief
+    connection to stamp the result. On corruption it flags rather than rebuilds.
+    """
+    key = (db_path, spec.table_name)
+    timeout = SQLITE_BUSY_TIMEOUT_MS / 1000.0
+    try:
+        scan_conn = sqlite3.connect(db_path, timeout=timeout, check_same_thread=False)
+        try:
+            scan_conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+            # Persist the scan-started stamp on this DB so a crash mid-scan is
+            # detectable cross-process via the staleness window above.
+            _record_scan_started(scan_conn, spec, now=started_at)
+            scan_conn.commit()
+            result = check_external_content_fts_integrity(scan_conn, spec)
+        finally:
+            scan_conn.close()
+
+        meta_conn = sqlite3.connect(db_path, timeout=timeout, check_same_thread=False)
+        try:
+            meta_conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+            status = result.get("status")
+            if status == "pass":
+                _record_integrity_checked(meta_conn, spec, now=started_at)
+                _clear_integrity_failed(meta_conn, spec)
+            elif status == "fail":
+                _record_integrity_failed(
+                    meta_conn, spec, detail=result.get("detail", ""), now=started_at
+                )
+                logger.warning(
+                    "Background FTS integrity-check found corruption in '%s': %s. "
+                    "Run `/lcm doctor repair apply` to rebuild the index.",
+                    spec.table_name,
+                    result.get("detail", ""),
+                )
+            # 'unchecked' (e.g. a read-only DB): leave the throttle marker unset
+            # so the next bind retries; do not stamp or flag.
+            _clear_scan_started(meta_conn, spec, expected=started_at)
+            meta_conn.commit()
+        finally:
+            meta_conn.close()
+    except Exception:  # pragma: no cover - defensive
+        logger.exception(
+            "Background FTS integrity-check for '%s' failed", spec.table_name
+        )
+        try:
+            cleanup = sqlite3.connect(db_path, timeout=timeout, check_same_thread=False)
+            try:
+                _clear_scan_started(cleanup, spec, expected=started_at)
+                cleanup.commit()
+            finally:
+                cleanup.close()
+        except sqlite3.DatabaseError:
+            pass
+    finally:
+        with _integrity_scan_lock:
+            if _integrity_scan_threads.get(key) is threading.current_thread():
+                _integrity_scan_threads.pop(key, None)
+
+
+def _dispatch_background_integrity_scan(
+    conn: sqlite3.Connection, spec: ExternalContentFtsSpec, *, now: float | None = None
+) -> bool:
+    """Try to run the deep FTS integrity-check on a daemon thread.
+
+    Returns ``True`` when the caller should NOT run the check synchronously —
+    either a scan was dispatched here or one is already in flight (in-process, or
+    in another process per a fresh ``fts_integrity_scan_started_at`` stamp).
+    Returns ``False`` to fall back to the synchronous check (e.g. an in-memory or
+    anonymous DB that cannot be reopened from another thread).
+    """
+    db_path = _database_path_for_connection(conn)
+    if not db_path or db_path == ":memory:":
+        return False
+    current = time.time() if now is None else now
+    key = (db_path, spec.table_name)
+    with _integrity_scan_lock:
+        existing = _integrity_scan_threads.get(key)
+        if existing is not None and existing.is_alive():
+            return True
+        started = _load_scan_started_at(conn, spec)
+        if started is not None and (current - started) < INTEGRITY_SCAN_STALE_SECONDS:
+            # A recent scan (this or another process) owns this table; let it
+            # stamp the marker. The bind returns fast without a duplicate scan.
+            return True
+        thread = threading.Thread(
+            target=_run_background_integrity_scan,
+            args=(db_path, spec, current),
+            name=f"lcm-fts-integrity-{spec.table_name}",
+            daemon=True,
+        )
+        _integrity_scan_threads[key] = thread
+        thread.start()
+        return True
+
+
+def join_background_integrity_scans(timeout: float | None = None) -> None:
+    """Block until in-flight background integrity scans finish.
+
+    Test/diagnostic helper so callers can deterministically observe the marker or
+    failure flag a dispatched scan writes."""
+    with _integrity_scan_lock:
+        threads = list(_integrity_scan_threads.values())
+    for thread in threads:
+        thread.join(timeout)
+
+
 def _fts_needs_rebuild(
     conn: sqlite3.Connection,
     spec: ExternalContentFtsSpec,
@@ -1348,6 +1600,13 @@ def _fts_needs_rebuild(
     # structural checks cannot see.
     if throttle and not _should_run_integrity_check(conn, spec, now=now):
         return False
+    # The deep check is due. On the startup path, dispatch it to a background
+    # thread so the bind returns immediately (issue #6); the scan flags any
+    # corruption via metadata rather than rebuilding here. The kill-switch and
+    # non-file DBs fall back to the exact old synchronous behavior below.
+    if throttle and _background_integrity_enabled():
+        if _dispatch_background_integrity_scan(conn, spec, now=now):
+            return False
     result = check_external_content_fts_integrity(conn, spec)
     if result["status"] == "pass":
         _record_integrity_checked(conn, spec, now=now)
