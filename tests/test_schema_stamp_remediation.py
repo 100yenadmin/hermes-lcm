@@ -167,6 +167,86 @@ def test_classify_genuinely_newer_on_unknown_table(tmp_path):
         conn.close()
 
 
+def test_classify_genuinely_newer_on_extra_feature_family_column(tmp_path):
+    """An EXTRA column on a feature-family table is a newer-build signature.
+
+    Reproduces F2-schema-stamp-drops-newer-data: a future release adds a column
+    to ``lcm_rollups``. The old classifier ignored feature-table internal shape
+    and called this an interim stamp, so remediation DROPPED the table and its
+    siblings. It must classify ``genuinely_newer`` instead — an unexpected
+    (extra) column is never an early-variant signature.
+    """
+    db_path = tmp_path / "lcm.db"
+    _build_v5_db(db_path, with_features=True)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("ALTER TABLE lcm_rollups ADD COLUMN future_col INTEGER DEFAULT 0")
+        conn.commit()
+    finally:
+        conn.close()
+    _stamp(db_path, db_bootstrap.SCHEMA_VERSION + 1)
+    conn = sqlite3.connect(db_path)
+    try:
+        assert (
+            classify_version_mismatch(conn)
+            == db_bootstrap.VERSION_MISMATCH_GENUINELY_NEWER
+        )
+    finally:
+        conn.close()
+
+
+def test_remediate_apply_refuses_and_preserves_extra_column_family(tmp_path):
+    """Remediation must NOT drop a family table that carries an extra column.
+
+    The data-destruction guard: with an extra ``lcm_rollups`` column present,
+    ``remediate_interim_schema_stamp(apply=True)`` refuses and leaves every
+    feature table (and the stamp) untouched.
+    """
+    db_path = tmp_path / "lcm.db"
+    _build_v5_db(db_path, with_features=True)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("ALTER TABLE lcm_rollups ADD COLUMN future_col INTEGER DEFAULT 0")
+        conn.commit()
+    finally:
+        conn.close()
+    stamped = db_bootstrap.SCHEMA_VERSION + 1
+    _stamp(db_path, stamped)
+    conn = sqlite3.connect(db_path)
+    try:
+        result = remediate_interim_schema_stamp(conn, apply=True)
+    finally:
+        conn.close()
+    assert result["status"] == "refused"
+    assert result["classification"] == db_bootstrap.VERSION_MISMATCH_GENUINELY_NEWER
+    assert result["applied"] is False
+    assert result["dropped_tables"] == []
+    # Nothing dropped, stamp untouched — real data survives.
+    assert _stored_version(db_path) == stamped
+    assert "lcm_rollups" in _table_names(db_path)
+
+
+def test_classify_interim_stamp_on_missing_feature_family_column(tmp_path):
+    """A feature table only MISSING a later-added column stays an interim stamp.
+
+    The counterpart to the extra-column case: an early variant omits pieces (no
+    ``generation``/``lease_nonce``/``failed_at`` on ``lcm_rollups``) and must
+    still be classified interim so remediation can drop-and-rebuild it.
+    """
+    db_path = tmp_path / "lcm.db"
+    _build_v5_db(db_path)
+    _add_early_feature_tables(db_path)
+    _stamp(db_path, db_bootstrap.SCHEMA_VERSION + 1)
+    conn = sqlite3.connect(db_path)
+    try:
+        assert (
+            classify_version_mismatch(conn)
+            == db_bootstrap.VERSION_MISMATCH_INTERIM_STAMP
+        )
+    finally:
+        conn.close()
+
+
 def test_classify_genuinely_newer_on_unknown_core_column(tmp_path):
     db_path = tmp_path / "lcm.db"
     _build_v5_db(db_path)

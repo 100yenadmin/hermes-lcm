@@ -277,6 +277,23 @@ def _family_verifier(prefix: str):
     return None
 
 
+# Verifier findings that name an *extra* piece this build does not recognise —
+# the signature of a genuinely-newer build, never of an early interim variant.
+# An interim variant only ever OMITS later-added pieces (reported as ``table:`` /
+# ``index:`` / ``column:`` / ``missing object:`` findings); a column the build
+# has never heard of means a newer release owns the DB. Such a family must never
+# be dropped, and its presence downgrades the whole DB to ``genuinely_newer``.
+# (An early column that was later *renamed* surfaces as a collapsed
+# ``malformed table:`` finding on the embedding/chunk verifiers — not as
+# ``unexpected-column:`` — so it correctly stays on the safe early-variant path.)
+_NEWER_BUILD_FINDING_PREFIXES = ("unexpected-column:",)
+
+
+def _family_reports_newer_shape(findings: Iterable[str]) -> bool:
+    """True when any verifier finding is an extra/unknown-piece (newer) signature."""
+    return any(str(finding).startswith(_NEWER_BUILD_FINDING_PREFIXES) for finding in findings)
+
+
 def _user_table_names(conn: sqlite3.Connection) -> set[str]:
     return {
         str(row[0])
@@ -345,6 +362,26 @@ def classify_version_mismatch(conn: sqlite3.Connection) -> str:
             continue
         return VERSION_MISMATCH_GENUINELY_NEWER
 
+    # A present feature-family table that carries an EXTRA column this build does
+    # not recognise is a newer-build signature, not an early interim variant —
+    # re-stamping (and dropping the family) would destroy real data. Early
+    # variants only ever OMIT later-added pieces, which the verifiers report as
+    # distinct "missing" findings; only an ``unexpected-column`` finding flips the
+    # classification to genuinely-newer.
+    for family in _INTERIM_FEATURE_FAMILIES:
+        prefix = family["prefix"]
+        if not any(table.startswith(prefix) for table in tables):
+            continue
+        verify = _family_verifier(prefix)
+        if verify is None:
+            continue
+        try:
+            findings = verify(conn)
+        except sqlite3.DatabaseError:
+            return VERSION_MISMATCH_GENUINELY_NEWER
+        if _family_reports_newer_shape(findings):
+            return VERSION_MISMATCH_GENUINELY_NEWER
+
     return VERSION_MISMATCH_INTERIM_STAMP
 
 
@@ -368,9 +405,16 @@ def _interim_family_drops(conn: sqlite3.Connection) -> list[dict[str, object]]:
         if not present:
             continue
         verify = _family_verifier(prefix)
-        if verify is None or not verify(conn):
-            # No verifier, or verifier clean — the family is at (or cannot be
-            # judged against) the final shape; keep it.
+        if verify is None:
+            continue
+        findings = verify(conn)
+        if not findings:
+            # Verifier clean — the family is at the final shape; keep it.
+            continue
+        if _family_reports_newer_shape(findings):
+            # An extra/unknown column is a newer-build signature, never an early
+            # interim variant — never drop it (defense in depth; the DB is
+            # already classified genuinely-newer and remediation has refused).
             continue
         triggers = sorted(
             str(row[0])
