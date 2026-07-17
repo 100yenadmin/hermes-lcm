@@ -1435,3 +1435,57 @@ def test_malformed_embedding_constraint_or_default_is_rejected(
         sqlite3.OperationalError, match="malformed (table|constraints)"
     ):
         VectorStore(db_path)
+
+
+def test_marker_write_skipped_when_already_stamped(tmp_path, monkeypatch):
+    """sprint-opt-1: constructing a VectorStore over an already-stamped DB does
+    not re-write the embeddings_v1 / chunk_vectors_v1 markers."""
+    db_path = tmp_path / "markers.db"
+    first = VectorStore(db_path)  # first construction stamps both markers
+    first.ensure_chunk_schema()
+    first.close()
+
+    calls: list[str] = []
+    real_mark = vector_store_module.mark_migration_step_complete
+
+    def counting_mark(conn, step_name):
+        calls.append(step_name)
+        return real_mark(conn, step_name)
+
+    monkeypatch.setattr(vector_store_module, "mark_migration_step_complete", counting_mark)
+    vs = VectorStore(db_path)
+    try:
+        vs.ensure_chunk_schema()
+        # Neither the embedding nor the chunk marker is re-written: both were
+        # already stamped by the first construction.
+        assert "embeddings_v1" not in calls
+        assert "chunk_vectors_v1" not in calls
+    finally:
+        vs.close()
+
+
+def test_summary_knn_survives_chunk_profile_registration(tmp_path):
+    """Registering the chunk-corpus profile for the same (model, provider) must
+    not redirect the summary knn to the chunk identity: _resolve_profile is
+    task-scoped. Regression for the harness summary-arm zeroing (coverage
+    'none' after H2 began registering both profiles per store)."""
+    db_path = tmp_path / "taskscope.db"
+    dag = SummaryDAG(db_path)
+    store = VectorStore(db_path, bounded_scan_rows=100)
+    try:
+        node = _add_summary(dag, created_at=1.0)
+        store.register_profile("m1", "local", 3)
+        _record_embedding(store, node, "summary", "m1", [1.0, 0.0, 0.0])
+
+        before = store.knn([1.0, 0.0, 0.0], k=5, model="m1", provider="local")
+        assert before.coverage == "full"
+        assert len(list(before)) == 1
+
+        store.register_profile("m1", "local", 3, task="chunk")
+
+        after = store.knn([1.0, 0.0, 0.0], k=5, model="m1", provider="local")
+        assert after.coverage == "full"
+        assert [row[0] for row in after] == [str(node)]
+    finally:
+        store.close()
+        dag.close()
