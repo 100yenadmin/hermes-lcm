@@ -28,6 +28,10 @@ from .tokens import count_tokens
 logger = logging.getLogger(__name__)
 
 _VOYAGE_URL = "https://api.voyageai.com/v1/embeddings"
+# Contextualized-chunk models (voyage-context-*) live ONLY on this endpoint;
+# posting them to the flat /v1/embeddings above returns HTTP 400 (live-proven on
+# the real archive: zero rows written, clean lease behavior held).
+_VOYAGE_CONTEXT_URL = "https://api.voyageai.com/v1/contextualizedembeddings"
 _VOYAGE_RERANK_URL = "https://api.voyageai.com/v1/rerank"
 # lcm_recall's cross-encoder rerank model. A lite model keeps the single extra
 # API call cheap and inside the latency-sensitive recall deadline.
@@ -71,6 +75,15 @@ def default_chunk_model(provider: str, configured_model: str) -> str:
     if mapped:
         return mapped
     return str(configured_model or "").strip()
+
+
+def _is_voyage_context_model(model: str) -> bool:
+    """True for Voyage contextualized-chunk models (voyage-context-3/-4/...).
+
+    These are served ONLY by the ``/v1/contextualizedembeddings`` endpoint; the
+    flat ``/v1/embeddings`` endpoint rejects them with HTTP 400.
+    """
+    return str(model or "").strip().lower().startswith("voyage-context")
 
 
 def embed_contextualized(
@@ -446,6 +459,12 @@ class VoyageProvider(_ResilientProvider):
         self._model_id = str(model).strip()
         if not self._model_id:
             raise ValueError("Voyage embedding model must not be empty")
+        # Context models are dispatched through the contextualized endpoint; the
+        # flat _request payload path is guarded against them (see _request).
+        self._is_context = _is_voyage_context_model(self._model_id)
+        # Populated from the contextualized response's usage.total_tokens so a
+        # caller (e.g. a live micro-proof) can report provider-billed tokens.
+        self.last_usage_tokens = 0
         self._transport = transport or _default_http_transport
         self.timeout = float(timeout)
         self._sleep = sleeper
@@ -494,16 +513,36 @@ class VoyageProvider(_ResilientProvider):
         retry_after_budget_s: float = _RETRY_AFTER_BUDGET_S,
         deadline_budget_s: float | None = None,
         before_transport: Callable[[], None] | None = None,
-    ) -> list[list[float]]:
+        url: str = _VOYAGE_URL,
+        payload: Mapping[str, Any] | None = None,
+        parse: Callable[[HttpResponse], Any] | None = None,
+    ) -> Any:
+        """POST to Voyage under one absolute deadline across attempts + backoff.
+
+        ``payload``/``parse``/``url`` are injected by the contextualized path
+        (:meth:`_contextualized_request`); when omitted this builds and parses
+        the flat ``/v1/embeddings`` request unchanged and returns
+        ``list[list[float]]`` ordered to ``texts``.
+        """
         api_key = os.environ.get("VOYAGE_API_KEY", "").strip()
         if not api_key:
             raise VoyageError("auth", "VOYAGE_API_KEY is not set")
-        payload = {
-            "model": self.model_id,
-            "input": list(texts),
-            "input_type": input_type,
-            "truncation": False,
-        }
+        if payload is None:
+            # Guard: a context model must NEVER be posted to the flat endpoint
+            # (live-proven HTTP 400). Callers route context models through the
+            # contextualized endpoint, which injects its own payload/url below.
+            if self._is_context:
+                raise VoyageError(
+                    "bad_request",
+                    f"{self.model_id} is a contextualized model; use the "
+                    "contextualized endpoint",
+                )
+            payload = {
+                "model": self.model_id,
+                "input": list(texts),
+                "input_type": input_type,
+                "truncation": False,
+            }
         request_timeout = self.timeout if timeout is None else max(0.001, float(timeout))
         attempts = max(1, int(max_attempts))
         retry_after_spent = 0.0
@@ -543,7 +582,7 @@ class VoyageProvider(_ResilientProvider):
                 attempt_timeout = request_timeout
             try:
                 response = self._transport(
-                    url=_VOYAGE_URL,
+                    url=url,
                     payload=payload,
                     headers={
                         "Authorization": f"Bearer {api_key}",
@@ -593,12 +632,15 @@ class VoyageProvider(_ResilientProvider):
                         )
                     return parsed
 
+                runner = (
+                    (lambda: parse(response)) if parse is not None else parse_success
+                )
                 try:
                     vectors = (
-                        parse_success()
+                        runner()
                         if remaining is None
                         else _run_blocking_with_deadline(
-                            parse_success,
+                            runner,
                             timeout=remaining,
                             provider="Voyage response processing",
                         )
@@ -652,6 +694,148 @@ class VoyageProvider(_ResilientProvider):
             if not self._sleep_within_deadline(delay, deadline):
                 raise last_error
         raise last_error or VoyageError("network", "Voyage request failed")
+
+    def _parse_contextualized(
+        self, response: HttpResponse, *, expected: Sequence[int]
+    ) -> list[list[list[float]]]:
+        """Parse the nested contextualized response, order-preserving.
+
+        The response ``data`` is one object per input list (outer ``index``),
+        each nesting its own ``data`` list of ``{embedding, index, ...}`` chunk
+        objects. Both levels are sorted by ``index`` so a KNN hit maps straight
+        back to its ``(document, chunk)`` position regardless of wire order.
+        ``usage.total_tokens`` is recorded for provider-billed accounting.
+        """
+        data = _response_json(response, provider="Voyage")
+        rows = data.get("data")
+        if not isinstance(rows, list):
+            raise EmbeddingProviderError(
+                "Voyage contextualized response did not contain embedding data"
+            )
+        ordered_outer = sorted(
+            (row for row in rows if isinstance(row, dict)),
+            key=lambda row: int(row.get("index", 0)),
+        )
+        if len(ordered_outer) != len(expected):
+            raise EmbeddingProviderError(
+                "Voyage returned a different number of documents than requested"
+            )
+        result: list[list[list[float]]] = []
+        for outer, want in zip(ordered_outer, expected):
+            inner = outer.get("data")
+            if not isinstance(inner, list):
+                raise EmbeddingProviderError(
+                    "Voyage contextualized document did not contain embeddings"
+                )
+            ordered_inner = sorted(
+                (item for item in inner if isinstance(item, dict)),
+                key=lambda item: int(item.get("index", 0)),
+            )
+            vectors = _coerce_vectors(
+                [item.get("embedding") for item in ordered_inner], provider="Voyage"
+            )
+            if len(vectors) != want:
+                raise EmbeddingProviderError(
+                    "Voyage returned a different number of chunk embeddings than requested"
+                )
+            result.append(vectors)
+        usage = data.get("usage")
+        if isinstance(usage, dict):
+            try:
+                self.last_usage_tokens = int(usage.get("total_tokens", 0))
+            except (TypeError, ValueError):
+                pass
+        return result
+
+    def _contextualized_request(
+        self,
+        inputs: Sequence[Sequence[str]],
+        *,
+        input_type: str,
+        timeout: float | None = None,
+        max_attempts: int = _MAX_ATTEMPTS,
+        retry_after_budget_s: float = _RETRY_AFTER_BUDGET_S,
+        deadline_budget_s: float | None = None,
+        before_transport: Callable[[], None] | None = None,
+    ) -> list[list[list[float]]]:
+        """POST one contextualized request; returns per-document vector lists.
+
+        Reuses the flat path's retry/deadline/cap discipline (:meth:`_request`)
+        with an injected ``inputs`` payload and nested parser, so a context
+        model shares the same absolute-deadline and fail-closed semantics.
+        """
+        groups = [[str(chunk) for chunk in group] for group in inputs]
+        expected = [len(group) for group in groups]
+        payload = {
+            "model": self.model_id,
+            "inputs": groups,
+            "input_type": input_type,
+        }
+        return self._request(
+            (),
+            input_type=input_type,
+            timeout=timeout,
+            max_attempts=max_attempts,
+            retry_after_budget_s=retry_after_budget_s,
+            deadline_budget_s=deadline_budget_s,
+            before_transport=before_transport,
+            url=_VOYAGE_CONTEXT_URL,
+            payload=payload,
+            parse=lambda response: self._parse_contextualized(
+                response, expected=expected
+            ),
+        )
+
+    def _embed_document_request(
+        self, texts: Sequence[str], **kwargs: Any
+    ) -> list[list[float]]:
+        """Embed a batch of documents, routing context models correctly.
+
+        Non-context models keep the flat endpoint unchanged. Context models go
+        through the contextualized endpoint as one single-chunk input list per
+        document (each document = one inner list; true cross-chunk grouping is
+        available via :meth:`embed_contextualized`), so the flat 400 is avoided
+        while the batch contract (one vector per input document) is preserved.
+        """
+        if not self._is_context:
+            return self._request(texts, input_type="document", **kwargs)
+        nested = self._contextualized_request(
+            [[text] for text in texts], input_type="document", **kwargs
+        )
+        return [group[0] for group in nested]
+
+    def embed_contextualized(
+        self, chunks_by_doc: Sequence[Sequence[str]]
+    ) -> list[list[list[float]]]:
+        """Embed per-document chunk lists via the contextualized endpoint.
+
+        One inner list per source document (conversation/message group); the
+        return nests one vector per chunk, aligned to each document's chunks.
+        Non-context Voyage models have no contextualized endpoint, so they fall
+        back to a flat per-chunk embedding regrouped by document — the module
+        ``embed_contextualized`` helper handles that dispatch for local
+        providers; here (Voyage) a context model uses the real endpoint.
+        """
+        groups = [list(group) for group in chunks_by_doc]
+        if not groups:
+            return []
+        if not self._is_context:
+            # A non-context voyage model: embed the flattened chunks and regroup.
+            flat = [chunk for group in groups for chunk in group]
+            vectors = self.embed_documents(flat) if flat else []
+            result: list[list[list[float]]] = []
+            offset = 0
+            for group in groups:
+                result.append(
+                    [list(vector) for vector in vectors[offset:offset + len(group)]]
+                )
+                offset += len(group)
+            return result
+        return self._guarded(
+            lambda: self._contextualized_request(
+                groups, input_type="document", deadline_budget_s=self.timeout
+            )
+        )
 
     def _sleep_within_deadline(self, delay: float, deadline: float | None) -> bool:
         """Sleep ``delay`` only if it fits the absolute deadline; else give up.
@@ -744,9 +928,8 @@ class VoyageProvider(_ResilientProvider):
                 else:
                     dispatch = None
                 vectors = self._guarded(
-                    lambda current=tuple(batch), budget=remaining: self._request(
+                    lambda current=tuple(batch), budget=remaining: self._embed_document_request(
                         current,
-                        input_type="document",
                         max_attempts=1 if before_dispatch is not None else _MAX_ATTEMPTS,
                         deadline_budget_s=budget,
                         before_transport=dispatch,
@@ -773,9 +956,8 @@ class VoyageProvider(_ResilientProvider):
             else:
                 dispatch = None
             vectors = self._guarded(
-                lambda current=tuple(batch), budget=remaining: self._request(
+                lambda current=tuple(batch), budget=remaining: self._embed_document_request(
                     current,
-                    input_type="document",
                     max_attempts=1 if before_dispatch is not None else _MAX_ATTEMPTS,
                     deadline_budget_s=budget,
                     before_transport=dispatch,
@@ -794,18 +976,42 @@ class VoyageProvider(_ResilientProvider):
             for vector in batch.vectors
         ]
 
+    def _query_request(
+        self, text: str, *, timeout: float | None, deadline_budget_s: float,
+        retry_after_budget_s: float = _RETRY_AFTER_BUDGET_S,
+    ) -> list[float]:
+        """Embed one query vector, routing context models to the right endpoint.
+
+        Per the Voyage docs a context model embeds a query on the SAME
+        contextualized endpoint with ``input_type="query"`` and a single-item
+        inner list (``inputs=[[query]]``); non-context models keep the flat
+        ``/v1/embeddings`` query path unchanged.
+        """
+        if self._is_context:
+            nested = self._contextualized_request(
+                [[str(text)]], input_type="query", timeout=timeout,
+                retry_after_budget_s=retry_after_budget_s,
+                deadline_budget_s=deadline_budget_s,
+            )
+            return nested[0][0]
+        return self._request(
+            (str(text),), input_type="query", timeout=timeout,
+            retry_after_budget_s=retry_after_budget_s,
+            deadline_budget_s=deadline_budget_s,
+        )[0]
+
     def embed_query(self, text: str) -> list[float]:
         # Normal (non-interactive) query embedding also gets ONE absolute
         # deadline across every attempt AND its backoff sleeps, so a tiny
         # configured timeout returns in ~that budget instead of stacking
         # per-attempt timeouts plus exponential backoff.
-        vectors = self._guarded(
-            lambda: self._request(
-                (str(text),), input_type="query", deadline_budget_s=self.timeout
+        vector = self._guarded(
+            lambda: self._query_request(
+                text, timeout=None, deadline_budget_s=self.timeout
             )
         )
-        self._remember_dim(vectors)
-        return vectors[0]
+        self._remember_dim([vector])
+        return vector
 
     def embed_query_interactive(self, text: str, *, timeout: float) -> list[float]:
         """Embed a latency-sensitive query under one absolute time budget.
@@ -814,17 +1020,14 @@ class VoyageProvider(_ResilientProvider):
         monotonic deadline covers every attempt plus any backoff, so a tiny
         budget returns within that budget instead of stacking per-attempt waits.
         """
-        vectors = self._guarded(
-            lambda: self._request(
-                (str(text),),
-                input_type="query",
-                timeout=timeout,
-                retry_after_budget_s=0.0,
+        vector = self._guarded(
+            lambda: self._query_request(
+                text, timeout=timeout, retry_after_budget_s=0.0,
                 deadline_budget_s=timeout,
             )
         )
-        self._remember_dim(vectors)
-        return vectors[0]
+        self._remember_dim([vector])
+        return vector
 
     def rerank(
         self,
