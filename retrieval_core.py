@@ -163,6 +163,140 @@ def run_knn(
         vector_store.close()
 
 
+def run_chunk_knn(
+    engine: "LCMEngine",
+    *,
+    query_vector: list[float],
+    provider: Any,
+    knn_limit: int,
+    deadline: float,
+    since: float | None,
+    until: float | None,
+    conversation_ids: list[str] | None,
+    source: str | None,
+    vector_store_cls: Any,
+) -> Any:
+    """Run the chunk-corpus KNN query inside the operation's absolute deadline.
+
+    Mirrors ``run_knn`` for the second (chunk) corpus: the same injected
+    ``vector_store_cls`` binding and progress-handler deadline guard, calling
+    ``knn_chunks`` instead of ``knn``. Returns the store's coverage contract
+    (full|bounded|none) so the caller degrades identically to the summary arm.
+    """
+    if time.monotonic() >= deadline:
+        raise TimeoutError("chunk vector search deadline exhausted")
+    vector_store = vector_store_cls(engine._store.db_path, config=engine._config)
+    try:
+        vector_conn = getattr(vector_store, "_conn", None)
+        if vector_conn is not None:
+            vector_conn.set_progress_handler(
+                lambda: 1 if time.monotonic() >= deadline else 0,
+                1000,
+            )
+        if time.monotonic() >= deadline:
+            raise TimeoutError("chunk vector search deadline exhausted")
+        return vector_store.knn_chunks(
+            query_vector,
+            k=knn_limit,
+            model=provider.model_id,
+            provider=provider.provider_id,
+            since=since,
+            until=until,
+            conversation_ids=conversation_ids,
+            source=source,
+        )
+    finally:
+        vector_store.close()
+
+
+def hydrate_chunk_hits(
+    engine: "LCMEngine",
+    *,
+    ranked_rows: list[Any],
+    knn_limit: int,
+    deadline: float,
+    snippet_chars: int,
+) -> list[tuple[dict[str, Any], float]]:
+    """Resolve ranked chunk ids to message-excerpt hits on a read-only connection.
+
+    A chunk id is ``store_id:chunk_index``; ``lcm_chunk_meta`` carries the span
+    (char_start/char_end) and the raw ``messages`` row supplies session/time and
+    the verbatim excerpt. Each hit maps 1:1 to
+    ``lcm_expand(store_id=..., content_offset=char_start)`` and is keyed by
+    ``store_id`` so RRF fuses it against an FTS raw hit for the same message.
+    """
+    conn: sqlite3.Connection | None = None
+
+    def require_remaining(stage: str) -> float:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                f"chunk result hydration deadline exhausted before {stage}"
+            )
+        return remaining
+
+    try:
+        require_remaining("database path resolution")
+        db_path = Path(engine._store.db_path).resolve()
+        uri = f"{db_path.as_uri()}?mode=ro"
+        require_remaining("database connection")
+        conn = sqlite3.connect(
+            uri,
+            uri=True,
+            timeout=max(0.001, require_remaining("database connection")),
+        )
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only=ON")
+        conn.set_progress_handler(
+            lambda: 1 if time.monotonic() >= deadline else 0,
+            1000,
+        )
+        hydrated: list[tuple[dict[str, Any], float]] = []
+        for chunk_id, score, kind in ranked_rows:
+            require_remaining("chunk lookup")
+            if kind != "chunk":
+                continue
+            row = conn.execute(
+                """
+                SELECT cm.store_id, cm.chunk_index, cm.char_start, cm.char_end,
+                       m.session_id, m.source, m.role, m.timestamp, m.content
+                FROM lcm_chunk_meta cm
+                JOIN messages m ON m.store_id = cm.store_id
+                WHERE cm.chunk_id = ? AND cm.archived = 0
+                LIMIT 1
+                """,
+                (str(chunk_id),),
+            ).fetchone()
+            if row is None:
+                continue
+            content = str(row["content"] or "")
+            char_start = int(row["char_start"])
+            char_end = int(row["char_end"])
+            excerpt = content[char_start:char_end]
+            hit = {
+                "kind": "message_excerpt",
+                "store_id": int(row["store_id"]),
+                "session_id": row["session_id"],
+                "source": row["source"] or "",
+                "role": row["role"],
+                "timestamp": row["timestamp"] or 0,
+                "chunk_span": {
+                    "chunk_index": int(row["chunk_index"]),
+                    "char_start": char_start,
+                    "char_end": char_end,
+                },
+                "content_offset": char_start,
+                "snippet": excerpt[:snippet_chars],
+            }
+            hydrated.append((hit, float(score)))
+            if len(hydrated) >= knn_limit:
+                break
+        return hydrated
+    finally:
+        if conn is not None:
+            conn.close()
+
+
 def hydrate_semantic_nodes(
     engine: "LCMEngine",
     *,

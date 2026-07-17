@@ -298,6 +298,7 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("expansion_timeout_ms", "LCM_EXPANSION_TIMEOUT_MS", int),
     _EnvFieldSpec("database_path", "LCM_DATABASE_PATH", str),
     _EnvFieldSpec("embeddings_enabled", "LCM_EMBEDDINGS_ENABLED", bool),
+    _EnvFieldSpec("rerank_enabled", "LCM_RERANK_ENABLED", bool),
     _EnvFieldSpec("embedding_bounded_scan_rows", "LCM_EMBEDDING_BOUNDED_SCAN_ROWS", int),
     _EnvFieldSpec("embedding_provider", "LCM_EMBEDDING_PROVIDER", str),
     _EnvFieldSpec("embedding_model", "LCM_EMBEDDING_MODEL", str),
@@ -491,6 +492,10 @@ class LCMConfig:
 
     # -- Embeddings (default-off until a provider/model are configured) ---
     embeddings_enabled: bool = False
+    # lcm_recall cross-encoder rerank stage (voyage rerank-2.5-lite over the top
+    # fused candidates). Default-off: recall ships value on RRF order alone, and
+    # rerank is one extra billable API call the operator opts into.
+    rerank_enabled: bool = False
     embedding_bounded_scan_rows: int = 2_000
     embedding_provider: str = ""
     embedding_model: str = ""
