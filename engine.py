@@ -3137,6 +3137,43 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 "LCM embedding purge for deleted nodes failed", exc_info=True
             )
 
+    def _archive_chunks_for_messages(
+        self,
+        store_ids: "list[int]",
+        *,
+        connection: "sqlite3.Connection | None" = None,
+    ) -> None:
+        """Soft-archive raw-history chunks for purged/GC'd messages (best effort).
+
+        Mirrors ``_purge_embeddings_for_nodes`` but for the chunk corpus: when a
+        message is deleted or its content is GC-rewritten, its chunks no longer
+        map to live content, so they are archived (dropped from ranking, rows
+        retained). No-op unless embeddings are enabled; any failure is swallowed
+        so a chunk-archive problem never breaks purge/GC.
+        """
+        if not store_ids:
+            return
+        if not bool(getattr(self._config, "embeddings_enabled", False)):
+            return
+        try:
+            from .vector_store import VectorStore
+
+            if connection is not None:
+                for offset in range(0, len(store_ids), 256):
+                    VectorStore.archive_chunks_for_messages_on_connection(
+                        connection, store_ids[offset:offset + 256]
+                    )
+                return
+            store = VectorStore(self._store.db_path, config=self._config)
+            try:
+                store.archive_chunks_for_messages(store_ids)
+            finally:
+                store.close()
+        except Exception:  # pragma: no cover - defensive; archive is best-effort
+            logger.debug(
+                "LCM chunk archive for purged messages failed", exc_info=True
+            )
+
     def carry_over_new_session_context(self, old_session_id: str, new_session_id: str) -> int:
         """Move retained summaries from the old session into the new one.
 
@@ -4381,6 +4418,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             return
 
         stored_by_id = self._store.get_batch(source_store_ids)
+        gc_rewritten: list[int] = []
         for store_id in source_store_ids:
             stored = stored_by_id.get(store_id)
             if not stored or stored.get("session_id") != self._session_id:
@@ -4407,7 +4445,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 )
                 if externalized is not None and externalized.get("kind", "tool_result") == "tool_result":
                     placeholder = build_transcript_gc_placeholder(externalized)
-                    self._store.gc_externalized_tool_result(store_id, placeholder)
+                    if self._store.gc_externalized_tool_result(store_id, placeholder):
+                        gc_rewritten.append(store_id)
                     continue
 
             lookup_candidates = []
@@ -4431,7 +4470,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 continue
 
             placeholder = build_transcript_gc_placeholder(externalized)
-            self._store.gc_externalized_tool_result(store_id, placeholder)
+            if self._store.gc_externalized_tool_result(store_id, placeholder):
+                gc_rewritten.append(store_id)
+
+        # GC rewrote these tool results' content to a compact placeholder, so
+        # any chunks embedded from the old content are now stale — archive them.
+        self._archive_chunks_for_messages(gc_rewritten)
 
     def _serialize_messages(self, messages: List[Dict[str, Any]]) -> str:
         """Serialize messages into labeled text for the summarizer."""

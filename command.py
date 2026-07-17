@@ -1639,11 +1639,25 @@ def _delete_clean_candidates_atomically(engine, session_ids: set[str]) -> dict[s
         conn.execute("BEGIN IMMEDIATE")
         SummaryDAG.stage_delete_session_scope(conn, session_ids)
         scope_table = SummaryDAG.DELETE_SESSION_SCOPE_TABLE
+        # Capture the store_ids about to be deleted so their raw-history chunks
+        # can be archived in this same transaction (chunks map to messages by
+        # store_id; a deleted message's chunks must drop from ranking).
+        deleted_store_ids = [
+            int(row[0])
+            for row in conn.execute(
+                f"SELECT store_id FROM messages WHERE EXISTS ("
+                f"SELECT 1 FROM {scope_table} AS scope "
+                "WHERE scope.session_id = messages.session_id)"
+            ).fetchall()
+        ]
         msg_cur = conn.execute(
             f"DELETE FROM messages WHERE EXISTS ("
             f"SELECT 1 FROM {scope_table} AS scope "
             "WHERE scope.session_id = messages.session_id)"
         )
+        archive_chunks = getattr(engine, "_archive_chunks_for_messages", None)
+        if callable(archive_chunks) and deleted_store_ids:
+            archive_chunks(deleted_store_ids, connection=conn)
         nodes_deleted = 0
         purge = getattr(engine, "_purge_embeddings_for_nodes", None)
         while True:
