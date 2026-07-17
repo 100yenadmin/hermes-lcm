@@ -959,3 +959,47 @@ def test_recall_eval_is_deterministic_and_hybrid_beats_fts_on_paraphrases():
     metrics = json.loads(first)
     assert metrics["hybrid"]["paraphrase"]["recall@5"] >= metrics["full_text"]["paraphrase"]["recall@5"]
     assert metrics["hybrid"]["paraphrase"]["recall@10"] >= metrics["full_text"]["paraphrase"]["recall@10"]
+
+
+def test_semantic_content_scope_degrades_to_full_text(semantic_engine, monkeypatch):
+    """content_scope beyond 'history' is a payload-search dimension owned by
+    the full-text arm; payloads are never embedded, so the semantic arm must
+    degrade rather than silently return history-only semantic hits (combined
+    contract with the externalized-payload-search train)."""
+    semantic_engine._store.append("session-a", {"role": "user", "content": "payload marker"})
+    node = _add_summary(semantic_engine, "an embedded summary", created_at=1.0)
+    _seed_vectors(semantic_engine, [(node, [1.0, 0.0])])
+    monkeypatch.setattr(lcm_tools, "resolve_provider", lambda _config: MockProvider())
+
+    for scope in ("externalized", "both"):
+        payload = json.loads(
+            lcm_tools.lcm_grep(
+                {"query": "marker", "mode": "semantic", "content_scope": scope},
+                engine=semantic_engine,
+            )
+        )
+        assert payload["degraded_to_fts"] is True, scope
+        assert "full_text" in payload["degraded_reason"], scope
+        # No semantic summary hit may leak through the requested payload scope.
+        assert all(hit.get("type") != "summary" for hit in payload["results"]), scope
+
+
+def test_hybrid_content_scope_degrades_to_full_text_arm(semantic_engine, monkeypatch):
+    """In hybrid mode the semantic arm's content_scope degrade must surface as
+    the full-text-arm result (which owns payload scanning) plus the explicit
+    degraded marker — never fused history-only semantic hits."""
+    semantic_engine._store.append("session-a", {"role": "user", "content": "payload marker"})
+    node = _add_summary(semantic_engine, "an embedded summary", created_at=1.0)
+    _seed_vectors(semantic_engine, [(node, [1.0, 0.0])])
+    monkeypatch.setattr(lcm_tools, "resolve_provider", lambda _config: MockProvider())
+
+    payload = json.loads(
+        lcm_tools.lcm_grep(
+            {"query": "marker", "mode": "hybrid", "content_scope": "externalized"},
+            engine=semantic_engine,
+        )
+    )
+    assert payload["mode"] == "hybrid"
+    assert payload["degraded_to_fts"] is True
+    assert "full_text" in payload["degraded_reason"]
+    assert all(hit.get("type") != "summary" for hit in payload["results"])
