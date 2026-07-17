@@ -915,7 +915,15 @@ class VectorStore:
             return []
         if (since is not None or until is not None) and "latest_at" not in columns:
             return []
-        recency_expr = "sn.latest_at" if "latest_at" in columns else "sn.created_at"
+        # Per-row fallback matters, not just column existence: the DAG
+        # migration adds ``latest_at`` without backfilling legacy rows, and a
+        # bare ``latest_at DESC`` sorts those NULLs last — silently dropping
+        # legacy summaries out of the bounded window on upgraded databases.
+        recency_expr = (
+            "COALESCE(sn.latest_at, sn.created_at)"
+            if "latest_at" in columns
+            else "sn.created_at"
+        )
         where = ["m.identity_hash = ?", "m.archived = 0"]
         args: list[object] = [str(identity_hash)]
         if "suppressed_at" in columns:
