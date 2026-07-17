@@ -275,3 +275,75 @@ Use benchmark output and `lcm_status`, not guesswork:
 | Large tool outputs dominate token pressure | externalization status, payload sizes | Enable large-output externalization before tuning compaction thresholds |
 
 Hard gates for promoting a preset: no replay failures, no raw transcript leakage in exports, stable retrieval recall, explainable fixture/provenance metadata, and no conflict with explicit operator config.
+
+## LongMemEval retrieval harness
+
+`scripts/lcm_longmemeval.py` measures retrieval quality (recall@k / NDCG@10)
+on **LongMemEval_S** (Wu et al., ICLR 2025) for the LCM retrieval arms —
+`fts` (raw-message FTS5), `summary_vectors` (summary embeddings), `hybrid_rrf`
+(reciprocal-rank fusion, k=60), and `hybrid_rerank` (a deterministic
+embedding-cosine reranker over the fused pool, a placeholder for a real
+cross-encoder). Chunk-vectors are future work. There is **no LLM judge**: the
+dataset labels the evidence session(s) per question (`answer_session_ids`), so
+recall is computable offline. It ingests each question's history into a fresh
+temporary LCM store (reusing the `store`/`dag`/`vector_store` APIs directly, no
+live Hermes host), builds one deterministic summary per session, optionally
+backfills embeddings, then scores each arm against the labeled evidence.
+
+The dataset is downloaded **once** by an explicit operator command, never during
+a run. The canonical source is the Hugging Face dataset `xiaowu0162/longmemeval`,
+file `longmemeval_s` (~278 MB, 500 questions), pinned to revision
+`2ec2a557f339b6c0369619b1ed5793734cc87533`:
+
+```bash
+python scripts/lcm_longmemeval.py fetch --output /path/to/longmemeval-data
+```
+
+Deterministic plumbing proof (offline, `<60s`, scores are meaningless with the
+hash-based stub embedder):
+
+```bash
+python scripts/lcm_longmemeval.py run \
+  --dataset /path/to/longmemeval-data/longmemeval_s \
+  --provider stub --limit 5 \
+  --output benchmarks/runs/longmemeval-stub
+```
+
+CI-grade local run with the deterministic FastEmbed provider (the model is
+downloaded once into the FastEmbed cache; the query path is local thereafter).
+`fastembed` is an optional dependency — install it into a virtualenv, and point
+its model cache at a roomy volume with `LCM_LONGMEMEVAL_FASTEMBED_CACHE`:
+
+```bash
+python -m venv .venv-fastembed
+.venv-fastembed/bin/pip install fastembed
+LCM_LONGMEMEVAL_FASTEMBED_CACHE=/path/to/fastembed-cache \
+  .venv-fastembed/bin/python scripts/lcm_longmemeval.py run \
+    --dataset /path/to/longmemeval-data/longmemeval_s \
+    --provider fastembed --model BAAI/bge-small-en-v1.5 --limit 25 \
+    --output benchmarks/runs/longmemeval-fastembed
+```
+
+`--provider voyage --model <voyage-model>` is allowed for an explicit
+live-provider run (network + spend). Use `--limit N` to bound cost; the full
+500-question run over all four arms with `bge-small` takes on the order of
+minutes on a laptop.
+
+Output is **aggregate-only**, matching the export hygiene of
+`scripts/lcm_benchmark.py`: `longmemeval_metrics.json` (per-arm and per-category
+recall@1/5/10, NDCG@10, and per-arm latency percentiles) plus a
+`longmemeval_metrics.md` table. It contains no transcript content, session ids,
+or local paths. Abstention questions (`question_id` ending in `_abs`) have no
+evidence session and are excluded from recall (`abstention_excluded` counts
+them). Categories: single-session-user / -assistant / -preference,
+multi-session, temporal (temporal-reasoning), and knowledge-update.
+
+**Honest caveat — this is our configuration, not a universal verdict.** MemDelta
+(arXiv:2606.29914) shows that memory-benchmark rankings **flip** with the choice
+of embedding model and base model: an arm that wins under one embedder can lose
+under another. So these numbers gate the LCM rerank and embed-policy defaults
+*for the precise configuration recorded in the metrics JSON* (provider, model,
+dataset revision) and must not be read as an absolute claim that one arm is
+better than another. Re-run with your intended production embedder before
+trusting the ordering, and always publish the exact configuration alongside the
+scores.
