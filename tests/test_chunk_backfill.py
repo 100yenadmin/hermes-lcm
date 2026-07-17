@@ -126,6 +126,27 @@ class TestChunkDryRun:
         assert "status: dry-run" in result
         assert "pending: 2" in result
 
+    def test_dry_run_display_honors_explicit_context_model(self, tmp_path):
+        # H3: an explicit voyage context model is the chunk-model intent and the
+        # dry-run display must equal it (single resolution path) rather than
+        # forcing the voyage-context-4 mapping — this is what apply would use.
+        engine = _engine(tmp_path)
+        engine._config.embedding_provider = "voyage"
+        engine._config.embedding_model = "voyage-context-3"
+        _seed_messages(engine, _user_msgs(1), register=False)
+        result = handle_lcm_command("embed backfill --corpus chunks", engine)
+        assert "model: voyage-context-3" in result
+
+    def test_dry_run_display_maps_plain_voyage_to_context_default(self, tmp_path):
+        # A plain (non-context) voyage model has no explicit chunk-model intent,
+        # so the voyage-context-4 mapping applies.
+        engine = _engine(tmp_path)
+        engine._config.embedding_provider = "voyage"
+        engine._config.embedding_model = "voyage-3"
+        _seed_messages(engine, _user_msgs(1), register=False)
+        result = handle_lcm_command("embed backfill --corpus chunks", engine)
+        assert "model: voyage-context-4" in result
+
     def test_policy_heads_includes_tool_heads(self, tmp_path):
         engine = _engine(tmp_path)
         rows = _user_msgs(1) + [(2, "sess-a", "history", "tool", "t" * 60, 2.0)]

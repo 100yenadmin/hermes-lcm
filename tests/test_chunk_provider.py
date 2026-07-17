@@ -75,6 +75,13 @@ class TestDefaultChunkModel:
         assert default_chunk_model("ollama", "nomic-embed") == "nomic-embed"
         assert default_chunk_model("fastembed", "bge-small") == "bge-small"
 
+    def test_explicit_context_model_wins_over_mapping(self):
+        # An explicit voyage context model is the chunk-model intent and wins;
+        # a plain voyage model still maps to the voyage-context-4 default.
+        assert default_chunk_model("voyage", "voyage-context-3") == "voyage-context-3"
+        assert default_chunk_model("voyage", "voyage-context-4") == "voyage-context-4"
+        assert default_chunk_model("voyage", "voyage-3") == "voyage-context-4"
+
 
 class TestEmbedContextualized:
     def test_plain_fallback_regroups_by_document(self):

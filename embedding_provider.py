@@ -70,11 +70,19 @@ def default_chunk_model(provider: str, configured_model: str) -> str:
     provider reuses the configured summary model so the local-first posture is
     unchanged (fastembed/ollama chunk-embed with the same local model).
     """
+    configured = str(configured_model or "").strip()
     key = str(provider or "").strip().lower()
     mapped = _DEFAULT_CHUNK_MODELS.get(key)
     if mapped:
+        # An explicit context model is the operator's stated chunk-model intent
+        # and wins over the mapping; the voyage-context-4 default applies ONLY
+        # when the configured model is a plain (non-context) voyage model. This
+        # keeps the dry-run display equal to what apply resolves for the chunk
+        # corpus (single resolution path through this function).
+        if _is_voyage_context_model(configured):
+            return configured
         return mapped
-    return str(configured_model or "").strip()
+    return configured
 
 
 def _is_voyage_context_model(model: str) -> bool:
