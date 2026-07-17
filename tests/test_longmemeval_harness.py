@@ -494,3 +494,15 @@ def test_db_template_reuse_matches_from_scratch_bootstrap(tmp_path):
             assert templated["arms"][arm]["turn"][metric] == from_scratch["arms"][arm]["turn"][metric]
     assert templated["ingest"]["reuse_db_template"] is True
     assert from_scratch["ingest"]["reuse_db_template"] is False
+
+
+def test_rrf_fuse_turn_keys_with_none_turn_tie_is_total_ordered():
+    """A summary turn key (session, None) tying a localized (session, int) key
+    on score and best rank must not crash the sort (None < int TypeError)."""
+    from benchmarking.longmemeval import rrf_fuse
+
+    fused = rrf_fuse([("s1", None), ("s2", 3)], [("s2", 3), ("s1", None)])
+    assert set(fused) == {("s1", None), ("s2", 3)}
+    # And a same-session tie between None-turn and int-turn keys:
+    fused2 = rrf_fuse([("s1", None)], [("s1", 4)])
+    assert set(fused2) == {("s1", None), ("s1", 4)}

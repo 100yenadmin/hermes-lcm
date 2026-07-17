@@ -557,6 +557,16 @@ def reorder_turn_keys_by_session(turn_keys: Sequence[TurnKey], session_order: Se
     return sorted(turn_keys, key=lambda key: rank.get(key[0], len(rank)))
 
 
+def _fuse_tiebreak(item):
+    """Total-order tie-break for fused ids: plain session strings sort as-is;
+    turn keys ``(session, turn|None)`` map a None turn (summary = whole
+    session) to -1 so ties never compare ``None < int`` (crash observed when
+    a summary turn key tied a localized turn key on score AND best rank)."""
+    if isinstance(item, tuple):
+        return tuple(-1 if part is None else part for part in item)
+    return item
+
+
 def rrf_fuse(*ranked_lists: Sequence[str]) -> list[str]:
     """Reciprocal-rank fusion over per-arm session rankings (``RRF_K`` = 60)."""
     scores: dict[str, float] = {}
@@ -565,7 +575,7 @@ def rrf_fuse(*ranked_lists: Sequence[str]) -> list[str]:
         for rank, session_id in enumerate(ranked, start=1):
             scores[session_id] = scores.get(session_id, 0.0) + 1.0 / (RRF_K + rank)
             best_rank[session_id] = min(best_rank.get(session_id, rank), rank)
-    return sorted(scores, key=lambda sid: (-scores[sid], best_rank[sid], sid))
+    return sorted(scores, key=lambda sid: (-scores[sid], best_rank[sid], _fuse_tiebreak(sid)))
 
 
 def rerank_by_cosine(
