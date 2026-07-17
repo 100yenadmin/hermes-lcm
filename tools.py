@@ -2825,10 +2825,18 @@ def _lcm_recall_rerank(
     deadline: float,
     config: Any,
 ) -> tuple[list[dict[str, Any]], str]:
-    """Optionally rerank the top ``window`` fused candidates in ONE API call.
+    """Optionally REORDER the top ``window`` fused candidates in ONE API call.
 
-    Default OFF. Any failure (no provider, non-voyage, network, deadline) skips
-    silently back to the RRF order with a ``skipped: <reason>`` status.
+    Default OFF. This is a pure rank-reorder WITHIN the window: the reranker's
+    relevance scores decide the intra-window order but are never spliced onto the
+    ``rrf_score``/``_final_score`` scale (the two live on incompatible scales, so a
+    ~0-1 voyage score would otherwise dominate the ~0.05-max RRF score). Entries
+    outside the window keep their incoming (post scope/recency prior) order.
+
+    ``ordered`` MUST already carry the scope/recency prior so the window reflects
+    the true top-N rather than the raw RRF order (RERANK-1). Any failure (no
+    provider, non-voyage, network, deadline) skips silently back to the incoming
+    order with a ``skipped: <reason>`` status.
     """
     if not bool(getattr(config, "rerank_enabled", False)):
         return ordered, "disabled"
@@ -2859,11 +2867,9 @@ def _lcm_recall_rerank(
         return ordered, "skipped: empty rerank result"
     reordered: list[dict[str, Any]] = []
     seen: set[int] = set()
-    for index, relevance in ranked:
-        if 0 <= index < len(head):
-            entry = head[index]
-            entry["_rerank_score"] = float(relevance)
-            reordered.append(entry)
+    for index, _relevance in ranked:
+        if 0 <= index < len(head) and index not in seen:
+            reordered.append(head[index])
             seen.add(index)
     for index, entry in enumerate(head):
         if index not in seen:
@@ -3017,40 +3023,68 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
     arm_order = [name for name in ("fts", "summary", "chunk") if arm_hits.get(name)]
     ordered = rrf_fuse([arm_hits[name] for name in arm_order], k=_LCM_RECALL_RRF_K)
 
-    # Merge a chunk span onto a message whose store_id also surfaced via FTS so
-    # its expand handle points at the exact excerpt (dedupe keeps the fused,
-    # higher-ranked entry; provenance from both arms is preserved via ranks).
-    chunk_by_store = {
-        hit.get("store_id"): hit for hit in arm_hits.get("chunk", [])
-    }
+    # Merge chunk-arm provenance onto a message whose store_id also surfaced via
+    # FTS. The chunk list is best-first, so keep the BEST-ranked chunk per store
+    # (setdefault, not a plain comprehension which keeps the WORST last entry --
+    # F1-chunk-dedupe-wrong-span). When both arms carry the message, the merged
+    # hit takes the better-ranked arm's snippet AND its offsets together so the
+    # displayed preview and the expand handle describe the SAME span (DEDUPE-1);
+    # a mismatched snippet/offset pair pointed at two different parts of the
+    # message. arm_order fixes the fused base object to the earliest arm, so we
+    # compare per-arm ranks explicitly rather than trusting insertion order.
+    chunk_by_store: dict[Any, dict[str, Any]] = {}
+    for chunk_hit in arm_hits.get("chunk", []):
+        chunk_by_store.setdefault(chunk_hit.get("store_id"), chunk_hit)
+    chunk_arm_index = arm_order.index("chunk") if "chunk" in arm_order else None
+    fts_arm_index = arm_order.index("fts") if "fts" in arm_order else None
     for entry in ordered:
         hit = entry["hit"]
-        if hit.get("kind") == "message_excerpt" and not hit.get("chunk_span"):
-            chunk_hit = chunk_by_store.get(hit.get("store_id"))
-            if chunk_hit is not None:
-                hit["chunk_span"] = chunk_hit.get("chunk_span")
-                hit["content_offset"] = chunk_hit.get("content_offset", 0)
-                hit["expand_hint"] = _lcm_recall_excerpt_expand_hint(hit)
+        if hit.get("kind") != "message_excerpt":
+            continue
+        chunk_hit = chunk_by_store.get(hit.get("store_id"))
+        if chunk_hit is None:
+            continue
+        ranks = entry["ranks"]
+        chunk_rank = ranks.get(chunk_arm_index) if chunk_arm_index is not None else None
+        fts_rank = ranks.get(fts_arm_index) if fts_arm_index is not None else None
+        # Adopt the chunk arm's span+snippet when the base hit lacks a span (a
+        # pure-FTS base) OR the chunk arm ranked this message at least as well as
+        # the FTS arm. Lower rank number == better.
+        chunk_wins = not hit.get("chunk_span") or (
+            chunk_rank is not None
+            and (fts_rank is None or chunk_rank <= fts_rank)
+        )
+        if chunk_wins:
+            hit["chunk_span"] = chunk_hit.get("chunk_span")
+            hit["content_offset"] = chunk_hit.get("content_offset", 0)
+            hit["snippet"] = chunk_hit.get("snippet") or hit.get("snippet")
+            hit["expand_hint"] = _lcm_recall_excerpt_expand_hint(hit)
 
-    # -- Optional rerank stage (default OFF) --
-    ordered, rerank_status = _lcm_recall_rerank(
-        provider, query, ordered, window=rerank_window, deadline=deadline, config=engine._config
-    )
-
-    # -- Scope-prior + recency rescoring --
+    # -- Scope-prior + recency rescoring. Applied BEFORE the rerank window is
+    #    selected so an item the prior lifts into the true top-N is the one
+    #    actually reranked (RERANK-1). Boost eligibility spans the whole
+    #    conversation-scope session set, not a single session-id equality, so a
+    #    mid-conversation session rotation keeps the boost (SCOPE-1). --
     now = time.time()
+    scope_session_ids = set(_recent_conversation_scope_session_ids(engine))
     for entry in ordered:
         hit = entry["hit"]
-        rank_score = float(entry.get("_rerank_score", entry.get("rrf_score", 0.0)))
-        is_current = 1.0 if hit.get("from_current_session") else 0.0
+        rank_score = float(entry.get("rrf_score", 0.0))
+        is_current = 1.0 if hit.get("session_id") in scope_session_ids else 0.0
         recency = _lcm_recall_recency_boost(hit.get("timestamp"), now=now)
         entry["_final_score"] = rank_score * (1.0 + scope_bias * is_current) * recency
     ordered.sort(
         key=lambda entry: (
             -float(entry["_final_score"]),
-            -float(entry.get("_rerank_score", entry.get("rrf_score", 0.0))),
+            -float(entry.get("rrf_score", 0.0)),
             _hit_identity(entry["hit"]),
         )
+    )
+
+    # -- Optional rerank stage (default OFF): a pure rank-REORDER within the top
+    #    window of the post-prior order (no score splicing onto the RRF scale). --
+    ordered, rerank_status = _lcm_recall_rerank(
+        provider, query, ordered, window=rerank_window, deadline=deadline, config=engine._config
     )
 
     # -- Response shaping (char-capped) --
@@ -3095,6 +3129,12 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
             "arms_run": arm_order,
             "coverage": coverage,
             "rerank": rerank_status,
+            "ordering": (
+                "rrf-fusion -> scope/recency prior -> rerank reorder (top window); "
+                "the reported score is the scope/recency-adjusted RRF score, and "
+                "rerank (when applied) only permutes the top window without "
+                "replacing that score"
+            ),
         },
         "degraded": degraded,
     }

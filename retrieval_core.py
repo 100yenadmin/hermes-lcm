@@ -386,6 +386,13 @@ def rrf_fuse(arms: list[list[dict[str, Any]]], k: int = 60) -> list[dict[str, An
     ``hit``, the fused score under ``rrf_score``, and each arm's 1-based rank in
     ``ranks`` (keyed by arm index). Callers own arm-specific metadata (which arm
     is FTS vs semantic, confidence, snippet provenance).
+
+    A single identity that appears more than once within the SAME arm (e.g. a
+    message chunked into several pieces, each a separate chunk-arm hit) is
+    collapsed to its best (first, since arms are best-first ordered) rank and
+    contributes exactly one ``1 / (k + rank)`` term for that arm -- otherwise a
+    multi-chunk message double-counts and out-scores a genuine higher-rank match
+    (RRF-1).
     """
     fused: dict[tuple[str, Any], dict[str, Any]] = {}
     for arm_index, arm in enumerate(arms):
@@ -394,6 +401,9 @@ def rrf_fuse(arms: list[list[dict[str, Any]]], k: int = 60) -> list[dict[str, An
             entry = fused.setdefault(
                 key, {"hit": dict(hit), "rrf_score": 0.0, "ranks": {}}
             )
+            if arm_index in entry["ranks"]:
+                # Already scored this identity for this arm at a better rank.
+                continue
             entry["ranks"][arm_index] = rank
             entry["rrf_score"] += 1.0 / (k + rank)
     return sorted(

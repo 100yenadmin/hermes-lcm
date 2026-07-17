@@ -327,3 +327,95 @@ def test_recall_scans_full_corpus_not_grep_recency_window(recall_engine, monkeyp
 
     # Both vector arms request the large recall bound, never the small grep one.
     assert observed and all(bound == 25_000 for bound in observed)
+
+
+def test_rrf_fuse_collapses_repeated_identity_within_arm():
+    """RRF-1: a message chunked into several pieces must contribute ONE term per
+    arm at its best rank, not one per chunk occurrence."""
+    from hermes_lcm.retrieval_core import rrf_fuse
+
+    # Arm 0 (chunk): message A appears 3x (ranks 2,3,4); message B once (rank 1).
+    chunk_arm = [
+        {"store_id": "B"},
+        {"store_id": "A"},
+        {"store_id": "A"},
+        {"store_id": "A"},
+    ]
+    fused = rrf_fuse([chunk_arm], k=60)
+    by_id = {entry["hit"]["store_id"]: entry for entry in fused}
+    # A is collapsed to its best (first) rank 2 and counted once; B's genuine
+    # rank-1 hit therefore out-scores it instead of losing to a 3x double-count.
+    assert by_id["A"]["ranks"] == {0: 2}
+    assert by_id["B"]["ranks"] == {0: 1}
+    assert by_id["B"]["rrf_score"] > by_id["A"]["rrf_score"]
+    assert fused[0]["hit"]["store_id"] == "B"
+
+
+def test_chunk_dedupe_keeps_best_ranked_span(recall_engine, monkeypatch):
+    """F1-chunk-dedupe-wrong-span: when one message has several chunks, the merged
+    hit keeps the BEST-ranked chunk's span, not the worst (last) one."""
+    content = "kanban dashboard sprint verbatim detail tail segment here"
+    store_id = recall_engine._store.append(CURRENT, {"role": "user", "content": content})
+    # Chunk 0 (char 0-24) is the strong cosine-1.0 match; chunk 1 (char 33-57) is
+    # a weak near-orthogonal match that must NOT overwrite the strong span.
+    _seed_chunk_vectors(
+        recall_engine,
+        [
+            (store_id, 0, 0, 24, [1.0, 0.0]),
+            (store_id, 1, 33, 57, [0.05, 0.998]),
+        ],
+    )
+
+    payload = _recall(recall_engine, monkeypatch, include="verbatim", limit=10)
+
+    excerpt_hits = [h for h in payload["hits"] if h.get("store_id") == store_id]
+    assert len(excerpt_hits) == 1
+    hit = excerpt_hits[0]
+    assert hit["chunk_span"]["char_start"] == 0 and hit["chunk_span"]["char_end"] == 24
+    assert "content_offset=0" in hit["expand_hint"]
+
+
+def test_chunk_fts_merge_snippet_and_offset_are_consistent(recall_engine, monkeypatch):
+    """DEDUPE-1: the merged hit's snippet and content_offset describe the SAME
+    span (both from the better-ranked chunk arm), never an FTS snippet glued to a
+    chunk offset."""
+    content = "prologue text then kanban dashboard sprint match zone trailing"
+    match_start = content.index("kanban")
+    match_end = match_start + len("kanban dashboard sprint match")
+    store_id = recall_engine._store.append(CURRENT, {"role": "user", "content": content})
+    _seed_chunk_vectors(recall_engine, [(store_id, 0, match_start, match_end, [1.0, 0.0])])
+
+    payload = _recall(recall_engine, monkeypatch, include="verbatim", limit=10)
+
+    hit = next(h for h in payload["hits"] if h.get("store_id") == store_id)
+    assert set(hit["arms"]) == {"fts", "chunk"}
+    # Snippet and expand offset both come from the chunk arm -> consistent.
+    assert hit["snippet"] == content[match_start:match_end]
+    assert f"content_offset={match_start}" in hit["expand_hint"]
+    assert hit["chunk_span"]["char_start"] == match_start
+
+
+def test_rerank_does_not_splice_voyage_score_onto_rrf_scale(recall_engine, monkeypatch):
+    """RERANK-1: rerank only permutes the window; the reported score stays on the
+    RRF scale rather than being replaced by the ~0-1 voyage relevance score."""
+    recall_engine._config.rerank_enabled = True
+    a = _add_summary(recall_engine, "kanban alpha", session_id="session-a", created_at=5.0)
+    b = _add_summary(recall_engine, "kanban beta", session_id="session-b", created_at=5.0)
+    _seed_summary_vectors(recall_engine, [(a, [1.0, 0.0]), (b, [0.95, 0.312])], provider="voyage")
+
+    class RerankProvider(MockProvider):
+        provider_id = "voyage"
+
+        def rerank(self, query, documents, *, top_k=None, timeout, model="rerank-2.5-lite"):
+            # Voyage-shaped scores in the 0..1 range, descending.
+            return sorted(
+                ((i, 0.9 - 0.1 * i) for i in range(len(documents))), key=lambda item: -item[1]
+            )
+
+    payload = _recall(
+        recall_engine, monkeypatch, provider=RerankProvider(), include="summaries", scope_bias=0.0, limit=5
+    )
+    assert payload["provenance"]["rerank"] == "applied"
+    # Had the 0.9 voyage score been spliced onto the RRF scale it would dwarf the
+    # ~0.016 RRF score; the reported score must stay RRF-scaled.
+    assert all(hit["score"] < 0.1 for hit in payload["hits"])
