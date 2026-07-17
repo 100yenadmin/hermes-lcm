@@ -483,6 +483,43 @@ def test_background_scan_flags_corruption_without_rebuilding(tmp_path, monkeypat
     conn.close()
 
 
+def test_dispatch_stamps_scan_started_before_thread_runs(tmp_path, monkeypatch):
+    """The dispatcher durably stamps scan_started_at before the thread runs (F6).
+
+    A second process racing dispatch in the window before the thread commits its
+    own stamp must see the claim and not launch a duplicate deep scan.
+    """
+    monkeypatch.setenv(INTERVAL_ENV, "24")
+    monkeypatch.delenv("LCM_FTS_INTEGRITY_BACKGROUND", raising=False)
+    conn = _make_conn(tmp_path)
+    spec = _spec()
+    ensure_external_content_fts(conn, spec)
+    _age_marker(conn)
+
+    # Block the scan thread body so it can NOT be the one that stamps.
+    release = threading.Event()
+    monkeypatch.setattr(
+        db_bootstrap, "_run_background_integrity_scan",
+        lambda *a, **k: release.wait(30),
+    )
+
+    dispatched = db_bootstrap._dispatch_background_integrity_scan(conn, spec)
+    assert dispatched is True
+    try:
+        # A separate connection sees the stamp already committed by the dispatcher.
+        verify = sqlite3.connect(_db_file(tmp_path))
+        try:
+            started = db_bootstrap._load_scan_started_at(verify, spec)
+        finally:
+            verify.close()
+        # The dispatcher wrote it — the thread body is blocked and cannot have.
+        assert started is not None
+    finally:
+        release.set()
+        db_bootstrap.join_background_integrity_scans(timeout=30)
+    conn.close()
+
+
 def test_kill_switch_false_runs_synchronously_without_a_thread(tmp_path, monkeypatch, integrity_calls):
     """SPEC E (c): LCM_FTS_INTEGRITY_BACKGROUND=false = exact old synchronous path."""
     monkeypatch.setenv(INTERVAL_ENV, "24")

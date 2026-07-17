@@ -2046,6 +2046,28 @@ def _dispatch_background_integrity_scan(
             # A recent scan (this or another process) owns this table; let it
             # stamp the marker. The bind returns fast without a duplicate scan.
             return True
+        # Durably claim the scan cross-process BEFORE starting the thread. The
+        # spawned thread stamps ``scan_started_at`` on its own connection, but
+        # ``thread.start()`` returns before that stamp is committed — a second
+        # process racing ``ensure_external_content_fts`` in that window would read
+        # no stamp and dispatch a duplicate deep scan (F6). Writing the stamp here
+        # under BEGIN IMMEDIATE closes that window; best-effort (a transient lock
+        # just falls back to the thread's own stamp).
+        claim_timeout = SQLITE_BUSY_TIMEOUT_MS / 1000.0
+        try:
+            claim_conn = sqlite3.connect(
+                db_path, timeout=claim_timeout, check_same_thread=False
+            )
+            try:
+                claim_conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+                claim_conn.execute("BEGIN IMMEDIATE")
+                _record_scan_started(claim_conn, spec, now=current)
+                claim_conn.commit()
+            finally:
+                claim_conn.close()
+        except sqlite3.DatabaseError:
+            pass
+
         thread = threading.Thread(
             target=_run_background_integrity_scan,
             args=(db_path, spec, current),
