@@ -315,6 +315,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # not session-scoped, so it is not cleared on session reset.
         self._ingest_failure_count = 0
         self._consecutive_ingest_failures = 0
+        # Proactive-recall injection telemetry (SPEC F). Store-scoped counters so
+        # a session reset does not zero the operator's running totals; surfaced
+        # through lcm_status. injected = a block was placed this assembly;
+        # skipped = ran but nothing survived the floor/dedupe; timeout = the
+        # recall query hit its deadline (inject nothing, never block assembly).
+        self._proactive_recall_injected_count = 0
+        self._proactive_recall_skipped_count = 0
+        self._proactive_recall_timeout_count = 0
         self._last_ingest_error = ""
         self._last_ingest_error_time: float = 0
         # Cooldown timestamp to prevent compression cascade after boundary skip.
@@ -5194,6 +5202,145 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             return self._build_preserved_objective_summary_part(message)
         return None
 
+    @staticmethod
+    def _newest_user_message_text(messages: List[Dict[str, Any]]) -> str:
+        """Return the newest real user turn's text (SPEC F injection query).
+
+        Scans from the tail so the block reflects the turn the host is about to
+        answer. Returns "" when the tail carries no user text (e.g. a tool-only
+        continuation) — the caller then leaves the feature inert.
+        """
+        for message in reversed(messages):
+            if not isinstance(message, dict) or message.get("role") != "user":
+                continue
+            text = (text_content_for_pattern_matching(message.get("content")) or "").strip()
+            if text:
+                return text
+        return ""
+
+    def _build_proactive_recall_message(
+        self,
+        tail_messages: List[Dict[str, Any]],
+        summary_role: str,
+        active_node_ids: set,
+    ) -> Optional[Dict[str, Any]]:
+        """Build the single proactive "relevant memories" block, or None.
+
+        SPEC F: at assembly time embed the newest user message, run the
+        lcm_recall pipeline (k=6, moderate scope bias), drop hits already in the
+        active context (summary-prefix node ids + current session) and hits
+        below the relevance floor, then render ONE budget-capped block. Any
+        failure or timeout injects nothing — assembly is never blocked. Wrapped
+        in <relevant-memories> so it is stripped before ingest/summarization and
+        never re-enters the lossless store as a real turn.
+        """
+        config = self._config
+        if not getattr(config, "proactive_recall_enabled", False):
+            return None
+        # Injection is an embedding-query feature: silently inert when embeddings
+        # are disabled/unwarmed (no provider to embed the newest message).
+        if not getattr(config, "embeddings_enabled", False):
+            return None
+
+        query = self._newest_user_message_text(tail_messages)
+        if not query:
+            return None
+
+        # SPEC F retrieval constants: small k, moderate scope bias (favor — never
+        # hard-filter — the current conversation).
+        recall_k = 6
+        scope_bias = 0.3
+        min_score = float(getattr(config, "proactive_recall_min_score", 0.02) or 0.0)
+        budget_tokens = int(getattr(config, "proactive_recall_budget_tokens", 500) or 0)
+        if budget_tokens <= 0:
+            return None
+        provider_override = getattr(config, "proactive_recall_provider", "") or ""
+
+        try:
+            from .tools import lcm_recall
+
+            raw = lcm_recall(
+                {
+                    "query": query,
+                    "limit": recall_k,
+                    "scope_bias": scope_bias,
+                    "include": "all",
+                },
+                engine=self,
+                provider_override=provider_override,
+            )
+            payload = json.loads(raw)
+        except Exception:  # noqa: BLE001 - never let recall break assembly
+            logger.debug("LCM proactive recall failed; injecting nothing", exc_info=True)
+            self._proactive_recall_skipped_count += 1
+            return None
+
+        if payload.get("timeout"):
+            # Deadline hit: inject nothing this turn (contract), count it.
+            self._proactive_recall_timeout_count += 1
+            return None
+
+        surviving: list[dict] = []
+        for hit in payload.get("hits", []):
+            if not isinstance(hit, dict):
+                continue
+            # Dedupe: skip anything already represented in the active context —
+            # the current session (its summary prefix + recent tail window) and
+            # any summary node already placed in the prefix.
+            if hit.get("from_current_session"):
+                continue
+            node_id = hit.get("node_id")
+            if node_id is not None and node_id in active_node_ids:
+                continue
+            # Relevance floor.
+            if float(hit.get("score") or 0.0) < min_score:
+                continue
+            snippet = (hit.get("snippet") or "").strip()
+            if not snippet:
+                continue
+            surviving.append(hit)
+
+        if not surviving:
+            self._proactive_recall_skipped_count += 1
+            return None
+
+        # Render 1-3 items inside the token budget. The header labels the block
+        # as retrieved memory (provenance-honest, never asserted as fact).
+        header = (
+            "Possibly relevant memories (retrieved from earlier conversations — "
+            "context only, not asserted as fact):"
+        )
+        rendered_lines: list[str] = []
+        for hit in surviving[:3]:
+            ts = hit.get("timestamp") or 0
+            try:
+                when = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(float(ts))) if ts else "unknown time"
+            except (TypeError, ValueError, OSError):
+                when = "unknown time"
+            snippet = (hit.get("snippet") or "").strip().replace("\n", " ")
+            expand = hit.get("expand_hint") or ""
+            line = f"- [{when}] {snippet}"
+            if expand:
+                line += f" (expand: {expand})"
+            candidate_lines = rendered_lines + [line]
+            block = self._wrap_relevant_memories(header, candidate_lines)
+            if count_message_tokens({"role": summary_role, "content": block}) > budget_tokens:
+                break
+            rendered_lines = candidate_lines
+
+        if not rendered_lines:
+            self._proactive_recall_skipped_count += 1
+            return None
+
+        content = self._wrap_relevant_memories(header, rendered_lines)
+        self._proactive_recall_injected_count += 1
+        return {"role": summary_role, "content": content}
+
+    @staticmethod
+    def _wrap_relevant_memories(header: str, lines: List[str]) -> str:
+        body = "\n".join([header, *lines])
+        return f"<relevant-memories>\n{body}\n</relevant-memories>"
+
     def _assemble_context(
         self,
         system_msg: Optional[Dict[str, Any]],
@@ -5284,6 +5431,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             if summary_budget is None or count_message_tokens(anchor_msg) <= summary_budget:
                 summary_parts.append(anchor_part)
 
+        # Node ids placed in the summary prefix — used to dedupe proactive-recall
+        # injection against summaries already visible in the active context.
+        active_summary_node_ids: set = set()
         all_nodes = self._dag.get_session_nodes(self._session_id)
         if all_nodes:
             # Group by depth, take the most recent uncondensed at each level
@@ -5293,6 +5443,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             for d in depths:
                 uncondensed = self._dag.get_uncondensed_at_depth(self._session_id, d)
                 for node in uncondensed:
+                    active_summary_node_ids.add(node.node_id)
                     depth_label = {
                         0: "Recent",
                         1: "Session Arc",
@@ -5319,6 +5470,17 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             if selected_parts:
                 combined = "\n\n---\n\n".join(selected_parts)
                 result.append({"role": summary_role, "content": combined})
+
+        # Proactive memory injection (SPEC F, default-off). One bounded block is
+        # placed adjacent to the summary prefix — a stable position below the
+        # cache-stable summaries and above the volatile fresh tail — so the
+        # already-volatile tail region absorbs its per-turn variability and the
+        # cached summary prefix is left intact. Never inside the fresh tail.
+        proactive_msg = self._build_proactive_recall_message(
+            tail_messages, summary_role, active_summary_node_ids
+        )
+        if proactive_msg is not None:
+            result.append(proactive_msg)
 
         # Fresh tail
         result.extend(tail_selected)
