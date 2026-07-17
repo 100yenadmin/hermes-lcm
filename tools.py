@@ -2369,6 +2369,19 @@ def _lcm_grep_semantic(
     if conversation_id is not None:
         return degraded("conversation-scoped queries return raw-message hits only")
 
+    # content_scope is a payload-search dimension owned by the full-text arm.
+    # Externalized payloads are never embedded (embedded_kind='summary'), so a
+    # semantic request scoped to them has no vector corpus to search. Degrade
+    # to full_text — which implements bounded externalized payload scanning —
+    # rather than silently returning history-only semantic hits that ignore
+    # the requested scope. In hybrid mode this surfaces as the full-text-arm
+    # result (which honors content_scope) plus the explicit degraded marker.
+    content_scope = str(args.get("content_scope") or "history").strip().lower()
+    if content_scope != "history":
+        return degraded(
+            "content_scope beyond history is served by full_text retrieval"
+        )
+
     # Scope the (current-session) summaries to the active session id. With the
     # raw-only degradations above, conversation_id is always None here, so this
     # resolves to the current session set.
