@@ -181,13 +181,272 @@ def read_existing_schema_version(conn: sqlite3.Connection) -> int:
 def refuse_schema_version_too_new(conn: sqlite3.Connection) -> None:
     """Raise before any startup DDL when a newer build owns the DB."""
     current_version = read_existing_schema_version(conn)
-    if current_version > SCHEMA_VERSION:
+    if current_version <= SCHEMA_VERSION:
+        return
+    if classify_version_mismatch(conn) == VERSION_MISMATCH_INTERIM_STAMP:
         raise SchemaVersionTooNewError(
-            f"LCM database schema version {current_version} is newer than this "
-            f"build supports (v{SCHEMA_VERSION}). Refusing to open to avoid "
-            f"corrupting data written by a newer hermes-lcm. Upgrade the plugin "
-            f"or restore a pre-upgrade backup (.db/-wal/-shm)."
+            f"LCM database is stamped schema_version {current_version}, but its "
+            f"actual schema is the v{SCHEMA_VERSION} shape plus named feature "
+            f"markers — the signature of an interim development build that "
+            f"recorded a numeric version it never migrated to. There is no newer "
+            f"hermes-lcm to upgrade to; do NOT upgrade the plugin. Run "
+            f"`/lcm doctor repair schema-stamp` to preview a backup-first reset "
+            f"of the stamp to v{SCHEMA_VERSION} (add `apply` to execute)."
         )
+    raise SchemaVersionTooNewError(
+        f"LCM database schema version {current_version} is newer than this "
+        f"build supports (v{SCHEMA_VERSION}). Refusing to open to avoid "
+        f"corrupting data written by a newer hermes-lcm. Upgrade the plugin "
+        f"or restore a pre-upgrade backup (.db/-wal/-shm)."
+    )
+
+
+# --- interim-build schema-stamp remediation (fix #7) ------------------------
+#
+# Some databases touched by interim development builds carry a numeric
+# ``schema_version`` ahead of this build's ladder even though their actual shape
+# is the v5 core plus the named opt-in feature markers (the trains reverted the
+# numeric bump in favour of markers). Such a DB is safe to re-stamp back to
+# ``SCHEMA_VERSION``; a genuinely newer DB is not. Classification is read-only
+# and errs toward ``genuinely_newer`` so an ambiguous shape is never downgraded.
+
+VERSION_MISMATCH_INTERIM_STAMP = "interim_stamp"
+VERSION_MISMATCH_GENUINELY_NEWER = "genuinely_newer"
+
+# The exact v5 column contract for every core table that carries one. A missing
+# OR an unexpected column both disqualify a DB from the interim-stamp path.
+_V5_CORE_TABLE_COLUMNS: dict[str, frozenset[str]] = {
+    "messages": frozenset({
+        "store_id", "session_id", "source", "conversation_id", "role",
+        "content", "tool_call_id", "tool_calls", "tool_name", "timestamp",
+        "token_estimate", "pinned",
+    }),
+    "summary_nodes": frozenset({
+        "node_id", "session_id", "depth", "summary", "token_count",
+        "source_token_count", "source_ids", "source_type", "created_at",
+        "earliest_at", "latest_at", "expand_hint",
+    }),
+    "metadata": frozenset({"key", "value"}),
+    "lcm_migration_state": frozenset({"step_name", "completed_at"}),
+    "lcm_lifecycle_state": frozenset({
+        "conversation_id", "current_session_id", "last_finalized_session_id",
+        "current_frontier_store_id", "last_finalized_frontier_store_id",
+        "debt_kind", "debt_size_estimate", "current_bound_at",
+        "last_finalized_at", "debt_updated_at", "last_maintenance_attempt_at",
+        "last_rollover_at", "last_reset_at", "updated_at",
+    }),
+}
+
+# Core FTS5 virtual tables: presence is enough — their column layout is owned by
+# the FTS5 module, not by this schema contract.
+_V5_CORE_PRESENCE_ONLY = ("messages_fts", "nodes_fts")
+
+# Extra tables are tolerated only when they belong to a known opt-in feature
+# family (temporal-rollup / embedding / chunk) or are FTS5 shadow tables of the
+# core FTS indexes. Anything else means a newer build owns the schema.
+_KNOWN_FEATURE_TABLE_PREFIXES = ("lcm_rollup", "lcm_embedding", "lcm_chunk")
+
+# The known opt-in feature families whose derived tables an interim build may
+# have created in an EARLY variant (missing later-added columns/tables). Each is
+# validated by its own final-shape verifier (resolved at call time in
+# :func:`_family_verifier` — the verifiers are defined later in this module); a
+# family that fails verification is a rebuildable derived cache that remediation
+# drops so the feature's own marker-gated init recreates it in the final shape.
+_INTERIM_FEATURE_FAMILIES: tuple[dict[str, str], ...] = (
+    {
+        "name": "temporal_rollup",
+        "prefix": "lcm_rollup",
+        "rebuild_hint": "derived rollup cache — rebuild via `/lcm rollups rebuild`",
+    },
+    {
+        "name": "embedding",
+        "prefix": "lcm_embedding",
+        "rebuild_hint": "derived embedding cache — re-run `/lcm embed backfill --apply`",
+    },
+)
+
+
+def _family_verifier(prefix: str):
+    """Return the final-shape verifier for a feature-family prefix, or ``None``
+    when the family has no verifier (its early variants cannot be judged, so it
+    is left untouched)."""
+    if prefix == "lcm_rollup":
+        return verify_temporal_rollup_schema
+    if prefix == "lcm_embedding":
+        return verify_embedding_schema
+    return None
+
+
+def _user_table_names(conn: sqlite3.Connection) -> set[str]:
+    return {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name NOT LIKE 'sqlite_%'"
+        ).fetchall()
+    }
+
+
+def classify_version_mismatch(conn: sqlite3.Connection) -> str:
+    """Classify a DB whose stored ``schema_version`` exceeds ``SCHEMA_VERSION``.
+
+    The numeric ``schema_version`` stamp only certifies the *core* schema shape;
+    the internal shape of each opt-in feature family (temporal-rollup /
+    embedding / chunk) is owned by that feature's own marker-gated init/verify,
+    not by the numeric counter. So classification only inspects the core tables
+    and the *names* of the extras:
+
+    * :data:`VERSION_MISMATCH_INTERIM_STAMP` — the core v5 shape matches exactly
+      AND every extra table matches a known feature-family prefix (or is an FTS5
+      shadow table). This is the signature of an interim development build that
+      stamped a numeric version it never migrated to; the feature tables may be
+      early variants and are remediated separately (see
+      :func:`remediate_interim_schema_stamp`).
+    * :data:`VERSION_MISMATCH_GENUINELY_NEWER` — any core table/column is missing
+      or unexpected, OR any extra table is not a known feature family. A newer
+      build genuinely owns this DB.
+
+    Never mutates schema; the safe default is ``genuinely_newer`` so an
+    unrecognised shape is never re-stamped/downgraded.
+    """
+    try:
+        tables = _user_table_names(conn)
+    except sqlite3.DatabaseError:
+        return VERSION_MISMATCH_GENUINELY_NEWER
+
+    # Every v5 core table must be present.
+    for table in (*_V5_CORE_TABLE_COLUMNS, *_V5_CORE_PRESENCE_ONLY):
+        if table not in tables:
+            return VERSION_MISMATCH_GENUINELY_NEWER
+
+    # Core tables must match the v5 column contract exactly — a missing or an
+    # unexpected column both mean this is not a v5-shaped DB.
+    for table, expected in _V5_CORE_TABLE_COLUMNS.items():
+        try:
+            actual = {
+                str(row[1])
+                for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+        except sqlite3.DatabaseError:
+            return VERSION_MISMATCH_GENUINELY_NEWER
+        if actual != set(expected):
+            return VERSION_MISMATCH_GENUINELY_NEWER
+
+    # Any extra table must belong to a known feature family or be an FTS5 shadow.
+    # The feature table's *internal* shape is intentionally NOT checked here — an
+    # early-variant feature table is still an interim stamp, repaired on apply.
+    allowed = set(_V5_CORE_TABLE_COLUMNS) | set(_V5_CORE_PRESENCE_ONLY)
+    for fts in _V5_CORE_PRESENCE_ONLY:
+        allowed.update(get_fts_shadow_table_names(fts))
+    for table in tables:
+        if table in allowed:
+            continue
+        if any(table.startswith(prefix) for prefix in _KNOWN_FEATURE_TABLE_PREFIXES):
+            continue
+        return VERSION_MISMATCH_GENUINELY_NEWER
+
+    return VERSION_MISMATCH_INTERIM_STAMP
+
+
+def _interim_family_drops(conn: sqlite3.Connection) -> list[dict[str, object]]:
+    """Return per-family drop plans for early-variant feature tables.
+
+    A feature family whose final-shape verifier reports NO findings is already
+    current and is left untouched. A family that fails verification is a
+    rebuildable derived cache: its tables (and any family-owned triggers, e.g.
+    the rollup invalidation triggers on ``summary_nodes``) are scheduled for a
+    drop so the feature's own init recreates the final shape on next use.
+    """
+    try:
+        tables = _user_table_names(conn)
+    except sqlite3.DatabaseError:
+        return []
+    plans: list[dict[str, object]] = []
+    for family in _INTERIM_FEATURE_FAMILIES:
+        prefix = family["prefix"]
+        present = sorted(t for t in tables if t.startswith(prefix))
+        if not present:
+            continue
+        verify = _family_verifier(prefix)
+        if verify is None or not verify(conn):
+            # No verifier, or verifier clean — the family is at (or cannot be
+            # judged against) the final shape; keep it.
+            continue
+        triggers = sorted(
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE ?",
+                (prefix + "%",),
+            ).fetchall()
+        )
+        plans.append({
+            "family": family["name"],
+            "tables": present,
+            "triggers": triggers,
+            "rebuild_hint": family["rebuild_hint"],
+        })
+    return plans
+
+
+def remediate_interim_schema_stamp(
+    conn: sqlite3.Connection, *, apply: bool = False
+) -> dict[str, object]:
+    """Reset an interim-build schema stamp back to ``SCHEMA_VERSION``.
+
+    Dry-run by default: classifies and reports the drop plan without mutating.
+    With ``apply=True`` and an ``interim_stamp`` classification it (1) drops any
+    early-variant feature-family tables that fail their own final-shape verifier
+    — derived caches that each feature's marker-gated init rebuilds — and then
+    (2) rewrites ``metadata.schema_version`` to ``SCHEMA_VERSION``. Refuses —
+    never mutates — a ``genuinely_newer`` DB. Callers are responsible for taking
+    a backup before ``apply`` (see
+    :func:`hermes_lcm.maintenance.backup_database`).
+    """
+    current_version = read_existing_schema_version(conn)
+    result: dict[str, object] = {
+        "current_version": current_version,
+        "target_version": SCHEMA_VERSION,
+        "classification": None,
+        "applied": False,
+        "status": "noop",
+        "drop_plan": [],
+        "dropped_tables": [],
+    }
+    if current_version <= SCHEMA_VERSION:
+        return result
+    classification = classify_version_mismatch(conn)
+    result["classification"] = classification
+    if classification != VERSION_MISMATCH_INTERIM_STAMP:
+        result["status"] = "refused"
+        return result
+    drop_plan = _interim_family_drops(conn)
+    result["drop_plan"] = drop_plan
+    if not apply:
+        result["status"] = "dry-run"
+        return result
+
+    dropped: list[str] = []
+    for plan in drop_plan:
+        for trigger in plan["triggers"]:  # type: ignore[index]
+            conn.execute(f"DROP TRIGGER IF EXISTS {quote_sql_identifier(str(trigger))}")
+        for table in plan["tables"]:  # type: ignore[index]
+            conn.execute(f"DROP TABLE IF EXISTS {quote_sql_identifier(str(table))}")
+            dropped.append(str(table))
+    set_schema_version(conn, SCHEMA_VERSION)
+    conn.commit()
+    result["dropped_tables"] = dropped
+    result["applied"] = True
+    result["status"] = "ok"
+    logger.info(
+        "Reset interim schema stamp from v%s to v%s (dropped %d early feature "
+        "table(s): %s)",
+        current_version,
+        SCHEMA_VERSION,
+        len(dropped),
+        ", ".join(dropped) or "none",
+    )
+    return result
+
 
 def ensure_migration_state_table(conn: sqlite3.Connection) -> None:
     conn.execute(
