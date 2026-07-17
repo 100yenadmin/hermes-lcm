@@ -329,6 +329,56 @@ def test_recall_scans_full_corpus_not_grep_recency_window(recall_engine, monkeyp
     assert observed and all(bound == 25_000 for bound in observed)
 
 
+def test_pooled_vector_store_survives_across_recall_calls(recall_engine, monkeypatch):
+    """F2-matrix-cache-never-persists: back-to-back recalls reuse ONE pooled
+    VectorStore whose matrix cache survives, instead of building+closing a fresh
+    store (and clearing the cache) every call."""
+    import hermes_lcm.retrieval_core as rc
+
+    rc._reset_vector_store_pool()
+    try:
+        node = _add_summary(recall_engine, "kanban pooled cache", session_id="session-a", created_at=5.0)
+        _seed_summary_vectors(recall_engine, [(node, [1.0, 0.0])])
+
+        _recall(recall_engine, monkeypatch, include="summaries", limit=5)
+        key = (str(recall_engine._store.db_path), 25_000)
+        assert key in rc._vector_store_pool
+        pooled = rc._vector_store_pool[key]["store"]
+        # The pooled store's matrix cache is populated (survived the call).
+        assert pooled._matrix_cache
+
+        _recall(recall_engine, monkeypatch, include="summaries", limit=5)
+        # Same instance reused, not rebuilt.
+        assert rc._vector_store_pool[key]["store"] is pooled
+    finally:
+        rc._reset_vector_store_pool()
+
+
+def test_matrix_cache_is_bounded_lru_not_cleared_on_miss():
+    """sprint-opt-6: distinct candidate sets coexist in a bounded LRU rather than
+    each miss clearing the whole cache."""
+    import numpy as np
+
+    import tempfile
+    from hermes_lcm.config import LCMConfig as _Cfg
+
+    with tempfile.TemporaryDirectory() as d:
+        vs = VectorStore(f"{d}/m.db", config=_Cfg(database_path=f"{d}/m.db", embeddings_enabled=True))
+        try:
+            vs.register_profile("mock-model", "mock", 2)
+            identity = vs.capture_identity("mock-model", provider="mock")
+            # Load several distinct candidate sets; all must remain cached (bounded).
+            for i in range(3):
+                vs._numpy_rows(np, identity.identity_hash, 2, [str(i)])
+            assert len(vs._matrix_cache) == 3  # no clear-on-miss; all coexist
+            # A fourth distinct set past the cap evicts the oldest, never all.
+            for i in range(3, vs._MATRIX_CACHE_MAX_ENTRIES + 2):
+                vs._numpy_rows(np, identity.identity_hash, 2, [str(i)])
+            assert len(vs._matrix_cache) == vs._MATRIX_CACHE_MAX_ENTRIES
+        finally:
+            vs.close()
+
+
 def test_rrf_fuse_collapses_repeated_identity_within_arm():
     """RRF-1: a message chunked into several pieces must contribute ONE term per
     arm at its best rank, not one per chunk occurrence."""

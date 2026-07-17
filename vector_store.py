@@ -14,6 +14,7 @@ import sqlite3
 import struct
 import threading
 import uuid
+from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -175,6 +176,15 @@ class EmbeddingPublishOutcome(str, Enum):
 class VectorStore:
     """SQLite-backed store for normalized summary embedding vectors."""
 
+    # Opt-in marker read by the retrieval-core pool: only the genuine store is
+    # long-lived/poolable (test fakes injected as ``vector_store_cls`` are not).
+    _supports_pooling = True
+    # Per-store matrix-cache ceiling. A bounded LRU (not clear-on-every-miss) so
+    # back-to-back recalls over an unchanged corpus reuse the loaded candidate
+    # matrix across BOTH arms and across calls once the store is pooled, without
+    # letting distinct candidate sets grow the cache without bound (sprint-opt-6).
+    _MATRIX_CACHE_MAX_ENTRIES = 4
+
     def __init__(
         self,
         db_path: str | Path,
@@ -197,18 +207,12 @@ class VectorStore:
         # per-identity ``data_version`` counter is bumped inside every vector
         # write/delete transaction, so a cross-process write invalidates this
         # cache even when max_rowid and row_count are unchanged.
-        self._matrix_cache: dict[
-            tuple[str, int, tuple[str, ...]],
-            tuple[list[int], list[str], list[str], Any],
-        ] = {}
+        self._matrix_cache: "OrderedDict[tuple[str, int, tuple[str, ...]], tuple[list[int], list[str], list[str], Any]]" = OrderedDict()
         # Separate cache for chunk-corpus matrices: chunk identities never
         # collide with summary identities (task is part of the hash), but the
         # loaders differ (chunk vectors join messages, summary vectors join
         # summary_nodes), so the two corpora keep independent matrix caches.
-        self._chunk_matrix_cache: dict[
-            tuple[str, int, tuple[str, ...]],
-            tuple[list[int], list[str], list[str], Any],
-        ] = {}
+        self._chunk_matrix_cache: "OrderedDict[tuple[str, int, tuple[str, ...]], tuple[list[int], list[str], list[str], Any]]" = OrderedDict()
         self._chunk_schema_ready = False
         self._init_db()
 
@@ -938,6 +942,7 @@ class VectorStore:
             key = (identity_hash, data_version, tuple(str(value) for value in embedded_ids))
             cached = self._matrix_cache.get(key)
             if cached is not None:
+                self._matrix_cache.move_to_end(key)  # mark most-recently used
                 return cached
             rowids, loaded_ids, kinds, raw_vectors = self._load_vectors_for_ids(
                 identity_hash, dim, embedded_ids
@@ -948,8 +953,9 @@ class VectorStore:
                 else numpy.empty((0, dim), dtype=numpy.float32)
             )
             loaded = (rowids, loaded_ids, kinds, matrix)
-            self._matrix_cache.clear()
             self._matrix_cache[key] = loaded
+            while len(self._matrix_cache) > self._MATRIX_CACHE_MAX_ENTRIES:
+                self._matrix_cache.popitem(last=False)  # evict oldest
             return loaded
 
     def _bounded_candidate_ids(
@@ -1648,6 +1654,7 @@ class VectorStore:
             key = (identity_hash, data_version, tuple(str(value) for value in chunk_ids))
             cached = self._chunk_matrix_cache.get(key)
             if cached is not None:
+                self._chunk_matrix_cache.move_to_end(key)  # mark most-recently used
                 return cached
             rowids, loaded_ids, kinds, raw_vectors = self._load_chunk_vectors_for_ids(
                 identity_hash, dim, chunk_ids
@@ -1658,8 +1665,9 @@ class VectorStore:
                 else numpy.empty((0, dim), dtype=numpy.float32)
             )
             loaded = (rowids, loaded_ids, kinds, matrix)
-            self._chunk_matrix_cache.clear()
             self._chunk_matrix_cache[key] = loaded
+            while len(self._chunk_matrix_cache) > self._MATRIX_CACHE_MAX_ENTRIES:
+                self._chunk_matrix_cache.popitem(last=False)  # evict oldest
             return loaded
 
     def knn_chunks(
