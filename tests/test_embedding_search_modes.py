@@ -966,6 +966,13 @@ def test_semantic_content_scope_degrades_to_full_text(semantic_engine, monkeypat
     the full-text arm; payloads are never embedded, so the semantic arm must
     degrade rather than silently return history-only semantic hits (combined
     contract with the externalized-payload-search train)."""
+    # On a combined head the degraded full-text arm actually runs the payload
+    # scan, which requires externalization to be enabled (disabled -> honest
+    # error instead of degrade markers). Enable it so the degrade contract is
+    # what gets asserted on every head this test runs against.
+    monkeypatch.setattr(
+        semantic_engine._config, "large_output_externalization_enabled", True
+    )
     semantic_engine._store.append("session-a", {"role": "user", "content": "payload marker"})
     node = _add_summary(semantic_engine, "an embedded summary", created_at=1.0)
     _seed_vectors(semantic_engine, [(node, [1.0, 0.0])])
@@ -988,6 +995,9 @@ def test_hybrid_content_scope_degrades_to_full_text_arm(semantic_engine, monkeyp
     """In hybrid mode the semantic arm's content_scope degrade must surface as
     the full-text-arm result (which owns payload scanning) plus the explicit
     degraded marker — never fused history-only semantic hits."""
+    monkeypatch.setattr(
+        semantic_engine._config, "large_output_externalization_enabled", True
+    )
     semantic_engine._store.append("session-a", {"role": "user", "content": "payload marker"})
     node = _add_summary(semantic_engine, "an embedded summary", created_at=1.0)
     _seed_vectors(semantic_engine, [(node, [1.0, 0.0])])
