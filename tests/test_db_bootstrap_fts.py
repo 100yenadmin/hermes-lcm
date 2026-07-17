@@ -13,6 +13,7 @@ the index first, then exercise the existing-index path.
 """
 
 import sqlite3
+import threading
 import time
 import types
 
@@ -109,7 +110,10 @@ def _marker(conn):
     return row[0] if row else None
 
 
-def test_existing_index_without_marker_runs_check_and_records_marker(tmp_path, integrity_calls):
+def test_existing_index_without_marker_runs_check_and_records_marker(tmp_path, monkeypatch, integrity_calls):
+    # Kill-switch off pins the synchronous throttle decision this test asserts;
+    # the async dispatch is covered separately below.
+    monkeypatch.setenv("LCM_FTS_INTEGRITY_BACKGROUND", "false")
     conn = _make_conn(tmp_path)
     ensure_external_content_fts(conn, _spec())  # builds index (rebuild path)
     # Simulate an existing DB upgraded to the throttling version: no marker yet.
@@ -137,6 +141,7 @@ def test_fresh_marker_skips_integrity_check(tmp_path, monkeypatch, integrity_cal
 
 def test_expired_marker_reruns_integrity_check(tmp_path, monkeypatch, integrity_calls):
     monkeypatch.setenv(INTERVAL_ENV, "24")
+    monkeypatch.setenv("LCM_FTS_INTEGRITY_BACKGROUND", "false")
     conn = _make_conn(tmp_path)
     ensure_external_content_fts(conn, _spec())
     # Age the marker well past the 24h interval.
@@ -154,6 +159,7 @@ def test_expired_marker_reruns_integrity_check(tmp_path, monkeypatch, integrity_
 
 def test_interval_zero_checks_every_init(tmp_path, monkeypatch, integrity_calls):
     monkeypatch.setenv(INTERVAL_ENV, "0")
+    monkeypatch.setenv("LCM_FTS_INTEGRITY_BACKGROUND", "false")
     conn = _make_conn(tmp_path)
     ensure_external_content_fts(conn, _spec())  # build
     integrity_calls.clear()
@@ -254,6 +260,166 @@ def test_startup_throttle_still_skips_explicitly(tmp_path, monkeypatch, integrit
     db_bootstrap.repair_external_content_fts(conn, spec, throttle=True)
 
     assert integrity_calls == []  # fresh marker -> throttled path skips deep check
+    conn.close()
+
+
+def _db_file(tmp_path, name="t.db"):
+    return str(tmp_path / name)
+
+
+def _age_marker(conn):
+    conn.execute(
+        "UPDATE metadata SET value = ? WHERE key = ?",
+        (str(time.time() - 100 * 3600), MARKER_KEY),
+    )
+    conn.commit()
+
+
+def test_due_marker_runs_deep_check_in_background_and_stamps_marker(tmp_path, monkeypatch):
+    """SPEC E (a): a due marker dispatches the deep scan to a background thread.
+
+    The bind path returns without running the O(index) check itself; the scan
+    runs on a daemon thread and stamps the throttle marker on clean completion.
+    """
+    monkeypatch.setenv(INTERVAL_ENV, "24")
+    monkeypatch.delenv("LCM_FTS_INTEGRITY_BACKGROUND", raising=False)  # default: on
+    conn = _make_conn(tmp_path)
+    spec = _spec()
+    ensure_external_content_fts(conn, spec)  # build + fresh marker (no deep check)
+    _age_marker(conn)
+    aged = float(_marker(conn))
+
+    ran_on = {}
+    real = db_bootstrap.check_external_content_fts_integrity
+
+    def spy(conn_, spec_):
+        ran_on["thread"] = threading.current_thread()
+        return real(conn_, spec_)
+
+    monkeypatch.setattr(db_bootstrap, "check_external_content_fts_integrity", spy)
+
+    ensure_external_content_fts(conn, spec)  # should dispatch, not block
+    db_bootstrap.join_background_integrity_scans(timeout=30)
+
+    # The deep check ran on a background (non-main) thread, not the bind thread.
+    assert ran_on.get("thread") is not None
+    assert ran_on["thread"] is not threading.main_thread()
+
+    # The background scan stamped a fresh marker (via its own connection).
+    verify = sqlite3.connect(_db_file(tmp_path))
+    try:
+        new = float(
+            verify.execute(
+                "SELECT value FROM metadata WHERE key = ?", (MARKER_KEY,)
+            ).fetchone()[0]
+        )
+    finally:
+        verify.close()
+    assert new > aged
+    conn.close()
+
+
+def test_background_scan_flags_corruption_without_rebuilding(tmp_path, monkeypatch):
+    """SPEC E (b): corruption found in the background writes a flag, no rebuild."""
+    monkeypatch.setenv(INTERVAL_ENV, "24")
+    monkeypatch.delenv("LCM_FTS_INTEGRITY_BACKGROUND", raising=False)
+    conn = _make_conn(tmp_path)
+    spec = _spec()
+    ensure_external_content_fts(conn, spec)  # build + fresh marker
+
+    # Same-row-count stale drift: structural checks pass, deep check fails (the
+    # spec has no update trigger, so the indexed tokens go stale in place).
+    conn.execute(
+        "UPDATE messages SET content = 'completely different searchable text' WHERE store_id = 1"
+    )
+    conn.commit()
+    assert db_bootstrap._fts_needs_rebuild_structural(conn, spec) is False
+    _age_marker(conn)
+
+    ensure_external_content_fts(conn, spec)  # dispatch background scan
+    db_bootstrap.join_background_integrity_scans(timeout=30)
+
+    verify = sqlite3.connect(_db_file(tmp_path))
+    try:
+        flag = db_bootstrap.load_integrity_failed(verify, spec)
+        # The background thread flags rather than rebuilds: corruption persists.
+        assert (
+            db_bootstrap.check_external_content_fts_integrity(verify, spec)["status"]
+            == "fail"
+        )
+    finally:
+        verify.close()
+    assert flag is not None
+    assert flag["at"] > 0
+    conn.close()
+
+
+def test_kill_switch_false_runs_synchronously_without_a_thread(tmp_path, monkeypatch, integrity_calls):
+    """SPEC E (c): LCM_FTS_INTEGRITY_BACKGROUND=false = exact old synchronous path."""
+    monkeypatch.setenv(INTERVAL_ENV, "24")
+    monkeypatch.setenv("LCM_FTS_INTEGRITY_BACKGROUND", "false")
+    conn = _make_conn(tmp_path)
+    spec = _spec()
+    ensure_external_content_fts(conn, spec)  # build + fresh marker
+    _age_marker(conn)
+    integrity_calls.clear()
+
+    ensure_external_content_fts(conn, spec)  # runs the deep check synchronously
+
+    assert integrity_calls == ["messages_fts"]
+    assert (_db_file(tmp_path), "messages_fts") not in db_bootstrap._integrity_scan_threads
+    conn.close()
+
+
+def test_only_one_background_scan_per_table_at_a_time(tmp_path, monkeypatch):
+    """SPEC E (d): a second dispatch while a scan is in flight does not spawn another."""
+    monkeypatch.setenv(INTERVAL_ENV, "24")
+    monkeypatch.delenv("LCM_FTS_INTEGRITY_BACKGROUND", raising=False)
+    conn = _make_conn(tmp_path)
+    spec = _spec()
+    ensure_external_content_fts(conn, spec)  # build + fresh marker
+    _age_marker(conn)
+
+    started = threading.Event()
+    release = threading.Event()
+    real = db_bootstrap.check_external_content_fts_integrity
+
+    def slow(conn_, spec_):
+        started.set()
+        release.wait(5)
+        return real(conn_, spec_)
+
+    monkeypatch.setattr(db_bootstrap, "check_external_content_fts_integrity", slow)
+    key = (_db_file(tmp_path), "messages_fts")
+
+    assert db_bootstrap._dispatch_background_integrity_scan(conn, spec) is True
+    assert started.wait(5)
+    first = db_bootstrap._integrity_scan_threads[key]
+
+    # Second dispatch while the first scan is still running: no new thread.
+    assert db_bootstrap._dispatch_background_integrity_scan(conn, spec) is True
+    assert db_bootstrap._integrity_scan_threads[key] is first
+
+    release.set()
+    db_bootstrap.join_background_integrity_scans(timeout=5)
+    conn.close()
+
+
+def test_stale_scan_stamp_does_not_wedge_future_dispatch(tmp_path, monkeypatch):
+    """A crashed scan (stale started-stamp, no live thread) must not block re-dispatch."""
+    monkeypatch.setenv(INTERVAL_ENV, "24")
+    monkeypatch.delenv("LCM_FTS_INTEGRITY_BACKGROUND", raising=False)
+    conn = _make_conn(tmp_path)
+    spec = _spec()
+    ensure_external_content_fts(conn, spec)
+    # Simulate a crashed scan: an old started-stamp with no in-process thread.
+    stale = time.time() - db_bootstrap.INTEGRITY_SCAN_STALE_SECONDS - 60
+    db_bootstrap._record_scan_started(conn, spec, now=stale)
+    conn.commit()
+
+    assert db_bootstrap._dispatch_background_integrity_scan(conn, spec) is True
+    assert (_db_file(tmp_path), "messages_fts") in db_bootstrap._integrity_scan_threads
+    db_bootstrap.join_background_integrity_scans(timeout=30)
     conn.close()
 
 

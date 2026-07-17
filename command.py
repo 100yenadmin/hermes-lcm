@@ -19,6 +19,7 @@ from .db_bootstrap import (
     check_external_content_fts_integrity,
     external_content_fts_needs_repair,
     inspect_lcm_schema_health,
+    load_integrity_failed,
     repair_external_content_fts,
 )
 from .diagnostics import (
@@ -1151,6 +1152,24 @@ def _doctor_text(engine) -> str:
         node_fts_integrity = {"status": "fail", "detail": str(exc)}
         issues.append("nodes_fts")
 
+    # A prior non-blocking background integrity scan (issue #6) records a
+    # persisted ``fts_integrity_failed:<table>`` flag when it finds corruption
+    # without rebuilding. Surface it even when this doctor run's live deep check
+    # could not confirm it (e.g. read-only access), pointing at the explicit
+    # repair path.
+    try:
+        store_fts_failed_flag = load_integrity_failed(store_conn, build_message_fts_spec())
+    except Exception:  # pragma: no cover - defensive
+        store_fts_failed_flag = None
+    try:
+        node_fts_failed_flag = load_integrity_failed(dag_conn, build_nodes_fts_spec())
+    except Exception:  # pragma: no cover - defensive
+        node_fts_failed_flag = None
+    if store_fts_failed_flag and "messages_fts" not in issues:
+        issues.append("messages_fts")
+    if node_fts_failed_flag and "nodes_fts" not in issues:
+        issues.append("nodes_fts")
+
     total_messages = _safe_count(store_conn, "SELECT COUNT(*) FROM messages", "messages_total")
     total_message_sessions = _safe_count(
         store_conn,
@@ -1397,6 +1416,23 @@ def _doctor_text(engine) -> str:
             "remove unknown LCM_SENSITIVE_PATTERNS entries or replace them with supported names"
         )
 
+    if store_fts_failed_flag:
+        observations.append(
+            "messages_fts_integrity: a background integrity scan flagged corruption "
+            f"(detail: {store_fts_failed_flag['detail'] or 'unknown'})"
+        )
+        recommended_actions.append(
+            "run `/lcm doctor repair`, then `/lcm backup` and `/lcm doctor repair apply` to rebuild messages_fts"
+        )
+    if node_fts_failed_flag:
+        observations.append(
+            "nodes_fts_integrity: a background integrity scan flagged corruption "
+            f"(detail: {node_fts_failed_flag['detail'] or 'unknown'})"
+        )
+        recommended_actions.append(
+            "run `/lcm doctor repair`, then `/lcm backup` and `/lcm doctor repair apply` to rebuild nodes_fts"
+        )
+
     triage_checks: list[dict[str, Any]] = []
     if integrity != "ok":
         triage_checks.append({"check": "database_integrity", "status": "fail", "detail": integrity})
@@ -1413,6 +1449,18 @@ def _doctor_text(engine) -> str:
             "check": "nodes_fts_integrity",
             "status": "warn" if node_fts == "unchecked" else "fail",
             "detail": node_fts_integrity,
+        })
+    if store_fts_failed_flag and store_fts != "fail":
+        triage_checks.append({
+            "check": "messages_fts_integrity",
+            "status": "fail",
+            "detail": {"status": "fail", "background_flag": store_fts_failed_flag},
+        })
+    if node_fts_failed_flag and node_fts != "fail":
+        triage_checks.append({
+            "check": "nodes_fts_integrity",
+            "status": "fail",
+            "detail": {"status": "fail", "background_flag": node_fts_failed_flag},
         })
     if clean_scan["candidates"]:
         triage_checks.append({"check": "cleanup_candidates", "status": "warn", "detail": clean_scan})
