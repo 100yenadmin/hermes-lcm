@@ -1369,6 +1369,181 @@ def verify_embedding_schema(conn: sqlite3.Connection) -> list[str]:
     return sorted(set(errors))
 
 
+def ensure_chunk_tables(conn: sqlite3.Connection) -> None:
+    """Create the opt-in raw-history chunk tables idempotently.
+
+    Like the embedding tables, these are NOT part of the core
+    ``schema_version`` ladder — they are materialized only when the chunk
+    corpus is actually used (a chunk-corpus VectorStore is constructed), so an
+    install that never runs ``embed backfill --corpus chunks`` stays at
+    schema_version 5 with none of them and remains openable by a base build.
+
+    Chunk profiles live in the SHARED ``lcm_embedding_profile`` table under
+    ``task='chunk'`` (coexisting with summary profiles), so ``ensure_embedding_tables``
+    must have run first. These two tables hold only the per-chunk metadata and
+    vectors, keyed on ``(chunk_id, identity_hash)`` where ``chunk_id`` is
+    ``store_id:chunk_index``.
+    """
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS lcm_chunk_meta (
+            chunk_id TEXT,
+            identity_hash TEXT,
+            store_id INTEGER,
+            chunk_index INTEGER,
+            char_start INTEGER,
+            char_end INTEGER,
+            token_estimate INTEGER,
+            embedded_at TEXT,
+            archived INTEGER DEFAULT 0,
+            PRIMARY KEY(chunk_id, identity_hash)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_lcm_chunk_meta_identity_embedded_at
+            ON lcm_chunk_meta(identity_hash, embedded_at DESC)
+            WHERE archived = 0;
+
+        CREATE INDEX IF NOT EXISTS idx_lcm_chunk_meta_store
+            ON lcm_chunk_meta(store_id);
+
+        CREATE TABLE IF NOT EXISTS lcm_chunk_vectors (
+            chunk_id TEXT,
+            identity_hash TEXT,
+            vec BLOB NOT NULL,
+            PRIMARY KEY(chunk_id, identity_hash)
+        );
+        """
+    )
+
+
+# The tables and indexes ``ensure_chunk_tables`` owns. Verified on chunk-corpus
+# VectorStore init rather than trusting the ``chunk_vectors_v1`` marker alone —
+# the same discipline as the embedding schema: a set marker over a dropped table
+# is repaired rather than believed.
+_REQUIRED_CHUNK_TABLES = (
+    "lcm_chunk_meta",
+    "lcm_chunk_vectors",
+)
+_REQUIRED_CHUNK_INDEXES = (
+    "idx_lcm_chunk_meta_identity_embedded_at",
+    "idx_lcm_chunk_meta_store",
+)
+
+_CHUNK_TABLE_SHAPES: dict[
+    str, tuple[tuple[str, str, int, int, str | None], ...]
+] = {
+    "lcm_chunk_meta": (
+        ("chunk_id", "TEXT", 0, 1, None),
+        ("identity_hash", "TEXT", 0, 2, None),
+        ("store_id", "INTEGER", 0, 0, None),
+        ("chunk_index", "INTEGER", 0, 0, None),
+        ("char_start", "INTEGER", 0, 0, None),
+        ("char_end", "INTEGER", 0, 0, None),
+        ("token_estimate", "INTEGER", 0, 0, None),
+        ("embedded_at", "TEXT", 0, 0, None),
+        ("archived", "INTEGER", 0, 0, "0"),
+    ),
+    "lcm_chunk_vectors": (
+        ("chunk_id", "TEXT", 0, 1, None),
+        ("identity_hash", "TEXT", 0, 2, None),
+        ("vec", "BLOB", 1, 0, None),
+    ),
+}
+
+_CHUNK_INDEX_SHAPES: dict[
+    str, tuple[str, tuple[tuple[str, int], ...], str | None]
+] = {
+    "idx_lcm_chunk_meta_identity_embedded_at": (
+        "lcm_chunk_meta",
+        (("identity_hash", 0), ("embedded_at", 1)),
+        "archived=0",
+    ),
+    "idx_lcm_chunk_meta_store": (
+        "lcm_chunk_meta",
+        (("store_id", 0),),
+        None,
+    ),
+}
+
+
+def chunk_schema_missing(conn: sqlite3.Connection) -> set[str]:
+    """Return names of required chunk tables/indexes that do not exist.
+
+    An empty set means the chunk schema is fully materialized; a non-empty set
+    means the ``chunk_vectors_v1`` marker cannot be trusted on its own and
+    ``ensure_chunk_tables`` must (re-)run to repair the gap.
+    """
+    present = {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type IN ('table', 'index')"
+        ).fetchall()
+    }
+    required = set(_REQUIRED_CHUNK_TABLES) | set(_REQUIRED_CHUNK_INDEXES)
+    return required - present
+
+
+def verify_chunk_schema(conn: sqlite3.Connection) -> list[str]:
+    """Return structural chunk-schema errors, mirroring ``verify_embedding_schema``.
+
+    Missing objects are repaired by ``ensure_chunk_tables``; incompatible
+    same-name objects are rejected before the ``chunk_vectors_v1`` marker is
+    published so a wrong-shaped table cannot masquerade as a valid corpus.
+    """
+    errors = [f"missing object: {name}" for name in sorted(chunk_schema_missing(conn))]
+    if errors:
+        return errors
+
+    for table, expected in _CHUNK_TABLE_SHAPES.items():
+        actual = tuple(
+            (
+                str(row[1]),
+                str(row[2]).upper(),
+                int(row[3]),
+                int(row[5]),
+                None if row[4] is None else str(row[4]).lower(),
+            )
+            for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+        )
+        if actual != expected:
+            errors.append(f"malformed table: {table}")
+
+    for index, (table, expected_columns, predicate) in _CHUNK_INDEX_SHAPES.items():
+        index_shape = tuple(
+            (
+                None if row[2] is None else str(row[2]),
+                int(row[3]),
+                str(row[4]).upper(),
+                int(row[5]),
+            )
+            for row in conn.execute(f"PRAGMA index_xinfo({index})").fetchall()
+        )
+        expected_shape = tuple(
+            (column, desc, "BINARY", 1) for column, desc in expected_columns
+        ) + ((None, 0, "BINARY", 0),)
+        index_list = {
+            str(row[1]): (int(row[2]), int(row[4]))
+            for row in conn.execute(f"PRAGMA index_list({table})").fetchall()
+        }
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+            (index,),
+        ).fetchone()
+        sql = " ".join(str(row[0] or "").lower().split()) if row else ""
+        actual_predicate = None
+        if " where " in sql:
+            actual_predicate = re.sub(r"\s+", "", sql.split(" where ", 1)[1])
+        unique, partial = index_list.get(index, (-1, -1))
+        if (
+            index_shape != expected_shape
+            or unique != 0
+            or partial != int(predicate is not None)
+            or actual_predicate != predicate
+        ):
+            errors.append(f"malformed index: {index}")
+    return sorted(set(errors))
+
+
 def mark_migration_step_complete(conn: sqlite3.Connection, step_name: str) -> None:
     ensure_migration_state_table(conn)
     conn.execute(

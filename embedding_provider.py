@@ -28,6 +28,10 @@ from .tokens import count_tokens
 logger = logging.getLogger(__name__)
 
 _VOYAGE_URL = "https://api.voyageai.com/v1/embeddings"
+_VOYAGE_RERANK_URL = "https://api.voyageai.com/v1/rerank"
+# lcm_recall's cross-encoder rerank model. A lite model keeps the single extra
+# API call cheap and inside the latency-sensitive recall deadline.
+_VOYAGE_RERANK_MODEL = "rerank-2.5-lite"
 _VOYAGE_MAX_BATCH_TOKENS = 80_000
 _VOYAGE_MAX_DOCUMENT_TOKENS = 27_000
 # Voyage caps a single request at 1000 input items regardless of token count;
@@ -48,6 +52,50 @@ _LOCAL_EMBED_MAX_WORKERS = 4
 _LOCAL_EMBED_WORKER_SLOTS = threading.BoundedSemaphore(_LOCAL_EMBED_MAX_WORKERS)
 
 BeforeDispatch = Callable[[tuple[int, ...]], None]
+
+# Default model per provider for the raw-history CHUNK corpus. Voyage maps to
+# voyage-context-4 (its contextualized-chunks model); local providers reuse the
+# configured model unchanged (local-first posture, plain per-chunk embedding).
+_DEFAULT_CHUNK_MODELS = {"voyage": "voyage-context-4", "voyageai": "voyage-context-4"}
+
+
+def default_chunk_model(provider: str, configured_model: str) -> str:
+    """Return the chunk-corpus model for a provider.
+
+    Voyage gets the contextualized voyage-context-4 default; every other
+    provider reuses the configured summary model so the local-first posture is
+    unchanged (fastembed/ollama chunk-embed with the same local model).
+    """
+    key = str(provider or "").strip().lower()
+    mapped = _DEFAULT_CHUNK_MODELS.get(key)
+    if mapped:
+        return mapped
+    return str(configured_model or "").strip()
+
+
+def embed_contextualized(
+    provider: "EmbeddingProvider",
+    chunks_by_doc: "Sequence[Sequence[str]]",
+) -> list[list[list[float]]]:
+    """Embed per-document chunk lists, contextualizing when the provider can.
+
+    Returns one vector list per input document, aligned to that document's
+    chunks. If the provider exposes ``embed_contextualized`` (Voyage), that is
+    used; otherwise the chunks are flattened, embedded with the plain
+    ``embed_documents`` path (ollama/fastembed local-first fallback), and
+    regrouped by document so the return shape is identical either way.
+    """
+    method = getattr(provider, "embed_contextualized", None)
+    if callable(method):
+        return method(chunks_by_doc)
+    flat: list[str] = []
+    spans: list[tuple[int, int]] = []
+    for chunks in chunks_by_doc:
+        start = len(flat)
+        flat.extend(str(chunk) for chunk in chunks)
+        spans.append((start, len(flat)))
+    vectors = provider.embed_documents(flat) if flat else []
+    return [[list(vector) for vector in vectors[start:end]] for start, end in spans]
 
 
 class EmbeddingProvider(Protocol):
@@ -777,6 +825,74 @@ class VoyageProvider(_ResilientProvider):
         )
         self._remember_dim(vectors)
         return vectors[0]
+
+    def rerank(
+        self,
+        query: str,
+        documents: Sequence[str],
+        *,
+        top_k: int | None = None,
+        timeout: float,
+        model: str = _VOYAGE_RERANK_MODEL,
+    ) -> list[tuple[int, float]]:
+        """Cross-encoder rerank ``documents`` against ``query`` in one API call.
+
+        Returns ``(original_index, relevance_score)`` pairs ordered by descending
+        relevance under a single absolute ``timeout`` budget. Callers treat any
+        raised error as "skip rerank" and fall back to their prior order.
+        """
+        docs = [str(document) for document in documents]
+        if not docs:
+            return []
+        budget = max(0.001, float(timeout))
+        deadline = time.monotonic() + budget
+        api_key = os.environ.get("VOYAGE_API_KEY", "").strip()
+        if not api_key:
+            raise VoyageError("auth", "VOYAGE_API_KEY is not set")
+        payload: dict[str, Any] = {
+            "model": str(model),
+            "query": str(query),
+            "documents": docs,
+            "truncation": True,
+        }
+        if top_k is not None:
+            payload["top_k"] = int(top_k)
+        response = self._transport(
+            url=_VOYAGE_RERANK_URL,
+            payload=payload,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            timeout=budget,
+        )
+        if not (200 <= response.status < 300):
+            raise self._error(response, include_body=False)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise VoyageError("timeout", "Voyage rerank deadline exceeded")
+
+        def parse() -> list[tuple[int, float]]:
+            data = _response_json(response, provider="Voyage rerank")
+            rows = data.get("data")
+            if not isinstance(rows, list):
+                raise EmbeddingProviderError(
+                    "Voyage rerank response did not contain result data"
+                )
+            ranked: list[tuple[int, float]] = []
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                index = int(row.get("index", -1))
+                if not 0 <= index < len(docs):
+                    continue
+                ranked.append((index, float(row.get("relevance_score", 0.0))))
+            ranked.sort(key=lambda item: (-item[1], item[0]))
+            return ranked
+
+        return _run_blocking_with_deadline(
+            parse, timeout=remaining, provider="Voyage rerank response processing"
+        )
 
 
 class OllamaProvider(_ResilientProvider):
