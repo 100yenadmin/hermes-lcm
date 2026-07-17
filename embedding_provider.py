@@ -49,6 +49,50 @@ _LOCAL_EMBED_WORKER_SLOTS = threading.BoundedSemaphore(_LOCAL_EMBED_MAX_WORKERS)
 
 BeforeDispatch = Callable[[tuple[int, ...]], None]
 
+# Default model per provider for the raw-history CHUNK corpus. Voyage maps to
+# voyage-context-4 (its contextualized-chunks model); local providers reuse the
+# configured model unchanged (local-first posture, plain per-chunk embedding).
+_DEFAULT_CHUNK_MODELS = {"voyage": "voyage-context-4", "voyageai": "voyage-context-4"}
+
+
+def default_chunk_model(provider: str, configured_model: str) -> str:
+    """Return the chunk-corpus model for a provider.
+
+    Voyage gets the contextualized voyage-context-4 default; every other
+    provider reuses the configured summary model so the local-first posture is
+    unchanged (fastembed/ollama chunk-embed with the same local model).
+    """
+    key = str(provider or "").strip().lower()
+    mapped = _DEFAULT_CHUNK_MODELS.get(key)
+    if mapped:
+        return mapped
+    return str(configured_model or "").strip()
+
+
+def embed_contextualized(
+    provider: "EmbeddingProvider",
+    chunks_by_doc: "Sequence[Sequence[str]]",
+) -> list[list[list[float]]]:
+    """Embed per-document chunk lists, contextualizing when the provider can.
+
+    Returns one vector list per input document, aligned to that document's
+    chunks. If the provider exposes ``embed_contextualized`` (Voyage), that is
+    used; otherwise the chunks are flattened, embedded with the plain
+    ``embed_documents`` path (ollama/fastembed local-first fallback), and
+    regrouped by document so the return shape is identical either way.
+    """
+    method = getattr(provider, "embed_contextualized", None)
+    if callable(method):
+        return method(chunks_by_doc)
+    flat: list[str] = []
+    spans: list[tuple[int, int]] = []
+    for chunks in chunks_by_doc:
+        start = len(flat)
+        flat.extend(str(chunk) for chunk in chunks)
+        spans.append((start, len(flat)))
+    vectors = provider.embed_documents(flat) if flat else []
+    return [[list(vector) for vector in vectors[start:end]] for start, end in spans]
+
 
 class EmbeddingProvider(Protocol):
     """Minimal provider contract consumed by later embedding workers."""
