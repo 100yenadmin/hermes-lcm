@@ -29,7 +29,11 @@ from .diagnostics import (
     doctor_guidance_for_checks,
 )
 from .dag import build_nodes_fts_spec
-from .db_bootstrap import check_external_content_fts_integrity, inspect_lcm_schema_health
+from .db_bootstrap import (
+    check_external_content_fts_integrity,
+    inspect_lcm_schema_health,
+    load_integrity_failed,
+)
 from .extraction import sanitize_pre_compaction_content
 from .ingest_protection import (
     externalized_payload_stats,
@@ -4514,6 +4518,24 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
                 "check": check_name,
                 "status": "fail",
                 "detail": str(e),
+            })
+        # A prior non-blocking background integrity scan records a persisted
+        # ``fts_integrity_failed:<table>`` flag when it finds corruption
+        # without rebuilding. Surface it even when this run's live check is
+        # throttled/unchecked, mirroring the /lcm doctor text path.
+        try:
+            failed_flag = load_integrity_failed(conn, spec)
+        except Exception:  # pragma: no cover - defensive
+            failed_flag = None
+        if failed_flag:
+            checks.append({
+                "check": f"{check_name}_background_flag",
+                "status": "fail",
+                "detail": {
+                    "flagged_at": failed_flag.get("at"),
+                    "detail": failed_flag.get("detail"),
+                    "guidance": "background integrity scan flagged this index; run `/lcm doctor repair apply`",
+                },
             })
 
     # 2. SQLite storage posture and payload diagnostics
