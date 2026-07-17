@@ -475,6 +475,32 @@ def test_matrix_cache_is_bounded_lru_not_cleared_on_miss():
             vs.close()
 
 
+def test_json_doctor_surfaces_background_integrity_flag(recall_engine):
+    """F1-json-doctor-background-flag-untested: the JSON lcm_doctor MCP tool (not
+    just the text path) surfaces a pre-recorded background FTS-corruption flag."""
+    from hermes_lcm.db_bootstrap import _record_integrity_failed
+    from hermes_lcm.store import build_message_fts_spec
+
+    # lcm_doctor reaches beyond the recall fixture's attribute set; supply the
+    # few unguarded ones it touches (context-pressure short-circuits at 0).
+    recall_engine.context_length = 0
+    recall_engine.last_prompt_tokens = 0
+    recall_engine.get_runtime_identity = lambda: {}
+
+    conn = recall_engine._store.connection
+    spec = build_message_fts_spec()
+    _record_integrity_failed(conn, spec, detail="messages_fts malformed (background scan)")
+    conn.commit()
+
+    payload = json.loads(lcm_tools.lcm_doctor({}, engine=recall_engine))
+    checks = {c["check"]: c for c in payload["checks"]}
+
+    flag_check = checks.get("messages_fts_integrity_background_flag")
+    assert flag_check is not None
+    assert flag_check["status"] == "fail"
+    assert "background integrity scan flagged" in flag_check["detail"]["guidance"]
+
+
 def test_rrf_fuse_collapses_repeated_identity_within_arm():
     """RRF-1: a message chunked into several pieces must contribute ONE term per
     arm at its best rank, not one per chunk occurrence."""
