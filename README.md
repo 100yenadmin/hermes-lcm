@@ -77,7 +77,7 @@ Core capabilities:
 - **Summary DAG** - builds depth-aware summary nodes over compacted history
 - **Bounded recovery** - pages raw messages, child summaries, and externalized
   payloads instead of dumping everything into the prompt
-- **Agent tools** - `lcm_grep`, `lcm_load_session`, `lcm_describe`,
+- **Agent tools** - `lcm_grep`, `lcm_recent`, `lcm_load_session`, `lcm_describe`,
   `lcm_expand`, `lcm_expand_query`, `lcm_status`, `lcm_inspect`, and
   `lcm_doctor`
 - **Source-aware retrieval** - filters raw rows and summaries by descendant
@@ -235,7 +235,8 @@ outside the LCM database.
 
 | Tool | Use |
 |------|-----|
-| `lcm_grep` | Search current-session raw messages and summaries. Opt into `content_scope='externalized'|'both'` for bounded active-session payload search, or `session_scope='all'|'session'` for bounded raw-message archive recovery. |
+| `lcm_grep` | Search current-session raw messages and summaries. Opt into `content_scope='externalized'|'both'` for bounded active-session payload search, or `session_scope='all'|'session'` for bounded raw-message archive recovery; broader scopes return raw-message hits only. |
+| `lcm_recent` | Retrieve recent summaries by natural UTC period, preferring ready rollups and transparently falling back to time-bounded leaf summaries. |
 | `lcm_load_session` | Load one ordered raw-message transcript page for an explicit `session_id`. Continues with `after_store_id` from `next_cursor`. |
 | `lcm_describe` | Inspect the current-session DAG or preview an `externalized_ref` without loading full content. |
 | `lcm_expand` | Recover source messages, child summaries, or externalized payloads with pagination. Use `store_id` to fetch a single raw message from a cross-session `lcm_grep` result. |

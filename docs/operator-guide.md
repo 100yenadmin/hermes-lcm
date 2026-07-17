@@ -165,6 +165,11 @@ environment variables:
 | `LCM_EXPANSION_MODEL` | summary model / auxiliary | Override `lcm_expand_query` synthesis model |
 | `LCM_EXPANSION_CONTEXT_TOKENS` | `32000` | Context budget used by the auxiliary LLM for `lcm_expand_query` |
 | `LCM_SUMMARY_TIMEOUT_MS` | `60000` | Timeout for one summarization call |
+| `LCM_TEMPORAL_ROLLUPS_ENABLED` | `false` | Enable derived UTC day/week/month summary rollups and their maintenance hooks |
+| `LCM_ROLLUP_DAILY_TARGET_TOKENS` | `5000` | Target size for daily rollup summarization |
+| `LCM_ROLLUP_DAILY_MAX_TOKENS` | `15000` | Hard token ceiling for a daily rollup |
+| `LCM_ROLLUP_AGGREGATE_MAX_TOKENS` | `20000` | Hard token ceiling for weekly and monthly rollups |
+| `LCM_ROLLUP_BUILDS_PER_PASS` | `2` | Maximum rollups built by one automatic pass or `/lcm rollups rebuild` command |
 | `LCM_EXPANSION_TIMEOUT_MS` | `120000` | Timeout for one `lcm_expand_query` synthesis call |
 | `LCM_DATABASE_PATH` | auto | SQLite database path. Empty config resolves to `HERMES_HOME/lcm.db`; plugin installs or operators may set this env var to another profile-scoped path such as `~/.hermes/hermes-lcm.db`. |
 | `LCM_FTS_INTEGRITY_CHECK_INTERVAL_HOURS` | `24` | Minimum hours between startup FTS5 deep integrity-checks (O(index size)). `0` checks every startup (previous behavior); a negative value never checks on startup. Structural checks always run regardless. |
@@ -175,6 +180,62 @@ environment variables:
 | `LCM_EMPTY_LIFECYCLE_GC_MAX_AGE_HOURS` | `24` | Automatic GC only deletes empty lifecycle rows at least this old; set `0` only in trusted/test environments that intentionally want immediate empty-row pruning |
 
 Advanced compaction, assembly, and extraction knobs are defined in `config.py`.
+
+### Temporal rollup operations
+
+Temporal rollups are opt-in. Set `LCM_TEMPORAL_ROLLUPS_ENABLED=true`, tune the
+four `LCM_ROLLUP_*` controls above if needed, and restart Hermes. Rollup periods
+are UTC calendar periods. Enabling the feature creates its tables lazily; a
+disabled install creates no rollup tables and leaves the core schema untouched,
+so a base build still opens the database.
+
+Automatic maintenance marks a day (and its containing week and month) stale when
+a **summary node covering that day is published** — publication, not raw
+ingest, is the signal a rollup consumes — and rebuilds at most
+`LCM_ROLLUP_BUILDS_PER_PASS` rows per pass, with daily rollups ahead of
+aggregates. A week or month is only published `ready` once every day in the
+period that has content has a `ready` daily rollup; while any content day is
+missing, stale, or building the aggregate stays stale with a recorded reason and
+`lcm_recent` falls back to daily/leaf summaries for the whole window. Rebuilding
+a daily re-stales its containing week and month so aggregates never remain
+`ready` against an outdated day.
+
+**Scope and rotation boundary.** Rollups are scoped to the LCM session id.
+Summary nodes carry no conversation-family key at this layer, so a rollup does
+not automatically span sessions across a `/new` rotation; after a rotation,
+retained higher-depth summaries are carried into the new session and remain
+retrievable, but per-period rollup rows are rebuilt under the new session scope.
+Build-cursor state is tracked per `(period_kind, scope)` so multiple scopes
+sharing one database never share a cursor.
+
+With `LCM_ENABLE_SLASH_COMMAND=true`, operators can inspect the current
+foreground session and request a bounded synchronous rebuild:
+
+```text
+/lcm rollups
+/lcm rollups rebuild day 2026-07-15
+/lcm rollups rebuild week 2026-07-15
+/lcm rollups rebuild month 2026-07-15
+/lcm rollups rebuild all 2026-07-15
+```
+
+The optional date defaults to the current UTC date. Week targets normalize to
+Monday and month targets to the first day. `all` targets the containing day,
+week, and month in that order. The command first **durably seeds a `stale` row
+for every requested target** (creating one if it does not yet exist), then
+attempts no more than the configured per-pass limit and prints an outcome for
+every target. Targets beyond the bound are reported `stale (bounded; not
+attempted)` and remain as durable `stale` rows, so later automatic maintenance
+builds them. Builds run now and may invoke the summary model. They use the same
+summary circuit breaker, fallback routes, timeout, and spend guard as normal LCM
+summarization.
+
+`lcm_inspect` always includes a `temporal_rollups` block with the enabled flag,
+ready/stale/building/failed counts for each period kind, oldest stale age,
+last-build cursors, and the last error. `/lcm rollups` renders the same data as a
+table. Both paths are read-only and make no LLM calls. When the feature is off
+or its tables are empty, the block remains present with zero counts and null
+age/cursor/error values so monitoring consumers do not need a second schema.
 
 Sensitive-pattern handling is disabled by default so ordinary LCM storage and
 `lcm_expand` remain lossless. When `LCM_SENSITIVE_PATTERNS_ENABLED=true`, matched

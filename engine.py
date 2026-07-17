@@ -77,6 +77,11 @@ from .runtime_identity import (
     _git_runtime_identity,
     _plugin_metadata,
 )
+from .rollup_builder import (
+    initialize_rollup_invalidation_outbox,
+    mark_stale_for_published_summary,
+    run_rollup_maintenance,
+)
 from .schemas import (
     LCM_DESCRIBE,
     LCM_DOCTOR,
@@ -85,6 +90,7 @@ from .schemas import (
     LCM_GREP,
     LCM_INSPECT,
     LCM_LOAD_SESSION,
+    LCM_RECENT,
     LCM_STATUS,
 )
 from .sanitize import (
@@ -438,6 +444,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             hermes_home=hermes_home,
         )
         self._dag = SummaryDAG(db_path)
+        if self._config.temporal_rollups_enabled:
+            # Install the transaction-coupled summary mutation triggers before
+            # this engine can publish or delete a DAG node.
+            initialize_rollup_invalidation_outbox(self._dag)
         self._lifecycle = LifecycleStateStore(db_path)
 
     def _close_storage(self) -> None:
@@ -1365,6 +1375,41 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     deleted,
                     self._config.empty_lifecycle_gc_threshold,
                 )
+        # Bypassed/stateless sessions skip every LCM write, so they must also skip
+        # rollup maintenance — otherwise the bind-time hook would build rollups for
+        # a session whose ingest is suppressed (maintainer #388: gate on the same
+        # not-bypassed condition the ingest write uses).
+        if (
+            self._config.temporal_rollups_enabled
+            and not self._session_ignored
+            and not self._session_stateless
+        ):
+            run_rollup_maintenance(
+                self._dag, self._config, session_id,
+                circuit_breaker=self._summary_circuit_breaker,
+                spend_guard=self._summary_spend_guard,
+            )
+
+    def _invalidate_rollups_for_published_node(self, node: "SummaryNode") -> None:
+        """Stale the rollups covering EVERY UTC day a just-published node spans.
+
+        Rollups consume published summary nodes, so publication — not raw ingest
+        — is the load-bearing staleness signal (maintainer #388 blocker 1). This
+        is called after every ``_dag.add_node`` on the engine so a later summary
+        cannot leave an older rollup ``ready`` and apparently current. The node's
+        ``earliest_at``/``latest_at`` coverage span is passed through so a summary
+        crossing midnight stales BOTH days, not only its newest (maintainer #388
+        blocker 2 / B2).
+        """
+        if not self._config.temporal_rollups_enabled:
+            return
+        mark_stale_for_published_summary(
+            self._dag,
+            str(node.session_id or ""),
+            node.latest_at,
+            node.created_at,
+            earliest_at=node.earliest_at,
+        )
 
     def _register_active_engine_binding(self) -> None:
         session_id = str(self._session_id or "")
@@ -3060,6 +3105,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         ``session_scope='current'`` may therefore include a carried-over node in
         the new session, while ``source`` filtering still evaluates against the
         node's original descendant message sources.
+
+        Temporal rollups are deliberately NOT re-scoped here: they are keyed by
+        (period_kind, period_start, scope=session_id) with a UNIQUE constraint, so
+        rewriting scope on rollover could collide with the new session's own
+        rollups and would need a core-schema change to do safely. Rotation is the
+        documented rollup scope boundary; ``lcm_recent`` compensates at read time
+        by spanning the same current + last-finalized sessions its leaf fallback
+        uses (see ``_recent_ready_rollups``), so no window content is dropped.
         """
         if not old_session_id or not new_session_id or old_session_id == new_session_id:
             return 0
@@ -3141,6 +3194,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return [
             LCM_GREP,
+            LCM_RECENT,
             LCM_LOAD_SESSION,
             LCM_DESCRIBE,
             LCM_EXPAND,
@@ -3169,6 +3223,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
         handlers = {
             "lcm_grep": lcm_tools.lcm_grep,
+            "lcm_recent": lcm_tools.lcm_recent,
             "lcm_load_session": lcm_tools.lcm_load_session,
             "lcm_describe": lcm_tools.lcm_describe,
             "lcm_expand": lcm_tools.lcm_expand,
@@ -4216,6 +4271,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             source=self._session_platform,
             conversation_id=self._conversation_id,
         )
+        # Rollup staleness is driven by summary-node PUBLICATION
+        # (_invalidate_rollups_for_published_node at every add_node site), not by
+        # raw ingest: marking a period stale before its covering summary exists
+        # would let a rebuild publish 'ready' from old sources and omit the leaf
+        # (maintainer #388 P1).
         self._ingest_cursor = n
         self._compression_boundary_ingest_pending = False
         self._compression_boundary_active_placeholder_digest_budget = {}
@@ -4839,7 +4899,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             [node.node_id for node in nodes]
         )
         summary_tokens = count_tokens(summary_text)
-        self._dag.add_node(SummaryNode(
+        condensed_node = SummaryNode(
             session_id=self._session_id,
             depth=depth + 1,
             summary=summary_text,
@@ -4851,7 +4911,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             earliest_at=earliest_at,
             latest_at=latest_at,
             expand_hint=self._extract_expand_hint(summary_text),
-        ))
+        )
+        self._dag.add_node(condensed_node)
+        self._invalidate_rollups_for_published_node(condensed_node)
         return source_tokens, summary_tokens, level
 
     def _summary_frontier_nodes(self) -> List[SummaryNode]:
