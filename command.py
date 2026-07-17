@@ -3967,6 +3967,10 @@ def _chunk_pending_rows(
             chunk_id = chunk.chunk_id
             if chunk_id in already or chunk_id in inflight:
                 continue
+            # Write-seam guard: a degenerate/zero span is non-embeddable and would
+            # persist an empty snippet + bogus lcm_expand offset (F3).
+            if chunk.char_end <= chunk.char_start:
+                continue
             total += 1
             if len(documents) < limit:
                 documents.append((chunk_id, chunk.text, chunk.token_estimate))
@@ -3981,12 +3985,14 @@ def _chunk_pending_rows(
 
 def _rebuild_chunk_document(
     conn: sqlite3.Connection, chunk_id: str, policy: str
-) -> tuple[str, int] | None:
-    """Reconstruct one chunk's text/tokens by re-chunking its source message.
+) -> tuple[str, int, int, int] | None:
+    """Reconstruct one chunk's text/tokens/span by re-chunking its source message.
 
-    Returns ``(text, token_estimate)`` for the chunk whose index matches
-    ``chunk_id`` (``store_id:chunk_index``), or None if the message is gone or no
-    longer produces that chunk under ``policy`` (content changed).
+    Returns ``(text, token_estimate, char_start, char_end)`` for the chunk whose
+    index matches ``chunk_id`` (``store_id:chunk_index``), or None if the message
+    is gone or no longer produces that chunk under ``policy`` (content changed).
+    The real char span is carried so ``--retry-uncertain`` recovery persists a
+    correct verbatim span instead of a ``(0, 0)`` placeholder (F3).
     """
     try:
         store_id_str, index_str = chunk_id.split(":", 1)
@@ -4001,7 +4007,7 @@ def _rebuild_chunk_document(
         return None
     for chunk in chunk_message(store_id, row[0], row[1], policy=policy):
         if chunk.chunk_index == chunk_index:
-            return chunk.text, chunk.token_estimate
+            return chunk.text, chunk.token_estimate, chunk.char_start, chunk.char_end
     return None
 
 
@@ -4035,10 +4041,14 @@ def _chunk_authorized_uncertain_rows(
         rebuilt = _rebuild_chunk_document(conn, chunk_id, policy)
         if rebuilt is None:
             continue
-        text, tokens = rebuilt
+        text, tokens, char_start, char_end = rebuilt
+        # Write-seam guard: never persist a degenerate/zero span — it yields an
+        # empty verbatim snippet and a bogus lcm_expand offset (F3).
+        if char_end <= char_start:
+            continue
         store_id_str, index_str = chunk_id.split(":", 1)
         documents.append((chunk_id, text, tokens))
-        meta[chunk_id] = (int(store_id_str), int(index_str), 0, 0)
+        meta[chunk_id] = (int(store_id_str), int(index_str), char_start, char_end)
     return len(documents), documents, meta
 
 

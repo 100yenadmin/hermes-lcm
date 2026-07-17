@@ -101,6 +101,74 @@ def _user_msgs(n, *, start=1):
     ]
 
 
+class TestChunkRetryUncertainSpans:
+    def test_rebuild_chunk_document_returns_real_span(self, tmp_path):
+        from hermes_lcm.chunking import chunk_message
+
+        engine = _engine(tmp_path)
+        content = "some substantial user output token " * 40
+        _seed_messages(engine, [(1, "sess-a", "history", "user", content, 1.0)])
+        expected = chunk_message(1, "user", content, policy="conversational")[0]
+
+        conn = sqlite3.connect(engine._store.db_path)
+        try:
+            rebuilt = command_mod._rebuild_chunk_document(
+                conn, expected.chunk_id, "conversational"
+            )
+        finally:
+            conn.close()
+
+        assert rebuilt is not None
+        text, tokens, char_start, char_end = rebuilt
+        # The real char span is carried, not the old (0, 0) placeholder.
+        assert (char_start, char_end) == (expected.char_start, expected.char_end)
+        assert char_end > char_start
+
+    def test_authorized_uncertain_rows_persist_real_span_not_zero(self, tmp_path):
+        from hermes_lcm.chunking import chunk_message
+
+        engine = _engine(tmp_path)
+        content = "another long verbatim user payload body " * 30
+        _seed_messages(engine, [(1, "sess-a", "history", "user", content, 1.0)])
+        expected = chunk_message(1, "user", content, policy="conversational")[0]
+
+        # _chunk_authorized_uncertain_rows only string-matches identity_hash (no
+        # profile join), so any stable value the inflight row shares works here.
+        identity = "test-chunk-identity"
+
+        conn = sqlite3.connect(engine._store.db_path)
+        try:
+            from hermes_lcm import db_bootstrap
+
+            db_bootstrap.ensure_embedding_tables(conn)
+            db_bootstrap.ensure_chunk_tables(conn)
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS lcm_embedding_backfill_inflight (
+                    embedded_id TEXT, identity_hash TEXT, state TEXT,
+                    updated_at REAL,
+                    PRIMARY KEY(embedded_id, identity_hash)
+                )
+                """
+            )
+            conn.execute(
+                "INSERT INTO lcm_embedding_backfill_inflight"
+                "(embedded_id, identity_hash, state, updated_at) VALUES(?, ?, 'uncertain', 1.0)",
+                (expected.chunk_id, identity),
+            )
+            conn.commit()
+            count, documents, meta = command_mod._chunk_authorized_uncertain_rows(
+                conn, identity, "conversational", 10
+            )
+        finally:
+            conn.close()
+
+        assert count == 1
+        _sid, _idx, char_start, char_end = meta[expected.chunk_id]
+        assert (char_start, char_end) == (expected.char_start, expected.char_end)
+        assert char_end > char_start
+
+
 class TestChunkDryRun:
     def test_reports_pending_without_writes(self, monkeypatch, tmp_path):
         engine = _engine(tmp_path)
