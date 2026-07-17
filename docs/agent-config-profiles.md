@@ -89,6 +89,9 @@ export LCM_EMBEDDINGS_ENABLED=true
 export LCM_EMBEDDING_PROVIDER=voyage          # or: fastembed / ollama (below)
 export LCM_EMBEDDING_MODEL=voyage-4-lite
 export VOYAGE_API_KEY=...                     # free key from dash.voyageai.com
+
+# The /lcm operator commands used below are an opt-in surface
+export LCM_ENABLE_SLASH_COMMAND=1
 ```
 
 Then, once:
@@ -155,7 +158,14 @@ estimate is the bill.
 hermes plugins        # plugin + engine loaded
 ```
 
-Then in a session:
+The `/lcm` operator commands below require the opt-in command surface:
+
+```bash
+export LCM_ENABLE_SLASH_COMMAND=1
+```
+
+(Without it, the `lcm_status` / `lcm_doctor` *agent tools* still cover the
+read-only checks — ask the agent to call them.) Then in a session:
 
 ```
 /lcm status           # effective config + sources, context pressure
