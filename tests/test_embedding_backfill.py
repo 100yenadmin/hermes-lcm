@@ -755,6 +755,132 @@ def test_lease_takeover_between_batches_stops_stale_worker(monkeypatch, tmp_path
     assert json.loads(_claim_value(engine))["owner"] == "successor"
 
 
+def test_network_batch_publishes_in_a_single_transaction(monkeypatch, tmp_path):
+    """F5: an accepted network batch opens ONE transaction, not one per row.
+
+    The whole point of batching — one fsync per provider batch instead of one
+    per accepted vector. A trace callback counts the ``BEGIN IMMEDIATE`` and
+    ``SAVEPOINT`` statements the batch publish issues: one BEGIN for the whole
+    batch, each of the five rows nested under its own savepoint.
+    """
+    engine = _engine(tmp_path)
+    _seed(engine, 5)
+    provider = FakeProvider()
+    monkeypatch.setattr(command_mod, "resolve_provider", lambda _config, **_kw: provider)
+
+    stats = {"begin": 0, "savepoint": 0}
+
+    class TracingStore(VectorStore):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._begins = 0
+            self._saves = 0
+            self._conn.set_trace_callback(self._trace)
+
+        def _trace(self, sql):
+            head = sql.lstrip().upper()
+            if head.startswith("BEGIN IMMEDIATE"):
+                self._begins += 1
+            elif head.startswith("SAVEPOINT"):
+                self._saves += 1
+
+        def publish_embedding_batch_under_lease(self, rows, **kwargs):
+            before = (self._begins, self._saves)
+            try:
+                return super().publish_embedding_batch_under_lease(rows, **kwargs)
+            finally:
+                stats["begin"] += self._begins - before[0]
+                stats["savepoint"] += self._saves - before[1]
+
+    monkeypatch.setattr(command_mod, "VectorStore", TracingStore)
+    result = handle_lcm_command("embed backfill --apply", engine)
+
+    assert "embedded: 5" in result
+    # Five accepted vectors, ONE transaction — the 5x fsync amplification is gone.
+    assert stats["begin"] == 1
+    assert stats["savepoint"] == 5
+
+
+class _CrashOnCommitConnection:
+    """Proxies a sqlite3 connection but raises on ``commit`` — emulating a process
+    killed after the batch's writes but before the transaction lands."""
+
+    def __init__(self, real):
+        self._real = real
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def commit(self):
+        raise RuntimeError("crash before batch commit")
+
+
+def test_crash_between_provider_return_and_commit_is_all_or_nothing(
+    monkeypatch, tmp_path
+):
+    """A crash after the provider returns but before the batch COMMIT publishes
+    nothing — the whole batch rolls back, leaving every row recoverably in-flight.
+
+    A failing COMMIT reproduces the durable state of a process killed mid-batch:
+    the transaction never lands, so no half-written vectors survive.
+    """
+    engine = _engine(tmp_path)
+    _seed(engine, 3)
+    provider = FakeProvider()
+    monkeypatch.setattr(command_mod, "resolve_provider", lambda _config, **_kw: provider)
+
+    class CrashStore(VectorStore):
+        def publish_embedding_batch_under_lease(self, rows, **kwargs):
+            real = self._conn
+            self._conn = _CrashOnCommitConnection(real)
+            try:
+                return super().publish_embedding_batch_under_lease(rows, **kwargs)
+            finally:
+                self._conn = real
+
+    monkeypatch.setattr(command_mod, "VectorStore", CrashStore)
+    result = handle_lcm_command("embed backfill --apply", engine)
+
+    # None half-published: the entire batch rolled back.
+    assert _meta_ids(engine) == []
+    assert "embedded: 0" in result
+    # All three dispatched rows survive in-flight for recovery — none lost.
+    rows = _inflight_rows(engine)
+    assert len(rows) == 3
+    assert {state for _id, state in rows} <= {"dispatched", "uncertain"}
+
+
+def test_batch_commits_published_rows_before_a_superseded_row(monkeypatch, tmp_path):
+    """A row superseded mid-batch stops the batch WITHOUT aborting the rows already
+    published in the same transaction — mixed per-row outcomes, no lost work.
+    """
+    engine = _engine(tmp_path)
+    node_ids = _seed(engine, 3)
+    provider = FakeProvider()
+    monkeypatch.setattr(command_mod, "resolve_provider", lambda _config, **_kw: provider)
+
+    original = VectorStore.publish_embedding_under_lease
+    seen: list[str] = []
+
+    def supersede_second(self, embedded_id, kind, model, vector, **kwargs):
+        seen.append(str(embedded_id))
+        if len(seen) == 2:
+            # The active identity is superseded for the 2nd row only; it writes
+            # nothing while the 1st row's publication is already in the batch.
+            return EmbeddingPublishOutcome.IDENTITY_SUPERSEDED
+        return original(self, embedded_id, kind, model, vector, **kwargs)
+
+    monkeypatch.setattr(
+        VectorStore, "publish_embedding_under_lease", supersede_second
+    )
+    result = handle_lcm_command("embed backfill --apply", engine)
+
+    assert "embedded: 1" in result
+    assert "stop_reason: identity_superseded" in result
+    # The first row committed; the third was never attempted after the stop.
+    assert _meta_ids(engine) == [str(node_ids[-1])]
+
+
 def test_active_identity_switch_quarantines_accepted_request_and_releases_claim(
     monkeypatch, tmp_path
 ):
