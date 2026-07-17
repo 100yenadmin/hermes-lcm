@@ -320,6 +320,8 @@ Most installs only need `plugins.enabled` and `context.engine: lcm`.
 | `LCM_LEAF_CHUNK_TOKENS` | `20000` | Raw-backlog floor before leaf compaction; with dynamic chunking enabled, the base chunk target |
 | `LCM_DYNAMIC_LEAF_CHUNK_ENABLED` | `false` | Enable chunk-sized leaf compaction passes instead of compacting the whole non-tail raw backlog per pass |
 | `LCM_DYNAMIC_LEAF_CHUNK_MAX` | `40000` | Upper bound for dynamic leaf chunk targets |
+| `LCM_THRESHOLD_FULL_SWEEP_ENABLED` | `false` | At threshold, opt into one synchronous bounded sweep that drains chunked raw history before publishing one new active context |
+| `LCM_SUMMARY_PREFIX_TARGET_TOKENS` | `0` | Sweep-only summary-frontier target; `0` derives one `LCM_LEAF_CHUNK_TOKENS` budget |
 | `LCM_NEW_SESSION_RETAIN_DEPTH` | `2` | DAG depth retained after manual `/new` (`-1` all, `0` none) |
 | `LCM_DATABASE_PATH` | auto | SQLite database path. Empty config resolves to `HERMES_HOME/lcm.db`; plugin installs or operators may set this env var to another profile-scoped path such as `~/.hermes/hermes-lcm.db`. |
 | `LCM_FTS_INTEGRITY_CHECK_INTERVAL_HOURS` | `24` | Minimum hours between startup FTS5 deep integrity-checks (O(index size)). `0` checks every startup; a negative value never checks on startup. Structural checks always run regardless. |
@@ -439,6 +441,16 @@ advertised window.
 Start with `LCM_CONTEXT_THRESHOLD`, `LCM_FRESH_TAIL_COUNT`, and large output
 externalization. Only tune leaf chunking after checking `lcm_status` and
 understanding whether your workload is dominated by huge raw backlog passes.
+
+`LCM_THRESHOLD_FULL_SWEEP_ENABLED=true` is an opt-in cache-shape policy. Once
+threshold pressure triggers compaction, the invocation keeps summarizing the
+oldest raw chunks outside the protected fresh tail even after pressure falls
+below the trigger. It then condenses the provider-visible summary frontier only
+when that frontier exceeds `LCM_SUMMARY_PREFIX_TARGET_TOKENS` (or one leaf
+budget when the target is `0`). One invocation is bounded to 12 total leaf plus
+condensation calls and 120 seconds between calls, persists each completed DAG
+pass, and publishes one newly assembled active context at the end. It is
+synchronous and independent of deferred/background maintenance.
 
 ### Cache policy boundary
 
