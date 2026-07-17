@@ -3093,9 +3093,49 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         retain = self._config.new_session_retain_depth
         if self._session_id and retain != -1:
             if retain == 0:
-                self._dag.delete_session_nodes(self._session_id)
+                self._dag.delete_session_nodes(
+                    self._session_id,
+                    on_deleted_batch=self._purge_embeddings_for_nodes,
+                )
             else:
-                self._dag.delete_below_depth(self._session_id, retain)
+                self._dag.delete_below_depth(
+                    self._session_id,
+                    retain,
+                    on_deleted_batch=self._purge_embeddings_for_nodes,
+                )
+
+    def _purge_embeddings_for_nodes(
+        self,
+        node_ids: "list[int]",
+        *,
+        connection: "sqlite3.Connection | None" = None,
+    ) -> None:
+        """Purge stored embeddings for deleted summary nodes (best effort).
+
+        No-op unless embeddings are enabled. Opens a short-lived VectorStore on
+        the shared DB; any failure is swallowed so a purge problem never breaks
+        session reset — the summary_nodes join still keeps orphaned vectors out
+        of ranking.
+        """
+        if not node_ids:
+            return
+        if not bool(getattr(self._config, "embeddings_enabled", False)):
+            return
+        try:
+            from .vector_store import VectorStore
+
+            if connection is not None:
+                VectorStore.purge_embedding_batch_on_connection(connection, node_ids)
+                return
+            store = VectorStore(self._store.db_path, config=self._config)
+            try:
+                store.purge_embeddings_for_nodes(node_ids)
+            finally:
+                store.close()
+        except Exception:  # pragma: no cover - defensive; purge is best-effort
+            logger.debug(
+                "LCM embedding purge for deleted nodes failed", exc_info=True
+            )
 
     def carry_over_new_session_context(self, old_session_id: str, new_session_id: str) -> int:
         """Move retained summaries from the old session into the new one.

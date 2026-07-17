@@ -174,6 +174,9 @@ environment variables:
 | `LCM_DATABASE_PATH` | auto | SQLite database path. Empty config resolves to `HERMES_HOME/lcm.db`; plugin installs or operators may set this env var to another profile-scoped path such as `~/.hermes/hermes-lcm.db`. |
 | `LCM_FTS_INTEGRITY_CHECK_INTERVAL_HOURS` | `24` | Minimum hours between startup FTS5 deep integrity-checks (O(index size)). `0` checks every startup (previous behavior); a negative value never checks on startup. Structural checks always run regardless. |
 | `LCM_ENABLE_SLASH_COMMAND` | `false` | Enable the optional `/lcm` operator command surface |
+| `LCM_EMBEDDINGS_ENABLED` | `false` | Opt in to embedding warmup, backfill, and semantic retrieval storage |
+| `LCM_EMBEDDING_PROVIDER` | empty | Embedding provider: `voyage`, `ollama`, or `fastembed` |
+| `LCM_EMBEDDING_MODEL` | empty | Provider model identifier registered by `/lcm embed warmup` |
 | `LCM_DOCTOR_CLEAN_APPLY_ENABLED` | `false` | Permit destructive `/lcm doctor clean apply` in trusted operator contexts |
 | `LCM_EMPTY_LIFECYCLE_GC_ENABLED` | `true` | Master toggle for automatic pruning of lifecycle rows for sessions that never ingested any messages or summary nodes |
 | `LCM_EMPTY_LIFECYCLE_GC_THRESHOLD` | `200` | Number of lifecycle rows at which the GC pass fires (default 200 so fresh installs skip the work) |
@@ -616,6 +619,9 @@ Available commands:
 - `/lcm backup` - timestamped SQLite backup
 - `/lcm rotate` - read-only preview of an in-place tail-preserving compact of the active session
 - `/lcm rotate apply` - backup-first rotate that advances the lifecycle frontier past pre-tail raw messages
+- `/lcm embed warmup` - explicitly prepare the configured provider/model and register its vector dimension
+- `/lcm embed backfill [--limit N]` - preview pending leaf-summary embeddings, token use, batches, and estimated cost
+- `/lcm embed backfill --apply [--limit N]` - populate a bounded set of pending leaf-summary embeddings
 - `/lcm help` - command help
 
 Apply paths are intentionally narrow and backup-first. Start with diagnostics
@@ -659,6 +665,48 @@ Re-running `/lcm rotate apply` on a session whose frontier is already at or
 ahead of the target boundary reports `status: noop` and is safe to retry.
 A no-op apply does not write a new rolling backup, so the previous
 known-good `*-rotate-latest.sqlite3` snapshot survives idempotent retries.
+
+## Embedding backfill
+
+Embedding backfill is opt-in and dry-run-first. Configure and warm the model
+before applying any work:
+
+```bash
+export LCM_EMBEDDINGS_ENABLED=true
+export LCM_EMBEDDING_PROVIDER=ollama   # voyage or fastembed are also supported
+export LCM_EMBEDDING_MODEL=nomic-embed-text
+
+/lcm embed warmup
+/lcm embed backfill
+/lcm embed backfill --apply
+```
+
+The default invocation previews up to 200 newest pending depth-0 summaries. It
+reports the total pending count, selected count, estimated input tokens,
+provider batches, estimated cost, remaining work, and duration. It makes no
+provider call and opens SQLite read-only, so it performs no database write.
+Use `--limit N` to choose a smaller bounded invocation before adding `--apply`.
+
+Local Ollama and FastEmbed estimates are `$0`. Voyage estimates use the known
+per-token rate for the configured model (or a conservative generic Voyage
+rate when the model is not in the built-in table); treat the line as a planning
+estimate and verify current provider pricing before a large run. The estimate
+uses gross list price and does not subtract account-specific free tokens.
+
+Apply mode is safe to resume. Rows already embedded for the current registered
+profile are skipped by the discovery query, and a run that stops leaves its
+unwritten rows pending for the next invocation. The command serializes apply
+runs with a single-flight claim; a crashed claim becomes eligible for takeover
+after 10 minutes. Provider calls occur before per-row SQLite writes, and each
+row is committed independently, so one malformed row does not roll back the
+rest of a successful provider batch.
+
+Voyage authentication failures abort immediately because later batches would
+fail the same way. Transient provider failures are reported for the affected
+rows and later batches continue; rerun the command to retry anything still
+pending. Documents rejected by a provider token cap are listed under
+`skipped_overcap` and also remain pending. The claim is released on normal,
+provider-error, and row-write-error exit paths.
 
 ## Import and backfill
 

@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import codecs
+import copy
 import json
 import logging
 import re
+import sqlite3
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -19,6 +22,7 @@ from .externalize import (
     load_externalized_payload,
     read_externalized_payload_search_prefix,
 )
+from .embedding_provider import VoyageError, resolve_provider
 from .diagnostics import (
     _has_lifecycle_fragmentation,
     _state_db_path_for_engine,
@@ -48,6 +52,7 @@ from .rollup_store import RollupStore
 from .search_query import AGE_DECAY_RATE, normalize_search_sort
 from .session_patterns import build_session_match_keys, compile_session_pattern
 from .store import build_message_fts_spec
+from .vector_store import VectorStore
 
 if TYPE_CHECKING:
     from .engine import LCMEngine
@@ -230,6 +235,9 @@ _LCM_GREP_RESPONSE_CHAR_CAP = 64_000
 _LCM_RECENT_DEFAULT_LIMIT = 10
 _LCM_RECENT_HARD_LIMIT_CAP = 200
 _LCM_RECENT_FRONTIER_WORK_LIMIT = 4096
+_LCM_GREP_HYBRID_CANDIDATE_CAP = 500
+_LCM_GREP_SEMANTIC_SNIPPET_CHARS = 300
+_LCM_GREP_RRF_K = 60
 _LCM_LOAD_SESSION_DEFAULT_LIMIT = 100
 _LCM_LOAD_SESSION_HARD_LIMIT_CAP = 200
 _LCM_LOAD_SESSION_DEFAULT_MAX_CONTENT_CHARS = 4000
@@ -1627,7 +1635,7 @@ def lcm_recent(args: Dict[str, Any], **kwargs) -> str:
     return _bounded_recent_json(response, sections)
 
 
-def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
+def _lcm_grep_full_text(args: Dict[str, Any], **kwargs) -> str:
     """Search raw messages + summaries with optional cross-session scoping.
 
     Default scope is the current session, preserving historical behavior and returning
@@ -1651,7 +1659,8 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
     if parsed_limit <= 0:
         return json.dumps({"error": "limit must be a positive integer"})
     requested_limit = parsed_limit
-    limit = min(requested_limit, _LCM_GREP_HARD_LIMIT_CAP)
+    limit_cap = int(kwargs.get("_limit_cap", _LCM_GREP_HARD_LIMIT_CAP))
+    limit = min(requested_limit, limit_cap)
     sort = normalize_search_sort(args.get("sort"))
     source_limit = max(limit * 4, limit, 20)
 
@@ -1986,7 +1995,7 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
         response["summary_results_omitted"] = True
     if session_scope == "session":
         response["session_id"] = explicit_session_id
-    if requested_limit > _LCM_GREP_HARD_LIMIT_CAP:
+    if requested_limit > limit_cap:
         response["limit_clamped_from"] = requested_limit
     if requested_session_scope not in _LCM_GREP_VALID_SCOPES:
         response["ignored_session_scope"] = requested_session_scope
@@ -1999,6 +2008,754 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
     if externalized_scan is not None:
         response["externalized_scan"] = externalized_scan
     return json.dumps(response)
+
+
+def _lcm_grep_confidence(score: float) -> str:
+    if score >= 0.65:
+        return "high"
+    if score >= 0.5:
+        return "medium"
+    if score >= 0.35:
+        return "low"
+    return "noise"
+
+
+# A hard-timed semantic operation cannot kill the worker thread it abandons
+# (Python has no thread cancellation), so bound how many can be live at once.
+# A worker releases its slot when it eventually finishes; once every slot is
+# held by a stuck worker, further requests degrade to full-text immediately
+# instead of spawning unbounded threads under repeated timeouts.
+_LCM_SEMANTIC_MAX_WORKERS = 4
+_lcm_semantic_worker_slots = threading.BoundedSemaphore(_LCM_SEMANTIC_MAX_WORKERS)
+# FTS fallback has its own bounded lane so abandoned semantic calls cannot
+# consume the capacity required to degrade safely.
+_LCM_FULL_TEXT_MAX_WORKERS = 4
+_lcm_full_text_worker_slots = threading.BoundedSemaphore(_LCM_FULL_TEXT_MAX_WORKERS)
+
+
+class _WorkerCapacityError(RuntimeError):
+    """Raised when no bounded worker slot is available."""
+
+
+def _run_within_deadline(
+    fn,
+    *,
+    remaining_s: float,
+    name: str,
+    worker_slots: threading.BoundedSemaphore | None = None,
+):
+    """Run ``fn`` in a bounded daemon worker, raising if the deadline lapses.
+
+    ``remaining_s`` is the time left in the operation's single absolute
+    deadline. On timeout the worker is abandoned but keeps its slot until it
+    finishes, so stuck workers cannot accumulate without bound.
+    """
+    remaining_s = float(remaining_s)
+    if remaining_s <= 0:
+        raise TimeoutError("semantic latency budget exhausted")
+    slots = _lcm_semantic_worker_slots if worker_slots is None else worker_slots
+    if not slots.acquire(blocking=False):
+        raise _WorkerCapacityError(f"{name} worker capacity is exhausted")
+    outcome: list[tuple[bool, Any]] = []
+
+    def invoke() -> None:
+        try:
+            outcome.append((True, fn()))
+        except BaseException as exc:  # noqa: BLE001 - forwarded to caller
+            outcome.append((False, exc))
+        finally:
+            slots.release()
+
+    worker = threading.Thread(target=invoke, name=name, daemon=True)
+    try:
+        worker.start()
+    except BaseException:
+        slots.release()
+        raise
+    worker.join(remaining_s)
+    if worker.is_alive():
+        raise TimeoutError(f"{name} exceeded the semantic latency budget")
+    succeeded, value = outcome[0]
+    if not succeeded:
+        raise value
+    return value
+
+
+def _lcm_grep_deadline_error(mode: str, stage: str) -> dict[str, Any]:
+    return {
+        "error": "lcm_grep request deadline exceeded",
+        "mode": mode,
+        "timeout": True,
+        "timeout_stage": stage,
+    }
+
+
+def _lcm_grep_full_text_with_deadline(
+    args: Dict[str, Any],
+    *,
+    engine: "LCMEngine",
+    deadline: float,
+    limit_cap: int = _LCM_GREP_HARD_LIMIT_CAP,
+) -> dict[str, Any]:
+    """Run FTS on independent read connections under the request deadline."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return _lcm_grep_deadline_error(
+            str(args.get("mode") or "semantic").lower(), "full_text"
+        )
+
+    def invoke() -> dict[str, Any]:
+        message_conn: sqlite3.Connection | None = None
+        dag_conn: sqlite3.Connection | None = None
+        expired = [False]
+
+        def require_remaining(stage: str) -> float:
+            stage_remaining = deadline - time.monotonic()
+            if stage_remaining <= 0:
+                raise TimeoutError(f"lcm full-text deadline exhausted before {stage}")
+            return stage_remaining
+
+        def interrupt_if_expired() -> int:
+            if time.monotonic() >= deadline:
+                expired[0] = True
+                return 1
+            return 0
+
+        try:
+            require_remaining("database path resolution")
+            db_path = Path(engine._store.db_path).resolve()
+            require_remaining("database path resolution")
+            uri = f"{db_path.as_uri()}?mode=ro"
+            require_remaining("database URI construction")
+            message_conn = sqlite3.connect(
+                uri,
+                uri=True,
+                timeout=max(0.001, require_remaining("message connection")),
+            )
+            require_remaining("message connection")
+            require_remaining("DAG connection")
+            dag_conn = sqlite3.connect(
+                uri,
+                uri=True,
+                timeout=max(0.001, require_remaining("DAG connection")),
+            )
+            require_remaining("DAG connection")
+            for conn in (message_conn, dag_conn):
+                require_remaining("connection setup")
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA query_only=ON")
+                require_remaining("connection setup")
+                conn.set_progress_handler(interrupt_if_expired, 1000)
+                require_remaining("connection setup")
+            read_engine = copy.copy(engine)
+            read_store = copy.copy(engine._store)
+            read_dag = copy.copy(engine._dag)
+            read_store._conn = message_conn
+            read_store._db_lock = threading.RLock()
+            read_dag._conn = dag_conn
+            read_dag._db_lock = threading.RLock()
+            read_engine._store = read_store
+            read_engine._dag = read_dag
+            require_remaining("full-text search")
+            payload = json.loads(
+                _lcm_grep_full_text(
+                    args,
+                    engine=read_engine,
+                    _limit_cap=limit_cap,
+                )
+            )
+            if expired[0] or time.monotonic() >= deadline:
+                return _lcm_grep_deadline_error(
+                    str(args.get("mode") or "semantic").lower(), "full_text"
+                )
+            return payload
+        finally:
+            if message_conn is not None:
+                message_conn.close()
+            if dag_conn is not None:
+                dag_conn.close()
+
+    try:
+        return _run_within_deadline(
+            invoke,
+            remaining_s=remaining,
+            name="lcm-full-text",
+            worker_slots=_lcm_full_text_worker_slots,
+        )
+    except (_WorkerCapacityError, TimeoutError):
+        return _lcm_grep_deadline_error(
+            str(args.get("mode") or "semantic").lower(), "full_text"
+        )
+    except Exception as exc:
+        return {
+            "error": f"full-text fallback failed: {exc}",
+            "mode": str(args.get("mode") or "semantic").lower(),
+        }
+
+
+def _lcm_grep_embed_query(
+    provider: Any, query: str, *, remaining_s: float
+) -> list[float]:
+    """Embed one query within the operation's remaining absolute budget."""
+    def invoke() -> list[float]:
+        interactive = getattr(provider, "embed_query_interactive", None)
+        if callable(interactive):
+            return interactive(query, timeout=max(0.001, remaining_s))
+        return provider.embed_query(query)
+
+    vector = _run_within_deadline(
+        invoke, remaining_s=remaining_s, name="lcm-query-embed"
+    )
+    return [float(value) for value in vector]
+
+
+def _lcm_grep_resolve_provider(
+    engine: "LCMEngine", *, deadline: float | None = None
+) -> Any:
+    config = engine._config
+    cache_key = (
+        str(getattr(config, "embedding_provider", "") or "").strip().lower(),
+        str(getattr(config, "embedding_model", "") or "").strip(),
+    )
+    cached = getattr(engine, "_lcm_embedding_provider_cache", None)
+    if cached is not None and cached[0] == cache_key:
+        return cached[1]
+    if deadline is not None and time.monotonic() >= deadline:
+        raise TimeoutError("provider resolution deadline exhausted")
+    provider = resolve_provider(config)
+    if deadline is not None and time.monotonic() >= deadline:
+        raise TimeoutError("provider resolution deadline exhausted")
+    engine._lcm_embedding_provider_cache = (cache_key, provider)
+    return provider
+
+
+def _resolve_semantic_conversation_scope(
+    engine: "LCMEngine",
+    *,
+    search_session_id: str | None,
+    conversation_id: str | None,
+) -> list[str] | None:
+    """Resolve the conversation filter to the session_ids KNN should allow.
+
+    Summaries are keyed by session_id, so a message-level ``conversation_id`` is
+    enforced by resolving it to the sessions that carry it (intersected with the
+    active scope). Returns ``None`` for "no session constraint", or a possibly
+    empty list when a conversation matches no sessions (which then degrades).
+    """
+    if not conversation_id:
+        return [search_session_id] if search_session_id is not None else None
+    try:
+        rows = engine._store.connection.execute(
+            "SELECT DISTINCT session_id FROM messages WHERE conversation_id = ?",
+            (conversation_id,),
+        ).fetchall()
+        conv_sessions = {str(row[0]) for row in rows if row and row[0] is not None}
+    except Exception:  # pragma: no cover - defensive; degrade on any store error
+        conv_sessions = set()
+    if search_session_id is not None:
+        return sorted(conv_sessions & {search_session_id})
+    return sorted(conv_sessions)
+
+
+def _lcm_grep_semantic(
+    args: Dict[str, Any],
+    *,
+    engine: "LCMEngine",
+    deadline: float,
+    candidate_limit: int | None = None,
+    allow_fallback: bool = True,
+) -> dict[str, Any]:
+    mode = str(args.get("mode") or "semantic").lower()
+    if time.monotonic() >= deadline:
+        return _lcm_grep_deadline_error(mode, "semantic_entry")
+    query = str(args.get("query", "")).strip()
+    if not query:
+        return {"error": "No query provided"}
+
+    raw_limit_arg = args.get("limit", 10)
+    parsed_limit = _parse_int_value(raw_limit_arg, 10)
+    if parsed_limit <= 0:
+        return {"error": "limit must be a positive integer"}
+    requested_limit = parsed_limit
+    limit = min(requested_limit, _LCM_GREP_HARD_LIMIT_CAP)
+    knn_limit = candidate_limit if candidate_limit is not None else limit
+
+    requested_session_scope = str(args.get("session_scope", "current")).lower()
+    raw_session_id_arg = args.get("session_id")
+    explicit_session_id = (
+        str(raw_session_id_arg).strip() if raw_session_id_arg is not None else ""
+    )
+    if requested_session_scope == "current":
+        if explicit_session_id:
+            return {"error": "session_id is only valid with session_scope=session"}
+        session_scope = "current"
+        search_session_id: str | None = engine.current_session_id
+    elif requested_session_scope == "all":
+        if explicit_session_id:
+            return {"error": "session_id is not used with session_scope=all"}
+        session_scope = "all"
+        search_session_id = None
+    elif requested_session_scope == "session":
+        if not explicit_session_id:
+            return {"error": "session_scope=session requires session_id"}
+        session_scope = "session"
+        search_session_id = explicit_session_id
+    else:
+        session_scope = "current"
+        search_session_id = engine.current_session_id
+        logger.warning(
+            "Ignoring unsupported session_scope=%s for semantic lcm_grep",
+            requested_session_scope,
+        )
+
+    source = str(args.get("source") or "").strip() or None
+    conversation_id = str(args.get("conversation_id") or "").strip() or None
+    role, role_error = _parse_grep_role(args.get("role"))
+    if role_error:
+        return {"error": role_error}
+    time_from, time_from_error = _parse_optional_timestamp(args.get("time_from"), "time_from")
+    if time_from_error:
+        return {"error": time_from_error}
+    time_to, time_to_error = _parse_optional_timestamp(args.get("time_to"), "time_to")
+    if time_to_error:
+        return {"error": time_to_error}
+    if time_from is not None and time_to is not None and time_to < time_from:
+        return {"error": "time_to must be greater than or equal to time_from"}
+
+    def degraded(reason: str) -> dict[str, Any]:
+        if not allow_fallback:
+            return {
+                "mode": mode,
+                "degraded_to_fts": True,
+                "degraded_reason": reason,
+                "coverage": "none",
+                "results": [],
+            }
+        fts_args = dict(args)
+        fts_args.pop("mode", None)
+        payload = _lcm_grep_full_text_with_deadline(
+            fts_args,
+            engine=engine,
+            deadline=deadline,
+        )
+        if "error" not in payload:
+            payload["mode"] = mode
+            payload["degraded_to_fts"] = True
+            payload["degraded_reason"] = reason
+            payload["coverage"] = "none"
+        return payload
+
+    if not bool(getattr(engine._config, "embeddings_enabled", False)):
+        return degraded("semantic retrieval is disabled")
+
+    # role is a raw-message dimension; a summary vector has no single role, so
+    # it cannot be enforced over embedded summaries. Rather than silently
+    # ignoring it, degrade to full_text — which does enforce role — so a
+    # role=user query never returns assistant/tool summaries.
+    if role is not None:
+        return degraded("role filtering is only supported by full_text retrieval")
+
+    # The advertised lcm_grep contract (schemas.LCM_GREP) returns RAW message
+    # hits only for broader scopes and for time/conversation filters; full_text
+    # honors this by omitting summary hits in exactly these cases. Embedded
+    # summaries have no single lane and are cross-session/unexpandable, so the
+    # semantic arm degrades to the raw full_text path rather than emit summary
+    # hits that violate the contract (and, for conversation_id, leak
+    # wrong-lane summaries from a session that carries multiple conversations).
+    if session_scope != "current":
+        return degraded("broader scopes return raw-message hits only")
+    if time_from is not None or time_to is not None:
+        return degraded("time-scoped queries return raw-message hits only")
+    if conversation_id is not None:
+        return degraded("conversation-scoped queries return raw-message hits only")
+
+    # Scope the (current-session) summaries to the active session id. With the
+    # raw-only degradations above, conversation_id is always None here, so this
+    # resolves to the current session set.
+    knn_conversation_ids = _resolve_semantic_conversation_scope(
+        engine, search_session_id=search_session_id, conversation_id=conversation_id
+    )
+    if time.monotonic() >= deadline:
+        return _lcm_grep_deadline_error(mode, "scope_resolution")
+
+    try:
+        provider = _run_within_deadline(
+            lambda: _lcm_grep_resolve_provider(engine, deadline=deadline),
+            remaining_s=deadline - time.monotonic(),
+            name="lcm-provider-resolution",
+        )
+    except _WorkerCapacityError as exc:
+        return degraded(f"semantic capacity exhausted: {exc}")
+    except TimeoutError:
+        return _lcm_grep_deadline_error(mode, "provider_resolution")
+    except Exception as exc:
+        return degraded(f"embedding provider unavailable: {exc}")
+    if provider is None:
+        return degraded("embedding provider is not configured")
+
+    try:
+        query_vector = _lcm_grep_embed_query(
+            provider, query, remaining_s=deadline - time.monotonic()
+        )
+    except VoyageError as exc:
+        if exc.kind == "auth":
+            return {
+                "error": f"Embedding provider authentication failed; {exc}",
+                "mode": mode,
+            }
+        return degraded(f"query embedding failed: {exc}")
+    except _WorkerCapacityError as exc:
+        return degraded(f"semantic capacity exhausted: {exc}")
+    except Exception as exc:
+        return degraded(f"query embedding failed: {exc}")
+
+    def _run_knn() -> Any:
+        if time.monotonic() >= deadline:
+            raise TimeoutError("semantic vector search deadline exhausted")
+        vector_store = VectorStore(engine._store.db_path, config=engine._config)
+        try:
+            vector_conn = getattr(vector_store, "_conn", None)
+            if vector_conn is not None:
+                vector_conn.set_progress_handler(
+                    lambda: 1 if time.monotonic() >= deadline else 0,
+                    1000,
+                )
+            if time.monotonic() >= deadline:
+                raise TimeoutError("semantic vector search deadline exhausted")
+            return vector_store.knn(
+                query_vector,
+                k=knn_limit,
+                model=provider.model_id,
+                provider=provider.provider_id,
+                since=time_from,
+                until=time_to,
+                conversation_ids=knn_conversation_ids,
+                source=source,
+            )
+        finally:
+            vector_store.close()
+
+    try:
+        knn_results = _run_within_deadline(
+            _run_knn,
+            remaining_s=deadline - time.monotonic(),
+            name="lcm-knn",
+        )
+        coverage = knn_results.coverage
+        ranked_rows = list(knn_results)
+    except _WorkerCapacityError as exc:
+        return degraded(f"semantic capacity exhausted: {exc}")
+    except TimeoutError as exc:
+        return degraded(f"semantic vector search exceeded the latency budget: {exc}")
+    except Exception as exc:
+        return degraded(f"semantic vector search failed: {exc}")
+
+    if coverage == "none":
+        return degraded("semantic vectors are unavailable (coverage=none)")
+    if not ranked_rows:
+        return degraded("semantic retrieval returned no vector candidates")
+
+    def hydrate_nodes() -> list[tuple[Any, float]]:
+        conn: sqlite3.Connection | None = None
+
+        def require_remaining(stage: str) -> float:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"semantic result hydration deadline exhausted before {stage}"
+                )
+            return remaining
+
+        try:
+            require_remaining("database path resolution")
+            db_path = Path(engine._store.db_path).resolve()
+            require_remaining("database path resolution")
+            uri = f"{db_path.as_uri()}?mode=ro"
+            require_remaining("database URI construction")
+            conn = sqlite3.connect(
+                uri,
+                uri=True,
+                timeout=max(0.001, require_remaining("database connection")),
+            )
+            require_remaining("database connection")
+            conn.row_factory = sqlite3.Row
+            require_remaining("connection setup")
+            conn.execute("PRAGMA query_only=ON")
+            require_remaining("connection setup")
+            conn.set_progress_handler(
+                lambda: 1 if time.monotonic() >= deadline else 0,
+                1000,
+            )
+            require_remaining("DAG setup")
+            read_dag = copy.copy(engine._dag)
+            read_dag._conn = conn
+            read_dag._db_lock = threading.RLock()
+            require_remaining("DAG setup")
+            hydrated: list[tuple[Any, float]] = []
+            for embedded_id, score, kind in ranked_rows:
+                require_remaining("node lookup")
+                if kind != "summary":
+                    continue
+                try:
+                    node_id = int(embedded_id)
+                except (TypeError, ValueError):
+                    continue
+                require_remaining("node lookup")
+                node = read_dag.get_node(node_id)
+                require_remaining("node lookup")
+                if node is not None:
+                    hydrated.append((node, float(score)))
+                if len(hydrated) >= knn_limit:
+                    break
+            return hydrated
+        finally:
+            if conn is not None:
+                conn.close()
+
+    try:
+        hydrated_nodes = _run_within_deadline(
+            hydrate_nodes,
+            remaining_s=deadline - time.monotonic(),
+            name="lcm-result-hydration",
+        )
+    except _WorkerCapacityError as exc:
+        return degraded(f"semantic capacity exhausted: {exc}")
+    except TimeoutError:
+        return _lcm_grep_deadline_error(mode, "result_resolution")
+    except Exception as exc:
+        return degraded(f"semantic result hydration failed: {exc}")
+
+    current_session_id = engine.current_session_id
+    has_current_session = bool(current_session_id)
+    results: list[dict[str, Any]] = []
+    for node, score in hydrated_nodes:
+        if time.monotonic() >= deadline:
+            return _lcm_grep_deadline_error(mode, "result_resolution")
+        # conversation/role/source/time filters are enforced inside knn() before
+        # the top-k cap, so no eligible lower-ranked vector was dropped for an
+        # ineligible top hit; nothing further to post-filter here.
+        confidence = _lcm_grep_confidence(score)
+        result = {
+            "type": "summary",
+            "depth": f"d{node.depth}",
+            "node_id": node.node_id,
+            "session_id": node.session_id,
+            "snippet": node.summary[:_LCM_GREP_SEMANTIC_SNIPPET_CHARS],
+            "token_count": node.token_count,
+            "expand_hint": node.expand_hint,
+            "earliest_at": node.earliest_at,
+            "latest_at": node.latest_at,
+            "from_current_session": has_current_session and node.session_id == current_session_id,
+            "score": score,
+            "cosine_score": score,
+            "confidence": confidence,
+            "confidence_band": confidence,
+        }
+        results.append(result)
+        if len(results) >= knn_limit:
+            break
+
+    if not results:
+        return degraded("semantic vector candidates could not be resolved")
+
+    response: dict[str, Any] = {
+        "query": query,
+        "mode": "semantic",
+        "sort": normalize_search_sort(args.get("sort")),
+        "session_scope": session_scope,
+        "source": source,
+        "conversation_id": conversation_id,
+        "limit": limit,
+        "total_results": len(results),
+        "results": results[:limit] if candidate_limit is None else results,
+        "coverage": coverage,
+        "degraded_to_fts": False,
+    }
+    if role is not None:
+        response["role"] = role
+    if time_from is not None:
+        response["time_from"] = time_from
+    if time_to is not None:
+        response["time_to"] = time_to
+    if session_scope == "session":
+        response["session_id"] = explicit_session_id
+    if requested_limit > _LCM_GREP_HARD_LIMIT_CAP:
+        response["limit_clamped_from"] = requested_limit
+    if requested_session_scope not in _LCM_GREP_VALID_SCOPES:
+        response["ignored_session_scope"] = requested_session_scope
+        response["scope_note"] = (
+            "Unsupported session_scope; stayed on current. "
+            "Valid values: current, all, session."
+        )
+    return response
+
+
+def _lcm_grep_hybrid(
+    args: Dict[str, Any], *, engine: "LCMEngine", deadline: float
+) -> dict[str, Any]:
+    if time.monotonic() >= deadline:
+        return _lcm_grep_deadline_error("hybrid", "hybrid_entry")
+    requested_limit = _parse_int_value(args.get("limit", 10), 10)
+    if requested_limit <= 0:
+        return {"error": "limit must be a positive integer"}
+    limit = min(requested_limit, _LCM_GREP_HARD_LIMIT_CAP)
+    candidate_limit = min(
+        _LCM_GREP_HYBRID_CANDIDATE_CAP,
+        max(50, limit * 3),
+    )
+
+    fts_args = dict(args)
+    fts_args["mode"] = "hybrid"
+    fts_args["limit"] = candidate_limit
+    fts = _lcm_grep_full_text_with_deadline(
+        fts_args,
+        engine=engine,
+        deadline=deadline,
+        limit_cap=_LCM_GREP_HYBRID_CANDIDATE_CAP,
+    )
+    if "error" in fts:
+        return fts
+
+    def degraded_to_fts(reason: str, *, coverage: str = "none") -> dict[str, Any]:
+        response = dict(fts)
+        response["mode"] = "hybrid"
+        response["limit"] = limit
+        response["total_results"] = len(fts.get("results", []))
+        response["results"] = list(fts.get("results", []))[:limit]
+        response["degraded_to_fts"] = True
+        response["degraded_reason"] = reason
+        response["coverage"] = coverage
+        if requested_limit > _LCM_GREP_HARD_LIMIT_CAP:
+            response["limit_clamped_from"] = requested_limit
+        else:
+            response.pop("limit_clamped_from", None)
+        return response
+
+    if time.monotonic() >= deadline:
+        return degraded_to_fts(
+            "semantic arm skipped because the request deadline was exhausted"
+        )
+
+    semantic_args = dict(args)
+    semantic_args["mode"] = "hybrid"
+    semantic_args["limit"] = candidate_limit
+    semantic = _lcm_grep_semantic(
+        semantic_args,
+        engine=engine,
+        deadline=deadline,
+        candidate_limit=candidate_limit,
+        allow_fallback=False,
+    )
+    if "error" in semantic:
+        if semantic.get("timeout") is True:
+            return degraded_to_fts(
+                "semantic arm exceeded the request deadline",
+                coverage=str(semantic.get("coverage", "none")),
+            )
+        return semantic
+    if semantic.get("degraded_to_fts"):
+        return degraded_to_fts(
+            str(semantic.get("degraded_reason", "semantic arm unavailable")),
+            coverage=str(semantic.get("coverage", "none")),
+        )
+
+    fused: dict[tuple[str, Any], dict[str, Any]] = {}
+
+    def identity(hit: dict[str, Any]) -> tuple[str, Any]:
+        if hit.get("node_id") is not None:
+            return ("node", hit.get("node_id"))
+        return ("message", hit.get("store_id"))
+
+    for rank, hit in enumerate(fts.get("results", []), start=1):
+        if time.monotonic() >= deadline:
+            return _lcm_grep_deadline_error("hybrid", "fusion")
+        key = identity(hit)
+        entry = fused.setdefault(key, {"hit": dict(hit), "rrf_score": 0.0})
+        entry["fts_rank"] = rank
+        entry["rrf_score"] += 1.0 / (_LCM_GREP_RRF_K + rank)
+
+    for rank, hit in enumerate(semantic.get("results", []), start=1):
+        if time.monotonic() >= deadline:
+            return _lcm_grep_deadline_error("hybrid", "fusion")
+        key = identity(hit)
+        entry = fused.setdefault(key, {"hit": dict(hit), "rrf_score": 0.0})
+        entry["semantic_rank"] = rank
+        entry["rrf_score"] += 1.0 / (_LCM_GREP_RRF_K + rank)
+        entry["semantic_score"] = hit.get("score")
+        entry["confidence"] = hit.get("confidence")
+        entry["confidence_band"] = hit.get("confidence_band")
+        if "fts_rank" in entry:
+            # The semantic form carries score/confidence while the FTS form carries
+            # its exact house snippet/provenance. Preserve the latter as the base.
+            entry["hit"].setdefault("semantic_snippet", hit.get("snippet", ""))
+
+    if time.monotonic() >= deadline:
+        return _lcm_grep_deadline_error("hybrid", "fusion")
+    ordered = sorted(
+        fused.values(),
+        key=lambda entry: (
+            -float(entry["rrf_score"]),
+            int(entry.get("fts_rank", 10**9)),
+            int(entry.get("semantic_rank", 10**9)),
+            identity(entry["hit"]),
+        ),
+    )
+    results: list[dict[str, Any]] = []
+    for entry in ordered[:limit]:
+        if time.monotonic() >= deadline:
+            return _lcm_grep_deadline_error("hybrid", "fusion")
+        hit = dict(entry["hit"])
+        hit["score"] = float(entry["rrf_score"])
+        hit["rrf_score"] = float(entry["rrf_score"])
+        if "fts_rank" in entry:
+            hit["fts_rank"] = entry["fts_rank"]
+        if "semantic_rank" in entry:
+            hit["semantic_rank"] = entry["semantic_rank"]
+            hit["semantic_score"] = entry["semantic_score"]
+            hit["confidence"] = entry["confidence"]
+            hit["confidence_band"] = entry["confidence_band"]
+        results.append(hit)
+
+    response = dict(fts)
+    response["mode"] = "hybrid"
+    response["limit"] = limit
+    response["total_results"] = len(fused)
+    response["results"] = results
+    response["coverage"] = semantic.get("coverage", "none")
+    response["degraded_to_fts"] = False
+    response["fusion"] = "rrf"
+    response["rrf_k"] = _LCM_GREP_RRF_K
+    if requested_limit > _LCM_GREP_HARD_LIMIT_CAP:
+        response["limit_clamped_from"] = requested_limit
+    else:
+        response.pop("limit_clamped_from", None)
+    return response
+
+
+def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
+    """Search LCM history using full-text, semantic, or RRF hybrid retrieval."""
+    request_started = time.monotonic()
+    mode = str(args.get("mode") or "full_text").strip().lower()
+    if mode == "full_text":
+        return _lcm_grep_full_text(args, **kwargs)
+
+    engine = _require_engine(kwargs)
+    if engine is None:
+        return json.dumps({"error": "LCM engine not initialized"})
+    timeout_s = max(
+        0.001,
+        float(getattr(engine._config, "embedding_query_timeout_s", 3.0)),
+    )
+    deadline = request_started + timeout_s
+    if time.monotonic() >= deadline:
+        return json.dumps(_lcm_grep_deadline_error(mode, "tool_entry"))
+    if mode == "semantic":
+        return json.dumps(_lcm_grep_semantic(args, engine=engine, deadline=deadline))
+    if mode == "hybrid":
+        return json.dumps(_lcm_grep_hybrid(args, engine=engine, deadline=deadline))
+    return json.dumps({
+        "error": "mode must be one of: full_text, semantic, hybrid",
+    })
 
 
 def lcm_describe(args: Dict[str, Any], **kwargs) -> str:
