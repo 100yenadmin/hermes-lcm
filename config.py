@@ -1,4 +1,5 @@
 """LCM configuration with defaults and env var overrides."""
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -8,6 +9,9 @@ try:
     import yaml
 except Exception:  # pragma: no cover - optional fallback for minimal installs
     yaml = None
+
+
+logger = logging.getLogger(__name__)
 
 
 def _parse_pattern_list(raw: str) -> list[str]:
@@ -30,6 +34,10 @@ def _parse_arm_weights(raw: str, defaults: dict[str, float]) -> dict[str, float]
     Unknown arm names, malformed pairs, and non-finite/non-numeric weights are
     skipped; any arm not overridden keeps its default. A wholly unparsable value
     therefore degrades to the defaults rather than erroring the tool.
+
+    A negative weight is invalid -- it would invert RRF rank-monotonicity (a
+    rank-1 hit scoring below a rank-2 hit) -- so it is rejected and the arm keeps
+    its default with a logged warning. ``0.0`` is legal and cleanly drops the arm.
     """
     weights = dict(defaults)
     for part in raw.split(","):
@@ -45,6 +53,15 @@ def _parse_arm_weights(raw: str, defaults: dict[str, float]) -> dict[str, float]
         except (TypeError, ValueError):
             continue
         if parsed != parsed or parsed in (float("inf"), float("-inf")):
+            continue
+        if parsed < 0.0:
+            logger.warning(
+                "LCM_RECALL_ARM_WEIGHTS: negative weight %r for arm %r is "
+                "invalid; using default %r",
+                parsed,
+                name,
+                defaults[name],
+            )
             continue
         weights[name] = parsed
     return weights

@@ -594,6 +594,35 @@ def test_rrf_weights_rank_vector_best_first_on_weak_fts_corpus():
     assert weighted[0]["hit"]["store_id"] == "V"  # down-weighting FTS fixes it
 
 
+def test_parse_arm_weights_rejects_negative_keeps_default(monkeypatch, caplog):
+    """FIX-1: a negative env weight is invalid (it would invert RRF
+    rank-monotonicity) -- the arm keeps its default and a warning is logged."""
+    import logging as _logging
+
+    monkeypatch.setenv("LCM_RECALL_ARM_WEIGHTS", "fts=-0.5,summary=1.0,chunk=0")
+    with caplog.at_level(_logging.WARNING, logger="hermes_lcm.config"):
+        cfg = LCMConfig.from_env()
+    # fts falls back to its 0.5 default (negative dropped); chunk=0 is legal.
+    assert cfg.recall_arm_weights == {"fts": 0.5, "summary": 1.0, "chunk": 0.0}
+    assert any("negative weight" in rec.getMessage() for rec in caplog.records)
+
+
+def test_rrf_fuse_clamps_negative_weight_no_inversion():
+    """FIX-1: a negative arm weight in rrf_fuse is clamped to 0.0 (the arm drops
+    out) rather than making a rank-1 hit score negative and inverting order."""
+    from hermes_lcm.retrieval_core import rrf_fuse
+
+    arm0 = [{"store_id": "A"}, {"store_id": "B"}]
+    arm1 = [{"store_id": "C"}]
+    # arm0 negative -> contributes 0; arm1 (weight 1.0) alone decides ordering.
+    fused = rrf_fuse([arm0, arm1], k=60, weights=[-3.0, 1.0])
+    by_id = {e["hit"]["store_id"]: e for e in fused}
+    assert by_id["A"]["rrf_score"] == 0.0  # negative arm contributes nothing
+    assert by_id["B"]["rrf_score"] == 0.0
+    assert by_id["C"]["rrf_score"] > 0.0
+    assert fused[0]["hit"]["store_id"] == "C"  # no negative-score inversion
+
+
 def test_chunk_dedupe_keeps_best_ranked_span(recall_engine, monkeypatch):
     """F1-chunk-dedupe-wrong-span: when one message has several chunks, the merged
     hit keeps the BEST-ranked chunk's span, not the worst (last) one."""

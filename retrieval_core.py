@@ -502,7 +502,9 @@ def rrf_fuse(
     3-arm hybrid is never dragged below its best arm (measured on LongMemEval:
     naive equal-weight fusion cost 21 R@5 points versus pure vectors because the
     weak FTS arm got equal say). A ``weights`` shorter than ``arms`` (or with a
-    missing/non-finite entry) falls back to ``1.0`` for the unspecified arms.
+    missing/non-finite entry) falls back to ``1.0`` for the unspecified arms. A
+    negative entry is clamped to ``0.0`` (the arm drops out) rather than allowed
+    to invert rank-monotonicity.
 
     A single identity that appears more than once within the SAME arm (e.g. a
     message chunked into several pieces, each a separate chunk-arm hit) is
@@ -522,6 +524,11 @@ def rrf_fuse(
             return 1.0
         if value != value or value in (float("inf"), float("-inf")):
             return 1.0
+        if value < 0.0:
+            # A negative weight would invert rank-monotonicity (a rank-1 hit
+            # scoring below a rank-2 hit). Clamp to 0.0 so the arm cleanly drops
+            # out of the fusion rather than corrupting the ordering.
+            return 0.0
         return value
 
     fused: dict[tuple[str, Any], dict[str, Any]] = {}
