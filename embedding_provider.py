@@ -49,6 +49,25 @@ _VOYAGE_BATCH_TOKEN_BUDGET = int(
 _VOYAGE_DOCUMENT_TOKEN_BUDGET = int(
     _VOYAGE_MAX_DOCUMENT_TOKENS * _VOYAGE_TOKEN_SAFETY_FACTOR
 )
+# voyage-context-* /v1/contextualizedembeddings caps. Per the official docs
+# (2026-07) a single request allows at most 1,000 inputs (inner lists), 120K
+# total tokens across all inputs, and 16K total chunks across all inputs. The
+# chunk-grouping spec additionally bounds one document (a single inputs inner
+# list = one message's chunks) at 120K tokens and one chunk at 32K tokens.
+# A document above the per-doc budget is split into contiguous sub-documents;
+# a single chunk above the per-chunk cap is non-embeddable and skipped by the
+# backfill path (chunking already caps a chunk well below 32K, so this is only
+# a defensive guard).
+_VOYAGE_CONTEXT_MAX_CHUNK_TOKENS = 32_000
+_VOYAGE_CONTEXT_MAX_DOCUMENT_TOKENS = 120_000
+_VOYAGE_CONTEXT_MAX_REQUEST_TOKENS = 120_000
+_VOYAGE_CONTEXT_MAX_REQUEST_CHUNKS = 16_000
+_VOYAGE_CONTEXT_DOCUMENT_TOKEN_BUDGET = int(
+    _VOYAGE_CONTEXT_MAX_DOCUMENT_TOKENS * _VOYAGE_TOKEN_SAFETY_FACTOR
+)
+_VOYAGE_CONTEXT_REQUEST_TOKEN_BUDGET = int(
+    _VOYAGE_CONTEXT_MAX_REQUEST_TOKENS * _VOYAGE_TOKEN_SAFETY_FACTOR
+)
 _MAX_ATTEMPTS = 3
 _RETRY_AFTER_BUDGET_S = 60.0
 _DEFAULT_FASTEMBED_CACHE = Path.home() / ".cache" / "fastembed"
@@ -92,6 +111,66 @@ def _is_voyage_context_model(model: str) -> bool:
     flat ``/v1/embeddings`` endpoint rejects them with HTTP 400.
     """
     return str(model or "").strip().lower().startswith("voyage-context")
+
+
+def _plan_contextualized_requests(
+    token_counts: "Sequence[Sequence[int]]",
+    *,
+    doc_token_budget: int,
+    request_token_budget: int,
+    request_chunk_budget: int,
+    max_inputs: int,
+) -> list[list[list[tuple[int, int]]]]:
+    """Plan contextualized requests from per-document chunk token counts.
+
+    ``token_counts[d]`` is the list of chunk token counts for document ``d``
+    (oversize single chunks already removed by the caller). Any document whose
+    summed tokens exceed ``doc_token_budget`` is split into contiguous
+    sub-documents, each still an inputs inner-list (context is preserved within
+    a sub-document). Sub-documents are then greedily packed into requests
+    bounded by ``request_token_budget`` (total tokens), ``request_chunk_budget``
+    (total chunks) and ``max_inputs`` (inner lists).
+
+    Returns a list of requests; each request is a list of sub-documents; each
+    sub-document is a list of ``(doc_index, chunk_index)`` positions, so the
+    caller maps every planned chunk straight back to its source text/vector.
+    """
+    subdocs: list[list[tuple[int, int]]] = []
+    for doc_index, tokens in enumerate(token_counts):
+        current: list[tuple[int, int]] = []
+        current_tokens = 0
+        for chunk_index, tok in enumerate(tokens):
+            if current and current_tokens + int(tok) > doc_token_budget:
+                subdocs.append(current)
+                current = []
+                current_tokens = 0
+            current.append((doc_index, chunk_index))
+            current_tokens += int(tok)
+        if current:
+            subdocs.append(current)
+    max_inputs = max(1, int(max_inputs))
+    requests: list[list[list[tuple[int, int]]]] = []
+    current_req: list[list[tuple[int, int]]] = []
+    req_tokens = 0
+    req_chunks = 0
+    for sub in subdocs:
+        sub_tokens = sum(int(token_counts[d][c]) for d, c in sub)
+        sub_chunks = len(sub)
+        if current_req and (
+            req_tokens + sub_tokens > request_token_budget
+            or req_chunks + sub_chunks > request_chunk_budget
+            or len(current_req) + 1 > max_inputs
+        ):
+            requests.append(current_req)
+            current_req = []
+            req_tokens = 0
+            req_chunks = 0
+        current_req.append(sub)
+        req_tokens += sub_tokens
+        req_chunks += sub_chunks
+    if current_req:
+        requests.append(current_req)
+    return requests
 
 
 def embed_contextualized(
@@ -824,7 +903,7 @@ class VoyageProvider(_ResilientProvider):
         ``embed_contextualized`` helper handles that dispatch for local
         providers; here (Voyage) a context model uses the real endpoint.
         """
-        groups = [list(group) for group in chunks_by_doc]
+        groups = [[str(chunk) for chunk in group] for group in chunks_by_doc]
         if not groups:
             return []
         if not self._is_context:
@@ -839,11 +918,144 @@ class VoyageProvider(_ResilientProvider):
                 )
                 offset += len(group)
             return result
-        return self._guarded(
-            lambda: self._contextualized_request(
-                groups, input_type="document", deadline_budget_s=self.timeout
-            )
+        # A context model: split oversize documents and pack the resulting
+        # sub-documents into cap-respecting requests, reassembling each chunk's
+        # vector back into its source document/chunk position.
+        token_counts = [[count_tokens(chunk) for chunk in group] for group in groups]
+        plan = _plan_contextualized_requests(
+            token_counts,
+            doc_token_budget=_VOYAGE_CONTEXT_DOCUMENT_TOKEN_BUDGET,
+            request_token_budget=_VOYAGE_CONTEXT_REQUEST_TOKEN_BUDGET,
+            request_chunk_budget=_VOYAGE_CONTEXT_MAX_REQUEST_CHUNKS,
+            max_inputs=self.max_batch_items,
         )
+        result: list[list[list[float]]] = [[[] for _ in group] for group in groups]
+        for request in plan:
+            inputs = [[groups[d][c] for d, c in sub] for sub in request]
+            nested = self._guarded(
+                lambda inputs=inputs: self._contextualized_request(
+                    inputs, input_type="document", deadline_budget_s=self.timeout
+                )
+            )
+            for sub, sub_vectors in zip(request, nested):
+                for (d, c), vector in zip(sub, sub_vectors):
+                    result[d][c] = list(vector)
+        return result
+
+    @property
+    def supports_contextualized_grouping(self) -> bool:
+        """True when this model can contextualize a document's chunks together.
+
+        Only voyage-context-* models actually gain cross-chunk context; a plain
+        voyage model keeps the flat per-chunk backfill path unchanged.
+        """
+        return self._is_context
+
+    def embed_chunk_group_batches(
+        self,
+        groups: Sequence[Sequence[tuple[int, str]]],
+        *,
+        before_dispatch: BeforeDispatch | None = None,
+    ) -> Iterator[EmbeddedDocumentBatch]:
+        """Contextualized chunk embedding, grouped one document per message.
+
+        Each group is one document — a message's chunks — as ``(flat_index,
+        text)`` pairs, where ``flat_index`` is the chunk's position in the
+        caller's flat backfill batch. A document's chunks are sent together in
+        one inputs inner-list so voyage-context-* contextualizes them across the
+        message, then each yielded :class:`EmbeddedDocumentBatch` still carries
+        per-chunk flat indexes + vectors so the caller publishes every chunk as
+        its own independent row (the batch-publish + lease/inflight path is
+        unchanged).
+
+        Oversize documents (> the per-doc token budget) are split into
+        contiguous sub-documents; a single chunk above the per-chunk cap is
+        recorded in ``last_skipped_documents`` and never dispatched. Requests
+        respect the 120K-token / 16K-chunk / 1,000-input caps.
+        """
+        deadline = time.monotonic() + max(0.0, self.timeout)
+        self.last_skipped_documents = []
+
+        def _remaining() -> float:
+            return deadline - time.monotonic()
+
+        # Tokenize and drop oversize single chunks (defensive; chunking caps a
+        # chunk well below the per-chunk limit). Surviving chunks keep their
+        # (flat_index, text) identity and per-document grouping.
+        documents: list[list[tuple[int, str]]] = []
+        token_counts: list[list[int]] = []
+        for group in groups:
+            kept: list[tuple[int, str]] = []
+            kept_tokens: list[int] = []
+            for flat_index, text in group:
+                if _remaining() <= 0:
+                    raise VoyageError(
+                        "timeout",
+                        "Voyage operation deadline exceeded during chunk grouping",
+                    )
+                prepared = str(text)
+
+                def prepare(value=prepared) -> int:
+                    return count_tokens(value)
+
+                tokens = _run_blocking_with_deadline(
+                    prepare,
+                    timeout=_remaining(),
+                    provider="Voyage chunk preprocessing",
+                )
+                if tokens > _VOYAGE_CONTEXT_MAX_CHUNK_TOKENS:
+                    self.last_skipped_documents.append(int(flat_index))
+                    logger.warning(
+                        "Skipping Voyage chunk index=%d tokens=%d limit=%d",
+                        int(flat_index),
+                        tokens,
+                        _VOYAGE_CONTEXT_MAX_CHUNK_TOKENS,
+                    )
+                    continue
+                kept.append((int(flat_index), prepared))
+                kept_tokens.append(tokens)
+            if kept:
+                documents.append(kept)
+                token_counts.append(kept_tokens)
+
+        if not documents:
+            return
+
+        plan = _plan_contextualized_requests(
+            token_counts,
+            doc_token_budget=_VOYAGE_CONTEXT_DOCUMENT_TOKEN_BUDGET,
+            request_token_budget=_VOYAGE_CONTEXT_REQUEST_TOKEN_BUDGET,
+            request_chunk_budget=_VOYAGE_CONTEXT_MAX_REQUEST_CHUNKS,
+            max_inputs=self.max_batch_items,
+        )
+        for request in plan:
+            if _remaining() <= 0:
+                raise VoyageError("timeout", "Voyage operation deadline exceeded")
+            inputs = [[documents[d][c][1] for d, c in sub] for sub in request]
+            flat_indexes = tuple(
+                documents[d][c][0] for sub in request for d, c in sub
+            )
+            if before_dispatch is not None:
+                dispatch = partial(before_dispatch, flat_indexes)
+            else:
+                dispatch = None
+            nested = self._guarded(
+                lambda inputs=inputs, dispatch=dispatch, budget=_remaining(): (
+                    self._contextualized_request(
+                        inputs,
+                        input_type="document",
+                        max_attempts=1 if before_dispatch is not None else _MAX_ATTEMPTS,
+                        deadline_budget_s=budget,
+                        before_transport=dispatch,
+                    )
+                )
+            )
+            vectors = [vector for sub_vectors in nested for vector in sub_vectors]
+            self._remember_dim(vectors)
+            yield EmbeddedDocumentBatch(
+                flat_indexes,
+                tuple(tuple(vector) for vector in vectors),
+            )
 
     def _sleep_within_deadline(self, delay: float, deadline: float | None) -> bool:
         """Sleep ``delay`` only if it fits the absolute deadline; else give up.

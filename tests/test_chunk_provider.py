@@ -9,6 +9,7 @@ from hermes_lcm.embedding_provider import (
     HttpResponse,
     VoyageError,
     VoyageProvider,
+    _plan_contextualized_requests,
     default_chunk_model,
     embed_contextualized,
 )
@@ -189,3 +190,155 @@ class TestVoyageContextualizedWireShape:
 
         assert transport.calls[0]["url"] == _FLAT_URL
         assert transport.calls[0]["payload"]["input"] == ["only-doc"]
+
+
+class TestPlanContextualizedRequests:
+    def test_small_docs_pack_into_one_request(self):
+        plan = _plan_contextualized_requests(
+            [[10, 20], [30]],
+            doc_token_budget=1000,
+            request_token_budget=1000,
+            request_chunk_budget=100,
+            max_inputs=100,
+        )
+        # One request, two sub-documents (one per source document), unsplit.
+        assert plan == [[[(0, 0), (0, 1)], [(1, 0)]]]
+
+    def test_oversize_document_is_split_into_subdocuments(self):
+        # Doc 0 sums to 250 tokens over a 100-token doc budget -> contiguous split.
+        plan = _plan_contextualized_requests(
+            [[60, 60, 60, 70]],
+            doc_token_budget=100,
+            request_token_budget=100000,
+            request_chunk_budget=100000,
+            max_inputs=100,
+        )
+        subdocs = plan[0]
+        # Each sub-document stays within the doc budget and preserves chunk order.
+        assert subdocs == [[(0, 0)], [(0, 1)], [(0, 2)], [(0, 3)]]
+
+    def test_request_token_budget_forces_new_request(self):
+        plan = _plan_contextualized_requests(
+            [[80], [80]],
+            doc_token_budget=1000,
+            request_token_budget=100,
+            request_chunk_budget=1000,
+            max_inputs=1000,
+        )
+        assert len(plan) == 2
+
+    def test_max_inputs_forces_new_request(self):
+        plan = _plan_contextualized_requests(
+            [[1], [1], [1]],
+            doc_token_budget=1000,
+            request_token_budget=1000,
+            request_chunk_budget=1000,
+            max_inputs=2,
+        )
+        assert [len(req) for req in plan] == [2, 1]
+
+    def test_empty(self):
+        assert _plan_contextualized_requests(
+            [], doc_token_budget=1, request_token_budget=1,
+            request_chunk_budget=1, max_inputs=1,
+        ) == []
+
+
+class TestSupportsContextualizedGrouping:
+    def test_true_for_context_model(self):
+        provider = VoyageProvider("voyage-context-4", transport=FakeTransport())
+        assert provider.supports_contextualized_grouping is True
+
+    def test_false_for_plain_model(self):
+        provider = VoyageProvider("voyage-3", transport=FakeTransport())
+        assert provider.supports_contextualized_grouping is False
+
+
+class TestEmbedChunkGroupBatches:
+    def test_groups_a_message_into_one_inputs_list(self, monkeypatch):
+        monkeypatch.setattr(provider_mod, "count_tokens", lambda _t: 1)
+        monkeypatch.setenv("VOYAGE_API_KEY", "test-key")
+        transport = FakeTransport(_context_response([2, 1]))
+        provider = VoyageProvider("voyage-context-3", transport=transport)
+
+        # Two documents: message A has chunks at flat indexes 0,1; message B at 2.
+        groups = [[(0, "a0"), (1, "a1")], [(2, "b0")]]
+        dispatched: list[tuple[int, ...]] = []
+        batches = list(
+            provider.embed_chunk_group_batches(
+                groups, before_dispatch=lambda idx: dispatched.append(idx)
+            )
+        )
+
+        # One network request; inputs grouped one inner list per message.
+        assert len(transport.calls) == 1
+        payload = transport.calls[0]["payload"]
+        assert payload["inputs"] == [["a0", "a1"], ["b0"]]
+        assert "input" not in payload
+        # before_dispatch marked exactly this request's flat chunk indexes.
+        assert dispatched == [(0, 1, 2)]
+        # One accepted batch carrying per-chunk flat indexes + vectors.
+        assert len(batches) == 1
+        assert batches[0].indexes == (0, 1, 2)
+        assert len(batches[0].vectors) == 3
+
+    def test_per_chunk_vectors_preserve_order(self, monkeypatch):
+        monkeypatch.setattr(provider_mod, "count_tokens", lambda _t: 1)
+        monkeypatch.setenv("VOYAGE_API_KEY", "test-key")
+        # Response encodes (outer_index, inner_index) into each embedding; the
+        # transport shuffles wire order, so correct mapping proves order-preservation.
+        transport = FakeTransport(_context_response([2, 1], order=[1, 0]))
+        provider = VoyageProvider("voyage-context-3", transport=transport)
+
+        groups = [[(5, "a0"), (6, "a1")], [(7, "b0")]]
+        (batch,) = list(provider.embed_chunk_group_batches(groups))
+
+        vectors_by_index = dict(zip(batch.indexes, batch.vectors))
+        # doc 0 chunk 0 -> (0,0); doc 0 chunk 1 -> (0,1); doc 1 chunk 0 -> (1,0).
+        assert vectors_by_index[5] == (0.0, 0.0, 0.0)
+        assert vectors_by_index[6] == (0.0, 1.0, 0.0)
+        assert vectors_by_index[7] == (1.0, 0.0, 0.0)
+
+    def test_oversize_document_splits_into_two_requests(self, monkeypatch):
+        # Force a tiny per-doc/request budget so a 2-chunk message splits.
+        monkeypatch.setattr(provider_mod, "count_tokens", lambda _t: 1000)
+        monkeypatch.setattr(
+            provider_mod, "_VOYAGE_CONTEXT_DOCUMENT_TOKEN_BUDGET", 1000
+        )
+        monkeypatch.setattr(
+            provider_mod, "_VOYAGE_CONTEXT_REQUEST_TOKEN_BUDGET", 1000
+        )
+        monkeypatch.setenv("VOYAGE_API_KEY", "test-key")
+        transport = FakeTransport(
+            _context_response([1]), _context_response([1])
+        )
+        provider = VoyageProvider("voyage-context-3", transport=transport)
+
+        groups = [[(0, "big0"), (1, "big1")]]
+        batches = list(provider.embed_chunk_group_batches(groups))
+
+        # Two requests, each one single-chunk sub-document.
+        assert len(transport.calls) == 2
+        assert transport.calls[0]["payload"]["inputs"] == [["big0"]]
+        assert transport.calls[1]["payload"]["inputs"] == [["big1"]]
+        # Every chunk still resolved to its own flat index.
+        resolved = sorted(i for b in batches for i in b.indexes)
+        assert resolved == [0, 1]
+
+    def test_oversize_single_chunk_is_skipped(self, monkeypatch):
+        # A single chunk above the per-chunk cap is non-embeddable -> skipped.
+        big = provider_mod._VOYAGE_CONTEXT_MAX_CHUNK_TOKENS + 1
+        monkeypatch.setattr(
+            provider_mod, "count_tokens",
+            lambda t: big if t == "huge" else 1,
+        )
+        monkeypatch.setenv("VOYAGE_API_KEY", "test-key")
+        transport = FakeTransport(_context_response([1]))
+        provider = VoyageProvider("voyage-context-3", transport=transport)
+
+        groups = [[(0, "huge"), (1, "ok")]]
+        (batch,) = list(provider.embed_chunk_group_batches(groups))
+
+        assert provider.last_skipped_documents == [0]
+        assert batch.indexes == (1,)
+        assert transport.calls[0]["payload"]["inputs"] == [["ok"]]
