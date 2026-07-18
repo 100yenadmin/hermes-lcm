@@ -1,6 +1,6 @@
 # hermes-lcm deterministic benchmarks
 
-This directory contains deterministic replay fixtures and policy files for benchmark-driven LCM preset work.
+This directory contains deterministic replay fixtures and policy files for benchmark-driven LCM preset work. For the retrieval-quality and judged-QA-accuracy benchmarks (LongMemEval harnesses, fairness rules, reproduction, results index), see [`METHODOLOGY.md`](METHODOLOGY.md).
 
 The benchmark harness is offline by default:
 
