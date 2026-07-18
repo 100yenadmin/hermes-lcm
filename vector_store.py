@@ -57,6 +57,13 @@ _INT8_MAX = 127
 # to a NumPy lookup array at query time). Indexing a uint8 XOR result into this
 # table and summing rows is the popcount without a per-element Python loop.
 _POPCOUNT_TABLE = tuple(bin(value).count("1") for value in range(256))
+# Revision tag that folds the float32 sign-bit prescreen opt-in
+# (LCM_EMBEDDING_BINARY_PRESCREEN) into the profile identity. A prescreen corpus
+# grows a companion sign-bit table that drives the two-stage KNN, so it MUST be a
+# distinct identity from a legacy binary-free float32 corpus — otherwise flipping
+# the flag on a populated identity leaves a mixed corpus the two-stage INNER JOIN
+# silently truncates. See VectorStore._prescreen_revision / FIX 1.
+_BINARY_PRESCREEN_REVISION_TAG = "binprescreen"
 _DEFAULT_TASK = "summary"
 _CHUNK_TASK = "chunk"
 # Tasks this store can encode. Summary and chunk corpora coexist in the shared
@@ -606,6 +613,28 @@ class VectorStore:
             raise ValueError(f"embedding profile is not registered: {target}")
         return self._identity_from_profile(profile)
 
+    def _prescreen_revision(self, revision: str, *, dtype: str) -> str:
+        """Fold the float32 sign-bit prescreen opt-in into the identity via revision.
+
+        ``LCM_EMBEDDING_BINARY_PRESCREEN`` changes a float32 identity's stored
+        corpus shape (it grows a companion sign-bit table that drives the
+        two-stage KNN), so a prescreen corpus MUST be a distinct identity from a
+        legacy binary-free one. Otherwise flipping the flag on a populated
+        float32 identity leaves a mixed corpus (a few post-flip rows with
+        sign-bits, the rest without) that the two-stage INNER JOIN silently
+        truncates while reporting coverage='full' (FIX 1).
+
+        Only the default (empty) revision is auto-tagged: an operator who set an
+        explicit revision has already taken ownership of identity separation (the
+        documented manual escape hatch), so their value is respected verbatim.
+        int8 identities always carry the prescreen and are already distinguished
+        by dtype, so the tag is float32-only — int8 identity hashes stay stable.
+        """
+        base = str(revision).strip()
+        if base or str(dtype).strip().lower() == _INT8_DTYPE:
+            return base
+        return _BINARY_PRESCREEN_REVISION_TAG if self._write_binary_prescreen else base
+
     def register_profile(
         self,
         model_name: str,
@@ -627,6 +656,7 @@ class VectorStore:
         needs no re-backfill). Exactly one profile is left active. Returns the
         identity hash.
         """
+        revision = self._prescreen_revision(revision, dtype=dtype)
         canonical = EmbeddingIdentity.canonical(
             provider, model_name, revision, dim, dtype, byteorder, task
         )
@@ -1579,6 +1609,37 @@ class VectorStore:
             return False
         return row is not None
 
+    def _binary_fully_synced(self, identity_hash: str, *, chunk: bool) -> bool:
+        """True iff EVERY stored vector for the identity has a sign-bit row.
+
+        Defense-in-depth for FIX 1: the two-stage path INNER JOINs the binary
+        table, so it is only correct when the binary corpus is a COMPLETE mirror
+        of the vector corpus. A partial binary corpus — e.g.
+        ``LCM_EMBEDDING_BINARY_PRESCREEN`` flipped on mid-life so sign-bits exist
+        only for rows written after the flip — would silently exclude every
+        pre-flip vector while reporting coverage='full'. When the counts disagree
+        (or no binary rows exist) this returns False so ``knn`` stays on the exact
+        scan with honest coverage. Both tables are written/deleted in lockstep for
+        a genuine prescreen identity (int8 or float32-with-prescreen), so a
+        fully-synced corpus reports equal counts.
+        """
+        binary_table = "lcm_chunk_binary" if chunk else "lcm_embedding_binary"
+        vector_table = "lcm_chunk_vectors" if chunk else "lcm_embedding_vectors"
+        try:
+            binary_count = self._conn.execute(
+                f"SELECT COUNT(*) FROM {binary_table} WHERE identity_hash = ?",
+                (str(identity_hash),),
+            ).fetchone()
+            vector_count = self._conn.execute(
+                f"SELECT COUNT(*) FROM {vector_table} WHERE identity_hash = ?",
+                (str(identity_hash),),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            return False
+        binary = int(binary_count[0]) if binary_count else 0
+        vectors = int(vector_count[0]) if vector_count else 0
+        return binary > 0 and binary == vectors
+
     def _load_chunk_binary_matrix(
         self,
         numpy: Any,
@@ -1823,10 +1884,12 @@ class VectorStore:
         except ImportError:
             numpy = None
 
-        # Two-stage full-corpus path when this identity has a sign-bit prescreen.
-        # The source filter stays on the exact bounded path (its lineage walk is
+        # Two-stage full-corpus path when this identity's sign-bit prescreen is a
+        # COMPLETE mirror of its vectors. A partial binary corpus (FIX 1) stays on
+        # the exact scan below so no vector is silently INNER-JOINed away. The
+        # source filter stays on the exact bounded path (its lineage walk is
         # budget-bounded and does not scale to a full-corpus scan).
-        if numpy is not None and source is None and self._has_binary(
+        if numpy is not None and source is None and self._binary_fully_synced(
             identity, chunk=False
         ):
             unfiltered = since is None and until is None and conversation_ids is None
@@ -2351,11 +2414,12 @@ class VectorStore:
         except ImportError:
             numpy = None
 
-        # Two-stage full-corpus path when this chunk identity has a sign-bit
-        # prescreen. Chunk filters are plain indexed message columns
-        # (timestamp/session_id/source), so they all apply in the binary load and
-        # coverage is 'full' over the whole (filtered) corpus.
-        if numpy is not None and self._has_binary(identity, chunk=True):
+        # Two-stage full-corpus path when this chunk identity's sign-bit prescreen
+        # is a COMPLETE mirror of its vectors (FIX 1 — a partial binary corpus
+        # would be silently truncated by the INNER JOIN). Chunk filters are plain
+        # indexed message columns (timestamp/session_id/source), so they all apply
+        # in the binary load over the whole (filtered) corpus.
+        if numpy is not None and self._binary_fully_synced(identity, chunk=True):
             unfiltered = (
                 since is None and until is None
                 and conversation_ids is None and source is None
