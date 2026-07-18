@@ -438,6 +438,34 @@ class TestChunkDryRun:
         result = handle_lcm_command("embed backfill --corpus chunks", engine)
         assert "status: refused" in result
 
+    def test_context_estimate_uses_grouped_caps_not_flat_27k(self):
+        """FIX 4: the contextualized estimate groups chunks per message, skips a
+        chunk only above the 32K per-chunk context cap (NOT the flat 27K per-doc
+        cap), and counts requests via the context planner -- so the cost/consent
+        preview matches the grouped apply path."""
+        from hermes_lcm.embedding_provider import _VOYAGE_CONTEXT_MAX_CHUNK_TOKENS
+
+        # message 1: two small chunks; message 2: one 30K chunk (27K<t<=32K -> now
+        # BILLABLE, was wrongly excluded by the old 27K cap) + one 40K chunk
+        # (>32K -> genuinely skipped by apply).
+        documents = [
+            ("1:0", "a", 10),
+            ("1:1", "b", 20),
+            ("2:0", "c", 30_000),
+            ("2:1", "d", _VOYAGE_CONTEXT_MAX_CHUNK_TOKENS + 8_000),
+        ]
+        est_tokens, est_cost_tokens, est_requests = command_mod._chunk_context_estimates(
+            documents
+        )
+        assert est_tokens == 10 + 20 + 30_000 + (_VOYAGE_CONTEXT_MAX_CHUNK_TOKENS + 8_000)
+        # Billable = every chunk at/under the 32K per-chunk cap (the 30K chunk is
+        # charged; the >32K chunk is skipped). The old flat estimate wrongly
+        # dropped the 30K chunk at 27K.
+        assert est_cost_tokens == 10 + 20 + 30_000
+        # Two messages -> two grouped documents packed into a single context
+        # request (well under the request budgets).
+        assert est_requests == 1
+
 
 class TestChunkApply:
     def test_records_meta_and_is_idempotent(self, monkeypatch, tmp_path):
@@ -577,6 +605,36 @@ class TestChunkContextualizedGrouping:
         assert len(meta_ids) == sum(len(inner) for inner in inputs)
         # Each row keyed store_id:chunk_index -> two messages, chunk 0 and 1 each.
         assert set(meta_ids) == {"1:0", "1:1", "2:0", "2:1"}
+
+    def test_dry_run_estimated_batches_match_apply_requests(self, monkeypatch, tmp_path):
+        """FIX 4: the dry-run 'estimated_batches' equals the number of context
+        requests the grouped apply path actually dispatches, so the preview
+        matches apply's request shape."""
+        import hermes_lcm.embedding_provider as provider_mod
+
+        monkeypatch.setenv("VOYAGE_API_KEY", "test-key")
+        engine = self._voyage_context_engine(tmp_path)
+
+        # Dry-run first (no writes): capture the estimated request count.
+        dry = handle_lcm_command("embed backfill --corpus chunks", engine)
+        estimated_batches = int(
+            next(
+                line.split(":", 1)[1].strip()
+                for line in dry.splitlines()
+                if line.startswith("estimated_batches:")
+            )
+        )
+        assert _chunk_meta_ids(engine) == []  # dry-run wrote nothing
+
+        # Apply with a request-recording transport: count real dispatches.
+        transport = _ContextFakeTransport()
+        provider = provider_mod.VoyageProvider("voyage-context-3", transport=transport)
+        monkeypatch.setattr(command_mod, "resolve_provider", lambda _c, **_k: provider)
+        out = handle_lcm_command(
+            "embed backfill --corpus chunks --apply --confirm-raw-text", engine
+        )
+        assert "status: refused" not in out
+        assert estimated_batches == len(transport.calls)
 
 
 class TestProviderChunkDocumentBatchesFlatPath:

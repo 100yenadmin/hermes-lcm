@@ -65,6 +65,13 @@ from .embedding_provider import (
     FastembedProvider,
     ProviderPreDispatchError,
     VoyageError,
+    _VOYAGE_CONTEXT_DOCUMENT_TOKEN_BUDGET,
+    _VOYAGE_CONTEXT_MAX_CHUNK_TOKENS,
+    _VOYAGE_CONTEXT_MAX_REQUEST_CHUNKS,
+    _VOYAGE_CONTEXT_REQUEST_TOKEN_BUDGET,
+    _VOYAGE_MAX_BATCH_ITEMS,
+    _is_voyage_context_model,
+    _plan_contextualized_requests,
     default_chunk_model,
     fastembed_download_size_note,
     resolve_provider,
@@ -2754,6 +2761,53 @@ def _embedding_batch_estimate(provider: str, token_counts: list[int]) -> int:
     return estimated
 
 
+def _chunk_context_estimates(
+    documents: list[tuple[str, str, int]]
+) -> tuple[int, int, int]:
+    """Estimate tokens/billable-tokens/requests for the contextualized chunk path.
+
+    The dry-run estimate must match what the grouped apply path actually sends
+    (FIX 4). Apply slices the selected documents into ``_EMBEDDING_BACKFILL_BATCH_SIZE``
+    batches, groups each batch's chunks per source message
+    (``group_by_store_id``), drops any single chunk over the per-chunk context cap
+    (``_VOYAGE_CONTEXT_MAX_CHUNK_TOKENS`` = 32K, NOT the flat 27K per-document cap),
+    and packs the surviving per-message documents into requests via
+    ``_plan_contextualized_requests``. Mirror that flow exactly so the request
+    count and billable tokens preview equal apply's, rather than the pre-C2 flat
+    per-document packing (``_embedding_batch_estimate``).
+    """
+    total_tokens = sum(int(document[2]) for document in documents)
+    billable_tokens = 0
+    total_requests = 0
+    for offset in range(0, len(documents), _EMBEDDING_BACKFILL_BATCH_SIZE):
+        batch = documents[offset:offset + _EMBEDDING_BACKFILL_BATCH_SIZE]
+        store_ids = [str(item[0]).split(":", 1)[0] for item in batch]
+        per_document_tokens: list[list[int]] = []
+        for group_indexes in group_by_store_id(store_ids):
+            kept: list[int] = []
+            for index in group_indexes:
+                tokens = int(batch[index][2])
+                # A single chunk above the per-chunk cap is non-embeddable and is
+                # skipped by the provider before grouping -> not sent, not billed.
+                if tokens > _VOYAGE_CONTEXT_MAX_CHUNK_TOKENS:
+                    continue
+                kept.append(tokens)
+                billable_tokens += tokens
+            if kept:
+                per_document_tokens.append(kept)
+        if per_document_tokens:
+            total_requests += len(
+                _plan_contextualized_requests(
+                    per_document_tokens,
+                    doc_token_budget=_VOYAGE_CONTEXT_DOCUMENT_TOKEN_BUDGET,
+                    request_token_budget=_VOYAGE_CONTEXT_REQUEST_TOKEN_BUDGET,
+                    request_chunk_budget=_VOYAGE_CONTEXT_MAX_REQUEST_CHUNKS,
+                    max_inputs=_VOYAGE_MAX_BATCH_ITEMS,
+                )
+            )
+    return total_tokens, billable_tokens, total_requests
+
+
 def _embedding_estimated_cost(provider: str, model: str, tokens: int) -> float:
     if provider.lower() != "voyage":
         return 0.0
@@ -4340,6 +4394,16 @@ def _chunk_backfill_text(
         read_conn.close()
 
     def _estimates(documents: list[tuple[str, str, int]]) -> tuple[int, int, int]:
+        # The contextualized (voyage-context) chunk apply path groups a message's
+        # chunks into one document, skips a chunk only above the 32K per-chunk
+        # context cap, and plans requests by the context budgets. Model that
+        # exactly so the cost/consent preview matches apply (FIX 4). Plain-voyage
+        # and local providers keep the flat per-document estimate.
+        if (
+            provider_name.strip().lower() in {"voyage", "voyageai"}
+            and _is_voyage_context_model(model)
+        ):
+            return _chunk_context_estimates(documents)
         est_tokens = sum(document[2] for document in documents)
         est_cost_tokens = sum(
             document[2]
