@@ -309,7 +309,7 @@ def test_record_normalizes_vector_before_packing(stores):
 )
 def test_profile_rejects_unsupported_vector_representation(stores, identity_field):
     _dag, store = stores
-    with pytest.raises(ValueError, match="supported representation is float32/little/summary"):
+    with pytest.raises(ValueError, match=r"supported representation is float32\|int8/little/summary"):
         store.register_profile("unsupported", "local", 2, **identity_field)
 
 
@@ -1319,9 +1319,9 @@ def test_numpy_candidate_load_is_sql_bounded(tmp_path, monkeypatch):
         loaded: list[int] = []
         original = store._numpy_rows
 
-        def counted(np, identity_hash, dim, ids):
+        def counted(np, identity_hash, dim, ids, dtype="float32"):
             loaded.append(len(ids))
-            return original(np, identity_hash, dim, ids)
+            return original(np, identity_hash, dim, ids, dtype)
 
         monkeypatch.setattr(store, "_numpy_rows", counted)
         result = store.knn([1.0, 0.0], k=1, model="m")
