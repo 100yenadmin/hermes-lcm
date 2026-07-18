@@ -4214,6 +4214,15 @@ def _chunk_authorized_uncertain_rows(
         store_id_str, index_str = chunk_id.split(":", 1)
         documents.append((chunk_id, text, tokens))
         meta[chunk_id] = (int(store_id_str), int(index_str), char_start, char_end)
+    # Rows are SELECTed by (updated_at, embedded_id) to pick WHICH uncertain
+    # chunks fall inside the retry budget, but that interleaves store_ids.
+    # ``group_by_store_id`` only merges ADJACENT equal store_ids, so an
+    # interleaved order collapses every retry chunk into a singleton group,
+    # defeating C2 cross-chunk contextualization on the retry path. Stably
+    # re-sort the selected documents by (store_id, chunk_index) so a message's
+    # chunks are contiguous and group into one contextualization document —
+    # matching the discovery path's natural store_id-ordered emission (FIX 3).
+    documents.sort(key=lambda item: meta[item[0]][:2])
     return len(documents), documents, meta
 
 

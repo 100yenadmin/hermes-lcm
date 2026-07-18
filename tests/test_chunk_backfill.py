@@ -214,6 +214,84 @@ class TestChunkRetryUncertainSpans:
         assert (char_start, char_end) == (expected.char_start, expected.char_end)
         assert char_end > char_start
 
+    def test_authorized_uncertain_rows_group_per_message_despite_interleave(
+        self, tmp_path
+    ):
+        """FIX 3: uncertain rows are SELECTed by (updated_at, embedded_id), which
+        interleaves store_ids. Since ``group_by_store_id`` only merges adjacent
+        equal store_ids, an interleaved order would collapse every retry chunk
+        into a singleton group and defeat C2 contextualization. The retry path
+        must stably re-sort documents by (store_id, chunk_index) so each message's
+        chunks stay contiguous and group into one contextualization document."""
+        from hermes_lcm.chunking import chunk_message, group_by_store_id
+        from hermes_lcm import db_bootstrap
+
+        engine = _engine(tmp_path)
+        # Many sentence boundaries so each message splits into several ~600-token
+        # chunks (the chunker splits at sentence boundaries, not raw length).
+        content = " ".join(
+            f"This is verbatim payload sentence {i} about kanban dashboards."
+            for i in range(400)
+        )
+        _seed_messages(
+            engine,
+            [
+                (1, "sess-a", "history", "user", content, 1.0),
+                (2, "sess-a", "history", "user", content, 2.0),
+            ],
+        )
+        chunks_1 = chunk_message(1, "user", content, policy="conversational")
+        chunks_2 = chunk_message(2, "user", content, policy="conversational")
+        assert len(chunks_1) >= 2 and len(chunks_2) >= 2  # multi-chunk messages
+
+        identity = "test-chunk-identity"
+        conn = sqlite3.connect(engine._store.db_path)
+        try:
+            db_bootstrap.ensure_embedding_tables(conn)
+            db_bootstrap.ensure_chunk_tables(conn)
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS lcm_embedding_backfill_inflight (
+                    embedded_id TEXT, identity_hash TEXT, state TEXT,
+                    updated_at REAL,
+                    PRIMARY KEY(embedded_id, identity_hash)
+                )
+                """
+            )
+            # Interleave updated_at so the SQL order alternates message 1 / 2.
+            interleaved = []
+            for i in range(max(len(chunks_1), len(chunks_2))):
+                if i < len(chunks_1):
+                    interleaved.append(chunks_1[i].chunk_id)
+                if i < len(chunks_2):
+                    interleaved.append(chunks_2[i].chunk_id)
+            for ordinal, chunk_id in enumerate(interleaved):
+                conn.execute(
+                    "INSERT INTO lcm_embedding_backfill_inflight"
+                    "(embedded_id, identity_hash, state, updated_at) "
+                    "VALUES(?, ?, 'uncertain', ?)",
+                    (chunk_id, identity, float(ordinal)),
+                )
+            conn.commit()
+            count, documents, meta = command_mod._chunk_authorized_uncertain_rows(
+                conn, identity, "conversational", 100
+            )
+        finally:
+            conn.close()
+
+        assert count == len(chunks_1) + len(chunks_2)
+        store_ids = [meta[chunk_id][0] for chunk_id, _text, _tokens in documents]
+        groups = group_by_store_id(store_ids)
+        # Exactly one group per message -- NOT one singleton per chunk.
+        assert len(groups) == 2
+        assert sorted(len(g) for g in groups) == sorted(
+            [len(chunks_1), len(chunks_2)]
+        )
+        # Within a message, chunk_index order is preserved.
+        for group in groups:
+            indexes = [meta[documents[pos][0]][1] for pos in group]
+            assert indexes == sorted(indexes)
+
 
 class TestChunkRawTextConsentGate:
     def _voyage_engine(self, tmp_path):
