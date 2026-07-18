@@ -101,6 +101,7 @@ from .message_analysis import (
     _matched_tool_call_ids,
     _tool_call_id,
 )
+from .fresh_tail import FreshTailBoundary, resolve_fresh_tail_boundary
 from .message_patterns import compile_message_patterns, matches_message_pattern
 from .aux_session import AuxiliarySessionMixin
 from .placeholder_ledger import PlaceholderLedgerMixin
@@ -1483,12 +1484,58 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._clear_pending_reset_boundary()
 
     def _raw_backlog_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        n = len(messages)
-        fresh_tail_start = max(0, n - self._config.fresh_tail_count)
+        fresh_tail_start = self._fresh_tail_start(messages)
         leading_anchor_count = self._leading_anchor_count(messages)
         if fresh_tail_start <= leading_anchor_count:
             return []
         return messages[leading_anchor_count:fresh_tail_start]
+
+    def _fresh_tail_boundary(self, messages: List[Dict[str, Any]]) -> FreshTailBoundary:
+        return resolve_fresh_tail_boundary(
+            messages,
+            fresh_tail_count=self._config.fresh_tail_count,
+            fresh_tail_max_tokens=self._config.fresh_tail_max_tokens,
+        )
+
+    def _fresh_tail_start(self, messages: List[Dict[str, Any]]) -> int:
+        return self._fresh_tail_boundary(messages).start
+
+    def _get_session_fresh_tail(
+        self,
+        session_id: str,
+        *,
+        minimum_count: int = 0,
+    ) -> tuple[List[Dict[str, Any]], FreshTailBoundary]:
+        """Load and resolve a stored tail, expanding backward for tool pairing."""
+        total_count = int(self._store.get_session_count(session_id))
+        configured_count = max(minimum_count, int(self._config.fresh_tail_count or 0))
+        if self._config.fresh_tail_max_tokens > 0:
+            configured_count = max(1, configured_count)
+        if total_count <= 0 or configured_count <= 0:
+            return [], resolve_fresh_tail_boundary(
+                [],
+                fresh_tail_count=configured_count,
+                fresh_tail_max_tokens=self._config.fresh_tail_max_tokens,
+            )
+
+        load_limit = min(total_count, configured_count)
+        while True:
+            rows = self._store.get_session_tail(session_id, load_limit)
+            boundary = resolve_fresh_tail_boundary(
+                rows,
+                fresh_tail_count=configured_count,
+                fresh_tail_max_tokens=self._config.fresh_tail_max_tokens,
+            )
+            selected = rows[boundary.start:]
+            unresolved_tool_boundary = bool(
+                selected
+                and selected[0].get("role") == "tool"
+                and not boundary.tool_group_extended
+                and load_limit < total_count
+            )
+            if not unresolved_tool_boundary:
+                return selected, boundary
+            load_limit = min(total_count, max(load_limit + 1, load_limit * 2))
 
     @staticmethod
     def _leading_anchor_count(messages: List[Dict[str, Any]]) -> int:
@@ -5363,8 +5410,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
           ``LCM_IGNORE_SESSION_PATTERNS``.
         - ``session_stateless``: foreground session matched
           ``LCM_STATELESS_SESSION_PATTERNS``.
-        - ``no_pre_tail_content``: total stored messages do not exceed
-          ``fresh_tail_count``; nothing to rotate.
+        - ``no_pre_tail_content``: no stored messages precede the resolved
+          count/token-bounded fresh tail; nothing to rotate.
         - ``empty_tail``: tail query returned no rows despite a non-zero
           count (concurrent deletion race); rotate cannot compute a boundary.
         - ``frontier_already_ahead``: lifecycle frontier is already at or
@@ -5385,6 +5432,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
         fresh_tail_count = max(1, int(self._config.fresh_tail_count))
         total_count = int(self._store.get_session_count(session_id))
+        tail, fresh_tail_boundary = self._get_session_fresh_tail(
+            session_id,
+            minimum_count=1,
+        )
+        effective_fresh_tail_count = len(tail)
 
         state = self._lifecycle.get_by_conversation(conversation_id)
         current_frontier = int(state.current_frontier_store_id) if state else 0
@@ -5395,11 +5447,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "conversation_id": conversation_id,
             "total_message_count": total_count,
             "fresh_tail_count": fresh_tail_count,
+            "fresh_tail_max_tokens": self._config.fresh_tail_max_tokens,
+            "effective_fresh_tail_count": effective_fresh_tail_count,
+            "effective_fresh_tail_tokens": fresh_tail_boundary.tokens,
+            "fresh_tail_token_limited": fresh_tail_boundary.token_limited,
+            "fresh_tail_tool_group_extended": fresh_tail_boundary.tool_group_extended,
             "current_frontier_store_id": current_frontier,
             "mode": "apply" if apply else "preview",
         }
 
-        if total_count <= fresh_tail_count:
+        if total_count <= effective_fresh_tail_count:
             return {
                 **base,
                 "noop": True,
@@ -5408,7 +5465,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 "new_frontier_store_id": current_frontier,
             }
 
-        tail = self._store.get_session_tail(session_id, fresh_tail_count)
         if not tail:
             # Concurrent deletion can empty the tail after the count check.
             # Surface the same shape callers expect for any other no-op so
