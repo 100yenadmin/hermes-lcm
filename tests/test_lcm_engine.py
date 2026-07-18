@@ -26104,6 +26104,69 @@ class TestHandleGrepExternalizedPayloads:
 
         assert "session_scope=current only" in result["error"]
 
+    def test_role_filter_omits_externalized_sidecar_hits(self, externalized_search_engine):
+        # The role schema documents "returns raw message hits only". Externalized
+        # sidecars are tool/ingest payloads, not raw messages, so a role filter
+        # must suppress them rather than leak an unfiltered payload -- even when
+        # the sidecar's own stored role would match the requested value.
+        externalized_search_engine._store.append(
+            "test-session", {"role": "user", "content": "history needle from user"}
+        )
+        self._externalize(externalized_search_engine, "tool payload needle " * 20)
+
+        # A non-matching role over externalized-only scope returns nothing.
+        externalized_only = json.loads(
+            externalized_search_engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "needle", "content_scope": "externalized", "role": "user"},
+            )
+        )
+        assert externalized_only["total_results"] == 0
+        assert externalized_only["results"] == []
+        assert externalized_only["externalized_results_omitted"] is True
+        assert "externalized_scan" not in externalized_only
+
+        # Even role="tool" (which matches the sidecar's stored role) stays
+        # suppressed: the contract is raw-message hits only, not filtered sidecars.
+        matching_role = json.loads(
+            externalized_search_engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "needle", "content_scope": "externalized", "role": "tool"},
+            )
+        )
+        assert matching_role["total_results"] == 0
+        assert matching_role["externalized_results_omitted"] is True
+
+        # Under content_scope="both" the raw-message hits survive; sidecars do not.
+        both = json.loads(
+            externalized_search_engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "needle", "content_scope": "both", "role": "user"},
+            )
+        )
+        assert {item["type"] for item in both["results"]} == {"message"}
+        assert both["externalized_results_omitted"] is True
+
+    def test_time_filter_omits_externalized_sidecar_hits(self, externalized_search_engine):
+        # time_from/time_to are documented as raw-message-only filters; sidecar
+        # search must be suppressed when they are supplied.
+        self._externalize(externalized_search_engine, "timed payload needle " * 20)
+
+        result = json.loads(
+            externalized_search_engine.handle_tool_call(
+                "lcm_grep",
+                {
+                    "query": "needle",
+                    "content_scope": "externalized",
+                    "time_from": 0,
+                },
+            )
+        )
+
+        assert result["total_results"] == 0
+        assert result["externalized_results_omitted"] is True
+        assert "externalized_scan" not in result
+
 
 class TestHandleExpandStoreId:
     """lcm_expand store_id mode for cross-session raw expansion."""

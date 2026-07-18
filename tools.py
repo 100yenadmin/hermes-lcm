@@ -1262,7 +1262,15 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
             logger.warning("Node search failed: %s", exc)
 
     externalized_scan: dict[str, Any] | None = None
-    if searches_externalized:
+    externalized_results_omitted = False
+    if searches_externalized and raw_message_filter_active:
+        # Externalized sidecars are tool/ingest payloads, not raw messages, and
+        # carry no role/timestamp/conversation lane comparable to history rows.
+        # The role/time_from/time_to schema contract documents these filters as
+        # returning raw-message hits only, so suppress sidecar search here rather
+        # than leak unfiltered payloads. Mirrors the summary-node omission above.
+        externalized_results_omitted = True
+    elif searches_externalized:
         try:
             storage_dir = get_large_output_storage_dir(
                 engine._config,
@@ -1474,6 +1482,8 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
         response["time_to"] = time_to
     if raw_message_filter_active:
         response["summary_results_omitted"] = True
+    if externalized_results_omitted:
+        response["externalized_results_omitted"] = True
     if session_scope == "session":
         response["session_id"] = explicit_session_id
     if requested_limit > _LCM_GREP_HARD_LIMIT_CAP:
