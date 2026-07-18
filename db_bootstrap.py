@@ -1226,6 +1226,13 @@ def ensure_embedding_tables(conn: sqlite3.Connection) -> None:
             vec BLOB NOT NULL,
             PRIMARY KEY(embedded_id, identity_hash)
         );
+
+        CREATE TABLE IF NOT EXISTS lcm_embedding_binary (
+            embedded_id TEXT,
+            identity_hash TEXT,
+            bits BLOB NOT NULL,
+            PRIMARY KEY(embedded_id, identity_hash)
+        );
         """
     )
 
@@ -1239,6 +1246,9 @@ _REQUIRED_EMBEDDING_TABLES = (
     "lcm_embedding_profile",
     "lcm_embedding_meta",
     "lcm_embedding_vectors",
+    # Sign-bit prescreen for the two-stage KNN. Present on every embedding
+    # schema (empty for float32 identities), populated only for int8 identities.
+    "lcm_embedding_binary",
 )
 _REQUIRED_EMBEDDING_INDEXES = (
     "idx_lcm_embedding_profile_model",
@@ -1275,6 +1285,11 @@ _EMBEDDING_TABLE_SHAPES: dict[
         ("identity_hash", "TEXT", 0, 2, None),
         ("vec", "BLOB", 1, 0, None),
     ),
+    "lcm_embedding_binary": (
+        ("embedded_id", "TEXT", 0, 1, None),
+        ("identity_hash", "TEXT", 0, 2, None),
+        ("bits", "BLOB", 1, 0, None),
+    ),
 }
 
 _EMBEDDING_INDEX_SHAPES: dict[
@@ -1296,6 +1311,7 @@ _EMBEDDING_CHECKS = {
     "lcm_embedding_profile": {"dimbetween1and4096"},
     "lcm_embedding_meta": {"embedded_kindin('summary')"},
     "lcm_embedding_vectors": set(),
+    "lcm_embedding_binary": set(),
 }
 
 
@@ -1374,7 +1390,7 @@ def verify_embedding_schema(conn: sqlite3.Connection) -> list[str]:
         str(row[0]): " ".join(str(row[1] or "").lower().split())
         for row in conn.execute(
             "SELECT name, sql FROM sqlite_master WHERE type = 'table' "
-            "AND name IN (?, ?, ?)",
+            "AND name IN (%s)" % ",".join("?" for _ in _REQUIRED_EMBEDDING_TABLES),
             _REQUIRED_EMBEDDING_TABLES,
         ).fetchall()
     }
@@ -1463,6 +1479,13 @@ def ensure_chunk_tables(conn: sqlite3.Connection) -> None:
             vec BLOB NOT NULL,
             PRIMARY KEY(chunk_id, identity_hash)
         );
+
+        CREATE TABLE IF NOT EXISTS lcm_chunk_binary (
+            chunk_id TEXT,
+            identity_hash TEXT,
+            bits BLOB NOT NULL,
+            PRIMARY KEY(chunk_id, identity_hash)
+        );
         """
     )
 
@@ -1474,6 +1497,9 @@ def ensure_chunk_tables(conn: sqlite3.Connection) -> None:
 _REQUIRED_CHUNK_TABLES = (
     "lcm_chunk_meta",
     "lcm_chunk_vectors",
+    # Sign-bit prescreen for the two-stage chunk KNN. Present on every chunk
+    # schema (empty for float32 identities), populated only for int8 identities.
+    "lcm_chunk_binary",
 )
 _REQUIRED_CHUNK_INDEXES = (
     "idx_lcm_chunk_meta_identity_embedded_at",
@@ -1498,6 +1524,11 @@ _CHUNK_TABLE_SHAPES: dict[
         ("chunk_id", "TEXT", 0, 1, None),
         ("identity_hash", "TEXT", 0, 2, None),
         ("vec", "BLOB", 1, 0, None),
+    ),
+    "lcm_chunk_binary": (
+        ("chunk_id", "TEXT", 0, 1, None),
+        ("identity_hash", "TEXT", 0, 2, None),
+        ("bits", "BLOB", 1, 0, None),
     ),
 }
 

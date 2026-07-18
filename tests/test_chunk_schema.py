@@ -38,6 +38,7 @@ class TestChunkSchema:
             "CREATE TABLE lcm_chunk_meta (chunk_id TEXT PRIMARY KEY, wrong INTEGER)"
         )
         conn.execute("CREATE TABLE lcm_chunk_vectors (chunk_id TEXT, identity_hash TEXT, vec BLOB NOT NULL, PRIMARY KEY(chunk_id, identity_hash))")
+        conn.execute("CREATE TABLE lcm_chunk_binary (chunk_id TEXT, identity_hash TEXT, bits BLOB NOT NULL, PRIMARY KEY(chunk_id, identity_hash))")
         conn.execute(
             "CREATE INDEX idx_lcm_chunk_meta_identity_embedded_at "
             "ON lcm_chunk_meta(chunk_id)"

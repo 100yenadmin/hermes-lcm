@@ -354,6 +354,9 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("rerank_enabled", "LCM_RERANK_ENABLED", bool),
     _EnvFieldSpec("recall_scan_rows", "LCM_RECALL_SCAN_ROWS", int),
     _EnvFieldSpec("embedding_bounded_scan_rows", "LCM_EMBEDDING_BOUNDED_SCAN_ROWS", int),
+    _EnvFieldSpec("embedding_storage_dtype", "LCM_EMBEDDING_STORAGE_DTYPE", str),
+    _EnvFieldSpec("embedding_store_dim", "LCM_EMBEDDING_STORE_DIM", int),
+    _EnvFieldSpec("knn_prescreen_multiplier", "LCM_KNN_PRESCREEN_MULTIPLIER", int),
     _EnvFieldSpec("embedding_provider", "LCM_EMBEDDING_PROVIDER", str),
     _EnvFieldSpec("embedding_model", "LCM_EMBEDDING_MODEL", str),
     _EnvFieldSpec("embedding_content_policy", "LCM_EMBED_CONTENT_POLICY", str),
@@ -552,6 +555,22 @@ class LCMConfig:
     # rerank is one extra billable API call the operator opts into.
     rerank_enabled: bool = False
     embedding_bounded_scan_rows: int = 2_000
+    # Vector storage dtype for NEWLY-registered embedding profiles: float32
+    # (default; a stock install keeps summary vectors byte-identical) or int8
+    # (per-vector symmetric quantization + a binary sign-bit prescreen column,
+    # unlocking full-corpus two-stage KNN). dtype is part of the profile identity
+    # hash, so an int8 identity never mixes with existing float32 vectors.
+    embedding_storage_dtype: str = "float32"
+    # Optional Matryoshka store dimension for newly-registered profiles (0 =
+    # full profile dim). When >0 and < the provider dim, vectors are truncated
+    # to this many leading dims and renormalized before storage/quantization.
+    # Also a profile-identity component (the stored dim is hashed), so truncated
+    # vectors never mix with full-dim ones.
+    embedding_store_dim: int = 0
+    # Stage-1 prescreen breadth for the two-stage (binary Hamming -> int8/float
+    # rescore) KNN: M = knn_prescreen_multiplier x k survivors are rescored.
+    # Larger widens the approximate prescreen toward exact recall at more cost.
+    knn_prescreen_multiplier: int = 4
     # lcm_recall candidate-scan bound. lcm_recall promises "all conversations,
     # all time", so it must NOT inherit the small recency-truncating grep bound
     # above (that structurally hides the oldest memories). This larger bound
