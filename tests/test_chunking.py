@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from hermes_lcm.chunking import (
     chunk_message,
+    group_by_store_id,
     iter_message_chunks,
     normalize_content_policy,
     _CHUNK_TARGET_TOKENS,
@@ -189,3 +190,21 @@ class TestIterMessageChunks:
         ]
         chunks = list(iter_message_chunks(rows, policy="full"))
         assert {c.store_id for c in chunks} == {5, 6}
+
+
+class TestGroupByStoreId:
+    def test_groups_contiguous_runs_preserving_order(self):
+        # Two chunks of message 1, one of 2, three of 3 (discovery order).
+        store_ids = [1, 1, 2, 3, 3, 3]
+        assert group_by_store_id(store_ids) == [[0, 1], [2], [3, 4, 5]]
+
+    def test_empty(self):
+        assert group_by_store_id([]) == []
+
+    def test_single_chunk_per_message(self):
+        assert group_by_store_id([7, 8, 9]) == [[0], [1], [2]]
+
+    def test_non_adjacent_same_store_stays_separate(self):
+        # Consecutive-run grouping: a repeat that is not adjacent opens a new
+        # document (chunk discovery never emits a message's chunks non-contiguously).
+        assert group_by_store_id([1, 2, 1]) == [[0], [1], [2]]
