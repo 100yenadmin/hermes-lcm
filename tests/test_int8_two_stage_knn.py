@@ -3,7 +3,7 @@
 SPEC C1. These exercise the additive, default-off int8 storage dtype and the
 full-corpus two-stage KNN. The legacy float32 path is covered by the existing
 vector-store suites (which must stay green); here we assert the new int8 identity
-is distinct, the sign-bit prescreen is written and consulted, coverage='full' is
+is distinct, the sign-bit prescreen is written and consulted, coverage='full_approx'
 reported, and stage-1 recall@M meets the spec bar on a synthetic 5k set.
 """
 from __future__ import annotations
@@ -138,7 +138,7 @@ def test_two_stage_reports_full_coverage(tmp_path):
             )
         result = vs.knn_chunks([1.0, 0.0, 0.0, 0.0], k=2, model=MODEL, provider=PROVIDER)
         # Full corpus reached despite bounded_scan_rows=1 -> the two-stage path fired.
-        assert result.coverage == "full"
+        assert result.coverage == "full_approx"
         assert result[0][0] == "0:0"
     finally:
         vs.close()
@@ -211,7 +211,7 @@ def test_two_stage_recall_vs_exact_float_through_store(tmp_path):
             )
         query = base
         result = vs.knn_chunks(query.tolist(), k=k, model=MODEL, provider=PROVIDER)
-        assert result.coverage == "full"
+        assert result.coverage == "full_approx"
         got = {row[0] for row in result}
         exact = {f"{i}:0" for i in np.argsort(-(vecs @ query))[:k].tolist()}
         assert len(got & exact) / k >= 0.98
@@ -301,7 +301,7 @@ def test_float32_prescreen_opt_in_writes_binary_and_stays_exact(tmp_path):
         assert vs.connection.execute("SELECT COUNT(*) FROM lcm_chunk_binary").fetchone()[0] == n
 
         result = vs.knn_chunks(base.tolist(), k=k, model=MODEL, provider=PROVIDER)
-        assert result.coverage == "full"
+        assert result.coverage == "full_approx"
         got = {row[0] for row in result}
         # Exact float rescore of survivors: score-threshold recall (ties-safe).
         scores = vecs @ base

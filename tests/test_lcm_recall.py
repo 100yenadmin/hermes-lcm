@@ -482,6 +482,28 @@ def test_bounded_chunk_coverage_surfaces_as_degraded(recall_engine, monkeypatch)
     assert "of 3 vectors" in payload["degraded_reason"]
 
 
+def test_two_stage_full_approx_coverage_surfaces_as_approximate(recall_engine, monkeypatch):
+    """FIX 2: a two-stage (binary prescreen) summary arm reaches the whole corpus
+    but ranks approximately, so it reports coverage='full_approx' and discloses
+    the approximate prescreen in degraded_reason (like 'bounded' is disclosed),
+    rather than passing as an exact 'full'."""
+    recall_engine._config.embedding_binary_prescreen = True
+    node = _add_summary(
+        recall_engine, "kanban board dashboard sprint plan",
+        session_id="session-a", created_at=10.0,
+    )
+    _seed_summary_vectors(recall_engine, [(node, [1.0, 0.0])])
+
+    payload = _recall(recall_engine, monkeypatch, include="summaries", limit=5)
+
+    assert payload["provenance"]["coverage"].get("summary") == "full_approx"
+    assert payload["degraded"] is True
+    assert "summary arm coverage full_approx" in payload["degraded_reason"]
+    assert "approximate" in payload["degraded_reason"]
+    # The corpus was still reached: the hit is returned, not dropped.
+    assert node in {hit["node_id"] for hit in payload["hits"]}
+
+
 def test_pooled_vector_store_survives_across_recall_calls(recall_engine, monkeypatch):
     """F2-matrix-cache-never-persists: back-to-back recalls reuse ONE pooled
     VectorStore whose matrix cache survives, instead of building+closing a fresh

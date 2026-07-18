@@ -1908,7 +1908,10 @@ class VectorStore:
                 numpy, identity, dim, dtype, query, k, binary_ids, binary_matrix,
                 chunk=False,
             )
-            return KNNResult(candidates, coverage="full")
+            # coverage='full_approx' (FIX 2): the whole corpus is REACHED, but
+            # stage-1 Hamming keeps only M=mult*k survivors, so top-k is an
+            # approximate (recall@M) result, not exact like the exact-scan 'full'.
+            return KNNResult(candidates, coverage="full_approx")
 
         limit = max(0, self.bounded_scan_rows)
         # Probe at most bound+1 through the indexed candidate query. This
@@ -2439,7 +2442,9 @@ class VectorStore:
                 numpy, identity, dim, dtype, query, k, binary_ids, binary_matrix,
                 chunk=True,
             )
-            return KNNResult(candidates, coverage="full")
+            # coverage='full_approx' (FIX 2): whole corpus reached, but stage-1
+            # keeps only M=mult*k survivors -> approximate top-k, not exact.
+            return KNNResult(candidates, coverage="full_approx")
 
         limit = max(0, self.bounded_scan_rows)
         probed_ids = self._bounded_chunk_candidate_ids(
