@@ -1263,11 +1263,16 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
 
     externalized_scan: dict[str, Any] | None = None
     if searches_externalized:
-        storage_dir = get_large_output_storage_dir(
-            engine._config,
-            hermes_home=engine._hermes_home,
-            create=False,
-        )
+        try:
+            storage_dir = get_large_output_storage_dir(
+                engine._config,
+                hermes_home=engine._hermes_home,
+                create=False,
+            )
+        except (OSError, ValueError) as exc:
+            return json.dumps({
+                "error": f"Externalized payload storage is unavailable: {exc}",
+            })
         scan_counts = {
             "candidate_files": 0,
             "discovery_files": 0,
@@ -1307,14 +1312,19 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
                     max_read_bytes=_LCM_GREP_EXTERNALIZED_METADATA_READ_BYTES,
                 )
                 if metadata.get("readable"):
-                    payload = read_externalized_payload_search_prefix(
-                        ref,
-                        config=engine._config,
-                        hermes_home=engine._hermes_home,
-                        # Re-open with no-follow/inode checks after strict
-                        # metadata validation; the candidate scan reads content.
-                        max_content_bytes=1,
-                    )
+                    try:
+                        payload = read_externalized_payload_search_prefix(
+                            ref,
+                            config=engine._config,
+                            hermes_home=engine._hermes_home,
+                            # Re-open with no-follow/inode checks after strict
+                            # metadata validation; the candidate scan reads content.
+                            max_content_bytes=1,
+                        )
+                    except (OSError, ValueError) as exc:
+                        return json.dumps({
+                            "error": f"Externalized payload storage is unavailable: {exc}",
+                        })
                     status = payload.get("status")
                     if status == "symlink":
                         scan_counts["rejected_symlink"] += 1
@@ -1334,14 +1344,36 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
             candidate_refs = externalized_refs
         scan_counts["candidate_files"] = len(candidate_refs)
 
-        response_chars = 0
+        externalized_matches: list[dict[str, Any]] = []
         for ref in candidate_refs:
-            payload = read_externalized_payload_search_prefix(
-                ref,
-                config=engine._config,
-                hermes_home=engine._hermes_home,
-                max_content_bytes=_LCM_GREP_EXTERNALIZED_CONTENT_BYTES,
-            )
+            if externalized_refs is not None:
+                path = storage_dir / ref
+                if path.is_symlink():
+                    scan_counts["rejected_symlink"] += 1
+                    return json.dumps({"error": f"Externalized ref is a symlink: {ref}"})
+                metadata = _inspect_externalized_payload_metadata(
+                    engine,
+                    ref,
+                    engine.current_session_id,
+                    max_read_bytes=_LCM_GREP_EXTERNALIZED_METADATA_READ_BYTES,
+                )
+                if not metadata.get("readable"):
+                    if metadata.get("error") == "session_mismatch":
+                        scan_counts["rejected_session_mismatch"] += 1
+                        return json.dumps({"error": f"Externalized ref is not owned by the active session: {ref}"})
+                    scan_counts["rejected_invalid_or_unreadable"] += 1
+                    return json.dumps({"error": f"Externalized ref is not readable: {ref}"})
+            try:
+                payload = read_externalized_payload_search_prefix(
+                    ref,
+                    config=engine._config,
+                    hermes_home=engine._hermes_home,
+                    max_content_bytes=_LCM_GREP_EXTERNALIZED_CONTENT_BYTES,
+                )
+            except (OSError, ValueError) as exc:
+                return json.dumps({
+                    "error": f"Externalized payload storage is unavailable: {exc}",
+                })
             status = payload.get("status")
             if status == "symlink":
                 scan_counts["rejected_symlink"] += 1
@@ -1384,14 +1416,20 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
                 "_sort_rank": byte_position,
                 "_sort_directness": 10.0,
             }
+            externalized_matches.append(item)
+            scan_counts["matched_files"] += 1
+
+        # Search every file in the bounded candidate set before truncating.
+        # Discovery order is not a ranking signal: relevance and hybrid use the
+        # payload's native byte position, while recency uses its timestamp.
+        externalized_matches.sort(key=lambda result: _combined_result_sort_key(result, sort))
+        response_chars = 0
+        for item in externalized_matches:
             item_chars = len(json.dumps(item, ensure_ascii=False))
             if response_chars + item_chars > _LCM_GREP_RESPONSE_CHAR_CAP:
                 break
             response_chars += item_chars
             results.append(item)
-            scan_counts["matched_files"] += 1
-            if scan_counts["matched_files"] >= limit:
-                break
         externalized_scan = {
             **scan_counts,
             "file_limit": _LCM_GREP_EXTERNALIZED_FILE_CAP,

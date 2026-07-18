@@ -25980,6 +25980,91 @@ class TestHandleGrepExternalizedPayloads:
         assert "Invalid externalized ref" in invalid["error"]
         assert "symlink" in symlink["error"]
 
+    def test_explicit_refs_reject_malformed_payloads_that_expand_cannot_load(
+        self,
+        externalized_search_engine,
+    ):
+        storage = Path(externalized_search_engine._hermes_home, "lcm-large-outputs")
+        storage.mkdir(parents=True, exist_ok=True)
+        ref = "malformed-explicit.json"
+        (storage / ref).write_text(
+            'not-json "session_id": "test-session", "content": "needle"',
+            encoding="utf-8",
+        )
+
+        searched = json.loads(
+            externalized_search_engine.handle_tool_call(
+                "lcm_grep",
+                {
+                    "query": "needle",
+                    "content_scope": "externalized",
+                    "externalized_refs": [ref],
+                },
+            )
+        )
+        expanded = json.loads(
+            externalized_search_engine.handle_tool_call(
+                "lcm_expand",
+                {"externalized_ref": ref},
+            )
+        )
+
+        assert "error" in searched
+        assert "not readable" in searched["error"]
+        assert "not found" in expanded["error"]
+
+    @pytest.mark.parametrize("sort", ["relevance", "hybrid"])
+    def test_explicit_payload_limit_applies_after_native_byte_position_ordering(
+        self,
+        externalized_search_engine,
+        sort,
+    ):
+        late_match_ref = self._externalize(
+            externalized_search_engine,
+            ("prefix " * 40) + "needle late",
+            "call-late-match",
+        )
+        early_match_ref = self._externalize(
+            externalized_search_engine,
+            "needle early " + ("tail " * 40),
+            "call-early-match",
+        )
+
+        result = json.loads(
+            externalized_search_engine.handle_tool_call(
+                "lcm_grep",
+                {
+                    "query": "needle",
+                    "content_scope": "externalized",
+                    "externalized_refs": [late_match_ref, early_match_ref],
+                    "sort": sort,
+                    "limit": 1,
+                },
+            )
+        )
+
+        assert result["results"][0]["ref"] == early_match_ref
+        assert result["results"][0]["byte_position"] == 0
+        assert result["externalized_scan"]["matched_files"] == 2
+
+    def test_externalized_storage_containment_failure_returns_structured_error(
+        self,
+        externalized_search_engine,
+        tmp_path,
+        monkeypatch,
+    ):
+        monkeypatch.setenv("LCM_HERMES_BASE_DIR", str(tmp_path / "different-base"))
+
+        result = json.loads(
+            externalized_search_engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "needle", "content_scope": "externalized"},
+            )
+        )
+
+        assert "error" in result
+        assert "Externalized payload storage is unavailable" in result["error"]
+
     def test_scan_never_reaches_content_after_512000_encoded_bytes(self, externalized_search_engine):
         content = ("a" * 520_000) + " unreachable-needle"
         ref = self._externalize(externalized_search_engine, content)
