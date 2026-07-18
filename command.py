@@ -2504,6 +2504,36 @@ def _rollups_text(tokens: list[str], engine) -> str:
     else:
         result = _help_text("`/lcm rollups` accepts only `rebuild <day|week|month|all> [date]`.")
     return _bounded_rollups_text(result)
+def _resolve_storage_dtype(config, override: str | None = None) -> str:
+    """Resolve the vector storage dtype: an explicit --dtype flag, else config.
+
+    SPEC C1: float32 (default) keeps vectors byte-identical; int8 stores
+    quantized vectors + a sign-bit prescreen and unlocks two-stage full-corpus
+    KNN. Any unrecognized value degrades to float32.
+    """
+    value = str(
+        override
+        if override is not None
+        else getattr(config, "embedding_storage_dtype", "float32")
+    ).strip().lower()
+    return "int8" if value == "int8" else "float32"
+
+
+def _resolve_store_dim(config, provider_dim: int, override: int | None = None) -> int:
+    """Resolve the Matryoshka store dim: --store-dim flag or config, capped to provider dim.
+
+    0 (default) or any value >= the provider dim means "store the full dim".
+    """
+    raw = override if override is not None else getattr(config, "embedding_store_dim", 0)
+    try:
+        store_dim = int(raw or 0)
+    except (TypeError, ValueError):
+        store_dim = 0
+    if store_dim <= 0 or store_dim >= int(provider_dim):
+        return int(provider_dim)
+    return store_dim
+
+
 def _embedding_warmup_text(engine) -> str:
     """Warm the configured provider and dimension-lock its vector profile."""
     try:
@@ -2540,9 +2570,16 @@ def _embedding_warmup_text(engine) -> str:
         dim = len(vector)
         if dim < 1:
             raise ValueError("provider returned an empty warmup embedding")
+        storage_dtype = _resolve_storage_dtype(engine._config)
+        store_dim = _resolve_store_dim(engine._config, dim)
         store = VectorStore(engine._store.db_path, config=engine._config)
         try:
-            store.register_profile(provider.model_id, provider.provider_id, dim)
+            store.register_profile(
+                provider.model_id,
+                provider.provider_id,
+                store_dim,
+                dtype=storage_dtype,
+            )
         finally:
             store.close()
         # Semantic search caches provider instances by configured provider and
@@ -2563,7 +2600,8 @@ def _embedding_warmup_text(engine) -> str:
             progress,
             f"provider: {provider.provider_id}",
             f"model: {provider.model_id}",
-            f"dim: {dim}",
+            f"dim: {store_dim}",
+            f"dtype: {storage_dtype}",
             f"cost_note: {cost_note}",
         ])
     except Exception as exc:
@@ -2586,7 +2624,7 @@ def _embedding_current_profile(conn: sqlite3.Connection) -> sqlite3.Row | None:
     try:
         return conn.execute(
             """
-            SELECT identity_hash, model_name, provider, dim, registered_at
+            SELECT identity_hash, model_name, provider, dim, dtype, registered_at
             FROM lcm_embedding_profile
             WHERE active = 1 AND archived_at IS NULL
             ORDER BY registered_at DESC, identity_hash DESC
@@ -3247,21 +3285,30 @@ def _owned_inflight_transition(
 
 def _embedding_backfill_options(
     tokens: list[str],
-) -> tuple[bool, int, bool, str, str, bool] | str:
+) -> tuple[bool, int, bool, str, str, bool, str | None] | str:
     apply = False
     limit = 200
     retry_uncertain = False
     corpus = "summary"
     policy = ""
     confirm_raw_text = False
+    expected_dtype: str | None = None
     seen_corpus = False
     seen_policy = False
+    seen_dtype = False
     index = 0
     while index < len(tokens):
         token = tokens[index].lower()
         if token == "--apply" and not apply:
             apply = True
             index += 1
+            continue
+        if token == "--dtype" and index + 1 < len(tokens) and not seen_dtype:
+            expected_dtype = tokens[index + 1].lower()
+            if expected_dtype not in {"float32", "int8"}:
+                return "`--dtype` must be one of `float32` or `int8`."
+            seen_dtype = True
+            index += 2
             continue
         if token == "--retry-uncertain" and not retry_uncertain:
             retry_uncertain = True
@@ -3297,7 +3344,7 @@ def _embedding_backfill_options(
         return (
             "`/lcm embed backfill` accepts only `--apply`, `--retry-uncertain`, "
             "`--confirm-raw-text`, `--limit N`, `--corpus summary|chunks|both`, "
-            "and `--policy conversational|heads|full`."
+            "`--policy conversational|heads|full`, and `--dtype float32|int8`."
         )
     if retry_uncertain and not apply:
         return "`--retry-uncertain` requires `--apply` because it may incur charges."
@@ -3308,7 +3355,7 @@ def _embedding_backfill_options(
             "`--confirm-raw-text` only applies to the chunk corpus; add "
             "`--corpus chunks` or `--corpus both`."
         )
-    return apply, limit, retry_uncertain, corpus, policy, confirm_raw_text
+    return apply, limit, retry_uncertain, corpus, policy, confirm_raw_text, expected_dtype
 
 
 def _embedding_backfill_report(
@@ -3419,23 +3466,23 @@ def _embedding_backfill_text(tokens: list[str], engine) -> str:
     parsed = _embedding_backfill_options(tokens)
     if isinstance(parsed, str):
         return _help_text(parsed)
-    apply, limit, retry_uncertain, corpus, policy, confirm_raw_text = parsed
+    apply, limit, retry_uncertain, corpus, policy, confirm_raw_text, expected_dtype = parsed
     if corpus == "chunks":
         return _chunk_backfill_text(
             engine, apply=apply, limit=limit,
             retry_uncertain=retry_uncertain, policy=policy,
-            confirm_raw_text=confirm_raw_text,
+            confirm_raw_text=confirm_raw_text, expected_dtype=expected_dtype,
         )
     if corpus == "both":
         summary_report = _embedding_backfill_summary_text(
             engine, apply=apply, limit=limit, retry_uncertain=retry_uncertain,
-            include_next_hint=False,
+            include_next_hint=False, expected_dtype=expected_dtype,
         )
         chunk_report = _chunk_backfill_text(
             engine, apply=apply, limit=limit,
             retry_uncertain=retry_uncertain, policy=policy,
             confirm_raw_text=confirm_raw_text,
-            include_next_hint=False,
+            include_next_hint=False, expected_dtype=expected_dtype,
         )
         combined = summary_report + "\n\n" + chunk_report
         if not apply:
@@ -3448,13 +3495,14 @@ def _embedding_backfill_text(tokens: list[str], engine) -> str:
             )
         return combined
     return _embedding_backfill_summary_text(
-        engine, apply=apply, limit=limit, retry_uncertain=retry_uncertain
+        engine, apply=apply, limit=limit, retry_uncertain=retry_uncertain,
+        expected_dtype=expected_dtype,
     )
 
 
 def _embedding_backfill_summary_text(
     engine, *, apply: bool, limit: int, retry_uncertain: bool,
-    include_next_hint: bool = True,
+    include_next_hint: bool = True, expected_dtype: str | None = None,
 ) -> str:
     mode = "apply" if apply else "dry-run"
     started = time.monotonic()
@@ -3491,6 +3539,16 @@ def _embedding_backfill_summary_text(
         identity = str(profile["identity_hash"])
         model = str(profile["model_name"])
         provider_name = str(profile["provider"])
+        profile_dtype = str(profile["dtype"] or "float32")
+        if expected_dtype is not None and expected_dtype != profile_dtype:
+            return "\n".join([
+                "LCM embedding backfill",
+                f"mode: {mode}",
+                "status: refused",
+                f"error: --dtype {expected_dtype} does not match the registered "
+                f"summary profile dtype ({profile_dtype}); re-run `/lcm embed warmup` "
+                f"with LCM_EMBEDDING_STORAGE_DTYPE={expected_dtype} to register that identity",
+            ])
         if not apply:
             pending, rows = _embedding_pending_rows(read_conn, identity, limit)
     except sqlite3.Error as exc:
@@ -3968,7 +4026,7 @@ def _chunk_current_profile(conn: sqlite3.Connection) -> sqlite3.Row | None:
     try:
         return conn.execute(
             """
-            SELECT identity_hash, model_name, provider, dim, registered_at
+            SELECT identity_hash, model_name, provider, dim, dtype, registered_at
             FROM lcm_embedding_profile
             WHERE active = 1 AND archived_at IS NULL AND task = 'chunk'
             ORDER BY registered_at DESC, identity_hash DESC
@@ -4174,6 +4232,7 @@ def _is_local_embedding_provider(provider_name: str) -> bool:
 def _chunk_backfill_text(
     engine, *, apply: bool, limit: int, retry_uncertain: bool, policy: str,
     confirm_raw_text: bool = False, include_next_hint: bool = True,
+    expected_dtype: str | None = None,
 ) -> str:
     policy = normalize_content_policy(policy or getattr(
         engine._config, "embedding_content_policy", "conversational"
@@ -4214,6 +4273,7 @@ def _chunk_backfill_text(
             model = str(profile["model_name"])
             provider_name = str(profile["provider"])
             profile_dim = int(profile["dim"])
+            profile_dtype = str(profile["dtype"] or "float32")
         else:
             # No chunk profile yet: a dry-run can still estimate pending/tokens/
             # cost using the default chunk model for the configured provider.
@@ -4221,6 +4281,17 @@ def _chunk_backfill_text(
             provider_name = configured_provider
             model = default_chunk_model(configured_provider, configured_model)
             profile_dim = 0
+            profile_dtype = "float32"
+        if (
+            expected_dtype is not None
+            and profile is not None
+            and expected_dtype != profile_dtype
+        ):
+            return _refused(
+                f"--dtype {expected_dtype} does not match the registered chunk "
+                f"profile dtype ({profile_dtype}); re-run `/lcm embed warmup` with "
+                f"LCM_EMBEDDING_STORAGE_DTYPE={expected_dtype} to register that identity"
+            )
         if not apply:
             pending, rows, _ = _chunk_pending_rows(read_conn, identity, policy, limit)
     except sqlite3.Error as exc:
@@ -4322,7 +4393,7 @@ def _chunk_backfill_text(
             )
         _prepare_inflight_for_lease(conn, identity, lease)
         captured_identity = EmbeddingIdentity.canonical(
-            provider_name, model, "", profile_dim, "float32", "little", "chunk"
+            provider_name, model, "", profile_dim, profile_dtype, "little", "chunk"
         )
         if captured_identity.identity_hash != identity:
             raise ValueError(
