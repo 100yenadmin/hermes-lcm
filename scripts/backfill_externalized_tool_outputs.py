@@ -14,6 +14,7 @@ import copy
 import hashlib
 import json
 import os
+import secrets
 import sqlite3
 import sys
 import tempfile
@@ -24,6 +25,8 @@ from typing import Any
 
 PLUGIN_DIR = Path(__file__).resolve().parents[1]
 PACKAGE_NAME = "hermes_lcm"
+BACKFILL_OPERATION = "historical_tool_output_externalization"
+BACKFILL_PROVENANCE_KEY = "historical_backfill_provenance"
 
 
 def _ensure_local_package_importable() -> None:
@@ -39,10 +42,10 @@ _ensure_local_package_importable()
 
 from hermes_lcm.config import LCMConfig  # noqa: E402
 from hermes_lcm.externalize import (  # noqa: E402
+    _replace_externalized_payload,
     find_externalized_payload_for_message,
     get_large_output_storage_dir,
     is_externalized_placeholder,
-    load_externalized_payload,
     maybe_externalize_payload,
 )
 from hermes_lcm.ingest_protection import _contains_media_payload  # noqa: E402
@@ -51,6 +54,84 @@ from hermes_lcm.tokens import count_tokens  # noqa: E402
 
 def _sha256(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def _ownership_proof(*, manifest_id: str, ref: str, content_sha256: str) -> str:
+    identity = json.dumps(
+        {
+            "operation": BACKFILL_OPERATION,
+            "manifest_id": manifest_id,
+            "ref": ref,
+            "sha256": content_sha256,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return _sha256(identity)
+
+
+def _is_hex_digest(value: Any, *, length: int) -> bool:
+    text = str(value or "")
+    return len(text) == length and all(character in "0123456789abcdef" for character in text)
+
+
+def _is_safe_ref(ref: str) -> bool:
+    return bool(ref) and Path(ref).name == ref and "/" not in ref and "\\" not in ref
+
+
+def _remove_unowned_sidecar(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _validate_rollback_manifest(source: Any) -> str:
+    if not isinstance(source, dict):
+        raise ValueError("rollback requires a JSON object manifest")
+    if source.get("schema_version") != 1 or source.get("applied") is not True:
+        raise ValueError("rollback requires an applied schema-v1 backfill manifest")
+    if source.get("operation") != BACKFILL_OPERATION:
+        raise ValueError(f"rollback requires operation {BACKFILL_OPERATION!r}")
+    manifest_id = str(source.get("manifest_id") or "")
+    if not _is_hex_digest(manifest_id, length=32):
+        raise ValueError("rollback manifest lacks valid backfill provenance")
+    items = source.get("items")
+    if not isinstance(items, list):
+        raise ValueError("rollback manifest items must be a list")
+
+    seen_refs: set[str] = set()
+    for item in items:
+        if not isinstance(item, dict) or item.get("created") is not True:
+            raise ValueError("rollback manifest contains an entry without backfill provenance")
+        ref = str(item.get("ref") or "")
+        if not _is_safe_ref(ref):
+            continue
+        content_sha256 = str(item.get("sha256") or "")
+        proof = str(item.get("ownership_proof") or "")
+        if not _is_hex_digest(content_sha256, length=64) or proof != _ownership_proof(
+            manifest_id=manifest_id,
+            ref=ref,
+            content_sha256=content_sha256,
+        ):
+            raise ValueError("rollback manifest contains an entry without valid backfill provenance")
+        if ref in seen_refs:
+            raise ValueError("rollback manifest contains duplicate sidecar references")
+        seen_refs.add(ref)
+    return manifest_id
+
+
+def _sidecar_matches_provenance(
+    payload: dict[str, Any],
+    *,
+    manifest_id: str,
+    ownership_proof: str,
+) -> bool:
+    return payload.get(BACKFILL_PROVENANCE_KEY) == {
+        "operation": BACKFILL_OPERATION,
+        "manifest_id": manifest_id,
+        "ownership_proof": ownership_proof,
+    }
 
 
 def _contains_serialized_media(content: str) -> bool:
@@ -110,6 +191,7 @@ def run_backfill(
     config: LCMConfig | None = None,
 ) -> dict[str, Any]:
     """Scan historical rows and optionally create idempotent native sidecars."""
+    manifest_id = secrets.token_hex(16)
     runtime_config = copy.copy(config or LCMConfig.from_env())
     runtime_config.large_output_externalization_enabled = True
     runtime_config.large_output_externalization_threshold_chars = max(1, threshold_chars)
@@ -184,12 +266,40 @@ def run_backfill(
             if not created or not ref:
                 counts["failed"] += 1
                 continue
+            content_sha256 = _sha256(content)
+            ownership_proof = _ownership_proof(
+                manifest_id=manifest_id,
+                ref=Path(ref).name,
+                content_sha256=content_sha256,
+            )
+            payload = created.get("payload")
+            path = Path(ref)
+            if not isinstance(payload, dict) or payload.get("content") != content:
+                # A concurrent writer may have created the same sidecar between
+                # our preflight lookup and maybe_externalize_payload(). Never
+                # claim or rewrite a sidecar this operation did not create.
+                counts["existing"] += 1
+                continue
+            payload[BACKFILL_PROVENANCE_KEY] = {
+                "operation": BACKFILL_OPERATION,
+                "manifest_id": manifest_id,
+                "ownership_proof": ownership_proof,
+            }
+            try:
+                _replace_externalized_payload(path, payload)
+            except OSError:
+                counts["failed"] += 1
+                _remove_unowned_sidecar(path)
+                continue
             counts["created"] += 1
-            items.append(_manifest_item(content=content, ref=Path(ref).name, created=True))
+            item = _manifest_item(content=content, ref=path.name, created=True)
+            item["ownership_proof"] = ownership_proof
+            items.append(item)
 
     manifest = {
         "schema_version": 1,
-        "operation": "historical_tool_output_externalization",
+        "operation": BACKFILL_OPERATION,
+        "manifest_id": manifest_id,
         "applied": apply,
         "threshold_chars": max(1, threshold_chars),
         "counts": counts,
@@ -230,8 +340,7 @@ def run_rollback(
 ) -> dict[str, Any]:
     """Delete only safe, unreferenced sidecars owned by an apply manifest."""
     source = json.loads(source_manifest_path.read_text(encoding="utf-8"))
-    if source.get("schema_version") != 1 or not source.get("applied"):
-        raise ValueError("rollback requires an applied schema-v1 backfill manifest")
+    manifest_id = _validate_rollback_manifest(source)
     runtime_config = copy.copy(config or LCMConfig.from_env())
     storage_dir = get_large_output_storage_dir(
         runtime_config,
@@ -248,18 +357,18 @@ def run_rollback(
         "skipped_invalid_ref": 0,
         "skipped_missing": 0,
         "skipped_symlink": 0,
+        "skipped_provenance_mismatch": 0,
         "skipped_digest_mismatch": 0,
         "skipped_referenced": 0,
     }
     failed_paths: list[str] = []
+    eligible_paths: list[Path] = []
 
     with _read_only_connection(database_path) as connection:
-        for item in source.get("items") or []:
-            if not isinstance(item, dict) or not item.get("created"):
-                continue
+        for item in source["items"]:
             counts["manifest_items"] += 1
             ref = str(item.get("ref") or "")
-            if not ref or Path(ref).name != ref or "/" in ref or "\\" in ref:
+            if not _is_safe_ref(ref):
                 counts["skipped_invalid_ref"] += 1
                 continue
             path = storage_dir / ref
@@ -269,12 +378,18 @@ def run_rollback(
             if not path.exists() or not path.is_file():
                 counts["skipped_missing"] += 1
                 continue
-            payload = load_externalized_payload(
-                ref,
-                config=runtime_config,
-                hermes_home=str(hermes_home),
-            )
-            content = (payload or {}).get("content")
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                payload = None
+            if not isinstance(payload, dict) or not _sidecar_matches_provenance(
+                payload,
+                manifest_id=manifest_id,
+                ownership_proof=str(item["ownership_proof"]),
+            ):
+                counts["skipped_provenance_mismatch"] += 1
+                continue
+            content = payload.get("content")
             if not isinstance(content, str) or _sha256(content) != str(item.get("sha256") or ""):
                 counts["skipped_digest_mismatch"] += 1
                 continue
@@ -282,15 +397,18 @@ def run_rollback(
                 counts["skipped_referenced"] += 1
                 continue
             counts["eligible"] += 1
-            if apply:
-                try:
-                    path.unlink()
-                except OSError:
-                    counts["failed"] += 1
-                    failed_paths.append(str(path))
-                    continue
-                counts["deleted"] += 1
-                counts["succeeded"] += 1
+            eligible_paths.append(path)
+
+    if apply:
+        for path in eligible_paths:
+            try:
+                path.unlink()
+            except OSError:
+                counts["failed"] += 1
+                failed_paths.append(str(path))
+                continue
+            counts["deleted"] += 1
+            counts["succeeded"] += 1
 
     counts["skipped"] = sum(
         counts[key]
@@ -298,6 +416,7 @@ def run_rollback(
             "skipped_invalid_ref",
             "skipped_missing",
             "skipped_symlink",
+            "skipped_provenance_mismatch",
             "skipped_digest_mismatch",
             "skipped_referenced",
         )

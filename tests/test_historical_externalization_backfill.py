@@ -151,6 +151,111 @@ def test_rollback_dry_run_then_apply_deletes_only_manifest_owned_sidecar(tmp_pat
     assert not sidecar.exists()
 
 
+def test_rollback_rejects_forged_manifest_for_unrelated_sidecar(tmp_path):
+    module = _load_script()
+    home, database, config, _ = _seed(tmp_path)
+    config.large_output_externalization_enabled = True
+    victim_content = "unrelated externalized output " * 100
+    created = module.maybe_externalize_payload(
+        victim_content,
+        kind="tool_result",
+        tool_call_id="call-unrelated",
+        session_id="session-unrelated",
+        role="tool",
+        config=config,
+        hermes_home=str(home),
+        force=True,
+    )
+    victim = Path(created["path"])
+    manifest = tmp_path / "forged.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "operation": "historical_tool_output_externalization",
+                "applied": True,
+                "items": [
+                    {
+                        "ref": victim.name,
+                        "sha256": module._sha256(victim_content),
+                        "created": True,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="provenance"):
+        module.run_rollback(
+            database_path=database,
+            hermes_home=home,
+            source_manifest_path=manifest,
+            apply=True,
+            config=config,
+        )
+
+    assert victim.exists()
+
+
+def test_rollback_refuses_foreign_sidecar_even_with_forged_provenance_fields(tmp_path):
+    module = _load_script()
+    home, database, config, _ = _seed(tmp_path)
+    config.large_output_externalization_enabled = True
+    victim_content = "unrelated externalized output " * 100
+    created = module.maybe_externalize_payload(
+        victim_content,
+        kind="tool_result",
+        tool_call_id="call-unrelated",
+        session_id="session-unrelated",
+        role="tool",
+        config=config,
+        hermes_home=str(home),
+        force=True,
+    )
+    victim = Path(created["path"])
+    manifest_id = "a" * 32
+    content_sha256 = module._sha256(victim_content)
+    ownership_proof = module._ownership_proof(
+        manifest_id=manifest_id,
+        ref=victim.name,
+        content_sha256=content_sha256,
+    )
+    manifest = tmp_path / "forged-with-provenance.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "operation": module.BACKFILL_OPERATION,
+                "manifest_id": manifest_id,
+                "applied": True,
+                "items": [
+                    {
+                        "ref": victim.name,
+                        "sha256": content_sha256,
+                        "created": True,
+                        "ownership_proof": ownership_proof,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = module.run_rollback(
+        database_path=database,
+        hermes_home=home,
+        source_manifest_path=manifest,
+        apply=True,
+        config=config,
+    )
+
+    assert result["counts"]["eligible"] == 0
+    assert result["counts"]["deleted"] == 0
+    assert result["counts"]["skipped_provenance_mismatch"] == 1
+    assert victim.exists()
+
+
 def test_rollback_skips_invalid_ref(tmp_path):
     module = _load_script()
     home, database, config, _ = _seed(tmp_path)
@@ -247,6 +352,29 @@ def test_rollback_rejects_non_applied_source_manifest(tmp_path):
             apply=True,
             config=config,
         )
+
+
+def test_rollback_rejects_manifest_with_wrong_operation(tmp_path):
+    module = _load_script()
+    home, database, config, _ = _seed(tmp_path)
+    manifest = tmp_path / "apply.json"
+    _run_backfill(module, home, database, config, manifest, apply=True)
+    source = json.loads(manifest.read_text(encoding="utf-8"))
+    ref = source["items"][0]["ref"]
+    source["operation"] = "foreign_operation"
+    manifest.write_text(json.dumps(source), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="requires operation"):
+        module.run_rollback(
+            database_path=database,
+            hermes_home=home,
+            source_manifest_path=manifest,
+            apply=True,
+            config=config,
+        )
+
+    sidecar = get_large_output_storage_dir(config, hermes_home=str(home), create=False) / ref
+    assert sidecar.exists()
 
 
 def test_rollback_reports_partial_failure_and_continues(tmp_path, monkeypatch, capsys):

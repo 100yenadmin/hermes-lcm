@@ -603,11 +603,13 @@ python scripts/backfill_externalized_tool_outputs.py \
   --apply
 ```
 
-The manifest contains references, digests, counts, sizes, and token estimates,
-not raw payload content, session ids, or tool-call ids. Repeated apply runs are
-idempotent. Rollback is also dry-run by default and accepts only an applied
-manifest; `--apply` deletes a manifest-owned sidecar only when its content still
-matches the recorded digest and neither a message nor a summary references it:
+The manifest contains references, digests, provenance proofs, counts, sizes, and
+token estimates, not raw payload content, session ids, or tool-call ids. Repeated
+apply runs are idempotent. Rollback is also dry-run by default and accepts only
+an applied manifest for the historical-externalization operation; `--apply`
+deletes a sidecar only when its backfill provenance binds it to that manifest,
+its content still matches the recorded digest, and neither a message nor a
+summary references it:
 
 ```bash
 python scripts/backfill_externalized_tool_outputs.py \
