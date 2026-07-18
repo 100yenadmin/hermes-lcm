@@ -603,13 +603,27 @@ python scripts/backfill_externalized_tool_outputs.py \
   --apply
 ```
 
-The manifest contains references, digests, provenance proofs, counts, sizes, and
-token estimates, not raw payload content, session ids, or tool-call ids. Repeated
-apply runs are idempotent. Rollback is also dry-run by default and accepts only
-an applied manifest for the historical-externalization operation; `--apply`
-deletes a sidecar only when its backfill provenance binds it to that manifest,
-its content still matches the recorded digest, and neither a message nor a
-summary references it:
+The manifest is a durable ownership journal containing references, digests,
+provenance proofs, target-identity hashes, counts, sizes, and token estimates,
+not raw payload content, session ids, or tool-call ids. Reusing the same manifest
+path preserves every sidecar created by earlier apply runs. An interrupted apply
+can be rerun with the same path to recover its pending journal entries. The
+journal is bound to one database file and one externalized-payload storage root;
+the command refuses reuse or rollback against another target. Manifest files and
+sidecars are opened without following their final symlink and rollback rechecks
+file identity before deletion. Apply and rollback require the storage directory
+to be owned by the current user and not writable by group or other users. They
+also hold an advisory lock on the opened directory so concurrent invocations of
+this script cannot mutate it together.
+
+The command also refuses database schemas newer than this build before scanning
+rows or writing sidecars. Apply failures are recorded in `counts.failed` and
+`failed_paths` and cause a nonzero exit status. Rollback is dry-run by default
+and accepts only a complete, applied ownership journal for the historical-
+externalization operation; `--apply` deletes a sidecar only when its backfill
+provenance binds it to that journal, its content still matches the recorded
+digest, and no message content, nested `messages.tool_calls` value, or summary
+references it:
 
 ```bash
 python scripts/backfill_externalized_tool_outputs.py \
@@ -618,9 +632,15 @@ python scripts/backfill_externalized_tool_outputs.py \
   --rollback ./externalization-backfill.json
 ```
 
-Stop the profile that owns the target database before an operator apply or
-rollback. Sidecar creation is additive, but a quiescent profile makes the
-reviewed manifest and reference checks a stable operator boundary.
+Stop the profile that owns the target database and every other process running
+as that account that can write the externalized-payload directory before an
+operator apply or rollback. The directory lock coordinates this script only;
+writers that ignore it are outside the supported integrity boundary. POSIX has
+no unlink-by-open-file-descriptor primitive, so rollback moves an owned sidecar
+to a random quarantine name, checks that inode again immediately before the
+name-based unlink, and fails closed with the quarantine entry retained if a
+replacement is detected. This quiescent, owner-controlled directory is the
+precondition that makes the final unlink safe.
 
 ### OpenClaw/lossless-claw history
 

@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from hermes_lcm.config import LCMConfig
-from hermes_lcm.externalize import get_large_output_storage_dir
+from hermes_lcm.externalize import get_large_output_storage_dir, maybe_externalize_payload
 from hermes_lcm.store import MessageStore
 
 
@@ -89,6 +89,132 @@ def test_apply_is_idempotent_and_raw_rows_remain_unchanged(tmp_path):
         assert connection.execute("SELECT content FROM messages").fetchone()[0] == content
 
 
+def test_same_path_apply_rerun_preserves_rollback_manifest_ownership(tmp_path):
+    module = _load_script()
+    home, database, config, _ = _seed(tmp_path)
+    manifest = tmp_path / "apply.json"
+
+    first = _run_backfill(module, home, database, config, manifest, apply=True)
+    second = _run_backfill(module, home, database, config, manifest, apply=True)
+    persisted = json.loads(manifest.read_text(encoding="utf-8"))
+
+    assert first["counts"]["created"] == 1
+    assert second["counts"]["existing"] == 1
+    assert len(persisted["items"]) == 1
+    assert persisted["items"][0]["created"] is True
+
+    rollback = module.run_rollback(
+        database_path=database,
+        hermes_home=home,
+        source_manifest_path=manifest,
+        apply=True,
+        config=config,
+    )
+    assert rollback["counts"]["deleted"] == 1
+
+
+def test_same_path_apply_appends_new_owned_sidecars_without_losing_old_ones(tmp_path):
+    module = _load_script()
+    home, database, config, _ = _seed(tmp_path, content="first historical output " * 100)
+    manifest = tmp_path / "apply.json"
+    first = _run_backfill(module, home, database, config, manifest, apply=True)
+    first_ref = first["items"][0]["ref"]
+    store = MessageStore(database, ingest_protection_config=config, hermes_home=str(home))
+    store.append(
+        "session-private",
+        {"role": "tool", "tool_call_id": "call-second", "content": "second historical output " * 100},
+    )
+    store.close()
+
+    second = _run_backfill(module, home, database, config, manifest, apply=True)
+
+    assert second["counts"]["existing"] == 1
+    assert second["counts"]["created"] == 1
+    assert len(second["items"]) == 2
+    assert first_ref in {item["ref"] for item in second["items"]}
+
+
+def test_interrupted_manifest_publication_recovers_pending_owned_sidecar(tmp_path, monkeypatch):
+    module = _load_script()
+    home, database, config, _ = _seed(tmp_path)
+    manifest = tmp_path / "recover.json"
+    original_write = module._write_manifest
+    writes = 0
+
+    def interrupt_after_sidecar(*args, **kwargs):
+        nonlocal writes
+        writes += 1
+        if writes == 3:
+            raise OSError("simulated crash before ownership finalization")
+        return original_write(*args, **kwargs)
+
+    monkeypatch.setattr(module, "_write_manifest", interrupt_after_sidecar)
+    with pytest.raises(OSError, match="simulated crash"):
+        _run_backfill(module, home, database, config, manifest, apply=True)
+
+    interrupted = json.loads(manifest.read_text(encoding="utf-8"))
+    assert interrupted["state"] == "applying"
+    assert len(interrupted["pending_items"]) == 1
+    assert interrupted["items"] == []
+
+    monkeypatch.setattr(module, "_write_manifest", original_write)
+    recovered = _run_backfill(module, home, database, config, manifest, apply=True)
+    assert recovered["state"] == "complete"
+    assert recovered["pending_items"] == []
+    assert len(recovered["items"]) == 1
+    assert recovered["counts"]["existing"] == 1
+
+
+def test_backfill_refuses_future_database_schema_before_scan_or_sidecar_write(tmp_path, monkeypatch):
+    module = _load_script()
+    home, database, config, _ = _seed(tmp_path)
+    manifest = tmp_path / "future-schema.json"
+    connection = __import__("sqlite3").connect(database)
+    connection.execute("UPDATE metadata SET value = '999' WHERE key = 'schema_version'")
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(Exception, match="newer than this build supports"):
+        _run_backfill(module, home, database, config, manifest, apply=True)
+
+    assert not manifest.exists()
+    storage_dir = get_large_output_storage_dir(config, hermes_home=str(home), create=False)
+    assert not storage_dir.exists()
+
+
+def test_manifest_symlink_is_refused_without_touching_target(tmp_path):
+    module = _load_script()
+    home, database, config, _ = _seed(tmp_path)
+    target = tmp_path / "unrelated-target.json"
+    target.write_text("UNRELATED-MUST-SURVIVE", encoding="utf-8")
+    manifest = tmp_path / "manifest-link.json"
+    manifest.symlink_to(target)
+
+    with pytest.raises(ValueError, match="manifest.*symlink"):
+        _run_backfill(module, home, database, config, manifest, apply=False)
+
+    assert manifest.is_symlink()
+    assert target.read_text(encoding="utf-8") == "UNRELATED-MUST-SURVIVE"
+
+
+def test_same_manifest_cannot_be_reused_for_another_database_or_storage_root(tmp_path):
+    module = _load_script()
+    home, database, config, _ = _seed(tmp_path / "first")
+    other_home, other_database, other_config, _ = _seed(tmp_path / "second")
+    manifest = tmp_path / "bound.json"
+
+    first = _run_backfill(module, home, database, config, manifest, apply=True)
+    first_ref = first["items"][0]["ref"]
+
+    with pytest.raises(ValueError, match="different database or storage root"):
+        _run_backfill(module, other_home, other_database, other_config, manifest, apply=True)
+
+    first_sidecar = get_large_output_storage_dir(config, hermes_home=str(home), create=False) / first_ref
+    assert first_sidecar.exists()
+    other_storage = get_large_output_storage_dir(other_config, hermes_home=str(other_home), create=False)
+    assert not other_storage.exists()
+
+
 def test_media_shaped_tool_rows_are_skipped(tmp_path):
     module = _load_script()
     media = json.dumps([
@@ -156,7 +282,7 @@ def test_rollback_rejects_forged_manifest_for_unrelated_sidecar(tmp_path):
     home, database, config, _ = _seed(tmp_path)
     config.large_output_externalization_enabled = True
     victim_content = "unrelated externalized output " * 100
-    created = module.maybe_externalize_payload(
+    created = maybe_externalize_payload(
         victim_content,
         kind="tool_result",
         tool_call_id="call-unrelated",
@@ -203,7 +329,7 @@ def test_rollback_refuses_foreign_sidecar_even_with_forged_provenance_fields(tmp
     home, database, config, _ = _seed(tmp_path)
     config.large_output_externalization_enabled = True
     victim_content = "unrelated externalized output " * 100
-    created = module.maybe_externalize_payload(
+    created = maybe_externalize_payload(
         victim_content,
         kind="tool_result",
         tool_call_id="call-unrelated",
@@ -229,6 +355,12 @@ def test_rollback_refuses_foreign_sidecar_even_with_forged_provenance_fields(tmp
                 "operation": module.BACKFILL_OPERATION,
                 "manifest_id": manifest_id,
                 "applied": True,
+                "state": "complete",
+                "target": module._target_binding(
+                    database,
+                    get_large_output_storage_dir(config, hermes_home=str(home), create=False),
+                ),
+                "pending_items": [],
                 "items": [
                     {
                         "ref": victim.name,
@@ -354,6 +486,29 @@ def test_rollback_rejects_non_applied_source_manifest(tmp_path):
         )
 
 
+def test_rollback_rejects_symlink_manifest_without_reading_target(tmp_path):
+    module = _load_script()
+    home, database, config, _ = _seed(tmp_path)
+    manifest = tmp_path / "apply.json"
+    _run_backfill(module, home, database, config, manifest, apply=True)
+    original = manifest.read_bytes()
+    target = tmp_path / "manifest-target.json"
+    manifest.replace(target)
+    manifest.symlink_to(target)
+
+    with pytest.raises(ValueError, match="manifest.*symlink"):
+        module.run_rollback(
+            database_path=database,
+            hermes_home=home,
+            source_manifest_path=manifest,
+            apply=True,
+            config=config,
+        )
+
+    assert manifest.is_symlink()
+    assert target.read_bytes() == original
+
+
 def test_rollback_rejects_manifest_with_wrong_operation(tmp_path):
     module = _load_script()
     home, database, config, _ = _seed(tmp_path)
@@ -392,14 +547,14 @@ def test_rollback_reports_partial_failure_and_continues(tmp_path, monkeypatch, c
     storage_dir = get_large_output_storage_dir(config, hermes_home=str(home), create=False)
     failed_path = storage_dir / refs[0]
     succeeded_path = storage_dir / refs[1]
-    original_unlink = Path.unlink
+    original_unlink = module._quarantine_unlink
 
-    def fail_one_unlink(path, *args, **kwargs):
-        if path == failed_path:
+    def fail_one_unlink(directory_fd, ref, identity):
+        if ref == failed_path.name:
             raise OSError("simulated unlink failure")
-        return original_unlink(path, *args, **kwargs)
+        return original_unlink(directory_fd, ref, identity)
 
-    monkeypatch.setattr(Path, "unlink", fail_one_unlink)
+    monkeypatch.setattr(module, "_quarantine_unlink", fail_one_unlink)
 
     exit_code = module.main(
         [
@@ -424,6 +579,132 @@ def test_rollback_reports_partial_failure_and_continues(tmp_path, monkeypatch, c
     assert not succeeded_path.exists()
 
 
+def test_rollback_does_not_delete_regular_file_swapped_after_validation(tmp_path, monkeypatch):
+    module = _load_script()
+    home, database, config, _ = _seed(tmp_path)
+    manifest = tmp_path / "apply.json"
+    result = _run_backfill(module, home, database, config, manifest, apply=True)
+    ref = result["items"][0]["ref"]
+    storage_dir = get_large_output_storage_dir(config, hermes_home=str(home), create=False)
+    sidecar = storage_dir / ref
+    checked_sidecar = storage_dir / "checked-sidecar-backup.json"
+    unrelated = tmp_path / "unrelated.json"
+    unrelated.write_text("UNRELATED-MUST-SURVIVE", encoding="utf-8")
+    original_unlink = module._quarantine_unlink
+
+    def swap_before_delete(directory_fd, candidate_ref, identity):
+        sidecar.replace(checked_sidecar)
+        unrelated.replace(sidecar)
+        return original_unlink(directory_fd, candidate_ref, identity)
+
+    monkeypatch.setattr(module, "_quarantine_unlink", swap_before_delete)
+    rollback = module.run_rollback(
+        database_path=database,
+        hermes_home=home,
+        source_manifest_path=manifest,
+        apply=True,
+        config=config,
+    )
+
+    assert rollback["counts"]["deleted"] == 0
+    assert rollback["counts"]["failed"] == 1
+    assert sidecar.read_text(encoding="utf-8") == "UNRELATED-MUST-SURVIVE"
+    assert checked_sidecar.exists()
+
+
+def test_rollback_fails_closed_when_quarantine_is_replaced_after_identity_check(tmp_path, monkeypatch):
+    module = _load_script()
+    home, database, config, _ = _seed(tmp_path)
+    manifest = tmp_path / "apply.json"
+    _run_backfill(module, home, database, config, manifest, apply=True)
+    storage_dir = get_large_output_storage_dir(config, hermes_home=str(home), create=False)
+    checked_sidecar = tmp_path / "checked-sidecar-backup.json"
+    replacement = tmp_path / "unrelated-replacement.json"
+    replacement.write_text("UNRELATED-MUST-SURVIVE", encoding="utf-8")
+    original_unlink = module._unlink_verified_quarantine
+    swapped = False
+
+    def swap_after_identity_check(directory_fd, quarantine, identity):
+        nonlocal swapped
+        quarantine_path = storage_dir / quarantine
+        quarantine_path.replace(checked_sidecar)
+        replacement.replace(quarantine_path)
+        swapped = True
+        return original_unlink(directory_fd, quarantine, identity)
+
+    monkeypatch.setattr(module, "_unlink_verified_quarantine", swap_after_identity_check)
+    rollback = module.run_rollback(
+        database_path=database,
+        hermes_home=home,
+        source_manifest_path=manifest,
+        apply=True,
+        config=config,
+    )
+
+    assert swapped is True
+    assert rollback["counts"]["deleted"] == 0
+    assert rollback["counts"]["failed"] == 1
+    assert checked_sidecar.exists()
+    quarantined = list(storage_dir.glob(".rollback-*.tmp"))
+    assert len(quarantined) == 1
+    assert quarantined[0].read_text(encoding="utf-8") == "UNRELATED-MUST-SURVIVE"
+
+
+def test_rollback_refuses_storage_directory_writable_by_other_users(tmp_path):
+    module = _load_script()
+    home, database, config, _ = _seed(tmp_path)
+    manifest = tmp_path / "apply.json"
+    result = _run_backfill(module, home, database, config, manifest, apply=True)
+    ref = result["items"][0]["ref"]
+    storage_dir = get_large_output_storage_dir(config, hermes_home=str(home), create=False)
+    sidecar = storage_dir / ref
+    storage_dir.chmod(0o777)
+
+    with pytest.raises(PermissionError, match="must not be writable by group or other users"):
+        module.run_rollback(
+            database_path=database,
+            hermes_home=home,
+            source_manifest_path=manifest,
+            apply=True,
+            config=config,
+        )
+
+    assert sidecar.exists()
+
+
+def test_backfill_apply_write_failure_returns_nonzero_with_failed_path(tmp_path, monkeypatch, capsys):
+    module = _load_script()
+    home, database, _config, _ = _seed(tmp_path)
+    manifest = tmp_path / "failed-apply.json"
+    unrelated = tmp_path / "unrelated.txt"
+    unrelated.write_text("keep me", encoding="utf-8")
+
+    def fail_write(*_args, **_kwargs):
+        raise OSError("injected sidecar write failure")
+
+    monkeypatch.setattr(module, "_replace_externalized_payload", fail_write)
+    exit_code = module.main(
+        [
+            "--database",
+            str(database),
+            "--hermes-home",
+            str(home),
+            "--manifest",
+            str(manifest),
+            "--threshold-chars",
+            "100",
+            "--apply",
+        ]
+    )
+    result = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 1
+    assert result["counts"]["failed"] == 1
+    assert result["counts"]["created"] == 0
+    assert len(result["failed_paths"]) == 1
+    assert unrelated.read_text(encoding="utf-8") == "keep me"
+
+
 def test_rollback_refuses_referenced_sidecar(tmp_path):
     module = _load_script()
     home, database, config, _ = _seed(tmp_path)
@@ -445,6 +726,34 @@ def test_rollback_refuses_referenced_sidecar(tmp_path):
 
     assert result["counts"]["skipped_referenced"] == 1
     sidecar = get_large_output_storage_dir(config, hermes_home=str(home), create=False) / ref
+    assert sidecar.exists()
+
+
+def test_rollback_refuses_sidecar_referenced_in_nested_tool_calls(tmp_path):
+    module = _load_script()
+    home, database, config, _ = _seed(tmp_path)
+    manifest = tmp_path / "apply.json"
+    _run_backfill(module, home, database, config, manifest, apply=True)
+    ref = json.loads(manifest.read_text(encoding="utf-8"))["items"][0]["ref"]
+    connection = __import__("sqlite3").connect(database)
+    connection.execute(
+        "UPDATE messages SET tool_calls = ?",
+        (json.dumps([{"nested": {"payload": f"[Externalized tool output: ref={ref}]"}}]),),
+    )
+    connection.commit()
+    connection.close()
+
+    result = module.run_rollback(
+        database_path=database,
+        hermes_home=home,
+        source_manifest_path=manifest,
+        apply=True,
+        config=config,
+    )
+
+    sidecar = get_large_output_storage_dir(config, hermes_home=str(home), create=False) / ref
+    assert result["counts"]["skipped_referenced"] == 1
+    assert result["counts"]["deleted"] == 0
     assert sidecar.exists()
 
 
