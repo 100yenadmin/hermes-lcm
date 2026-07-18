@@ -25679,6 +25679,17 @@ class TestHandleGrepExternalizedPayloads:
         created = set(Path(engine._hermes_home, "lcm-large-outputs").glob("*.json")) - before
         return next(path.name for path in created)
 
+    def _write_payload_with_created_at(self, engine, ref, created_at):
+        storage = Path(engine._hermes_home, "lcm-large-outputs")
+        storage.mkdir(parents=True, exist_ok=True)
+        (storage / ref).write_text(
+            '{"kind":"tool_result","role":"tool","session_id":"test-session",'
+            '"tool_call_id":"call-created-at","content_chars":14,"content_bytes":14,'
+            f'"created_at":{created_at},"content":"needle payload"}}',
+            encoding="utf-8",
+        )
+        return ref
+
     def test_default_history_scope_does_not_scan_sidecars(self, externalized_search_engine):
         self._externalize(externalized_search_engine, "private external needle " * 20)
 
@@ -25713,6 +25724,87 @@ class TestHandleGrepExternalizedPayloads:
             )
         )
         assert recovered["content"] == content
+
+    @pytest.mark.parametrize(
+        ("label", "created_at"),
+        [
+            ("oversized-integer", "9" * 401),
+            ("non-finite-decimal", ("9" * 400) + ".0"),
+        ],
+    )
+    def test_explicit_ref_search_ignores_unrepresentable_created_at(
+        self,
+        externalized_search_engine,
+        label,
+        created_at,
+    ):
+        ref = self._write_payload_with_created_at(
+            externalized_search_engine,
+            f"explicit-{label}.json",
+            created_at,
+        )
+        valid_ref = self._write_payload_with_created_at(
+            externalized_search_engine,
+            f"explicit-valid-{label}.json",
+            "1.0",
+        )
+
+        result = json.loads(
+            externalized_search_engine.handle_tool_call(
+                "lcm_grep",
+                {
+                    "query": "needle",
+                    "content_scope": "externalized",
+                    "externalized_refs": [ref, valid_ref],
+                    "sort": "recency",
+                },
+            )
+        )
+
+        assert [item["ref"] for item in result["results"]] == [valid_ref, ref]
+        assert result["externalized_scan"]["candidate_files"] == 2
+        assert result["externalized_scan"]["scanned_files"] == 2
+        assert result["externalized_scan"]["matched_files"] == 2
+
+    @pytest.mark.parametrize(
+        ("label", "created_at"),
+        [
+            ("oversized-integer", "9" * 401),
+            ("non-finite-decimal", ("9" * 400) + ".0"),
+        ],
+    )
+    def test_auto_discovery_ignores_unrepresentable_created_at(
+        self,
+        externalized_search_engine,
+        label,
+        created_at,
+    ):
+        ref = self._write_payload_with_created_at(
+            externalized_search_engine,
+            f"auto-{label}.json",
+            created_at,
+        )
+        valid_ref = self._write_payload_with_created_at(
+            externalized_search_engine,
+            f"auto-valid-{label}.json",
+            "1.0",
+        )
+
+        result = json.loads(
+            externalized_search_engine.handle_tool_call(
+                "lcm_grep",
+                {
+                    "query": "needle",
+                    "content_scope": "externalized",
+                    "sort": "recency",
+                },
+            )
+        )
+
+        assert [item["ref"] for item in result["results"]] == [valid_ref, ref]
+        assert result["externalized_scan"]["candidate_files"] == 2
+        assert result["externalized_scan"]["scanned_files"] == 2
+        assert result["externalized_scan"]["matched_files"] == 2
 
     def test_both_scope_combines_history_and_payload_hits(self, externalized_search_engine):
         externalized_search_engine._store.append(

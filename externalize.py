@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import stat
@@ -731,6 +732,12 @@ def read_externalized_payload_search_prefix(
     original_bytes = _numeric_json_field(tail, "content_bytes")
     original_chars = _numeric_json_field(tail, "content_chars")
     created_at = _numeric_json_field(tail, "created_at")
+    try:
+        created_at_float = float(created_at or 0)
+    except (OverflowError, ValueError):
+        created_at_float = 0.0
+    if not math.isfinite(created_at_float):
+        created_at_float = 0.0
     return {
         "status": "ok",
         "ref": ref,
@@ -742,7 +749,7 @@ def read_externalized_payload_search_prefix(
         "content_scanned_bytes": len(raw),
         "original_content_bytes": int(original_bytes) if original_bytes is not None else None,
         "original_content_chars": int(original_chars) if original_chars is not None else None,
-        "created_at": float(created_at or 0),
+        "created_at": created_at_float,
         "scan_truncated": not closed,
     }
 

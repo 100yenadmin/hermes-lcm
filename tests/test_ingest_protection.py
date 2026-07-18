@@ -12,6 +12,8 @@ import sys
 from copy import deepcopy
 from pathlib import Path
 
+import pytest
+
 from hermes_lcm import tools as lcm_tools
 from hermes_lcm.command import handle_lcm_command
 from hermes_lcm.config import LCMConfig
@@ -540,6 +542,40 @@ def test_externalized_search_prefix_rejects_path_replaced_during_open(tmp_path, 
 
     assert replaced is True
     assert result["status"] == "unreadable"
+
+
+@pytest.mark.parametrize(
+    ("label", "created_at"),
+    [
+        ("oversized-integer", "9" * 401),
+        ("non-finite-decimal", ("9" * 400) + ".0"),
+    ],
+)
+def test_externalized_search_prefix_ignores_unrepresentable_created_at(
+    tmp_path,
+    label,
+    created_at,
+):
+    engine = _engine(tmp_path)
+    storage = tmp_path / "externalized"
+    storage.mkdir(parents=True, exist_ok=True)
+    ref = f"{label}.json"
+    (storage / ref).write_text(
+        '{"kind":"ingest_payload","role":"user","session_id":"payload-session",'
+        '"field_path":"content","content_chars":14,"content_bytes":14,'
+        f'"created_at":{created_at},"content":"search needle"}}',
+        encoding="utf-8",
+    )
+
+    result = read_externalized_payload_search_prefix(
+        ref,
+        config=engine._config,
+        hermes_home=str(tmp_path),
+    )
+
+    assert result["status"] == "ok"
+    assert result["created_at"] == 0.0
+    assert result["content"] == "search needle"
 
 
 def test_first_externalized_payload_fsyncs_new_storage_directory_parent(tmp_path, monkeypatch):
