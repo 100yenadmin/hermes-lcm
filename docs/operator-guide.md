@@ -139,6 +139,7 @@ environment variables:
 |----------|---------|-----|
 | `LCM_CONTEXT_THRESHOLD` | `0.35` | Fraction of the context window that triggers LCM compaction |
 | `LCM_FRESH_TAIL_COUNT` | `32` | Recent messages protected from compaction |
+| `LCM_FRESH_TAIL_MAX_TOKENS` | `0` | Optional token cap for the protected fresh tail (`0` disables it); always retains the newest message and complete assistant/tool-result groups |
 | `LCM_INCREMENTAL_MAX_DEPTH` | `3` | Max DAG condensation depth (`-1` = unlimited, `0` = leaf only); enables hierarchical summarization |
 | `LCM_LEAF_CHUNK_TOKENS` | `20000` | Raw-backlog floor before leaf compaction; with dynamic chunking enabled, the base chunk target |
 | `LCM_DYNAMIC_LEAF_CHUNK_ENABLED` | `false` | Enable chunk-sized leaf compaction passes instead of compacting the whole non-tail raw backlog per pass |
@@ -151,6 +152,8 @@ environment variables:
 | `LCM_SENSITIVE_PATTERNS` | `api_key,bearer_token,password_assignment,private_key` | Comma-separated named sensitive pattern catalog entries to apply when redaction is enabled |
 | `LCM_LARGE_OUTPUT_EXTERNALIZATION_ENABLED` | `false` | Store oversized ingest payloads, including tool results, media blocks, and generic raw content, in plugin-managed JSON files |
 | `LCM_LARGE_OUTPUT_EXTERNALIZATION_THRESHOLD_CHARS` | `12000` | Externalization threshold for normalized payload text |
+| `LCM_LARGE_OUTPUT_ACTIVE_REPLAY_STUBBING_ENABLED` | `false` | Replace token-heavy textual tool results with recoverable externalized refs in active replay; current-turn ingest is immediate and historical assembly respects the protected fresh tail; requires large-output externalization |
+| `LCM_LARGE_OUTPUT_ACTIVE_REPLAY_STUB_THRESHOLD_TOKENS` | `25000` | Token-aware threshold for active-replay tool-result stubbing |
 | `LCM_LARGE_OUTPUT_TRANSCRIPT_GC_ENABLED` | `false` | Rewrite already-externalized summarized tool rows to compact placeholders |
 | `LCM_CRITICAL_BUDGET_PRESSURE_RATIO` | `0.0` | Disabled at `0.0`; when set, permits critical-pressure bypasses for bounded deferred catch-up and cache-friendly follow-on condensation only |
 | `LCM_SUMMARY_MODEL` | auxiliary | Override summarization model |
@@ -450,6 +453,20 @@ Externalization for ordinary large tool output is opt-in. When enabled,
 oversized tool results are written to plugin-managed JSON files and referenced
 from summaries. They remain inspectable later through
 `lcm_describe(externalized_ref=...)` and `lcm_expand(externalized_ref=...)`.
+
+Active-replay stubbing is separately opt-in and requires ordinary large-output
+externalization. Newly ingested textual tool results above the token threshold
+are durably externalized and immediately replaced in provider-visible replay,
+including results in the protected fresh tail. Preflight adopts that replay
+change even if no leaf compaction is eligible. A second historical assembly
+pass replaces older eligible results before evaluating the assembly budget and
+respects the protected fresh tail. Tool roles, `tool_call_id` values, and
+compatible structured text block types/keys are retained; the historical pass
+does not rewrite raw SQLite/DAG lineage. Structured image/media tool results
+remain inline, preserving the provider-replay contract established by PR #226.
+Failure to durably externalize is fail-open: the provider receives the original
+inline payload. Results from `lcm_describe` and `lcm_expand` also stay inline so
+recovery does not recursively create another drilldown step.
 
 The storage-boundary payload guard is separate from that opt-in. LCM always
 scans messages at the store boundary before writing `messages.content` or
