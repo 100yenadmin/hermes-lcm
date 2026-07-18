@@ -257,3 +257,56 @@ def test_prescreen_multiplier_respected(tmp_path):
         assert vs.knn_prescreen_multiplier == 9
     finally:
         vs.close()
+
+
+# -- float32 + binary prescreen: full-corpus two-stage with EXACT float rescore --
+
+
+def test_float32_prescreen_opt_in_writes_binary_and_stays_exact(tmp_path):
+    """A float32 identity with LCM_EMBEDDING_BINARY_PRESCREEN keeps float32 vec
+    bytes but gains a prescreen, giving the two-stage path with exact rescore."""
+    from hermes_lcm.config import LCMConfig
+
+    db_path = tmp_path / "lcm.db"
+    n, dim, k = 1500, 128, 10
+    _seed_messages(db_path, n)
+    rng = np.random.default_rng(5)
+    base = _unit(rng, dim)
+    vecs = rng.standard_normal((n, dim)).astype(np.float32)
+    vecs /= np.linalg.norm(vecs, axis=1, keepdims=True)
+    for j in rng.choice(n, k, replace=False):
+        u = rng.standard_normal(dim).astype(np.float32)
+        vecs[j] = (base + 0.4 * u / np.linalg.norm(u))
+        vecs[j] /= np.linalg.norm(vecs[j])
+
+    cfg = LCMConfig(embedding_binary_prescreen=True)
+    vs = VectorStore(db_path, config=cfg)
+    try:
+        # Distinct identity (revision) so prescreen rows never mix with a legacy
+        # float32 identity; dtype stays float32 -> vec bytes byte-identical.
+        ident = EmbeddingIdentity.canonical(
+            PROVIDER, MODEL, "prescreen", dim, "float32", "little", "chunk"
+        )
+        vs.register_profile(MODEL, PROVIDER, dim, revision="prescreen", dtype="float32", task="chunk")
+        for i in range(n):
+            vs.record_chunk_embedding(
+                f"{i}:0", MODEL, vecs[i].tolist(), store_id=i, chunk_index=0,
+                char_start=0, char_end=1, token_estimate=1, identity=ident,
+            )
+        # float32 layout preserved (dim*4 bytes), and a binary row was written.
+        blob = vs.connection.execute(
+            "SELECT vec FROM lcm_chunk_vectors WHERE chunk_id='0:0'"
+        ).fetchone()[0]
+        assert len(blob) == dim * 4
+        assert vs.connection.execute("SELECT COUNT(*) FROM lcm_chunk_binary").fetchone()[0] == n
+
+        result = vs.knn_chunks(base.tolist(), k=k, model=MODEL, provider=PROVIDER)
+        assert result.coverage == "full"
+        got = {row[0] for row in result}
+        # Exact float rescore of survivors: score-threshold recall (ties-safe).
+        scores = vecs @ base
+        thr = np.sort(scores)[-k]
+        idx = {int(cid.split(":")[0]) for cid in got}
+        assert np.mean([scores[i] >= thr - 1e-5 for i in idx]) >= 0.95
+    finally:
+        vs.close()

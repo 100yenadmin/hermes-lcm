@@ -291,6 +291,16 @@ class VectorStore:
         self.knn_prescreen_multiplier = max(
             1, int(getattr(resolved_config, "knn_prescreen_multiplier", 4) or 4)
         )
+        # Opt-in: also write the sign-bit prescreen for float32 identities (not
+        # just int8). A float32-vec identity carrying the prescreen gets the
+        # full-corpus two-stage path with EXACT float rescore of survivors — the
+        # high-recall, low-RAM config. Default-off keeps stock float32 identities
+        # byte-identical AND binary-free (legacy bounded path). Operators pick a
+        # distinct identity (e.g. via revision) so prescreen rows never mix into a
+        # legacy float32 identity.
+        self._write_binary_prescreen = bool(
+            getattr(resolved_config, "embedding_binary_prescreen", False)
+        )
         self._conn: Optional[sqlite3.Connection] = None
         self._write_lock = threading.RLock()
         self._cache_lock = threading.RLock()
@@ -310,6 +320,13 @@ class VectorStore:
         # loaders differ (chunk vectors join messages, summary vectors join
         # summary_nodes), so the two corpora keep independent matrix caches.
         self._chunk_matrix_cache: "OrderedDict[tuple[str, int, tuple[str, ...]], tuple[list[int], list[str], list[str], Any]]" = OrderedDict()
+        # Full-corpus binary prescreen matrices for the two-stage path, keyed by
+        # (identity_hash, data_version). Only the UNFILTERED full corpus is cached
+        # (filtered loads vary per call); this lets a pooled store's back-to-back
+        # recalls skip re-loading the whole sign-bit corpus (the dominant
+        # two-stage cost) — the same amortization the float matrix cache gives.
+        self._binary_matrix_cache: "OrderedDict[tuple[str, int], tuple[list[str], Any]]" = OrderedDict()
+        self._chunk_binary_matrix_cache: "OrderedDict[tuple[str, int], tuple[list[str], Any]]" = OrderedDict()
         self._chunk_schema_ready = False
         self._init_db()
 
@@ -411,6 +428,8 @@ class VectorStore:
                 finally:
                     self._txn_depth = 0
                     self._matrix_cache.clear()
+                    self._binary_matrix_cache.clear()
+                    self._chunk_binary_matrix_cache.clear()
         except sqlite3.Error as exc:
             if _is_sqlite_locked_error(exc):
                 logger.warning("Embedding write blocked by SQLite lock contention")
@@ -921,19 +940,20 @@ class VectorStore:
             )
         return profile
 
-    @staticmethod
     def _encode_stored_vector(
-        vec: Sequence[float], profile: sqlite3.Row
+        self, vec: Sequence[float], profile: sqlite3.Row
     ) -> tuple[list[float], bytes, bytes | None]:
         """Normalize (and, for a Matryoshka profile, truncate) then encode a vector.
 
         Returns ``(normalized, vec_blob, sign_bits)``. For a float32 profile the
-        blob is the existing little-endian float32 wire format and ``sign_bits`` is
-        None (byte-identical to the pre-int8 path). For an int8 profile the blob is
-        the quantized ``dim`` bytes + float32 scale and ``sign_bits`` is the packed
-        prescreen row. When the incoming vector is longer than the profile dim
-        (Matryoshka ``LCM_EMBEDDING_STORE_DIM``), it is truncated to the leading
-        ``dim`` components and renormalized before encoding.
+        blob is the existing little-endian float32 wire format; ``sign_bits`` is
+        None unless the store opts into a float32 prescreen
+        (``LCM_EMBEDDING_BINARY_PRESCREEN``), which yields float32-vec + binary =
+        the two-stage path with EXACT float rescore. For an int8 profile the blob
+        is the quantized ``dim`` bytes + float32 scale and ``sign_bits`` is always
+        the packed prescreen row. When the incoming vector is longer than the
+        profile dim (Matryoshka ``LCM_EMBEDDING_STORE_DIM``), it is truncated to
+        the leading ``dim`` components and renormalized before encoding.
         """
         dim = int(profile["dim"])
         source = list(vec)
@@ -947,8 +967,10 @@ class VectorStore:
                 _pack_sign_bits(normalized),
             )
         # Persist an explicit little-endian float32 wire format. Native
-        # ``array('f')`` bytes would be mislabeled on a big-endian host.
-        return normalized, struct.pack(f"<{len(normalized)}f", *normalized), None
+        # ``array('f')`` bytes would be mislabeled on a big-endian host. The
+        # sign-bit prescreen is written only when explicitly opted in.
+        sign_bits = _pack_sign_bits(normalized) if self._write_binary_prescreen else None
+        return normalized, struct.pack(f"<{len(normalized)}f", *normalized), sign_bits
 
     def _write_embedding_row(
         self,
@@ -1658,6 +1680,31 @@ class VectorStore:
             ).fetchall()
         return self._binary_rows_to_matrix(numpy, rows)
 
+    def _cached_binary_matrix(
+        self, cache: "OrderedDict[tuple[str, int], tuple[list[str], Any]]",
+        identity_hash: str, loader, *, cacheable: bool,
+    ) -> tuple[list[str], Any]:
+        """Load a full-corpus binary matrix, caching only the UNFILTERED case.
+
+        A filtered load (recency/session/source) varies per call, so it bypasses
+        the cache; the common unfiltered full-corpus recall reuses the loaded
+        sign-bit matrix across calls (keyed on data_version for cross-process
+        invalidation), which is what makes back-to-back two-stage recalls cheap.
+        """
+        if not cacheable:
+            return loader()
+        with self._cache_lock:
+            key = (identity_hash, self._data_version(identity_hash))
+            cached = cache.get(key)
+            if cached is not None:
+                cache.move_to_end(key)
+                return cached
+            loaded = loader()
+            cache[key] = loaded
+            while len(cache) > self._MATRIX_CACHE_MAX_ENTRIES:
+                cache.popitem(last=False)
+            return loaded
+
     @staticmethod
     def _binary_rows_to_matrix(numpy: Any, rows: Sequence[sqlite3.Row]) -> tuple[list[str], Any]:
         ids: list[str] = []
@@ -1782,12 +1829,15 @@ class VectorStore:
         if numpy is not None and source is None and self._has_binary(
             identity, chunk=False
         ):
-            binary_ids, binary_matrix = self._load_embedding_binary_matrix(
-                numpy,
+            unfiltered = since is None and until is None and conversation_ids is None
+            binary_ids, binary_matrix = self._cached_binary_matrix(
+                self._binary_matrix_cache,
                 identity,
-                since=since,
-                until=until,
-                conversation_ids=conversation_ids,
+                lambda: self._load_embedding_binary_matrix(
+                    numpy, identity, since=since, until=until,
+                    conversation_ids=conversation_ids,
+                ),
+                cacheable=unfiltered,
             )
             if binary_matrix.shape[0] == 0:
                 return KNNResult(coverage="none")
@@ -2306,13 +2356,18 @@ class VectorStore:
         # (timestamp/session_id/source), so they all apply in the binary load and
         # coverage is 'full' over the whole (filtered) corpus.
         if numpy is not None and self._has_binary(identity, chunk=True):
-            binary_ids, binary_matrix = self._load_chunk_binary_matrix(
-                numpy,
+            unfiltered = (
+                since is None and until is None
+                and conversation_ids is None and source is None
+            )
+            binary_ids, binary_matrix = self._cached_binary_matrix(
+                self._chunk_binary_matrix_cache,
                 identity,
-                since=since,
-                until=until,
-                conversation_ids=conversation_ids,
-                source=source,
+                lambda: self._load_chunk_binary_matrix(
+                    numpy, identity, since=since, until=until,
+                    conversation_ids=conversation_ids, source=source,
+                ),
+                cacheable=unfiltered,
             )
             if binary_matrix.shape[0] == 0:
                 return KNNResult(coverage="none")
@@ -2386,6 +2441,8 @@ class VectorStore:
         with self._cache_lock:
             self._matrix_cache.clear()
             self._chunk_matrix_cache.clear()
+            self._binary_matrix_cache.clear()
+            self._chunk_binary_matrix_cache.clear()
 
     def __del__(self) -> None:  # pragma: no cover - defensive resource cleanup
         try:

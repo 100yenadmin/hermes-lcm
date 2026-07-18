@@ -356,6 +356,7 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("embedding_bounded_scan_rows", "LCM_EMBEDDING_BOUNDED_SCAN_ROWS", int),
     _EnvFieldSpec("embedding_storage_dtype", "LCM_EMBEDDING_STORAGE_DTYPE", str),
     _EnvFieldSpec("embedding_store_dim", "LCM_EMBEDDING_STORE_DIM", int),
+    _EnvFieldSpec("embedding_binary_prescreen", "LCM_EMBEDDING_BINARY_PRESCREEN", bool),
     _EnvFieldSpec("knn_prescreen_multiplier", "LCM_KNN_PRESCREEN_MULTIPLIER", int),
     _EnvFieldSpec("embedding_provider", "LCM_EMBEDDING_PROVIDER", str),
     _EnvFieldSpec("embedding_model", "LCM_EMBEDDING_MODEL", str),
@@ -567,6 +568,13 @@ class LCMConfig:
     # Also a profile-identity component (the stored dim is hashed), so truncated
     # vectors never mix with full-dim ones.
     embedding_store_dim: int = 0
+    # Write the sign-bit prescreen for float32 identities too (int8 always writes
+    # it). float32-vec + prescreen = the full-corpus two-stage KNN with EXACT
+    # float rescore of survivors (highest recall, ~10x less query RAM than a full
+    # float32 scan). Default-off keeps stock float32 identities byte-identical and
+    # binary-free (legacy bounded path); enable it on a DISTINCT identity so
+    # prescreen rows never mix into a legacy float32 identity.
+    embedding_binary_prescreen: bool = False
     # Stage-1 prescreen breadth for the two-stage (binary Hamming -> int8/float
     # rescore) KNN: M = knn_prescreen_multiplier x k survivors are rescored.
     # Larger widens the approximate prescreen toward exact recall at more cost.
