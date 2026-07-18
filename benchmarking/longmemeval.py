@@ -280,6 +280,11 @@ def deterministic_session_summary(turns: Sequence[dict[str, Any]], *, max_chars:
         content = turn.get("content", "") if isinstance(turn, dict) else str(turn)
         parts.append(f"{role}: {content}")
     condensed = _WHITESPACE_RE.sub(" ", " ".join(parts)).strip()
+    if not condensed:
+        # LongMemEval_S contains empty haystack sessions; cloud embedding
+        # endpoints (voyage) reject empty inputs with HTTP 400, so an empty
+        # session gets a deterministic non-empty placeholder instead.
+        return "(empty session)"
     return condensed[:max_chars]
 
 

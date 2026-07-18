@@ -716,3 +716,13 @@ def test_rrf_fuse_turn_keys_with_none_turn_tie_is_total_ordered():
     # And a same-session tie between None-turn and int-turn keys:
     fused2 = rrf_fuse([("s1", None)], [("s1", 4)])
     assert set(fused2) == {("s1", None), ("s1", 4)}
+
+
+def test_deterministic_summary_of_empty_session_is_non_empty():
+    """Empty haystack sessions must yield embeddable (non-empty) summary text —
+    cloud endpoints reject empty inputs with HTTP 400 (regression: voyage 500q
+    run died on LongMemEval_S's empty sessions)."""
+    from benchmarking.longmemeval import deterministic_session_summary
+
+    assert deterministic_session_summary([]) == "(empty session)"
+    assert deterministic_session_summary([{"role": "user", "content": "  "}]).strip()
