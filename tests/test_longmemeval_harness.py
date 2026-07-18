@@ -16,6 +16,7 @@ import pytest
 from benchmarking.longmemeval import (
     ARMS,
     DATASET_REVISION,
+    RERANK_MODE_MIXED,
     RERANK_MODE_PLACEHOLDER,
     RERANK_MODE_VOYAGE,
     Question,
@@ -466,6 +467,50 @@ def test_evaluate_question_real_rerank_path_labels_voyage_mode(tmp_path):
         tmp_dir=tmp_path, embeddings_enabled=True, use_rerank=True,
     )
     assert scored["hybrid_rerank"]["rerank_mode"] == RERANK_MODE_VOYAGE
+
+
+def test_run_harness_mixed_rerank_reports_mixed_not_real(tmp_path, monkeypatch):
+    """FIX-2: when some questions use the real reranker and others silently fall
+    back, the run-level mode is ``mixed`` (with counts), never mislabeled ``real``
+    from whatever the final question happened to use."""
+    import benchmarking.longmemeval as lme
+
+    monkeypatch.setattr(lme, "resolve_harness_provider", lambda *a, **k: _RerankingEmbedder())
+    calls = {"n": 0}
+
+    def _fake_rerank(reranker, query, sessions, summaries, **kwargs):
+        calls["n"] += 1
+        # First scored question gets a real rerank; the rest fall back silently.
+        return list(sessions) if calls["n"] == 1 else None
+
+    monkeypatch.setattr(lme, "rerank_sessions_voyage", _fake_rerank)
+
+    report = run_harness(
+        _synthetic_dataset(), provider_name="voyage", model="voyage-3",
+        tmp_dir=tmp_path, use_rerank=True,
+    )
+    assert report["rerank"]["mode"] == RERANK_MODE_MIXED
+    assert report["rerank"]["real_count"] == 1
+    assert report["rerank"]["placeholder_count"] == 2
+    assert report["rerank"]["counts"][RERANK_MODE_VOYAGE] == 1
+
+
+def test_run_harness_all_real_rerank_reports_voyage(tmp_path, monkeypatch):
+    """FIX-2: a run where every question used the real reranker is labeled real."""
+    import benchmarking.longmemeval as lme
+
+    monkeypatch.setattr(lme, "resolve_harness_provider", lambda *a, **k: _RerankingEmbedder())
+    monkeypatch.setattr(
+        lme, "rerank_sessions_voyage",
+        lambda reranker, query, sessions, summaries, **kwargs: list(sessions),
+    )
+    report = run_harness(
+        _synthetic_dataset(), provider_name="voyage", model="voyage-3",
+        tmp_dir=tmp_path, use_rerank=True,
+    )
+    assert report["rerank"]["mode"] == RERANK_MODE_VOYAGE
+    assert report["rerank"]["real_count"] == 3
+    assert report["rerank"]["placeholder_count"] == 0
 
 
 def test_stub_run_end_to_end_produces_report_and_fts_recovers_evidence(tmp_path):

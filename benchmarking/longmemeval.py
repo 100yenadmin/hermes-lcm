@@ -606,6 +606,9 @@ RERANK_CANDIDATE_WINDOW = 20
 RERANK_TIMEOUT_S = 10.0
 RERANK_MODE_PLACEHOLDER = "placeholder-cosine"
 RERANK_MODE_VOYAGE = "voyage:rerank-2.5-lite"
+# Run-level label when some (but not all) questions used the real reranker while
+# others silently fell back -- the run is neither a clean real nor placeholder run.
+RERANK_MODE_MIXED = "mixed"
 
 
 def rerank_sessions_voyage(
@@ -936,6 +939,32 @@ def _mean(values: Sequence[float]) -> float:
     return round(sum(values) / len(values), 6) if values else 0.0
 
 
+def _aggregate_rerank_mode(mode_counts: dict[str, int]) -> dict[str, Any]:
+    """Collapse per-question rerank modes into one auditable run-level label.
+
+    A run is labeled ``real`` (voyage) only if EVERY scored rerank-arm question
+    used the real reranker; if any question silently fell back to the placeholder
+    the run is ``mixed`` (never mislabeled as real); if none used voyage it is
+    ``placeholder``. Per-mode counts ride alongside so the label is verifiable
+    against the run rather than reflecting only the final question.
+    """
+    voyage = mode_counts.get(RERANK_MODE_VOYAGE, 0)
+    placeholder = mode_counts.get(RERANK_MODE_PLACEHOLDER, 0)
+    total = sum(mode_counts.values())
+    if total == 0 or voyage == 0:
+        mode = RERANK_MODE_PLACEHOLDER
+    elif voyage == total:
+        mode = RERANK_MODE_VOYAGE
+    else:
+        mode = RERANK_MODE_MIXED
+    return {
+        "mode": mode,
+        "real_count": voyage,
+        "placeholder_count": placeholder,
+        "counts": dict(mode_counts),
+    }
+
+
 def run_harness(
     questions: Sequence[Question],
     *,
@@ -972,7 +1001,9 @@ def run_harness(
     scored_count = 0
     abstention_count = 0
     ingest_samples: list[float] = []
-    rerank_mode = RERANK_MODE_VOYAGE if use_rerank and provider_name == "voyage" else RERANK_MODE_PLACEHOLDER
+    # Track per-question rerank modes so the run-level label is an aggregate, not
+    # whatever the final question happened to use (FIX-2).
+    rerank_mode_counts: dict[str, int] = {}
 
     for question in questions:
         if question.is_abstention:
@@ -989,7 +1020,8 @@ def run_harness(
         )
         scored_count += 1
         ingest_samples.append(scored.pop("ingest_ms", 0.0))
-        rerank_mode = scored["hybrid_rerank"].pop("rerank_mode", rerank_mode)
+        q_mode = scored["hybrid_rerank"].pop("rerank_mode", RERANK_MODE_PLACEHOLDER)
+        rerank_mode_counts[q_mode] = rerank_mode_counts.get(q_mode, 0) + 1
         category = question.category
         bucket = by_category.setdefault(category, _new_arm_samples())
         for arm, metrics in scored.items():
@@ -1027,7 +1059,7 @@ def run_harness(
         "scored_count": scored_count,
         "abstention_excluded": abstention_count,
         "rerank": {
-            "mode": rerank_mode,
+            **_aggregate_rerank_mode(rerank_mode_counts),
             "candidate_window": RERANK_CANDIDATE_WINDOW,
             "timeout_s": RERANK_TIMEOUT_S,
         },
