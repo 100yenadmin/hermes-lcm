@@ -282,8 +282,9 @@ Hard gates for promoting a preset: no replay failures, no raw transcript leakage
 on **LongMemEval_S** (Wu et al., ICLR 2025) for the LCM retrieval arms —
 `fts` (raw-message FTS5), `summary_vectors` (summary embeddings), `hybrid_rrf`
 (reciprocal-rank fusion, k=60), `hybrid_rerank` (a reranker over the fused pool,
-see below), `chunk_vectors` (raw-chunk KNN), and `hybrid_rrf3` (FTS + summary +
-chunk fusion). There is **no LLM judge**: the dataset labels the evidence
+see below), `chunk_vectors` (raw-chunk KNN), `hybrid_rrf3` (FTS + summary +
+chunk fusion), and `lcm_recall` (the **production tool users actually call** — see
+below). There is **no LLM judge**: the dataset labels the evidence
 session(s) per question (`answer_session_ids`), so recall is computable offline.
 It ingests each question's history into a fresh temporary LCM store (reusing the
 `store`/`dag`/`vector_store` APIs directly, no live Hermes host), builds one
@@ -316,6 +317,35 @@ single API call under an absolute `RERANK_TIMEOUT_S` (=10s) budget; the remainin
 fused tail is appended unchanged. Any provider error falls back to the placeholder.
 The mode actually used is recorded in the JSON (`rerank.mode`) and the markdown
 header so no one mistakes a placeholder run for a real-reranker run.
+
+### The production arm (`lcm_recall`)
+
+The other arms measure retrieval *primitives* — the harness reimplements each
+arm's ranking (its own FTS query builder, its own RRF fusion). `lcm_recall`
+instead scores the **actual `tools.lcm_recall` tool** end-to-end: weighted RRF
+over the FTS + summary + chunk arms (`retrieval_core.rrf_fuse` with the
+`LCM_RECALL_ARM_WEIGHTS` down-weighting of the FTS arm), the scope/recency prior,
+chunk-vs-FTS dedup by `store_id`, and `include`-filtering — the full path a caller
+gets, none of which the per-arm numbers exercise. It is invoked per question
+against the same per-question temp store via a `SimpleNamespace` engine (the proven
+smoke-test stand-in), with the warmed harness embedder injected through the tool's
+provider cache so no second model load or network call occurs.
+
+Two honesty notes on how the production behavior shows up in these numbers:
+
+- **Scope prior is neutral, recency prior is not.** The probe engine uses a
+  *fresh* current-session id that is disjoint from the dataset's sessions (see
+  `fresh_recall_session_id`), so the scope prior — which boosts hits from the
+  *current conversation* — never fires on a dataset session. The **recency prior
+  still applies** to every hit (newer hits are boosted by a half-life multiplier);
+  that is the real production behavior and is deliberately left in rather than
+  stubbed out, so the number reflects the tool as shipped.
+- **`limit` is clamped to the production ceiling.** `lcm_recall` caps its response
+  at `_LCM_RECALL_LIMIT_CAP` (=25) hits, so its session ranking is only as deep as
+  the tool will ever surface; recall@10 is measured over the deduped sessions of
+  those top hits. Its per-question latency is also the *real* tool cost (thread
+  pool, read-only connection setup, provider resolution, KNN pooling), so it is
+  much higher than the reimplemented arms' microbenchmark timings.
 
 ### Ingest batching (F7)
 
