@@ -25980,17 +25980,23 @@ class TestHandleGrepExternalizedPayloads:
         assert "Invalid externalized ref" in invalid["error"]
         assert "symlink" in symlink["error"]
 
+    @pytest.mark.parametrize(
+        "payload_text",
+        [
+            '{"session_id":"test-session","content":"needle"',
+            '{"session_id":"test-session","content":"needle"} trailing',
+        ],
+        ids=["truncated-tail", "trailing-garbage"],
+    )
     def test_explicit_refs_reject_malformed_payloads_that_expand_cannot_load(
         self,
         externalized_search_engine,
+        payload_text,
     ):
         storage = Path(externalized_search_engine._hermes_home, "lcm-large-outputs")
         storage.mkdir(parents=True, exist_ok=True)
         ref = "malformed-explicit.json"
-        (storage / ref).write_text(
-            'not-json "session_id": "test-session", "content": "needle"',
-            encoding="utf-8",
-        )
+        (storage / ref).write_text(payload_text, encoding="utf-8")
 
         searched = json.loads(
             externalized_search_engine.handle_tool_call(
@@ -26065,9 +26071,18 @@ class TestHandleGrepExternalizedPayloads:
         assert "error" in result
         assert "Externalized payload storage is unavailable" in result["error"]
 
-    def test_scan_never_reaches_content_after_512000_encoded_bytes(self, externalized_search_engine):
+    def test_scan_never_reaches_content_after_512000_encoded_bytes(
+        self,
+        externalized_search_engine,
+        monkeypatch,
+    ):
         content = ("a" * 520_000) + " unreachable-needle"
         ref = self._externalize(externalized_search_engine, content)
+        monkeypatch.setattr(
+            lcm_tools,
+            "load_externalized_payload",
+            lambda *args, **kwargs: pytest.fail("grep validation must not deserialize full payloads"),
+        )
 
         missed = json.loads(
             externalized_search_engine.handle_tool_call(
@@ -26094,6 +26109,57 @@ class TestHandleGrepExternalizedPayloads:
         assert bounded_hit["results"][0]["scan_truncated"] is True
         assert bounded_hit["results"][0]["content_scanned_bytes"] == 512_000
 
+    def test_explicit_ref_tail_validation_reads_only_a_bounded_window(
+        self,
+        externalized_search_engine,
+        monkeypatch,
+    ):
+        ref = self._externalize(externalized_search_engine, ("a" * 2_000_000) + "\x00needle")
+        payload_path = Path(externalized_search_engine._hermes_home, "lcm-large-outputs", ref)
+        metadata_prefix, content_key_seen, prefix_truncated = (
+            lcm_tools._read_externalized_payload_metadata_prefix(
+                payload_path,
+                max_read_bytes=lcm_tools._LCM_GREP_EXTERNALIZED_METADATA_READ_BYTES,
+            )
+        )
+        assert content_key_seen is True
+        assert prefix_truncated is False
+
+        real_open = Path.open
+        bytes_read = []
+
+        class TrackedHandle:
+            def __init__(self, handle):
+                self._handle = handle
+
+            def __enter__(self):
+                self._handle.__enter__()
+                return self
+
+            def __exit__(self, *args):
+                return self._handle.__exit__(*args)
+
+            def seek(self, *args):
+                return self._handle.seek(*args)
+
+            def read(self, size=-1):
+                assert 0 <= size <= lcm_tools._LCM_GREP_EXTERNALIZED_DOCUMENT_TAIL_BYTES + 1
+                data = self._handle.read(size)
+                bytes_read.append(len(data))
+                return data
+
+        def tracked_open(path, *args, **kwargs):
+            handle = real_open(path, *args, **kwargs)
+            return TrackedHandle(handle) if path == payload_path else handle
+
+        monkeypatch.setattr(Path, "open", tracked_open)
+
+        payload = lcm_tools._validate_externalized_payload_json_tail(payload_path, metadata_prefix)
+
+        assert payload is not None
+        assert payload["session_id"] == "test-session"
+        assert sum(bytes_read) <= lcm_tools._LCM_GREP_EXTERNALIZED_DOCUMENT_TAIL_BYTES
+
     def test_externalized_scope_rejects_cross_session_search(self, externalized_search_engine):
         result = json.loads(
             externalized_search_engine.handle_tool_call(
@@ -26104,66 +26170,45 @@ class TestHandleGrepExternalizedPayloads:
 
         assert "session_scope=current only" in result["error"]
 
-    def test_role_filter_omits_externalized_sidecar_hits(self, externalized_search_engine):
-        # The role schema documents "returns raw message hits only". Externalized
-        # sidecars are tool/ingest payloads, not raw messages, so a role filter
-        # must suppress them rather than leak an unfiltered payload -- even when
-        # the sidecar's own stored role would match the requested value.
-        externalized_search_engine._store.append(
-            "test-session", {"role": "user", "content": "history needle from user"}
+    @pytest.mark.parametrize("content_scope", ["externalized", "both"])
+    @pytest.mark.parametrize(
+        ("filter_name", "filter_args"),
+        [
+            ("role", {"role": "user"}),
+            ("time_from", {"time_from": 0}),
+            ("time_to", {"time_to": 4_102_444_800}),
+            ("source", {"source": "discord"}),
+            ("conversation_id", {"conversation_id": "lane-123"}),
+        ],
+    )
+    def test_raw_message_filters_omit_externalized_sidecar_hits(
+        self,
+        externalized_search_engine,
+        content_scope,
+        filter_name,
+        filter_args,
+    ):
+        raw_store_id = externalized_search_engine._store.append(
+            "test-session",
+            {"role": "user", "content": "history needle from user"},
+            source="discord",
+            conversation_id="lane-123",
         )
         self._externalize(externalized_search_engine, "tool payload needle " * 20)
-
-        # A non-matching role over externalized-only scope returns nothing.
-        externalized_only = json.loads(
-            externalized_search_engine.handle_tool_call(
-                "lcm_grep",
-                {"query": "needle", "content_scope": "externalized", "role": "user"},
-            )
-        )
-        assert externalized_only["total_results"] == 0
-        assert externalized_only["results"] == []
-        assert externalized_only["externalized_results_omitted"] is True
-        assert "externalized_scan" not in externalized_only
-
-        # Even role="tool" (which matches the sidecar's stored role) stays
-        # suppressed: the contract is raw-message hits only, not filtered sidecars.
-        matching_role = json.loads(
-            externalized_search_engine.handle_tool_call(
-                "lcm_grep",
-                {"query": "needle", "content_scope": "externalized", "role": "tool"},
-            )
-        )
-        assert matching_role["total_results"] == 0
-        assert matching_role["externalized_results_omitted"] is True
-
-        # Under content_scope="both" the raw-message hits survive; sidecars do not.
-        both = json.loads(
-            externalized_search_engine.handle_tool_call(
-                "lcm_grep",
-                {"query": "needle", "content_scope": "both", "role": "user"},
-            )
-        )
-        assert {item["type"] for item in both["results"]} == {"message"}
-        assert both["externalized_results_omitted"] is True
-
-    def test_time_filter_omits_externalized_sidecar_hits(self, externalized_search_engine):
-        # time_from/time_to are documented as raw-message-only filters; sidecar
-        # search must be suppressed when they are supplied.
-        self._externalize(externalized_search_engine, "timed payload needle " * 20)
 
         result = json.loads(
             externalized_search_engine.handle_tool_call(
                 "lcm_grep",
                 {
                     "query": "needle",
-                    "content_scope": "externalized",
-                    "time_from": 0,
+                    "content_scope": content_scope,
+                    **filter_args,
                 },
             )
         )
 
-        assert result["total_results"] == 0
+        expected_store_ids = [raw_store_id] if content_scope == "both" else []
+        assert [item["store_id"] for item in result["results"]] == expected_store_ids, filter_name
         assert result["externalized_results_omitted"] is True
         assert "externalized_scan" not in result
 

@@ -219,6 +219,7 @@ _LCM_GREP_EXTERNALIZED_FILE_CAP = 256
 _LCM_GREP_EXTERNALIZED_DISCOVERY_CAP = 4096
 _LCM_GREP_EXTERNALIZED_METADATA_READ_BYTES = 64 * 1024
 _LCM_GREP_EXTERNALIZED_CONTENT_BYTES = 512_000
+_LCM_GREP_EXTERNALIZED_DOCUMENT_TAIL_BYTES = 64 * 1024
 _LCM_GREP_RESPONSE_CHAR_CAP = 64_000
 _LCM_LOAD_SESSION_DEFAULT_LIMIT = 100
 _LCM_LOAD_SESSION_HARD_LIMIT_CAP = 200
@@ -1138,6 +1139,7 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
         or time_to is not None
         or conversation_id is not None
     )
+    externalized_filter_active = raw_message_filter_active or source is not None
 
     if requested_session_scope == "current":
         if explicit_session_id:
@@ -1263,12 +1265,12 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
 
     externalized_scan: dict[str, Any] | None = None
     externalized_results_omitted = False
-    if searches_externalized and raw_message_filter_active:
+    if searches_externalized and externalized_filter_active:
         # Externalized sidecars are tool/ingest payloads, not raw messages, and
-        # carry no role/timestamp/conversation lane comparable to history rows.
-        # The role/time_from/time_to schema contract documents these filters as
-        # returning raw-message hits only, so suppress sidecar search here rather
-        # than leak unfiltered payloads. Mirrors the summary-node omission above.
+        # carry no role/timestamp/source/conversation lane comparable to history
+        # rows. Suppress sidecar search whenever one of those filters is active
+        # rather than leak unscoped payloads. Source remains valid for summary
+        # search above, so it intentionally does not affect summary omission.
         externalized_results_omitted = True
     elif searches_externalized:
         try:
@@ -1364,6 +1366,7 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
                     ref,
                     engine.current_session_id,
                     max_read_bytes=_LCM_GREP_EXTERNALIZED_METADATA_READ_BYTES,
+                    require_valid_document_tail=True,
                 )
                 if not metadata.get("readable"):
                     if metadata.get("error") == "session_mismatch":
@@ -2313,12 +2316,51 @@ def _read_externalized_payload_metadata_prefix(
     return "".join(text_parts), False, prefix_truncated
 
 
+def _validate_externalized_payload_json_tail(
+    path: Path,
+    metadata_prefix_text: str,
+    *,
+    max_tail_bytes: int = _LCM_GREP_EXTERNALIZED_DOCUMENT_TAIL_BYTES,
+) -> dict[str, Any] | None:
+    """Validate the closing JSON structure using only a bounded tail window."""
+    metadata_prefix = metadata_prefix_text.encode("utf-8")
+    try:
+        file_size = path.stat().st_size
+        tail_offset = max(len(metadata_prefix), file_size - max_tail_bytes)
+        with path.open("rb") as handle:
+            handle.seek(tail_offset)
+            tail = handle.read(max_tail_bytes + 1)
+    except OSError:
+        return None
+    if len(tail) > max_tail_bytes:
+        return None
+
+    for index, byte in enumerate(tail):
+        if byte != ord('"'):
+            continue
+        backslashes = 0
+        cursor = index - 1
+        while cursor >= 0 and tail[cursor] == ord("\\"):
+            backslashes += 1
+            cursor -= 1
+        if backslashes % 2:
+            continue
+        try:
+            payload = json.loads((metadata_prefix + b'"' + tail[index + 1 :]).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict):
+            return payload
+    return None
+
+
 def _inspect_externalized_payload_metadata(
     engine: "LCMEngine",
     ref: str,
     session_id: str,
     *,
     max_read_bytes: int = _LCM_INSPECT_PAYLOAD_METADATA_READ_BYTES,
+    require_valid_document_tail: bool = False,
 ) -> dict[str, Any]:
     if not ref or Path(ref).name != ref:
         return {"readable": False, "error": "invalid_ref"}
@@ -2352,6 +2394,13 @@ def _inspect_externalized_payload_metadata(
         error = "metadata_prefix_truncated" if prefix_truncated else "invalid_payload"
         return {"readable": False, "error": error}
 
+    if require_valid_document_tail:
+        full_payload = _validate_externalized_payload_json_tail(path, metadata_prefix_text)
+        if full_payload is None:
+            return {"readable": False, "error": "invalid_payload"}
+        if (full_payload.get("session_id") or "") != session_id:
+            return {"readable": False, "error": "session_mismatch"}
+
     try:
         stat = path.stat()
     except FileNotFoundError:
@@ -2363,7 +2412,7 @@ def _inspect_externalized_payload_metadata(
         "readable": True,
         "file_size_bytes": stat.st_size,
         "modified_at": stat.st_mtime,
-        "payload_validation": "metadata_prefix",
+        "payload_validation": "document_tail" if require_valid_document_tail else "metadata_prefix",
     }
     if payload_session_id:
         metadata["payload_session_id"] = payload_session_id
