@@ -622,7 +622,8 @@ def rerank_sessions_voyage(
     Uses ``VoyageProvider.rerank`` (rerank-2.5-lite) over each candidate session's
     deterministic summary in one API call. Returns the reordered candidate window
     followed by the untouched fused tail, or ``None`` to signal the caller should
-    fall back to the deterministic placeholder (empty window or any provider error).
+    fall back to the deterministic placeholder (empty window, any provider error,
+    or an empty/degenerate response that does not cover every candidate).
     """
     candidates = list(sessions[:window])
     if not candidates:
@@ -631,6 +632,13 @@ def rerank_sessions_voyage(
     try:
         ranked = reranker.rerank(query, documents, top_k=len(documents), timeout=timeout)
     except Exception:
+        return None
+    # A non-exception but empty/degenerate response (e.g. ``data: []`` or scores
+    # covering only some candidates) is NOT a trustworthy real rerank -- treat it
+    # exactly like a provider error so it is labeled a placeholder fallback rather
+    # than silently counted as real voyage rerank.
+    covered = {index for index, _score in ranked if 0 <= index < len(candidates)}
+    if len(covered) != len(candidates):
         return None
     reordered = [candidates[index] for index, _score in ranked if 0 <= index < len(candidates)]
     seen = set(reordered)

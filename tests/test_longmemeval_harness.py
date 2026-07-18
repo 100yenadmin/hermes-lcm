@@ -420,6 +420,23 @@ def test_rerank_sessions_voyage_signals_fallback_on_error_and_empty():
     assert rerank_sessions_voyage(reranker, "q", [], {}) is None
 
 
+def test_rerank_sessions_voyage_empty_response_signals_fallback():
+    """FIX-3: a non-exception empty response (e.g. ``data: []``) is degenerate --
+    it must signal the placeholder fallback, not be accepted as a real rerank."""
+    reranker = _FakeReranker(order=[])  # provider returns [] without raising
+    out = rerank_sessions_voyage(reranker, "q", ["a", "b", "c"], {"a": "x", "b": "y", "c": "z"})
+    assert out is None
+    assert reranker.calls == 1  # the provider WAS called; its response was degenerate
+
+
+def test_rerank_sessions_voyage_partial_coverage_signals_fallback():
+    """FIX-3: a response scoring only some candidates does not cover the input
+    set, so it is degenerate and must fall back rather than count as real."""
+    reranker = _FakeReranker(order=[0])  # only 1 of 3 candidates scored
+    out = rerank_sessions_voyage(reranker, "q", ["a", "b", "c"], {"a": "x", "b": "y", "c": "z"})
+    assert out is None
+
+
 class _RerankingEmbedder(_KeyedEmbedder):
     """A voyage-shaped embedder that also exposes a fake ``rerank``."""
 
