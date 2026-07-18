@@ -603,10 +603,21 @@ python scripts/backfill_externalized_tool_outputs.py \
   --apply
 ```
 
+Sidecar retention and redaction: before a historical tool result is written to
+the externalized-payload directory the command applies the currently enabled
+`LCM_SENSITIVE_PATTERNS` policy to its content, exactly as live ingest does, so no
+un-redacted secret is copied onto the new retention surface. Every manifest digest,
+ref, and provenance proof is derived from the redacted content that is actually
+stored. Each sidecar mirrors the live externalized-payload shape (kind, role,
+session id, tool-call id, and the redacted content) so recovery through
+`lcm_expand(externalized_ref=...)` keeps working. The manifest records the active
+redaction policy and refuses to resume a journal written under a different policy.
+
 The manifest is a durable ownership journal containing references, digests,
-provenance proofs, target-identity hashes, counts, sizes, and token estimates,
-not raw payload content, session ids, or tool-call ids. Reusing the same manifest
-path preserves every sidecar created by earlier apply runs. An interrupted apply
+provenance proofs, target-identity hashes, the redaction policy, counts, sizes, and
+token estimates, not raw payload content, session ids, or tool-call ids; the refs
+carry a `historical-backfill` marker rather than a tool-call stub. Reusing the same
+manifest path preserves every sidecar created by earlier apply runs. An interrupted apply
 can be rerun with the same path to recover its pending journal entries. The
 journal is bound to one database file and one externalized-payload storage root;
 the command refuses reuse or rollback against another target. Manifest files and

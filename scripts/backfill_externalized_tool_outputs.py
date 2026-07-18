@@ -57,6 +57,8 @@ from hermes_lcm.externalize import (  # noqa: E402
 from hermes_lcm.ingest_protection import (  # noqa: E402
     _contains_media_payload,
     extract_all_externalized_payload_refs,
+    redact_sensitive_value,
+    sensitive_pattern_status,
 )
 from hermes_lcm.tokens import count_tokens  # noqa: E402
 
@@ -148,6 +150,23 @@ def _sidecar_matches_provenance(
         "manifest_id": manifest_id,
         "ownership_proof": ownership_proof,
     }
+
+
+def _redaction_binding(config: LCMConfig) -> dict[str, Any]:
+    """Record the sensitive-pattern policy applied to persisted sidecar content."""
+    status = sensitive_pattern_status(config)
+    return {
+        "enabled": bool(status.get("enabled")),
+        "active_patterns": sorted(str(name) for name in (status.get("active_patterns") or [])),
+    }
+
+
+def _redact_backfill_content(content: str, config: LCMConfig) -> str:
+    """Apply the currently-enabled sensitive-pattern policy exactly as live ingest
+    does before a tool result is externalized, so no un-redacted secret reaches the
+    new sidecar retention surface."""
+    redacted = redact_sensitive_value(content, config, parse_json_strings=False)
+    return redacted if isinstance(redacted, str) else content
 
 
 def _contains_serialized_media(content: str) -> bool:
@@ -494,6 +513,25 @@ def _validate_target_binding(source: dict[str, Any], current: dict[str, Any]) ->
         raise ValueError("manifest belongs to a different database or storage root")
 
 
+def _validate_redaction_binding(source: dict[str, Any], current: dict[str, Any]) -> None:
+    """Refuse to resume a journal written under a different sensitive-pattern policy.
+
+    The persisted sidecar content is redacted with the active policy, so reusing a
+    journal after the policy changed would key pending entries by a different digest
+    and could strand or duplicate owned sidecars. Fail closed instead.
+    """
+    recorded = source.get("redaction")
+    if recorded is None:
+        recorded = {"enabled": False, "active_patterns": []}
+    if not isinstance(recorded, dict):
+        raise ValueError("manifest is not bound to a sensitive-pattern redaction policy")
+    recorded_patterns = recorded.get("active_patterns") or []
+    if bool(recorded.get("enabled")) != bool(current.get("enabled")) or sorted(
+        str(name) for name in recorded_patterns
+    ) != list(current.get("active_patterns") or []):
+        raise ValueError("manifest was written under a different sensitive-pattern redaction policy")
+
+
 def _validate_existing_journal(source: dict[str, Any]) -> str:
     schema_version = source.get("schema_version")
     if type(schema_version) is not int or schema_version != 1:
@@ -620,6 +658,7 @@ def run_backfill(
             create=False,
         )
         current_target = _target_binding(database_path, storage_dir)
+        redaction = _redaction_binding(runtime_config)
 
         with _manifest_guard(manifest_path) as (guarded_manifest_path, manifest_directory_fd):
             existing_manifest = _read_manifest(manifest_directory_fd, guarded_manifest_path.name)
@@ -632,6 +671,7 @@ def run_backfill(
                 source, manifest_identity = existing_manifest
                 manifest_id = _validate_existing_journal(source)
                 _validate_target_binding(source, current_target)
+                _validate_redaction_binding(source, redaction)
                 if source["applied"] is True and not apply:
                     raise ValueError("an applied ownership journal cannot be replaced by a dry run")
                 if source["applied"] is False:
@@ -668,6 +708,7 @@ def run_backfill(
                 "applied": apply,
                 "state": "applying" if apply else "dry_run",
                 "target": current_target,
+                "redaction": redaction,
                 "threshold_chars": threshold_chars,
                 "counts": counts,
                 "token_estimate_total": 0,
@@ -716,17 +757,21 @@ def run_backfill(
                         continue
 
                     counts["eligible"] += 1
-                    item = _manifest_item(content=content)
+                    # Redact secrets exactly as live ingest does before externalizing,
+                    # so the persisted sidecar (and every digest, ref, and provenance
+                    # proof derived from it) never carries an un-redacted secret.
+                    payload_content = _redact_backfill_content(content, runtime_config)
+                    item = _manifest_item(content=payload_content)
                     token_estimate_total += int(item["token_estimate"])
                     manifest["token_estimate_total"] = token_estimate_total
                     session_id = str(row["session_id"] or "")
                     tool_call_id = str(row["tool_call_id"] or "")
-                    key = _row_key(content=content, session_id=session_id, tool_call_id=tool_call_id)
+                    key = _row_key(content=payload_content, session_id=session_id, tool_call_id=tool_call_id)
                     pending = pending_by_key.get(key)
 
                     if pending is None:
                         existing = find_externalized_payload_for_message(
-                            content,
+                            payload_content,
                             tool_call_id=tool_call_id,
                             session_id=session_id,
                             kind="tool_result",
@@ -743,7 +788,7 @@ def run_backfill(
 
                     assert storage_directory_fd is not None
                     if pending is None:
-                        ref = _backfill_ref(content)
+                        ref = _backfill_ref(payload_content)
                         ownership_proof = _ownership_proof(
                             manifest_id=manifest_id,
                             ref=ref,
@@ -768,7 +813,7 @@ def run_backfill(
                         counts["existing"] += 1
                     elif status == "missing":
                         payload = _backfill_payload(
-                            content=content,
+                            content=payload_content,
                             session_id=session_id,
                             tool_call_id=tool_call_id,
                             manifest_id=manifest_id,
@@ -798,7 +843,7 @@ def run_backfill(
                     pending_items.remove(pending)
                     pending_by_key.pop(key, None)
                     if ref not in owned_refs:
-                        owned_item = _manifest_item(content=content, ref=ref, created=True)
+                        owned_item = _manifest_item(content=payload_content, ref=ref, created=True)
                         owned_item["ownership_proof"] = ownership_proof
                         owned_items.append(owned_item)
                         owned_refs.add(ref)

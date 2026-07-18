@@ -832,3 +832,82 @@ def test_rollback_refuses_digest_mismatch(tmp_path):
 
     assert result["counts"]["skipped_digest_mismatch"] == 1
     assert sidecar.exists()
+
+
+def _redacting_config(database, patterns):
+    return LCMConfig(
+        database_path=str(database),
+        large_output_externalization_enabled=False,
+        large_output_externalization_threshold_chars=100,
+        sensitive_patterns_enabled=True,
+        sensitive_patterns=list(patterns),
+    )
+
+
+def test_apply_redacts_sensitive_content_before_writing_sidecar(tmp_path):
+    module = _load_script()
+    secret = "SUPERSECRETVALUE1234"
+    content = f"api_key={secret}\n" + ("historical tool output line\n" * 40)
+    home, database, _, _ = _seed(tmp_path, content=content)
+    redacting_config = _redacting_config(database, ["api_key"])
+    manifest = tmp_path / "apply.json"
+
+    result = _run_backfill(module, home, database, redacting_config, manifest, apply=True)
+
+    assert result["counts"]["created"] == 1
+    storage_dir = get_large_output_storage_dir(redacting_config, hermes_home=str(home), create=False)
+    sidecars = list(storage_dir.glob("*.json"))
+    assert len(sidecars) == 1
+    payload = json.loads(sidecars[0].read_text(encoding="utf-8"))
+    # The current sensitive-pattern policy is applied before persisting, exactly as
+    # live ingest does, so the raw secret never reaches the new retention surface.
+    assert secret not in json.dumps(payload)
+    assert "LCM sensitive redaction" in payload["content"]
+    # The manifest digest and ownership proof bind the redacted content actually stored.
+    persisted = json.loads(manifest.read_text(encoding="utf-8"))
+    assert module._sha256(payload["content"]) == persisted["items"][0]["sha256"]
+    assert persisted["redaction"] == {"enabled": True, "active_patterns": ["api_key"]}
+    # Raw message rows are never rewritten.
+    with module._read_only_connection(database) as connection:
+        assert secret in connection.execute("SELECT content FROM messages").fetchone()[0]
+    # Rollback still recognizes and deletes its own redacted sidecar.
+    rollback = module.run_rollback(
+        database_path=database,
+        hermes_home=home,
+        source_manifest_path=manifest,
+        apply=True,
+        config=redacting_config,
+    )
+    assert rollback["counts"]["deleted"] == 1
+
+
+def test_manifest_never_leaks_tool_call_or_session_ids(tmp_path):
+    module = _load_script()
+    home, database, config, _ = _seed(
+        tmp_path, content="historical output " * 100, session_id="session-supersecret-id"
+    )
+    manifest = tmp_path / "apply.json"
+    _run_backfill(module, home, database, config, manifest, apply=True)
+
+    manifest_text = manifest.read_text(encoding="utf-8")
+    # The operator guide promises the manifest omits raw tool-call and session ids;
+    # refs also carry no tool-call stub, only the historical-backfill marker.
+    assert "session-supersecret-id" not in manifest_text
+    assert "call-private" not in manifest_text
+    persisted = json.loads(manifest_text)
+    for record in persisted["items"] + persisted.get("pending_items", []):
+        assert "tool_call_id" not in record
+        assert "session_id" not in record
+        assert "historical-backfill" in str(record.get("ref", ""))
+
+
+def test_backfill_refuses_manifest_reuse_under_changed_redaction_policy(tmp_path):
+    module = _load_script()
+    home, database, _, _ = _seed(tmp_path)
+    manifest = tmp_path / "apply.json"
+
+    first = _run_backfill(module, home, database, _redacting_config(database, ["api_key"]), manifest, apply=True)
+    assert first["counts"]["created"] == 1
+
+    with pytest.raises(ValueError, match="different sensitive-pattern redaction policy"):
+        _run_backfill(module, home, database, _redacting_config(database, ["bearer_token"]), manifest, apply=True)
