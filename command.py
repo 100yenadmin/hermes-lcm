@@ -3674,6 +3674,8 @@ def _embedding_backfill_summary_text(
                             raise EmbeddingProviderError(
                                 "provider returned a different number of indexes and embeddings"
                             )
+                        publish_rows = []
+                        publish_items = []
                         for batch_index, vector in zip(
                             accepted_batch.indexes, accepted_batch.vectors
                         ):
@@ -3689,19 +3691,26 @@ def _embedding_backfill_summary_text(
                                 raise EmbeddingProviderError(
                                     "provider returned an embedding before durable dispatch"
                                 )
-                            try:
-                                publish_outcome = store.publish_embedding_under_lease(
-                                    item[0],
-                                    "summary",
-                                    model,
-                                    vector,
-                                    identity=captured_identity,
-                                    claim_key=_EMBEDDING_BACKFILL_CLAIM_KEY,
-                                    lease_id=lease.lease_id,
-                                    generation=lease.generation,
-                                    request_id=request_id,
-                                )
-                            except Exception as exc:
+                            publish_rows.append(
+                                (item[0], "summary", model, vector, request_id)
+                            )
+                            publish_items.append((item, request_id))
+                        # One BEGIN IMMEDIATE per accepted network batch (one fsync)
+                        # instead of one per row; each row still runs the full CAS
+                        # under its own savepoint, so a mid-batch failure quarantines
+                        # only its request while the committed siblings survive.
+                        for result, (item, request_id) in zip(
+                            store.publish_embedding_batch_under_lease(
+                                publish_rows,
+                                identity=captured_identity,
+                                claim_key=_EMBEDDING_BACKFILL_CLAIM_KEY,
+                                lease_id=lease.lease_id,
+                                generation=lease.generation,
+                            ),
+                            publish_items,
+                        ):
+                            if result.error is not None:
+                                exc = result.error
                                 failed.append((item[0], f"record_error:{exc}"))
                                 if not _owned_inflight_transition(
                                     conn,
@@ -3719,6 +3728,7 @@ def _embedding_backfill_summary_text(
                                         "accepted remotely; local publication failed"
                                     ) from exc
                                 break
+                            publish_outcome = result.outcome
                             if publish_outcome is EmbeddingPublishOutcome.OWNERSHIP_LOST:
                                 lease_lost = True
                                 stop_reason = "lease_lost"
@@ -4364,6 +4374,8 @@ def _chunk_backfill_text(
                             raise EmbeddingProviderError(
                                 "provider returned a different number of indexes and embeddings"
                             )
+                        publish_rows = []
+                        publish_items = []
                         for batch_index, vector in zip(
                             accepted_batch.indexes, accepted_batch.vectors
                         ):
@@ -4380,17 +4392,29 @@ def _chunk_backfill_text(
                                     "provider returned an embedding before durable dispatch"
                                 )
                             store_id, chunk_index, char_start, char_end = chunk_meta[item[0]]
-                            try:
-                                publish_outcome = store.publish_chunk_embedding_under_lease(
-                                    item[0], model, vector,
-                                    store_id=store_id, chunk_index=chunk_index,
-                                    char_start=char_start, char_end=char_end,
-                                    token_estimate=item[2], identity=captured_identity,
-                                    claim_key=_EMBEDDING_BACKFILL_CLAIM_KEY,
-                                    lease_id=lease.lease_id, generation=lease.generation,
-                                    request_id=request_id,
-                                )
-                            except Exception as exc:
+                            publish_rows.append({
+                                "chunk_id": item[0], "vec": vector,
+                                "store_id": store_id, "chunk_index": chunk_index,
+                                "char_start": char_start, "char_end": char_end,
+                                "token_estimate": item[2], "request_id": request_id,
+                            })
+                            publish_items.append((item, request_id))
+                        # One BEGIN IMMEDIATE per accepted network batch (one fsync)
+                        # instead of one per row; each row still runs the full CAS
+                        # under its own savepoint (see the summary path).
+                        for result, (item, request_id) in zip(
+                            store.publish_chunk_embedding_batch_under_lease(
+                                publish_rows,
+                                model=model,
+                                identity=captured_identity,
+                                claim_key=_EMBEDDING_BACKFILL_CLAIM_KEY,
+                                lease_id=lease.lease_id,
+                                generation=lease.generation,
+                            ),
+                            publish_items,
+                        ):
+                            if result.error is not None:
+                                exc = result.error
                                 failed.append((item[0], f"record_error:{exc}"))
                                 if not _owned_inflight_transition(
                                     conn, identity, lease, request_id,
@@ -4405,6 +4429,7 @@ def _chunk_backfill_text(
                                         "accepted remotely; local publication failed"
                                     ) from exc
                                 break
+                            publish_outcome = result.outcome
                             if publish_outcome is EmbeddingPublishOutcome.OWNERSHIP_LOST:
                                 lease_lost = True
                                 stop_reason = "lease_lost"

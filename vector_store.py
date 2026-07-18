@@ -180,6 +180,22 @@ class EmbeddingPublishOutcome(str, Enum):
     IDENTITY_SUPERSEDED = "identity_superseded"
 
 
+@dataclass(frozen=True)
+class BatchPublishResult:
+    """Per-row result from a batched publication.
+
+    ``outcome`` carries the same CAS verdict a single-row publish would return;
+    ``error`` is set (and ``outcome`` is ``None``) when that row's publish raised
+    — its savepoint was rolled back, so the row stayed in-flight while its
+    batch siblings that already succeeded remain committed. The caller reproduces
+    exactly the accounting it applied on the single-row path.
+    """
+
+    embedded_id: str
+    outcome: EmbeddingPublishOutcome | None
+    error: Exception | None = None
+
+
 class VectorStore:
     """SQLite-backed store for normalized summary embedding vectors."""
 
@@ -210,6 +226,12 @@ class VectorStore:
         self._conn: Optional[sqlite3.Connection] = None
         self._write_lock = threading.RLock()
         self._cache_lock = threading.RLock()
+        # Nesting depth for _write_transaction. The outermost entry owns the
+        # BEGIN IMMEDIATE/COMMIT (one fsync); a re-entrant inner entry (e.g. a
+        # single-row publish invoked from publish_*_batch_under_lease) rides the
+        # open transaction under a SAVEPOINT so its failure rolls back only its
+        # own row, never the sibling rows already written in the same batch.
+        self._txn_depth = 0
         # Cache key: (identity_hash, data_version, candidate_ids). The durable
         # per-identity ``data_version`` counter is bumped inside every vector
         # write/delete transaction, so a cross-process write invalidates this
@@ -288,9 +310,30 @@ class VectorStore:
         # multi-statement write must open its own explicit transaction to stay
         # atomic — the data_version bump has to commit with the vector write it
         # accompanies, never separately.
+        #
+        # Re-entrant: the outermost caller owns the BEGIN IMMEDIATE + COMMIT (one
+        # fsync); a nested caller opens a SAVEPOINT instead so a batch of per-row
+        # publications shares a single transaction. A nested failure rolls back
+        # to its own savepoint and re-raises, leaving the earlier rows of the
+        # batch intact for the outer COMMIT.
         try:
             with self._write_lock, self._cache_lock:
+                if self._txn_depth > 0:
+                    savepoint = f"lcm_pub_sp_{self._txn_depth}"
+                    self._conn.execute(f"SAVEPOINT {savepoint}")
+                    self._txn_depth += 1
+                    try:
+                        yield
+                        self._conn.execute(f"RELEASE {savepoint}")
+                    except BaseException:
+                        self._conn.execute(f"ROLLBACK TO {savepoint}")
+                        self._conn.execute(f"RELEASE {savepoint}")
+                        raise
+                    finally:
+                        self._txn_depth -= 1
+                    return
                 self._conn.execute("BEGIN IMMEDIATE")
+                self._txn_depth = 1
                 try:
                     yield
                     self._conn.commit()
@@ -298,6 +341,7 @@ class VectorStore:
                     self._conn.rollback()
                     raise
                 finally:
+                    self._txn_depth = 0
                     self._matrix_cache.clear()
         except sqlite3.Error as exc:
             if _is_sqlite_locked_error(exc):
@@ -598,6 +642,73 @@ class VectorStore:
                 embedded_id, kind, vec, identity=identity, profile=profile
             ),
         )
+
+    def publish_embedding_batch_under_lease(
+        self,
+        rows: Sequence[tuple[str, str, str, Sequence[float]]],
+        *,
+        identity: EmbeddingIdentity,
+        claim_key: str,
+        lease_id: str,
+        generation: int,
+    ) -> list[BatchPublishResult]:
+        """Publish an accepted network batch of summary vectors in ONE transaction.
+
+        ``rows`` is a sequence of ``(embedded_id, kind, model, vec)`` in provider
+        order. All rows share one ``BEGIN IMMEDIATE`` (a single fsync per network
+        batch instead of one per row), yet each still runs the full per-row
+        ownership/identity CAS under its own savepoint via the single-row
+        ``publish_embedding_under_lease``. Publication stops at the first row that
+        is not ``PUBLISHED`` (or that raises), mirroring the single-row loop it
+        replaces; the rows already published in that transaction are kept.
+        """
+        return self._run_publish_batch(
+            [
+                (
+                    str(embedded_id),
+                    lambda embedded_id=embedded_id, kind=kind, model=model, vec=vec, request_id=request_id: self.publish_embedding_under_lease(
+                        embedded_id,
+                        kind,
+                        model,
+                        vec,
+                        identity=identity,
+                        claim_key=claim_key,
+                        lease_id=lease_id,
+                        generation=generation,
+                        request_id=request_id,
+                    ),
+                )
+                for embedded_id, kind, model, vec, request_id in rows
+            ]
+        )
+
+    def _run_publish_batch(
+        self, publishers: Sequence[tuple[str, "Any"]]
+    ) -> list[BatchPublishResult]:
+        """Run per-row publishers inside one write transaction.
+
+        Each entry is ``(embedded_id, publish)`` where ``publish`` is a zero-arg
+        call into the corpus-specific single-row publish method (kept as the
+        per-row worker so its behaviour — and any test monkeypatch of it — is
+        exercised unchanged, now under a savepoint). A raised publisher rolls its
+        own savepoint back and is reported as an errored row; the loop then stops
+        so the caller can quarantine the request exactly as the single-row path
+        did, while the committed siblings survive.
+        """
+        results: list[BatchPublishResult] = []
+        with self._write_transaction():
+            for embedded_id, publish in publishers:
+                try:
+                    outcome = publish()
+                except Exception as exc:  # noqa: BLE001 — reported to the caller
+                    results.append(
+                        BatchPublishResult(embedded_id, outcome=None, error=exc)
+                    )
+                    break
+                results.append(BatchPublishResult(embedded_id, outcome=outcome))
+                if outcome is not EmbeddingPublishOutcome.PUBLISHED:
+                    break
+        return results
 
     def _publish_under_lease(
         self,
@@ -1543,6 +1654,48 @@ class VectorStore:
                 identity=identity,
                 profile=profile,
             ),
+        )
+
+    def publish_chunk_embedding_batch_under_lease(
+        self,
+        rows: Sequence[dict],
+        *,
+        model: str,
+        identity: EmbeddingIdentity,
+        claim_key: str,
+        lease_id: str,
+        generation: int,
+    ) -> list[BatchPublishResult]:
+        """Publish an accepted network batch of chunk vectors in ONE transaction.
+
+        Chunk analogue of :meth:`publish_embedding_batch_under_lease`. Each row
+        dict carries ``chunk_id``, ``vec``, ``request_id`` and the chunk-meta
+        fields (``store_id``/``chunk_index``/``char_start``/``char_end``/
+        ``token_estimate``); each publishes under its own savepoint via the
+        single-row ``publish_chunk_embedding_under_lease``.
+        """
+        return self._run_publish_batch(
+            [
+                (
+                    str(row["chunk_id"]),
+                    lambda row=row: self.publish_chunk_embedding_under_lease(
+                        row["chunk_id"],
+                        model,
+                        row["vec"],
+                        store_id=row["store_id"],
+                        chunk_index=row["chunk_index"],
+                        char_start=row["char_start"],
+                        char_end=row["char_end"],
+                        token_estimate=row["token_estimate"],
+                        identity=identity,
+                        claim_key=claim_key,
+                        lease_id=lease_id,
+                        generation=generation,
+                        request_id=row["request_id"],
+                    ),
+                )
+                for row in rows
+            ]
         )
 
     def archive_chunks_for_messages(self, store_ids: Sequence[int | str]) -> int:
