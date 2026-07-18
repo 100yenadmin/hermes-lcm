@@ -25690,6 +25690,46 @@ class TestHandleGrepExternalizedPayloads:
         )
         return ref
 
+    def _write_payload_with_content_size(self, engine, ref, size_field):
+        storage = Path(engine._hermes_home, "lcm-large-outputs")
+        storage.mkdir(parents=True, exist_ok=True)
+        content = "needle payload"
+        sizes = {
+            "content_chars": str(len(content)),
+            "content_bytes": str(len(content.encode("utf-8"))),
+        }
+        sizes[size_field] = ("9" * 400) + ".0"
+        (storage / ref).write_text(
+            '{"kind":"tool_result","role":"tool","session_id":"test-session",'
+            '"tool_call_id":"call-content-size",'
+            f'"content_chars":{sizes["content_chars"]},'
+            f'"content_bytes":{sizes["content_bytes"]},'
+            f'"created_at":1.0,"content":{json.dumps(content)}}}',
+            encoding="utf-8",
+        )
+        return ref
+
+    def _write_payload_with_nested_content(self, engine, ref):
+        storage = Path(engine._hermes_home, "lcm-large-outputs")
+        storage.mkdir(parents=True, exist_ok=True)
+        content = "real payload target"
+        payload = {
+            "metadata": {
+                "session_id": "foreign-session",
+                "content": "nested decoy target",
+            },
+            "kind": "tool_result",
+            "role": "tool",
+            "session_id": "test-session",
+            "tool_call_id": "call-nested-content",
+            "content": content,
+            "content_chars": len(content),
+            "content_bytes": len(content.encode("utf-8")),
+            "created_at": 1.0,
+        }
+        (storage / ref).write_text(json.dumps(payload), encoding="utf-8")
+        return ref, content
+
     def test_default_history_scope_does_not_scan_sidecars(self, externalized_search_engine):
         self._externalize(externalized_search_engine, "private external needle " * 20)
 
@@ -25805,6 +25845,66 @@ class TestHandleGrepExternalizedPayloads:
         assert result["externalized_scan"]["candidate_files"] == 2
         assert result["externalized_scan"]["scanned_files"] == 2
         assert result["externalized_scan"]["matched_files"] == 2
+
+    @pytest.mark.parametrize("explicit_refs", [False, True], ids=["auto", "explicit"])
+    @pytest.mark.parametrize("size_field", ["content_bytes", "content_chars"])
+    def test_externalized_search_ignores_non_finite_content_size(
+        self,
+        externalized_search_engine,
+        explicit_refs,
+        size_field,
+    ):
+        ref = self._write_payload_with_content_size(
+            externalized_search_engine,
+            f"non-finite-{size_field}.json",
+            size_field,
+        )
+        args: dict[str, object] = {"query": "needle", "content_scope": "externalized"}
+        if explicit_refs:
+            args["externalized_refs"] = [ref]
+
+        result = json.loads(externalized_search_engine.handle_tool_call("lcm_grep", args))
+
+        assert [item["ref"] for item in result["results"]] == [ref]
+        assert result["results"][0][f"original_{size_field}"] is None
+        assert result["externalized_scan"]["scanned_files"] == 1
+        assert result["externalized_scan"]["matched_files"] == 1
+
+    @pytest.mark.parametrize("explicit_refs", [False, True], ids=["auto", "explicit"])
+    def test_externalized_search_uses_top_level_content_and_remains_expandable(
+        self,
+        externalized_search_engine,
+        explicit_refs,
+    ):
+        ref, content = self._write_payload_with_nested_content(
+            externalized_search_engine,
+            f"nested-content-{'explicit' if explicit_refs else 'auto'}.json",
+        )
+        args: dict[str, object] = {"query": "real payload", "content_scope": "externalized"}
+        if explicit_refs:
+            args["externalized_refs"] = [ref]
+
+        matched = json.loads(externalized_search_engine.handle_tool_call("lcm_grep", args))
+        decoy = json.loads(
+            externalized_search_engine.handle_tool_call(
+                "lcm_grep",
+                {
+                    **args,
+                    "query": "nested decoy",
+                },
+            )
+        )
+        expanded = json.loads(
+            externalized_search_engine.handle_tool_call(
+                "lcm_expand",
+                {"externalized_ref": ref, "max_tokens": 100_000},
+            )
+        )
+
+        assert [item["ref"] for item in matched["results"]] == [ref]
+        assert matched["results"][0]["snippet"] == content
+        assert decoy["total_results"] == 0
+        assert expanded["content"] == content
 
     def test_both_scope_combines_history_and_payload_hits(self, externalized_search_engine):
         externalized_search_engine._store.append(

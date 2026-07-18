@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import codecs
 import json
 import logging
 import re
@@ -12,11 +11,13 @@ from pathlib import Path
 from typing import Any, Dict, TYPE_CHECKING
 
 from .externalize import (
+    _inspect_top_level_json_string_fields_before_content as _externalized_top_level_fields_before_content,
     extract_externalized_ref,
     extract_externalized_refs,
     find_externalized_payload_for_message,
     get_large_output_storage_dir,
     load_externalized_payload,
+    read_externalized_payload_metadata_prefix,
     read_externalized_payload_search_prefix,
 )
 from .diagnostics import (
@@ -2214,59 +2215,7 @@ def _inspect_highest_compacted_source_store_id(engine: "LCMEngine", session_id: 
 
 
 def _inspect_top_level_json_string_fields_before_content(text: str) -> tuple[dict[str, str], bool]:
-    decoder = json.JSONDecoder()
-    fields: dict[str, str] = {}
-    length = len(text)
-    index = 0
-
-    def skip_json_whitespace(pos: int) -> int:
-        while pos < length and text[pos] in " \t\n\r":
-            pos += 1
-        return pos
-
-    index = skip_json_whitespace(index)
-    if index >= length or text[index] != "{":
-        return fields, False
-    index += 1
-
-    while True:
-        index = skip_json_whitespace(index)
-        if index >= length or text[index] == "}":
-            return fields, False
-        if text[index] != '"':
-            return fields, False
-        try:
-            key, index = decoder.raw_decode(text, index)
-        except json.JSONDecodeError:
-            return fields, False
-        if not isinstance(key, str):
-            return fields, False
-        index = skip_json_whitespace(index)
-        if index >= length or text[index] != ":":
-            return fields, False
-        index += 1
-        index = skip_json_whitespace(index)
-        if key == "content":
-            return fields, index < length and text[index] == '"'
-        if index >= length:
-            return fields, False
-        try:
-            value, index = decoder.raw_decode(text, index)
-        except json.JSONDecodeError:
-            return fields, False
-        if isinstance(value, str):
-            fields[key] = value
-        elif key == "session_id":
-            fields.pop(key, None)
-        index = skip_json_whitespace(index)
-        if index >= length:
-            return fields, False
-        if text[index] == ",":
-            index += 1
-            continue
-        if text[index] == "}":
-            return fields, False
-        return fields, False
+    return _externalized_top_level_fields_before_content(text)
 
 
 def _read_externalized_payload_metadata_prefix(
@@ -2280,40 +2229,10 @@ def _read_externalized_payload_metadata_prefix(
     string body is intentionally not consumed; ``lcm_inspect`` reports bounded
     metadata only and leaves full JSON/body validation to explicit expansion.
     """
-    prefix = bytearray()
-    text_parts: list[str] = []
-    decoder = codecs.getincrementaldecoder("utf-8")("strict")
-    prefix_truncated = False
-    read_limit = max(1, int(max_read_bytes))
-    with path.open("rb") as handle:
-        while len(prefix) < read_limit:
-            chunk = handle.read(min(4096, read_limit - len(prefix)))
-            if not chunk:
-                break
-            prefix.extend(chunk)
-            try:
-                decoded = decoder.decode(chunk, final=False)
-            except UnicodeDecodeError as exc:
-                raise ValueError("invalid_payload") from exc
-            if decoded:
-                text_parts.append(decoded)
-            prefix_text = "".join(text_parts)
-            _, content_key_seen = _inspect_top_level_json_string_fields_before_content(prefix_text)
-            if content_key_seen:
-                # The final matching marker is the top-level content field the
-                # strict parser just reached. Do not return body bytes that
-                # happened to share its read chunk with metadata.
-                content_markers = list(re.finditer(r'"content"\s*:\s*"', prefix_text))
-                return prefix_text[: content_markers[-1].end()], True, False
-        prefix_truncated = len(prefix) >= read_limit and bool(handle.read(1))
-    if not prefix_truncated:
-        try:
-            final_text = decoder.decode(b"", final=True)
-        except UnicodeDecodeError as exc:
-            raise ValueError("invalid_payload") from exc
-        if final_text:
-            text_parts.append(final_text)
-    return "".join(text_parts), False, prefix_truncated
+    return read_externalized_payload_metadata_prefix(
+        path,
+        max_read_bytes=max_read_bytes,
+    )
 
 
 def _validate_externalized_payload_json_tail(
