@@ -189,6 +189,36 @@ def test_chunk_hit_dedupes_against_fts_by_store_id(recall_engine, monkeypatch):
     assert "content_offset=0" in hit["expand_hint"]
 
 
+def test_summary_and_chunk_for_same_session_coexist_no_swamp(recall_engine, monkeypatch):
+    """C6 pathology assessment: the harness turn-level collapse (a summary marker
+    swamping precise chunk keys under a fixed top-k coverage budget) does NOT exist
+    in lcm_recall's rrf_fuse.
+
+    A summary hit keys as ("node", node_id) and a chunk/message hit as
+    ("message", store_id), so a summary and the chunks of its own session are
+    DISTINCT fused entries that coexist in the heterogeneous result — one never
+    suppresses the other, and lcm_recall has no per-turn coverage budget to dilute.
+    Both granularities surface for the same session, both scoring perfectly.
+    """
+    node = _add_summary(recall_engine, "kanban dashboard sprint overview", session_id="session-a", created_at=5.0)
+    _seed_summary_vectors(recall_engine, [(node, [1.0, 0.0])])
+    store_id = recall_engine._store.append(
+        "session-a", {"role": "user", "content": "kanban dashboard sprint precise verbatim detail"}
+    )
+    _seed_chunk_vectors(recall_engine, [(store_id, 0, 0, 45, [1.0, 0.0])])
+
+    payload = _recall(recall_engine, monkeypatch, include="all", scope_bias=0.0, limit=10)
+
+    summary_hits = [h for h in payload["hits"] if h["kind"] == "summary"]
+    excerpt_hits = [h for h in payload["hits"] if h["kind"] == "message_excerpt"]
+    # Both granularities survive fusion as separate entries (no swamp/suppression).
+    assert any(h["node_id"] == node for h in summary_hits)
+    assert any(h["store_id"] == store_id for h in excerpt_hits)
+    # The precise chunk carries the chunk arm; the summary carries the summary arm.
+    precise = next(h for h in excerpt_hits if h["store_id"] == store_id)
+    assert "chunk" in precise["arms"]
+
+
 def test_include_verbatim_excludes_summaries(recall_engine, monkeypatch):
     node = _add_summary(recall_engine, "kanban summary only", session_id="session-a", created_at=5.0)
     _seed_summary_vectors(recall_engine, [(node, [1.0, 0.0])])

@@ -33,6 +33,7 @@ from benchmarking.longmemeval import (
     rerank_sessions_voyage,
     rrf_fuse,
     run_harness,
+    summary_turn_keys,
     turn_ndcg_at_k,
     turn_recall_at_k,
 )
@@ -191,6 +192,42 @@ def test_turn_recall_summary_marker_covers_session_at_granularity():
     assert turn_recall_at_k([("s9", None)], evidence, 1) == 0.0
     assert turn_recall_at_k([], evidence, 5) == 0.0
     assert turn_recall_at_k([("s1", 3)], set(), 5) == 0.0
+
+
+def test_hybrid_turn_keys_project_from_fused_ranking_not_raw_key_fusion():
+    """C6: a hybrid arm's turn keys are session-granularity markers derived from its
+    fused SESSION ranking, NOT an RRF over the raw per-arm turn-key lists.
+
+    Regression for the B5-measured turn-precision collapse: fusing precise (fts /
+    chunk) and coarse (summary) turn keys in one ranked list let a flood of precise
+    NON-evidence keys consume the fixed top-k coverage budget ahead of the summary
+    markers of the high-ranked evidence session, dragging turn recall below every
+    input arm. Projecting the (strong) fused session ranking to (session, None)
+    markers restores full session-granularity coverage.
+    """
+    # Evidence lives entirely in session "sE" (3 labeled turns).
+    evidence = {("sE", 0), ("sE", 1), ("sE", 2)}
+    # The fused SESSION ranking puts the evidence session first (its strong signal).
+    fused_ranking = ["sE", "sA", "sB", "sC", "sD", "sF"]
+    # The precise arms AGREE on five NON-evidence turns, so each of those keys earns
+    # two RRF terms and outscores the evidence session's single-arm summary marker.
+    noise = [("sA", 0), ("sB", 0), ("sC", 0), ("sD", 0), ("sF", 0)]
+    fts_turns = list(noise)
+    chunk_turns = list(noise)
+    # In the summary arm the evidence session ranks LAST, so its marker lands at
+    # rank 6 — pushed out of the top-5 budget by the agreed-upon noise.
+    summary_turns = summary_turn_keys(["sA", "sB", "sC", "sD", "sF", "sE"])
+
+    # Old behavior: raw-key RRF buries ("sE", None) below five non-evidence keys.
+    diluted = rrf_fuse(fts_turns, summary_turns, chunk_turns)
+    # New behavior: project the fused session ranking to session-granularity markers.
+    projected = summary_turn_keys(fused_ranking)
+
+    assert all(key[1] is None for key in projected)
+    # The evidence session's marker sits at rank 1 and covers all its turns.
+    assert turn_recall_at_k(projected, evidence, 5) == pytest.approx(1.0)
+    # The diluted fusion recovers nothing in the top-5 (the collapse being fixed).
+    assert turn_recall_at_k(diluted, evidence, 5) == pytest.approx(0.0)
 
 
 def test_turn_ndcg_rewards_ranking_and_credits_summary_markers():

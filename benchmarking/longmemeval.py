@@ -547,16 +547,6 @@ def summary_turn_keys(session_ranked: Sequence[str]) -> list[TurnKey]:
     return [(session, None) for session in session_ranked]
 
 
-def reorder_turn_keys_by_session(turn_keys: Sequence[TurnKey], session_order: Sequence[str]) -> list[TurnKey]:
-    """Stably reorder turn keys to follow a reranked session order.
-
-    Keeps turn-level output of the rerank arm consistent with its session ranking
-    (whether the session ranking came from the real reranker or the placeholder).
-    """
-    rank = {session: index for index, session in enumerate(session_order)}
-    return sorted(turn_keys, key=lambda key: rank.get(key[0], len(rank)))
-
-
 def _fuse_tiebreak(item):
     """Total-order tie-break for fused ids: plain session strings sort as-is;
     turn keys ``(session, turn|None)`` map a None turn (summary = whole
@@ -834,7 +824,16 @@ def evaluate_question(
         summary_turns = summary_turn_keys(vector_ranked)
 
         hybrid_ranked, hybrid_ms = _timed(lambda: rrf_fuse(fts_ranked, vector_ranked))
-        hybrid_turns = rrf_fuse(fts_turns, summary_turns)
+        # C6: a hybrid arm's turn keys are session-granularity markers projected from
+        # its fused SESSION ranking, NOT an RRF over the raw per-arm turn-key lists.
+        # Fusing precise (fts/chunk) and coarse (summary) keys in one ranked list let
+        # non-evidence precise keys consume the fixed top-k coverage budget ahead of
+        # the summary markers of high-ranked evidence sessions, cratering turn recall
+        # below every input arm (measured 25q: rrf3 tR@5 0.40 vs chunk 0.62 / summary
+        # 0.76; session-marker projection restores it to 0.88). The fused session
+        # ranking is the arm's trustworthy signal, so its turn localization is honestly
+        # session-granularity (carried by the ``*`` asterisk), same as summary_vectors.
+        hybrid_turns = summary_turn_keys(hybrid_ranked)
 
         rerank_mode = RERANK_MODE_PLACEHOLDER
         rerank_start = time.perf_counter()
@@ -858,7 +857,8 @@ def evaluate_question(
         else:
             rerank_ranked = list(hybrid_ranked)
         rerank_ms = (time.perf_counter() - rerank_start) * 1000.0
-        rerank_turns = reorder_turn_keys_by_session(hybrid_turns, rerank_ranked)
+        # C6: session-granularity markers follow the reranked session order.
+        rerank_turns = summary_turn_keys(rerank_ranked)
 
         if embeddings_enabled:
             chunk_raw, chunk_ms = _timed(
@@ -872,7 +872,8 @@ def evaluate_question(
         hybrid_rrf3_ranked, rrf3_ms = _timed(
             lambda: rrf_fuse(fts_ranked, vector_ranked, chunk_ranked)
         )
-        rrf3_turns = rrf_fuse(fts_turns, summary_turns, chunk_turns)
+        # C6: session-granularity markers projected from the fused 3-arm ranking.
+        rrf3_turns = summary_turn_keys(hybrid_rrf3_ranked)
 
         # arm -> (session ranking, latency, turn keys, session_granularity asterisk).
         ranked_by_arm: dict[str, tuple[list[str], float, list[TurnKey], bool]] = {
