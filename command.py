@@ -53,7 +53,12 @@ from . import rollup_builder
 from .rollup_store import RollupStore
 from .session_patterns import build_session_match_keys, matches_session_pattern
 from .store import build_message_fts_spec
-from .chunking import VALID_CONTENT_POLICIES, chunk_message, normalize_content_policy
+from .chunking import (
+    VALID_CONTENT_POLICIES,
+    chunk_message,
+    group_by_store_id,
+    normalize_content_policy,
+)
 from .embedding_provider import (
     EmbeddedDocumentBatch,
     EmbeddingProviderError,
@@ -3462,6 +3467,32 @@ def _provider_document_batches(provider, texts: list[str], *, before_dispatch):
     )
 
 
+def _provider_chunk_document_batches(
+    provider, batch, chunk_meta, *, before_dispatch
+):
+    """Yield accepted provider requests for a chunk backfill batch.
+
+    A contextualized provider (voyage-context-*) groups each message's chunks
+    into one inputs inner-list so the context model embeds them together; every
+    accepted batch still carries per-chunk flat indexes + vectors, so the
+    downstream publish/lease/inflight path stays per-chunk and unchanged.
+    Non-context / local providers keep the flat per-chunk document path.
+    """
+    if getattr(provider, "supports_contextualized_grouping", False):
+        store_ids = [chunk_meta[item[0]][0] for item in batch]
+        groups = [
+            [(index, batch[index][1]) for index in group_indexes]
+            for group_indexes in group_by_store_id(store_ids)
+        ]
+        yield from provider.embed_chunk_group_batches(
+            groups, before_dispatch=before_dispatch
+        )
+        return
+    yield from _provider_document_batches(
+        provider, [item[1] for item in batch], before_dispatch=before_dispatch
+    )
+
+
 def _embedding_backfill_text(tokens: list[str], engine) -> str:
     parsed = _embedding_backfill_options(tokens)
     if isinstance(parsed, str):
@@ -4474,8 +4505,8 @@ def _chunk_backfill_text(
 
                 try:
                     accepted_indexes: set[int] = set()
-                    for accepted_batch in _provider_document_batches(
-                        provider, [item[1] for item in batch],
+                    for accepted_batch in _provider_chunk_document_batches(
+                        provider, batch, chunk_meta,
                         before_dispatch=before_dispatch,
                     ):
                         if len(accepted_batch.indexes) != len(accepted_batch.vectors):

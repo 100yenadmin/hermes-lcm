@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from types import SimpleNamespace
 
@@ -414,3 +415,108 @@ class TestChunkApply:
         )
         assert "1:0" in _chunk_meta_ids(engine)
         assert "embedded: 1" in retry
+
+
+class _ContextFakeTransport:
+    """Records contextualized requests and returns a nested per-doc response."""
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, **kwargs):
+        self.calls.append(kwargs)
+        inputs = kwargs["payload"]["inputs"]
+        data = []
+        for outer, group in enumerate(inputs):
+            inner = [
+                {"index": i, "embedding": [float(outer + 1), float(i + 1), 1.0]}
+                for i in range(len(group))
+            ]
+            data.append({"index": outer, "data": inner})
+        from hermes_lcm.embedding_provider import HttpResponse
+
+        return HttpResponse(
+            status=200, headers={},
+            body=json.dumps({"data": data, "usage": {"total_tokens": 10}}).encode(),
+        )
+
+
+def _two_chunk_msg(store_id, session="sess-a"):
+    # With len-based token counting (~600-token window target), ~900 chars of
+    # sentence-delimited text splits into two chunks.
+    sentence = "this is a sufficiently long sentence with several words. "
+    content = sentence * 16
+    return (store_id, session, "history", "user", content, float(store_id))
+
+
+class TestChunkContextualizedGrouping:
+    def _voyage_context_engine(self, tmp_path):
+        tmp_path.mkdir(parents=True, exist_ok=True)
+        db_path = tmp_path / "backfill.db"
+        config = LCMConfig(
+            database_path=str(db_path),
+            embeddings_enabled=True,
+            embedding_provider="voyage",
+            embedding_model="voyage-context-3",
+        )
+        engine = SimpleNamespace(
+            _config=config, _store=SimpleNamespace(db_path=db_path)
+        )
+        # Two multi-chunk messages so grouping is observable on the wire.
+        _seed_messages(
+            engine, [_two_chunk_msg(1), _two_chunk_msg(2)], register=False
+        )
+        store = VectorStore(db_path, config=config)
+        try:
+            store.register_profile("voyage-context-3", "voyage", 3, task="chunk")
+        finally:
+            store.close()
+        return engine
+
+    def test_message_chunks_grouped_into_one_inputs_list(self, monkeypatch, tmp_path):
+        import hermes_lcm.embedding_provider as provider_mod
+
+        monkeypatch.setenv("VOYAGE_API_KEY", "test-key")
+        engine = self._voyage_context_engine(tmp_path)
+        transport = _ContextFakeTransport()
+        provider = provider_mod.VoyageProvider(
+            "voyage-context-3", transport=transport
+        )
+        monkeypatch.setattr(command_mod, "resolve_provider", lambda _c, **_k: provider)
+
+        out = handle_lcm_command(
+            "embed backfill --corpus chunks --apply --confirm-raw-text", engine
+        )
+
+        assert "status: refused" not in out
+        # The context endpoint saw one inner list PER MESSAGE (cross-chunk
+        # contextualization), not one single-chunk list per chunk.
+        assert transport.calls
+        inputs = transport.calls[0]["payload"]["inputs"]
+        assert all(len(inner) >= 2 for inner in inputs), inputs
+        # Every chunk was still published as its own independent row.
+        meta_ids = _chunk_meta_ids(engine)
+        assert len(meta_ids) == sum(len(inner) for inner in inputs)
+        # Each row keyed store_id:chunk_index -> two messages, chunk 0 and 1 each.
+        assert set(meta_ids) == {"1:0", "1:1", "2:0", "2:1"}
+
+
+class TestProviderChunkDocumentBatchesFlatPath:
+    def test_non_context_provider_keeps_flat_per_chunk_path(self):
+        provider = FakeProvider()  # no supports_contextualized_grouping attr
+        batch = [("1:0", "a", 1), ("1:1", "b", 1), ("2:0", "c", 1)]
+        chunk_meta = {
+            "1:0": (1, 0, 0, 1), "1:1": (1, 1, 0, 1), "2:0": (2, 0, 0, 1),
+        }
+        dispatched: list[tuple[int, ...]] = []
+        batches = list(
+            command_mod._provider_chunk_document_batches(
+                provider, batch, chunk_meta,
+                before_dispatch=lambda idx: dispatched.append(idx),
+            )
+        )
+        # Flat path: all chunks embedded as independent documents in one call.
+        assert provider.calls == [["a", "b", "c"]]
+        assert len(batches) == 1
+        assert batches[0].indexes == (0, 1, 2)
+        assert dispatched == [(0, 1, 2)]
