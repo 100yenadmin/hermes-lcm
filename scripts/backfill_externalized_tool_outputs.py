@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import argparse
 import copy
+import ctypes
+import errno
 import fcntl
 import hashlib
 import json
@@ -186,6 +188,10 @@ def _entry_identity(result: os.stat_result) -> tuple[int, int, int, int, int]:
     )
 
 
+def _same_inode(result: os.stat_result, identity: tuple[int, int, int, int, int]) -> bool:
+    return (int(result.st_dev), int(result.st_ino)) == identity[:2]
+
+
 def _open_directory(path: Path) -> int:
     flags = os.O_RDONLY
     if hasattr(os, "O_DIRECTORY"):
@@ -253,6 +259,51 @@ def _stat_entry(directory_fd: int, name: str) -> os.stat_result | None:
         return None
 
 
+def _rename_exchange(directory_fd: int, first: str, second: str) -> None:
+    """Atomically exchange two names without replacing either inode."""
+    if sys.platform.startswith("linux"):
+        function_name = "renameat2"
+        exchange_flag = 2  # RENAME_EXCHANGE
+    elif sys.platform == "darwin":
+        function_name = "renameatx_np"
+        exchange_flag = 0x00000002  # RENAME_SWAP
+    else:
+        raise OSError(errno.ENOTSUP, "atomic manifest exchange is not supported on this platform")
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    rename_exchange = getattr(libc, function_name, None)
+    if rename_exchange is None:
+        raise OSError(errno.ENOTSUP, "atomic manifest exchange is not available on this platform")
+    rename_exchange.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    rename_exchange.restype = ctypes.c_int
+    result = rename_exchange(
+        directory_fd,
+        os.fsencode(first),
+        directory_fd,
+        os.fsencode(second),
+        exchange_flag,
+    )
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), second)
+
+
+def _unlink_if_identity(
+    directory_fd: int,
+    name: str,
+    expected_identity: tuple[int, int, int, int, int],
+) -> None:
+    current = _stat_entry(directory_fd, name)
+    if current is not None and _entry_identity(current) == expected_identity:
+        os.unlink(name, dir_fd=directory_fd)
+
+
 def _read_regular_entry(directory_fd: int, name: str, *, label: str) -> tuple[bytes, tuple[int, int, int, int, int]]:
     before = _stat_entry(directory_fd, name)
     if before is None:
@@ -304,7 +355,7 @@ def _write_manifest(
     *,
     expected_identity: tuple[int, int, int, int, int] | None,
 ) -> tuple[int, int, int, int, int]:
-    """Atomically publish JSON without following or writing through the target."""
+    """Atomically publish JSON without clobbering a raced target."""
     current = _stat_entry(directory_fd, name)
     if current is not None and stat.S_ISLNK(current.st_mode):
         raise ValueError("manifest path must not be a symlink")
@@ -320,12 +371,16 @@ def _write_manifest(
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     descriptor = os.open(temporary_name, flags, 0o600, dir_fd=directory_fd)
+    temporary_identity: tuple[int, int, int, int, int] | None = None
+    cleanup_identity: tuple[int, int, int, int, int] | None = None
     try:
         with os.fdopen(descriptor, "wb") as handle:
             descriptor = -1
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
+            temporary_identity = _entry_identity(os.fstat(handle.fileno()))
+        cleanup_identity = temporary_identity
         current = _stat_entry(directory_fd, name)
         if current is not None and stat.S_ISLNK(current.st_mode):
             raise ValueError("manifest path must not be a symlink")
@@ -334,19 +389,72 @@ def _write_manifest(
                 raise FileExistsError("manifest path appeared during the operation")
         elif current is None or _entry_identity(current) != expected_identity:
             raise RuntimeError("manifest changed during the operation")
-        os.replace(temporary_name, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+
+        if expected_identity is None:
+            try:
+                os.link(
+                    temporary_name,
+                    name,
+                    src_dir_fd=directory_fd,
+                    dst_dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+            except FileExistsError as exc:
+                raise FileExistsError("manifest path appeared during the operation") from exc
+            linked_temporary = _stat_entry(directory_fd, temporary_name)
+            if linked_temporary is None:
+                raise RuntimeError("manifest temporary file disappeared during publication")
+            cleanup_identity = _entry_identity(linked_temporary)
+        else:
+            try:
+                _rename_exchange(directory_fd, temporary_name, name)
+            except FileNotFoundError as exc:
+                raise RuntimeError("manifest changed during publication") from exc
+            displaced = _stat_entry(directory_fd, temporary_name)
+            published = _stat_entry(directory_fd, name)
+            if (
+                displaced is None
+                or not _same_inode(displaced, expected_identity)
+                or published is None
+                or temporary_identity is None
+                or not _same_inode(published, temporary_identity)
+            ):
+                try:
+                    _rename_exchange(directory_fd, temporary_name, name)
+                    os.fsync(directory_fd)
+                except OSError as exc:
+                    raise RuntimeError(
+                        "manifest changed during publication and could not be restored"
+                    ) from exc
+                restored_temporary = _stat_entry(directory_fd, temporary_name)
+                cleanup_identity = (
+                    _entry_identity(restored_temporary)
+                    if restored_temporary is not None
+                    and temporary_identity is not None
+                    and _same_inode(restored_temporary, temporary_identity)
+                    else None
+                )
+                raise RuntimeError("manifest changed during publication")
+            cleanup_identity = _entry_identity(displaced)
+
+        if cleanup_identity is not None:
+            _unlink_if_identity(directory_fd, temporary_name, cleanup_identity)
+            cleanup_identity = None
         os.fsync(directory_fd)
         published = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-        if not stat.S_ISREG(published.st_mode):
+        if (
+            not stat.S_ISREG(published.st_mode)
+            or temporary_identity is None
+            or not _same_inode(published, temporary_identity)
+        ):
             raise RuntimeError("published manifest is not a regular file")
         return _entry_identity(published)
     finally:
         if descriptor >= 0:
             os.close(descriptor)
-        try:
-            os.unlink(temporary_name, dir_fd=directory_fd)
-        except FileNotFoundError:
-            pass
+        if cleanup_identity is not None:
+            _unlink_if_identity(directory_fd, temporary_name, cleanup_identity)
+            os.fsync(directory_fd)
 
 
 def _target_binding(database_path: Path, storage_dir: Path) -> dict[str, Any]:

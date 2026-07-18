@@ -611,10 +611,15 @@ can be rerun with the same path to recover its pending journal entries. The
 journal is bound to one database file and one externalized-payload storage root;
 the command refuses reuse or rollback against another target. Manifest files and
 sidecars are opened without following their final symlink and rollback rechecks
-file identity before deletion. Apply and rollback require the storage directory
-to be owned by the current user and not writable by group or other users. They
-also hold an advisory lock on the opened directory so concurrent invocations of
-this script cannot mutate it together.
+file identity before deletion. A new manifest is published with a no-clobber
+link; an existing journal is updated with an atomic name exchange and restored
+if the displaced inode is not the validated manifest. A regular file or symlink
+that races into the manifest leaf is therefore preserved and the command fails
+closed. Existing-journal updates require atomic name-exchange support from the
+host OS and filesystem. Apply and rollback require the storage directory to be
+owned by the current user and not writable by group or other users. They also
+hold an advisory lock on the opened directory so concurrent invocations of this
+script cannot mutate it together.
 
 The command also refuses database schemas newer than this build before scanning
 rows or writing sidecars. Apply failures are recorded in `counts.failed` and

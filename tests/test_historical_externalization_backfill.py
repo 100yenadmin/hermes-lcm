@@ -197,6 +197,60 @@ def test_manifest_symlink_is_refused_without_touching_target(tmp_path):
     assert target.read_text(encoding="utf-8") == "UNRELATED-MUST-SURVIVE"
 
 
+def test_manifest_publication_does_not_replace_regular_file_that_appears_at_publish_boundary(
+    tmp_path, monkeypatch
+):
+    module = _load_script()
+    home, database, config, _ = _seed(tmp_path)
+    manifest = tmp_path / "manifest.json"
+    sentinel = "UNRELATED-MANIFEST-MUST-SURVIVE"
+    original_link = module.os.link
+    injected = False
+
+    def link_with_interloper(source, destination, *args, **kwargs):
+        nonlocal injected
+        if not injected and destination == manifest.name:
+            manifest.write_text(sentinel, encoding="utf-8")
+            injected = True
+        return original_link(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(module.os, "link", link_with_interloper)
+
+    with pytest.raises(FileExistsError, match="manifest path appeared"):
+        _run_backfill(module, home, database, config, manifest, apply=False)
+
+    assert injected is True
+    assert manifest.read_text(encoding="utf-8") == sentinel
+
+
+def test_manifest_update_restores_regular_file_swapped_in_at_exchange_boundary(tmp_path, monkeypatch):
+    module = _load_script()
+    home, database, config, _ = _seed(tmp_path)
+    manifest = tmp_path / "manifest.json"
+    _run_backfill(module, home, database, config, manifest, apply=True)
+    prior_manifest = tmp_path / "prior-manifest.json"
+    sentinel = "UNRELATED-MANIFEST-MUST-SURVIVE"
+    original_exchange = module._rename_exchange
+    injected = False
+
+    def exchange_with_interloper(directory_fd, first, second):
+        nonlocal injected
+        if not injected and second == manifest.name:
+            manifest.replace(prior_manifest)
+            manifest.write_text(sentinel, encoding="utf-8")
+            injected = True
+        return original_exchange(directory_fd, first, second)
+
+    monkeypatch.setattr(module, "_rename_exchange", exchange_with_interloper)
+
+    with pytest.raises(RuntimeError, match="manifest changed during publication"):
+        _run_backfill(module, home, database, config, manifest, apply=True)
+
+    assert injected is True
+    assert manifest.read_text(encoding="utf-8") == sentinel
+    assert json.loads(prior_manifest.read_text(encoding="utf-8"))["state"] == "complete"
+
+
 def test_same_manifest_cannot_be_reused_for_another_database_or_storage_root(tmp_path):
     module = _load_script()
     home, database, config, _ = _seed(tmp_path / "first")
