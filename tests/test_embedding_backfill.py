@@ -848,6 +848,13 @@ def test_crash_between_provider_return_and_commit_is_all_or_nothing(
     rows = _inflight_rows(engine)
     assert len(rows) == 3
     assert {state for _id, state in rows} <= {"dispatched", "uncertain"}
+    # FIX-4: a commit crash is a LOCAL storage failure, not a provider error.
+    # Every dispatched row must be counted as failed and labeled local_error
+    # (distinct from provider_error), so the operator-facing count + reason are
+    # accurate rather than silently under-counting these unpublished rows.
+    assert "failed: 3" in result
+    assert "reason=local_error:" in result
+    assert "reason=provider_error:" not in result
 
 
 def test_batch_commits_published_rows_before_a_superseded_row(monkeypatch, tmp_path):

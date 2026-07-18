@@ -2735,6 +2735,21 @@ class _BackfillLeaseLost(RuntimeError):
     """The caller no longer owns the exact backfill lease generation."""
 
 
+class _LocalPublishError(RuntimeError):
+    """The batch-publish CALL itself failed locally (e.g. SQLITE_BUSY on BEGIN
+    IMMEDIATE, or a commit I/O error), as opposed to a provider/network error.
+
+    Carries the operator-facing ``local_error:`` reason so the outer handler
+    routes the quarantine reason text correctly and counts the rows, instead of
+    mislabeling a local storage/lock failure as a provider error and omitting the
+    unpublished rows from the run's ``failed`` count.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
 class _BackfillLease:
     """A renewable owner-CAS lease for the one-shot embedding backfill worker.
 
@@ -3699,14 +3714,32 @@ def _embedding_backfill_summary_text(
                         # instead of one per row; each row still runs the full CAS
                         # under its own savepoint, so a mid-batch failure quarantines
                         # only its request while the committed siblings survive.
-                        for result, (item, request_id) in zip(
-                            store.publish_embedding_batch_under_lease(
+                        try:
+                            published_results = store.publish_embedding_batch_under_lease(
                                 publish_rows,
                                 identity=captured_identity,
                                 claim_key=_EMBEDDING_BACKFILL_CLAIM_KEY,
                                 lease_id=lease.lease_id,
                                 generation=lease.generation,
-                            ),
+                            )
+                        except Exception as publish_exc:
+                            # The batch publish CALL itself failed locally (e.g.
+                            # SQLITE_BUSY on BEGIN IMMEDIATE, or a commit I/O
+                            # error) -- NOT a provider error. The generic handler
+                            # below would mislabel it provider_error and omit
+                            # these rows from `failed` (accepted_indexes already
+                            # holds them, so failed_indexes is empty). Record
+                            # every accepted-batch row as a local_error failure
+                            # here; the rows still go uncertain via the inflight
+                            # fallback in the outer handler, now carrying the
+                            # correct local_error reason text.
+                            local_reason = f"local_error:{publish_exc}"
+                            failed.extend(
+                                (item[0], local_reason) for item, _rid in publish_items
+                            )
+                            raise _LocalPublishError(local_reason) from publish_exc
+                        for result, (item, request_id) in zip(
+                            published_results,
                             publish_items,
                         ):
                             if result.error is not None:
@@ -3779,11 +3812,15 @@ def _embedding_backfill_summary_text(
                             "provider did not resolve every dispatched document"
                         )
                 except Exception as exc:
-                    reason = (
-                        f"provider_{exc.kind}:{exc}"
-                        if isinstance(exc, VoyageError)
-                        else f"provider_error:{exc}"
-                    )
+                    if isinstance(exc, _LocalPublishError):
+                        # Local storage/lock failure of the batch publish call:
+                        # the accepted rows were already appended to `failed` with
+                        # this reason; do not relabel it a provider error.
+                        reason = exc.reason
+                    elif isinstance(exc, VoyageError):
+                        reason = f"provider_{exc.kind}:{exc}"
+                    else:
+                        reason = f"provider_error:{exc}"
                     definitive_rejection = (
                         isinstance(exc, ProviderPreDispatchError)
                         or (
@@ -4402,15 +4439,28 @@ def _chunk_backfill_text(
                         # One BEGIN IMMEDIATE per accepted network batch (one fsync)
                         # instead of one per row; each row still runs the full CAS
                         # under its own savepoint (see the summary path).
-                        for result, (item, request_id) in zip(
-                            store.publish_chunk_embedding_batch_under_lease(
+                        try:
+                            published_results = store.publish_chunk_embedding_batch_under_lease(
                                 publish_rows,
                                 model=model,
                                 identity=captured_identity,
                                 claim_key=_EMBEDDING_BACKFILL_CLAIM_KEY,
                                 lease_id=lease.lease_id,
                                 generation=lease.generation,
-                            ),
+                            )
+                        except Exception as publish_exc:
+                            # Local storage/lock failure of the batch publish call
+                            # itself (see the summary path) -- record every
+                            # accepted-batch row as a local_error failure rather
+                            # than letting the generic handler mislabel it a
+                            # provider error and drop the count.
+                            local_reason = f"local_error:{publish_exc}"
+                            failed.extend(
+                                (item[0], local_reason) for item, _rid in publish_items
+                            )
+                            raise _LocalPublishError(local_reason) from publish_exc
+                        for result, (item, request_id) in zip(
+                            published_results,
                             publish_items,
                         ):
                             if result.error is not None:
@@ -4471,11 +4521,14 @@ def _chunk_backfill_text(
                             "provider did not resolve every dispatched document"
                         )
                 except Exception as exc:
-                    reason = (
-                        f"provider_{exc.kind}:{exc}"
-                        if isinstance(exc, VoyageError)
-                        else f"provider_error:{exc}"
-                    )
+                    if isinstance(exc, _LocalPublishError):
+                        # Local storage/lock failure of the batch publish call:
+                        # rows already appended to `failed` with this reason.
+                        reason = exc.reason
+                    elif isinstance(exc, VoyageError):
+                        reason = f"provider_{exc.kind}:{exc}"
+                    else:
+                        reason = f"provider_error:{exc}"
                     definitive_rejection = (
                         isinstance(exc, ProviderPreDispatchError)
                         or (

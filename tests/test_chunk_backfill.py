@@ -101,6 +101,51 @@ def _user_msgs(n, *, start=1):
     ]
 
 
+class _CrashOnCommitConnection:
+    """Proxies a sqlite3 connection but raises on ``commit`` -- emulating a batch
+    publish whose transaction never lands (process killed before commit)."""
+
+    def __init__(self, real):
+        self._real = real
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def commit(self):
+        raise RuntimeError("crash before chunk batch commit")
+
+
+def test_chunk_crash_on_commit_labels_local_error_and_counts_failed(monkeypatch, tmp_path):
+    """FIX-4 (chunk path): a commit crash during the chunk batch publish is a
+    LOCAL storage failure -- every dispatched chunk row is counted as failed and
+    labeled local_error (not provider_error), instead of being silently omitted
+    from the run's failed count while mislabeled as a provider error."""
+    engine = _engine(tmp_path)  # ollama (local) -> exempt from raw-text gate
+    _seed_messages(engine, _user_msgs(2))
+    provider = FakeProvider()
+    monkeypatch.setattr(command_mod, "resolve_provider", lambda _c, **_k: provider)
+
+    class CrashStore(VectorStore):
+        def publish_chunk_embedding_batch_under_lease(self, rows, **kwargs):
+            real = self._conn
+            self._conn = _CrashOnCommitConnection(real)
+            try:
+                return super().publish_chunk_embedding_batch_under_lease(rows, **kwargs)
+            finally:
+                self._conn = real
+
+    monkeypatch.setattr(command_mod, "VectorStore", CrashStore)
+    out = handle_lcm_command("embed backfill --corpus chunks --apply", engine)
+
+    # Nothing half-published; the crash is labeled a local storage failure and
+    # every dispatched chunk row is counted as failed (not under-counted).
+    assert _chunk_meta_ids(engine) == []
+    assert "embedded: 0" in out
+    assert "failed: 0" not in out
+    assert "reason=local_error:" in out
+    assert "reason=provider_error:" not in out
+
+
 class TestChunkRetryUncertainSpans:
     def test_rebuild_chunk_document_returns_real_span(self, tmp_path):
         from hermes_lcm.chunking import chunk_message
