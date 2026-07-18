@@ -25760,7 +25760,7 @@ class TestHandleGrepExternalizedPayloads:
             ensure_ascii=False,
         )
 
-    @pytest.mark.parametrize("sort", ["relevance", "hybrid"])
+    @pytest.mark.parametrize("sort", ["relevance", "hybrid", "recency"])
     def test_combined_sort_tiers_externalized_native_rank(self, sort):
         message = {
             "type": "message",
@@ -25771,7 +25771,7 @@ class TestHandleGrepExternalizedPayloads:
         externalized = {
             "type": "externalized",
             "_sort_rank": 0,
-            "_sort_ts": 1.0,
+            "_sort_ts": 2.0,
         }
 
         ordered = sorted(
@@ -25780,6 +25780,46 @@ class TestHandleGrepExternalizedPayloads:
         )
 
         assert ordered == [message, externalized]
+
+    def test_auto_discovery_bounds_directory_iteration_before_sorting(
+        self,
+        externalized_search_engine,
+        monkeypatch,
+    ):
+        storage = Path(externalized_search_engine._hermes_home, "lcm-large-outputs")
+        real_iterdir = Path.iterdir
+        entries_consumed = 0
+        refs_probed = []
+
+        def many_payloads(path):
+            nonlocal entries_consumed
+            if path != storage:
+                yield from real_iterdir(path)
+                return
+            for index in range(10_000):
+                entries_consumed += 1
+                suffix = ".json" if index % 2 else ".tmp"
+                yield storage / f"payload-{index:05d}{suffix}"
+
+        def reject_probe(_engine, ref, _session_id, **_kwargs):
+            refs_probed.append(ref)
+            return {"readable": False, "error": "missing"}
+
+        monkeypatch.setattr(Path, "iterdir", many_payloads)
+        monkeypatch.setattr(lcm_tools, "_inspect_externalized_payload_metadata", reject_probe)
+
+        result = json.loads(
+            externalized_search_engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "needle", "content_scope": "externalized"},
+            )
+        )
+
+        assert entries_consumed == lcm_tools._LCM_GREP_EXTERNALIZED_DISCOVERY_CAP + 1
+        assert len(refs_probed) == lcm_tools._LCM_GREP_EXTERNALIZED_DISCOVERY_CAP // 2
+        assert result["externalized_scan"]["discovery_files"] == len(refs_probed)
+        assert result["externalized_scan"]["discovery_truncated"] is True
+        assert result["externalized_scan"]["candidate_files"] == 0
 
     def test_auto_discovery_filters_session_before_candidate_cap(self, externalized_search_engine):
         owned_refs = {
@@ -25822,6 +25862,64 @@ class TestHandleGrepExternalizedPayloads:
         assert {item["ref"] for item in result["results"]} == owned_refs
         assert result["externalized_scan"]["candidate_files"] == len(owned_refs)
         assert result["externalized_scan"]["rejected_session_mismatch"] == 257
+
+    def test_auto_discovery_accepts_owned_payload_with_long_precontent_metadata(
+        self,
+        externalized_search_engine,
+    ):
+        written = externalize_ingest_payload(
+            "needle payload",
+            role="user",
+            session_id=externalized_search_engine.current_session_id,
+            field_path="x" * 20_000,
+            config=externalized_search_engine._config,
+            hermes_home=externalized_search_engine._hermes_home,
+        )
+        assert written is not None
+        ref = written["path"].name
+        metadata = lcm_tools._inspect_externalized_payload_metadata(
+            externalized_search_engine,
+            ref,
+            externalized_search_engine.current_session_id,
+        )
+        assert metadata == {"readable": False, "error": "metadata_prefix_truncated"}
+
+        result = json.loads(
+            externalized_search_engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "needle", "content_scope": "externalized"},
+            )
+        )
+
+        assert [item["ref"] for item in result["results"]] == [ref]
+
+    def test_auto_discovery_keeps_malformed_symlink_and_foreign_payloads_fail_closed(
+        self,
+        externalized_search_engine,
+    ):
+        valid_ref = self._externalize(externalized_search_engine, "valid needle " * 20)
+        storage = Path(externalized_search_engine._hermes_home, "lcm-large-outputs")
+        (storage / "malformed.json").write_text(
+            'not-json "session_id": "test-session", "content": "needle"',
+            encoding="utf-8",
+        )
+        (storage / "foreign.json").write_text(
+            json.dumps({"session_id": "foreign-session", "content": "needle"}),
+            encoding="utf-8",
+        )
+        (storage / "linked.json").symlink_to(storage / valid_ref)
+
+        result = json.loads(
+            externalized_search_engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "needle", "content_scope": "externalized"},
+            )
+        )
+
+        assert [item["ref"] for item in result["results"]] == [valid_ref]
+        assert result["externalized_scan"]["rejected_invalid_or_unreadable"] == 1
+        assert result["externalized_scan"]["rejected_session_mismatch"] == 1
+        assert result["externalized_scan"]["rejected_symlink"] == 1
 
     def test_explicit_refs_filter_and_rejects_cross_session_payload(self, externalized_search_engine):
         current_ref = self._externalize(externalized_search_engine, "current needle " * 20, "call-current")

@@ -88,8 +88,8 @@ def _combined_result_sort_key(result: dict[str, Any], sort: str) -> tuple:
         )
 
     if result.get("type") == "message":
-        return (-sort_timestamp, type_bias, role_bias, rank_value, 0.0, float("inf"))
-    return (-sort_timestamp, type_bias, 0, rank_value, 0.0, role_bias)
+        return (rank_tier, -sort_timestamp, type_bias, role_bias, rank_value, 0.0, float("inf"))
+    return (rank_tier, -sort_timestamp, type_bias, 0, rank_value, 0.0, role_bias)
 
 def _require_engine(kwargs: Dict[str, Any]) -> "LCMEngine | None":
     engine = kwargs.get("engine")
@@ -217,6 +217,7 @@ _LCM_GREP_VALID_CONTENT_SCOPES = frozenset({"history", "externalized", "both"})
 _LCM_GREP_HARD_LIMIT_CAP = 200
 _LCM_GREP_EXTERNALIZED_FILE_CAP = 256
 _LCM_GREP_EXTERNALIZED_DISCOVERY_CAP = 4096
+_LCM_GREP_EXTERNALIZED_METADATA_READ_BYTES = 64 * 1024
 _LCM_GREP_EXTERNALIZED_CONTENT_BYTES = 512_000
 _LCM_GREP_RESPONSE_CHAR_CAP = 64_000
 _LCM_LOAD_SESSION_DEFAULT_LIMIT = 100
@@ -1278,20 +1279,22 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
             "rejected_session_mismatch": 0,
         }
         if externalized_refs is None:
+            discovered_refs = []
             try:
-                discovered_refs = sorted(
-                    (path.name for path in storage_dir.iterdir() if path.name.endswith(".json")),
-                    reverse=True,
-                )
+                for entries_seen, path in enumerate(storage_dir.iterdir(), start=1):
+                    if entries_seen > _LCM_GREP_EXTERNALIZED_DISCOVERY_CAP:
+                        scan_counts["discovery_truncated"] = True
+                        break
+                    if not path.name.endswith(".json"):
+                        continue
+                    discovered_refs.append(path.name)
             except OSError:
                 discovered_refs = []
-            # Directory enumeration is cheap, but metadata probes may stat/open
-            # files. Bound those probes separately, then cap owned candidates.
-            scan_counts["discovery_truncated"] = (
-                len(discovered_refs) > _LCM_GREP_EXTERNALIZED_DISCOVERY_CAP
-            )
+            # Bound directory consumption before sorting so one busy payload
+            # directory cannot make a search materialize every sidecar name.
+            discovered_refs.sort(reverse=True)
             candidate_refs = []
-            for ref in discovered_refs[:_LCM_GREP_EXTERNALIZED_DISCOVERY_CAP]:
+            for ref in discovered_refs:
                 scan_counts["discovery_files"] += 1
                 path = storage_dir / ref
                 if path.is_symlink():
@@ -1301,11 +1304,28 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
                     engine,
                     ref,
                     engine.current_session_id,
+                    max_read_bytes=_LCM_GREP_EXTERNALIZED_METADATA_READ_BYTES,
                 )
                 if metadata.get("readable"):
-                    candidate_refs.append(ref)
-                    if len(candidate_refs) >= _LCM_GREP_EXTERNALIZED_FILE_CAP:
-                        break
+                    payload = read_externalized_payload_search_prefix(
+                        ref,
+                        config=engine._config,
+                        hermes_home=engine._hermes_home,
+                        # Re-open with no-follow/inode checks after strict
+                        # metadata validation; the candidate scan reads content.
+                        max_content_bytes=1,
+                    )
+                    status = payload.get("status")
+                    if status == "symlink":
+                        scan_counts["rejected_symlink"] += 1
+                    elif status != "ok":
+                        scan_counts["rejected_invalid_or_unreadable"] += 1
+                    elif payload.get("session_id") != engine.current_session_id:
+                        scan_counts["rejected_session_mismatch"] += 1
+                    else:
+                        candidate_refs.append(ref)
+                        if len(candidate_refs) >= _LCM_GREP_EXTERNALIZED_FILE_CAP:
+                            break
                 elif metadata.get("error") == "session_mismatch":
                     scan_counts["rejected_session_mismatch"] += 1
                 else:
@@ -2198,7 +2218,11 @@ def _inspect_top_level_json_string_fields_before_content(text: str) -> tuple[dic
         return fields, False
 
 
-def _read_externalized_payload_metadata_prefix(path: Path) -> tuple[str, bool, bool]:
+def _read_externalized_payload_metadata_prefix(
+    path: Path,
+    *,
+    max_read_bytes: int = _LCM_INSPECT_PAYLOAD_METADATA_READ_BYTES,
+) -> tuple[str, bool, bool]:
     """Read bounded JSON metadata before the externalized payload body.
 
     Returns ``(prefix_text, content_string_seen, prefix_truncated)``. The content
@@ -2209,14 +2233,15 @@ def _read_externalized_payload_metadata_prefix(path: Path) -> tuple[str, bool, b
     text_parts: list[str] = []
     decoder = codecs.getincrementaldecoder("utf-8")("strict")
     prefix_truncated = False
+    read_limit = max(1, int(max_read_bytes))
     with path.open("rb") as handle:
-        while len(prefix) < _LCM_INSPECT_PAYLOAD_METADATA_READ_BYTES:
-            byte = handle.read(1)
-            if not byte:
+        while len(prefix) < read_limit:
+            chunk = handle.read(min(4096, read_limit - len(prefix)))
+            if not chunk:
                 break
-            prefix.extend(byte)
+            prefix.extend(chunk)
             try:
-                decoded = decoder.decode(byte, final=False)
+                decoded = decoder.decode(chunk, final=False)
             except UnicodeDecodeError as exc:
                 raise ValueError("invalid_payload") from exc
             if decoded:
@@ -2224,8 +2249,12 @@ def _read_externalized_payload_metadata_prefix(path: Path) -> tuple[str, bool, b
             prefix_text = "".join(text_parts)
             _, content_key_seen = _inspect_top_level_json_string_fields_before_content(prefix_text)
             if content_key_seen:
-                return prefix_text, True, False
-        prefix_truncated = len(prefix) >= _LCM_INSPECT_PAYLOAD_METADATA_READ_BYTES and bool(handle.read(1))
+                # The final matching marker is the top-level content field the
+                # strict parser just reached. Do not return body bytes that
+                # happened to share its read chunk with metadata.
+                content_markers = list(re.finditer(r'"content"\s*:\s*"', prefix_text))
+                return prefix_text[: content_markers[-1].end()], True, False
+        prefix_truncated = len(prefix) >= read_limit and bool(handle.read(1))
     if not prefix_truncated:
         try:
             final_text = decoder.decode(b"", final=True)
@@ -2236,7 +2265,13 @@ def _read_externalized_payload_metadata_prefix(path: Path) -> tuple[str, bool, b
     return "".join(text_parts), False, prefix_truncated
 
 
-def _inspect_externalized_payload_metadata(engine: "LCMEngine", ref: str, session_id: str) -> dict[str, Any]:
+def _inspect_externalized_payload_metadata(
+    engine: "LCMEngine",
+    ref: str,
+    session_id: str,
+    *,
+    max_read_bytes: int = _LCM_INSPECT_PAYLOAD_METADATA_READ_BYTES,
+) -> dict[str, Any]:
     if not ref or Path(ref).name != ref:
         return {"readable": False, "error": "invalid_ref"}
     try:
@@ -2250,7 +2285,10 @@ def _inspect_externalized_payload_metadata(engine: "LCMEngine", ref: str, sessio
             return {"readable": False, "error": "missing"}
         if not path.is_file():
             return {"readable": False, "error": "not_a_file"}
-        metadata_prefix_text, content_key_seen, prefix_truncated = _read_externalized_payload_metadata_prefix(path)
+        metadata_prefix_text, content_key_seen, prefix_truncated = _read_externalized_payload_metadata_prefix(
+            path,
+            max_read_bytes=max_read_bytes,
+        )
     except FileNotFoundError:
         return {"readable": False, "error": "missing"}
     except (OSError, ValueError) as exc:
