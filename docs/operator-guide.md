@@ -144,6 +144,8 @@ environment variables:
 | `LCM_LEAF_CHUNK_TOKENS` | `20000` | Raw-backlog floor before leaf compaction; with dynamic chunking enabled, the base chunk target |
 | `LCM_DYNAMIC_LEAF_CHUNK_ENABLED` | `false` | Enable chunk-sized leaf compaction passes instead of compacting the whole non-tail raw backlog per pass |
 | `LCM_DYNAMIC_LEAF_CHUNK_MAX` | `40000` | Upper bound for dynamic leaf chunk targets |
+| `LCM_THRESHOLD_FULL_SWEEP_ENABLED` | `false` | At threshold, opt into one synchronous bounded sweep that drains chunked raw history before publishing one new active context |
+| `LCM_SUMMARY_PREFIX_TARGET_TOKENS` | `0` | Sweep-only summary-frontier target; `0` derives one `LCM_LEAF_CHUNK_TOKENS` budget |
 | `LCM_NEW_SESSION_RETAIN_DEPTH` | `2` | DAG depth retained after manual `/new` (`-1` all, `0` none) |
 | `LCM_IGNORE_SESSION_PATTERNS` | empty | Comma-separated session globs excluded from LCM storage |
 | `LCM_STATELESS_SESSION_PATTERNS` | empty | Comma-separated session globs kept read-only |
@@ -163,16 +165,88 @@ environment variables:
 | `LCM_EXPANSION_MODEL` | summary model / auxiliary | Override `lcm_expand_query` synthesis model |
 | `LCM_EXPANSION_CONTEXT_TOKENS` | `32000` | Context budget used by the auxiliary LLM for `lcm_expand_query` |
 | `LCM_SUMMARY_TIMEOUT_MS` | `60000` | Timeout for one summarization call |
+| `LCM_TEMPORAL_ROLLUPS_ENABLED` | `false` | Enable derived UTC day/week/month summary rollups and their maintenance hooks |
+| `LCM_ROLLUP_DAILY_TARGET_TOKENS` | `5000` | Target size for daily rollup summarization |
+| `LCM_ROLLUP_DAILY_MAX_TOKENS` | `15000` | Hard token ceiling for a daily rollup |
+| `LCM_ROLLUP_AGGREGATE_MAX_TOKENS` | `20000` | Hard token ceiling for weekly and monthly rollups |
+| `LCM_ROLLUP_BUILDS_PER_PASS` | `2` | Maximum rollups built by one automatic pass or `/lcm rollups rebuild` command |
 | `LCM_EXPANSION_TIMEOUT_MS` | `120000` | Timeout for one `lcm_expand_query` synthesis call |
 | `LCM_DATABASE_PATH` | auto | SQLite database path. Empty config resolves to `HERMES_HOME/lcm.db`; plugin installs or operators may set this env var to another profile-scoped path such as `~/.hermes/hermes-lcm.db`. |
 | `LCM_FTS_INTEGRITY_CHECK_INTERVAL_HOURS` | `24` | Minimum hours between startup FTS5 deep integrity-checks (O(index size)). `0` checks every startup (previous behavior); a negative value never checks on startup. Structural checks always run regardless. |
 | `LCM_ENABLE_SLASH_COMMAND` | `false` | Enable the optional `/lcm` operator command surface |
+| `LCM_EMBEDDINGS_ENABLED` | `false` | Opt in to embedding warmup, backfill, and semantic retrieval storage |
+| `LCM_EMBEDDING_PROVIDER` | empty | Embedding provider: `voyage`, `ollama`, or `fastembed` |
+| `LCM_EMBEDDING_MODEL` | empty | Provider model identifier registered by `/lcm embed warmup` |
+| `LCM_EMBEDDING_STORAGE_DTYPE` | `float32` | Vector storage dtype for newly-registered embedding profiles: `float32` (byte-identical legacy path) or `int8` (per-vector quantization plus a sign-bit prescreen, a distinct profile identity). See [Vector storage scale options (v3)](#vector-storage-scale-options-v3) |
+| `LCM_EMBEDDING_STORE_DIM` | `0` | Optional Matryoshka truncation dimension for newly-registered profiles (`0` = full profile dim); truncated vectors are renormalized and are also a distinct profile identity |
+| `LCM_EMBEDDING_BINARY_PRESCREEN` | `false` | Write the sign-bit prescreen for float32 identities too (int8 identities always write it), unlocking the full-corpus two-stage KNN; flipping it on an already-populated identity mints a new, distinct identity rather than mutating the existing one |
+| `LCM_KNN_PRESCREEN_MULTIPLIER` | `4` | Stage-1 prescreen breadth for two-stage KNN: `M = multiplier × k` lowest-Hamming-distance survivors are exact-rescored |
+| `LCM_PROACTIVE_RECALL_ENABLED` | `false` | Opt in to proactive memory injection: at assembly, embed the newest user message and inject one budget-capped "relevant memories" block (needs `LCM_EMBEDDINGS_ENABLED`). Default-off keeps assembly byte-identical |
+| `LCM_PROACTIVE_RECALL_MIN_SCORE` | `0.01` | Relevance floor for an injected memory. RRF-scale by default (a top-of-arm hit is ~0.016); with `LCM_RERANK_ENABLED` the score is a `[0,1]` cross-encoder relevance, so raise this (e.g. `0.3`) for a strict semantic gate |
+| `LCM_PROACTIVE_RECALL_BUDGET_TOKENS` | `500` | Hard token budget for the single injected block (1-3 items) |
+| `LCM_PROACTIVE_RECALL_PROVIDER` | empty | Embedding-provider override for the injection query only (e.g. keep a local `fastembed` provider offline even when search uses `voyage`). Empty reuses the main provider. The override provider must have embedded the corpus for its arms to return hits |
 | `LCM_DOCTOR_CLEAN_APPLY_ENABLED` | `false` | Permit destructive `/lcm doctor clean apply` in trusted operator contexts |
 | `LCM_EMPTY_LIFECYCLE_GC_ENABLED` | `true` | Master toggle for automatic pruning of lifecycle rows for sessions that never ingested any messages or summary nodes |
 | `LCM_EMPTY_LIFECYCLE_GC_THRESHOLD` | `200` | Number of lifecycle rows at which the GC pass fires (default 200 so fresh installs skip the work) |
 | `LCM_EMPTY_LIFECYCLE_GC_MAX_AGE_HOURS` | `24` | Automatic GC only deletes empty lifecycle rows at least this old; set `0` only in trusted/test environments that intentionally want immediate empty-row pruning |
 
 Advanced compaction, assembly, and extraction knobs are defined in `config.py`.
+
+### Temporal rollup operations
+
+Temporal rollups are opt-in. Set `LCM_TEMPORAL_ROLLUPS_ENABLED=true`, tune the
+four `LCM_ROLLUP_*` controls above if needed, and restart Hermes. Rollup periods
+are UTC calendar periods. Enabling the feature creates its tables lazily; a
+disabled install creates no rollup tables and leaves the core schema untouched,
+so a base build still opens the database.
+
+Automatic maintenance marks a day (and its containing week and month) stale when
+a **summary node covering that day is published** — publication, not raw
+ingest, is the signal a rollup consumes — and rebuilds at most
+`LCM_ROLLUP_BUILDS_PER_PASS` rows per pass, with daily rollups ahead of
+aggregates. A week or month is only published `ready` once every day in the
+period that has content has a `ready` daily rollup; while any content day is
+missing, stale, or building the aggregate stays stale with a recorded reason and
+`lcm_recent` falls back to daily/leaf summaries for the whole window. Rebuilding
+a daily re-stales its containing week and month so aggregates never remain
+`ready` against an outdated day.
+
+**Scope and rotation boundary.** Rollups are scoped to the LCM session id.
+Summary nodes carry no conversation-family key at this layer, so a rollup does
+not automatically span sessions across a `/new` rotation; after a rotation,
+retained higher-depth summaries are carried into the new session and remain
+retrievable, but per-period rollup rows are rebuilt under the new session scope.
+Build-cursor state is tracked per `(period_kind, scope)` so multiple scopes
+sharing one database never share a cursor.
+
+With `LCM_ENABLE_SLASH_COMMAND=true`, operators can inspect the current
+foreground session and request a bounded synchronous rebuild:
+
+```text
+/lcm rollups
+/lcm rollups rebuild day 2026-07-15
+/lcm rollups rebuild week 2026-07-15
+/lcm rollups rebuild month 2026-07-15
+/lcm rollups rebuild all 2026-07-15
+```
+
+The optional date defaults to the current UTC date. Week targets normalize to
+Monday and month targets to the first day. `all` targets the containing day,
+week, and month in that order. The command first **durably seeds a `stale` row
+for every requested target** (creating one if it does not yet exist), then
+attempts no more than the configured per-pass limit and prints an outcome for
+every target. Targets beyond the bound are reported `stale (bounded; not
+attempted)` and remain as durable `stale` rows, so later automatic maintenance
+builds them. Builds run now and may invoke the summary model. They use the same
+summary circuit breaker, fallback routes, timeout, and spend guard as normal LCM
+summarization.
+
+`lcm_inspect` always includes a `temporal_rollups` block with the enabled flag,
+ready/stale/building/failed counts for each period kind, oldest stale age,
+last-build cursors, and the last error. `/lcm rollups` renders the same data as a
+table. Both paths are read-only and make no LLM calls. When the feature is off
+or its tables are empty, the block remains present with zero counts and null
+age/cursor/error values so monitoring consumers do not need a second schema.
 
 Sensitive-pattern handling is disabled by default so ordinary LCM storage and
 `lcm_expand` remain lossless. When `LCM_SENSITIVE_PATTERNS_ENABLED=true`, matched
@@ -330,6 +404,14 @@ What the main knobs do:
 - `LCM_DYNAMIC_LEAF_CHUNK_ENABLED=true` changes leaf passes into chunk-sized
   work. In that mode `LCM_LEAF_CHUNK_TOKENS` is the base target and
   `LCM_DYNAMIC_LEAF_CHUNK_MAX` is the upper bound for a dynamic chunk target.
+- `LCM_THRESHOLD_FULL_SWEEP_ENABLED=true` makes a threshold-triggered invocation
+  keep draining oldest raw chunks outside the protected tail, even after prompt
+  pressure falls below the trigger. It always uses the configured working leaf
+  size, then condenses a too-large summary frontier toward
+  `LCM_SUMMARY_PREFIX_TARGET_TOKENS` (`0` means one leaf budget). The whole
+  invocation is bounded to 12 summary calls and 120 seconds between calls,
+  persists each completed DAG pass, and publishes one active context at the end.
+  It remains synchronous and does not enable deferred/background maintenance.
 - `LCM_EXPANSION_CONTEXT_TOKENS` controls how much recovered material
   `lcm_expand_query` may feed to the auxiliary model. It does not change what
   LCM stores.
@@ -465,6 +547,15 @@ Failure to durably externalize is fail-open: the provider receives the original
 inline payload. Results from `lcm_describe` and `lcm_expand` also stay inline so
 recovery does not recursively create another drilldown step.
 
+`lcm_grep` keeps history-only behavior by default. Operators and agents may opt
+into bounded active-session payload search with
+`content_scope='externalized'|'both'`; optional `externalized_refs` narrows the
+scan to known refs. The payload path rejects symlinks and foreign-session refs,
+scans at most 256 files and 512,000 encoded content bytes per file, and returns
+only bounded snippets plus recovery metadata. See the
+[retrieval tools reference](retrieval-tools.md#searching-externalized-payloads)
+for the exact contract.
+
 The storage-boundary payload guard is separate from that opt-in. LCM always
 scans messages at the store boundary before writing `messages.content` or
 `messages.tool_calls` to SQLite. Inline `data:*;base64,...` payloads and
@@ -536,7 +627,15 @@ Available commands:
 - `/lcm backup` - timestamped SQLite backup
 - `/lcm rotate` - read-only preview of an in-place tail-preserving compact of the active session
 - `/lcm rotate apply` - backup-first rotate that advances the lifecycle frontier past pre-tail raw messages
+- `/lcm embed warmup` - explicitly prepare the configured provider/model and register its vector dimension
+- `/lcm embed backfill [--limit N] [--corpus summary|chunks|both] [--policy conversational|heads|full]` - preview pending embeddings, token use, batches, and estimated cost for a corpus
+- `/lcm embed backfill --apply [--limit N] [--corpus summary|chunks|both] [--policy ...] [--confirm-raw-text]` - populate a bounded set of pending embeddings for a corpus
 - `/lcm help` - command help
+
+`--corpus` selects which corpus to backfill (default `summary`); `--policy` chooses the chunking
+policy and applies only to the chunk corpus; `--confirm-raw-text` acknowledges that the chunk corpus
+sends raw verbatim text to a cloud provider (required for `--corpus chunks|both --apply` on a cloud
+provider — see *Embedding backfill* below).
 
 Apply paths are intentionally narrow and backup-first. Start with diagnostics
 before cleanup or repair.
@@ -580,6 +679,174 @@ ahead of the target boundary reports `status: noop` and is safe to retry.
 A no-op apply does not write a new rolling backup, so the previous
 known-good `*-rotate-latest.sqlite3` snapshot survives idempotent retries.
 
+## Embedding backfill
+
+Embedding backfill is opt-in and dry-run-first. Configure and warm the model
+before applying any work:
+
+```bash
+export LCM_EMBEDDINGS_ENABLED=true
+export LCM_EMBEDDING_PROVIDER=ollama   # voyage or fastembed are also supported
+export LCM_EMBEDDING_MODEL=nomic-embed-text
+
+/lcm embed warmup
+/lcm embed backfill
+/lcm embed backfill --apply
+```
+
+The default invocation previews up to 200 newest pending depth-0 summaries. It
+reports the total pending count, selected count, estimated input tokens,
+provider batches, estimated cost, remaining work, and duration. It makes no
+provider call and opens SQLite read-only, so it performs no database write.
+Use `--limit N` to choose a smaller bounded invocation before adding `--apply`.
+
+Local Ollama and FastEmbed estimates are `$0`. Voyage estimates use the known
+per-token rate for the configured model (or a conservative generic Voyage
+rate when the model is not in the built-in table); treat the line as a planning
+estimate and verify current provider pricing before a large run. The estimate
+uses gross list price and does not subtract account-specific free tokens.
+
+Apply mode is safe to resume. Rows already embedded for the current registered
+profile are skipped by the discovery query, and a run that stops leaves its
+unwritten rows pending for the next invocation. The command serializes apply
+runs with a single-flight claim; a crashed claim becomes eligible for takeover
+after 10 minutes. Provider calls occur before per-row SQLite writes, and each
+row is committed independently, so one malformed row does not roll back the
+rest of a successful provider batch.
+
+Voyage authentication failures abort immediately because later batches would
+fail the same way. Transient provider failures are reported for the affected
+rows and later batches continue; rerun the command to retry anything still
+pending. Documents rejected by a provider token cap are listed under
+`skipped_overcap` and also remain pending. The claim is released on normal,
+provider-error, and row-write-error exit paths.
+
+### Corpora: summary vs chunks
+
+`--corpus` selects what gets embedded:
+
+- `summary` (default) — the generated leaf-summary embeddings described above.
+- `chunks` — the **raw-history chunk corpus**: verbatim message text chunked by
+  `--policy` (`conversational` | `heads` | `full`), used for verbatim/chunk-KNN
+  recall. This is a **separate corpus with its own backfill run** — a
+  summary-only backfill leaves it empty, and verbatim/chunk recall returns
+  nothing beyond FTS until you run `--corpus chunks --apply` as well.
+- `both` — runs the summary backfill, then the chunk backfill, in one command.
+
+```bash
+/lcm embed backfill --corpus chunks              # dry-run preview for the chunk corpus
+/lcm embed backfill --corpus chunks --apply --confirm-raw-text
+/lcm embed backfill --corpus both --apply --confirm-raw-text
+```
+
+**Raw-text consent gate.** Unlike summaries, the chunk corpus sends **raw,
+verbatim message text** — including tool-result and error/traceback content — to
+the embedding provider. When the provider is a cloud provider (e.g. Voyage),
+`--corpus chunks|both --apply` **refuses** unless you also pass
+`--confirm-raw-text`. Local providers (fastembed/ollama) never transmit text
+off-box and are exempt. Note that `LCM_SENSITIVE_PATTERNS_ENABLED` redaction runs
+at **ingest**, so it does not retro-redact history already stored — that older
+raw text is still sent during a chunk backfill. See
+[embeddings-setup.md](embeddings-setup.md) for the full discussion.
+
+### Contextualized chunk grouping
+
+Voyage's `voyage-context-*` chunk models (the chunk-corpus default for the
+`voyage` provider, see `default_chunk_model`) are contextualized-embedding
+models: one message's chunks are sent to the provider's
+`/v1/contextualizedembeddings` endpoint as a single grouped document — an inner
+list of that message's chunks — instead of as independent inputs, so the model
+actually conditions each chunk's embedding on its sibling chunks from the same
+message. Non-context providers and models (fastembed, ollama, plain Voyage
+embedding models) are unaffected and continue to embed chunks independently.
+Grouped requests are bounded by the provider's per-document and per-request
+caps (32K tokens per chunk, 120K tokens per document, 120K tokens and 16,000
+chunks per request); a document over the per-document budget is split into
+contiguous sub-documents so no single request is rejected. The retry path for
+uncertain chunks (`/lcm embed backfill`'s retry-uncertain pass) selects rows
+out of store_id order, so it stably re-sorts the selected documents by
+`(store_id, chunk_index)` before batching — otherwise interleaved retry rows
+would collapse into singleton groups and silently defeat contextualization for
+that pass.
+
+### Vector storage scale options (v3)
+
+The default embedding storage path is float32 at full provider dimension, with
+an exact scan bounded by `LCM_EMBEDDING_BOUNDED_SCAN_ROWS` once a corpus
+outgrows that bound (see the `coverage` contract in the
+[retrieval tools reference](retrieval-tools.md#full-text-semantic-and-hybrid-modes)).
+That path is unchanged from pre-v3 installs. At real-archive scale — tens of
+thousands of vectors and up — a full brute-force scan gets slow and
+memory-heavy, and the recency-bounded fallback stops reaching the whole corpus.
+Four v3 environment variables, all opt-in, additive, and default-off, trade
+some exactness for full-corpus reach at much lower query cost:
+
+- `LCM_EMBEDDING_STORAGE_DTYPE` (default `float32`) selects the vector storage
+  dtype for **newly-registered** embedding profiles. `int8` stores each vector
+  as a per-vector symmetrically-quantized signed-byte array plus a
+  little-endian float32 scale in the same blob, and always writes a
+  companion sign-bit prescreen. `dtype` is part of the profile identity hash,
+  so an int8 identity never mixes with an existing float32 one.
+- `LCM_EMBEDDING_STORE_DIM` (default `0`, meaning the full profile dimension)
+  applies an optional Matryoshka truncation to newly-registered profiles. When
+  set to a value less than the provider's native dimension, vectors are
+  truncated to that many leading dimensions and renormalized before
+  storage/quantization. The stored dimension is also part of the profile
+  identity hash, so truncated vectors never mix with full-dimension ones.
+- `LCM_EMBEDDING_BINARY_PRESCREEN` (default `false`) writes the sign-bit
+  Hamming prescreen for float32 identities too (int8 identities always write
+  it), unlocking the two-stage KNN described below.
+- `LCM_KNN_PRESCREEN_MULTIPLIER` (default `4`) sets the two-stage KNN's stage-1
+  prescreen breadth: `M = multiplier × k` lowest-Hamming-distance survivors are
+  loaded and exact-rescored in stage 2. Larger values widen the approximate
+  prescreen toward exact recall at more cost.
+
+**Two-stage KNN.** With a sign-bit prescreen present, `knn` packs the query's
+sign bits, Hamming-XORs against every corpus row's prescreen bits (the whole
+corpus, not a recency-bounded slice), keeps the `M = LCM_KNN_PRESCREEN_MULTIPLIER
+× k` lowest-Hamming survivors, then loads only those survivors' full vectors and
+ranks them by exact cosine. The response reports `coverage='full_approx'`: the
+whole corpus was reached, but stage-1 keeps only the closest `M` candidates
+before the exact rescore, so the result is an approximate top-k rather than the
+exhaustive top-k that exact-scan `coverage='full'` gives.
+
+**Safety design (flipping the prescreen flag never silently truncates a
+corpus).** `LCM_EMBEDDING_BINARY_PRESCREEN` growing a companion sign-bit table
+means a prescreen corpus must never be read as if it were a legacy
+binary-free float32 corpus. Flipping the flag on an already-populated float32
+identity therefore mints a **new, distinct profile identity** (folded into the
+identity hash) rather than adding sign-bits to the existing one in place. As a
+second, independent guard, the two-stage path only engages when the sign-bit
+table is a **complete** mirror of the vector table for that identity — every
+stored vector has a matching sign-bit row. If the two tables disagree (a
+partially-populated prescreen, or none at all), `knn` falls back to the
+existing exact bounded/full scan and reports honest `bounded`/`full` coverage
+instead of silently dropping rows the sign-bit table doesn't cover while still
+claiming `coverage='full'`.
+
+**Measured trade-offs (C1 bench, 92,997-vector real chunk archive, Voyage
+`voyage-context-3`, dim 1024):**
+
+| Path | Coverage | Query latency (warm) | Peak RSS | recall@10 vs. exact |
+|---|---|---|---|---|
+| float32 full-scan (default) | `full` | ~195ms | ~3.3GB | — (exact) |
+| float32 + binary prescreen, two-stage | `full_approx` | ~67ms | ~279MB | 0.96 |
+| int8, two-stage | `full_approx` | ~65ms | ~279MB | 0.84 |
+
+The int8 path trades additional recall for roughly a quarter of the disk
+footprint of stored vectors (quantized bytes vs. float32), making it the option
+for disk-constrained installs; the float32+binary path keeps full-precision
+vectors on disk and gives up less recall for the same query-time and RAM win.
+
+**Current limitation.** Enabling `LCM_EMBEDDING_BINARY_PRESCREEN` (or switching
+to `int8`) on an archive that is already fully embedded requires a full
+re-backfill under the newly-minted identity — there is no shipped operator path
+yet to derive the prescreen bits (or quantized vectors) locally from the
+existing float32 corpus without re-registering and re-running
+`/lcm embed backfill --apply` against the new identity. A local-derive
+migration path (computing sign-bits/quantization from already-stored float32
+vectors, no provider re-call) is planned but not yet built.
+
 ## Import and backfill
 
 ### Historical tool-output sidecars
@@ -603,6 +870,11 @@ python scripts/backfill_externalized_tool_outputs.py \
   --apply
 ```
 
+The manifest contains references, digests, counts, sizes, and token estimates,
+not raw payload content, session ids, or tool-call ids. Repeated apply runs are
+idempotent. Rollback is also dry-run by default and accepts only an applied
+manifest; `--apply` deletes a manifest-owned sidecar only when its content still
+matches the recorded digest and neither a message nor a summary references it:
 Sidecar retention and redaction: before a historical tool result is written to
 the externalized-payload directory the command applies the currently enabled
 `LCM_SENSITIVE_PATTERNS` policy to its content, exactly as live ingest does, so no
@@ -648,6 +920,9 @@ python scripts/backfill_externalized_tool_outputs.py \
   --rollback ./externalization-backfill.json
 ```
 
+Stop the profile that owns the target database before an operator apply or
+rollback. Sidecar creation is additive, but a quiescent profile makes the
+reviewed manifest and reference checks a stable operator boundary.
 Stop the profile that owns the target database and every other process running
 as that account that can write the externalized-payload directory before an
 operator apply or rollback. The directory lock coordinates this script only;

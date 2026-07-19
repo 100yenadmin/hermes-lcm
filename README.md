@@ -77,9 +77,9 @@ Core capabilities:
 - **Summary DAG** - builds depth-aware summary nodes over compacted history
 - **Bounded recovery** - pages raw messages, child summaries, and externalized
   payloads instead of dumping everything into the prompt
-- **Agent tools** - `lcm_grep`, `lcm_load_session`, `lcm_describe`,
-  `lcm_expand`, `lcm_expand_query`, `lcm_status`, `lcm_inspect`, and
-  `lcm_doctor`
+- **Agent tools** - `lcm_grep`, `lcm_recall`, `lcm_recent`, `lcm_load_session`,
+  `lcm_describe`, `lcm_expand`, `lcm_expand_query`, `lcm_status`, `lcm_inspect`,
+  and `lcm_doctor`
 - **Source-aware retrieval** - filters raw rows and summaries by descendant
   source lineage
 - **Session controls** - ignore noisy sessions or keep sessions read-only with
@@ -90,6 +90,17 @@ Core capabilities:
   tokens, passwords, and private keys before LCM stores or summarizes them
 - **Diagnostics** - runtime health, database checks, optional `/lcm` slash
   commands, backup-first repair/rotate paths
+
+Beyond the core loop, three opt-in (default-off) feature families extend LCM
+from a compression layer into a memory system: **large-output externalization
+and context-budget controls** (giant tool results move to recoverable refs
+instead of crowding the prompt), **temporal memory** (day/week/month rollups
+plus natural-time recall through `lcm_recent`), and **semantic retrieval**
+(embedding-backed `lcm_grep` semantic/hybrid modes with free-tier cloud or
+fully-local providers). See the
+[Feature overview](docs/features-overview.md) for what each family does and
+why, and [Agent configuration profiles](docs/agent-config-profiles.md) for
+copy-paste setups per agent type.
 
 ## LCM vs built-in compression
 
@@ -235,7 +246,9 @@ outside the LCM database.
 
 | Tool | Use |
 |------|-----|
-| `lcm_grep` | Search current-session raw messages and summaries. Opt into `session_scope='all'` or `session_scope='session'` for bounded archive recovery over rows already present in `lcm.db`; broader scopes return raw-message hits only. |
+| `lcm_grep` | Search current-session raw messages and summaries. Opt into `content_scope='externalized'|'both'` for bounded active-session payload search, or `session_scope='all'|'session'` for bounded raw-message archive recovery; broader scopes return raw-message hits only. |
+| `lcm_recall` | Search the entire memory across ALL conversations and all time by meaning. Fuses full-text, summary-vector, and chunk-vector arms with RRF, then applies a soft current-conversation (`scope_bias`) and recency prior. Returns bounded summary and verbatim-excerpt hits with `lcm_expand` handles; works FTS-only when embeddings are disabled. |
+| `lcm_recent` | Retrieve recent summaries by natural UTC period, preferring ready rollups and transparently falling back to time-bounded leaf summaries. |
 | `lcm_load_session` | Load one ordered raw-message transcript page for an explicit `session_id`. Continues with `after_store_id` from `next_cursor`. |
 | `lcm_describe` | Inspect the current-session DAG or preview an `externalized_ref` without loading full content. |
 | `lcm_expand` | Recover source messages, child summaries, or externalized payloads with pagination. Use `store_id` to fetch a single raw message from a cross-session `lcm_grep` result. |
@@ -320,6 +333,8 @@ Most installs only need `plugins.enabled` and `context.engine: lcm`.
 | `LCM_LEAF_CHUNK_TOKENS` | `20000` | Raw-backlog floor before leaf compaction; with dynamic chunking enabled, the base chunk target |
 | `LCM_DYNAMIC_LEAF_CHUNK_ENABLED` | `false` | Enable chunk-sized leaf compaction passes instead of compacting the whole non-tail raw backlog per pass |
 | `LCM_DYNAMIC_LEAF_CHUNK_MAX` | `40000` | Upper bound for dynamic leaf chunk targets |
+| `LCM_THRESHOLD_FULL_SWEEP_ENABLED` | `false` | At threshold, opt into one synchronous bounded sweep that drains chunked raw history before publishing one new active context |
+| `LCM_SUMMARY_PREFIX_TARGET_TOKENS` | `0` | Sweep-only summary-frontier target; `0` derives one `LCM_LEAF_CHUNK_TOKENS` budget |
 | `LCM_NEW_SESSION_RETAIN_DEPTH` | `2` | DAG depth retained after manual `/new` (`-1` all, `0` none) |
 | `LCM_DATABASE_PATH` | auto | SQLite database path. Empty config resolves to `HERMES_HOME/lcm.db`; plugin installs or operators may set this env var to another profile-scoped path such as `~/.hermes/hermes-lcm.db`. |
 | `LCM_FTS_INTEGRITY_CHECK_INTERVAL_HOURS` | `24` | Minimum hours between startup FTS5 deep integrity-checks (O(index size)). `0` checks every startup; a negative value never checks on startup. Structural checks always run regardless. |
@@ -439,6 +454,16 @@ advertised window.
 Start with `LCM_CONTEXT_THRESHOLD`, `LCM_FRESH_TAIL_COUNT`, and large output
 externalization. Only tune leaf chunking after checking `lcm_status` and
 understanding whether your workload is dominated by huge raw backlog passes.
+
+`LCM_THRESHOLD_FULL_SWEEP_ENABLED=true` is an opt-in cache-shape policy. Once
+threshold pressure triggers compaction, the invocation keeps summarizing the
+oldest raw chunks outside the protected fresh tail even after pressure falls
+below the trigger. It then condenses the provider-visible summary frontier only
+when that frontier exceeds `LCM_SUMMARY_PREFIX_TARGET_TOKENS` (or one leaf
+budget when the target is `0`). One invocation is bounded to 12 total leaf plus
+condensation calls and 120 seconds between calls, persists each completed DAG
+pass, and publishes one newly assembled active context at the end. It is
+synchronous and independent of deferred/background maintenance.
 
 ### Cache policy boundary
 
@@ -720,6 +745,15 @@ exposes retrieval tools that can drill back into exact stored sources.
 
 ## Documentation
 
+- [Feature overview](docs/features-overview.md) — every feature family, what
+  it does, why it exists, and the switch that enables it
+- [Agent configuration profiles](docs/agent-config-profiles.md) — copy-paste
+  env profiles: coding agent, long-horizon assistant, fully-local, cost-guarded
+- [Operator guide](docs/operator-guide.md) — install, activation, full
+  configuration reference, diagnostics
+- [Retrieval tools reference](docs/retrieval-tools.md) — exact tool contracts
+- [Embeddings setup](docs/embeddings-setup.md) — free-tier and local embedding
+  providers, warmup, backfill
 - [LCM paper](https://papers.voltropy.com/LCM)
 - [Architecture diagram](docs/architecture.png)
 - [Standard compression diagram](docs/standard_compression.png)

@@ -5,6 +5,7 @@ from pathlib import Path
 import importlib.util
 import sqlite3
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -1035,7 +1036,7 @@ def test_lcm_help_on_unknown_subcommand(engine):
 def test_lcm_doctor_clean_rejects_unknown_extra_args(engine):
     result = handle_lcm_command("doctor clean foo", engine)
 
-    assert "currently supports `clean`, `clean apply`, `clean lifecycle`, `clean lifecycle apply`, `repair`, `repair apply`, `source`, `source apply`, and `retention`" in result
+    assert "currently supports `clean`, `clean apply`, `clean lifecycle`, `clean lifecycle apply`, `repair`, `repair apply`, `repair schema-stamp`, `repair schema-stamp apply`, `source`, `source apply`, and `retention`" in result
     assert "/lcm doctor clean apply" in result
     assert "/lcm doctor clean lifecycle" in result
     assert "/lcm doctor clean lifecycle apply" in result
@@ -1111,6 +1112,33 @@ def test_lcm_doctor_json_preserves_unchecked_fts_detail_for_guidance(engine, mon
     assert guidance["messages_fts_integrity"]["warning_only"] is True
     assert "read-write SQLite access" in guidance["messages_fts_integrity"]["operator_action"]
     assert "/lcm doctor repair" not in guidance["messages_fts_integrity"]["operator_action"]
+
+
+def test_lcm_doctor_surfaces_background_fts_integrity_failed_flag(engine, monkeypatch):
+    """A background integrity scan's persisted corruption flag (issue #6) must
+    surface in `/lcm doctor`, even when this run's live deep check reports clean."""
+    from hermes_lcm import db_bootstrap
+
+    db_bootstrap._record_integrity_failed(
+        engine._store._conn,
+        build_message_fts_spec(),
+        detail="fts5: index integrity-check failed",
+    )
+    engine._store._conn.commit()
+
+    # Live deep check reports clean so the persisted flag is the sole signal.
+    monkeypatch.setattr(
+        command_mod,
+        "check_external_content_fts_integrity",
+        lambda _conn, _spec: {"status": "pass", "detail": "ok"},
+    )
+
+    text_result = handle_lcm_command("doctor", engine)
+
+    assert "status: issues-found" in text_result
+    assert "issues: " in text_result and "messages_fts" in text_result
+    assert "background integrity scan flagged corruption" in text_result
+    assert "/lcm doctor repair apply" in text_result
 
 
 def test_lcm_doctor_repair_reports_fts_drift_without_mutating(tmp_path):
@@ -1536,6 +1564,76 @@ def test_lcm_doctor_clean_apply_rolls_back_if_delete_fails_after_backup(tmp_path
     assert len(engine._store.get_range("cron_20260414")) == 1
     assert len(engine._dag.get_session_nodes("cron_20260414")) == 1
     assert engine._lifecycle.get_by_conversation("cron_20260414") is not None
+
+
+def test_clean_apply_stages_250001_sessions_and_bounds_node_purge_batches(tmp_path):
+    conn = sqlite3.connect(tmp_path / "large-clean-scope.db")
+    conn.executescript(
+        """
+        CREATE TABLE messages(
+            store_id INTEGER PRIMARY KEY,
+            session_id TEXT NOT NULL
+        );
+        CREATE TABLE summary_nodes(
+            node_id INTEGER PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            depth INTEGER NOT NULL
+        );
+        CREATE INDEX idx_nodes_session_node
+            ON summary_nodes(session_id, node_id);
+        CREATE TABLE lcm_lifecycle_state(
+            conversation_id TEXT PRIMARY KEY,
+            current_session_id TEXT,
+            last_finalized_session_id TEXT
+        );
+        CREATE INDEX idx_lcm_lifecycle_current_session
+            ON lcm_lifecycle_state(current_session_id);
+        CREATE INDEX idx_lcm_lifecycle_last_finalized_session
+            ON lcm_lifecycle_state(last_finalized_session_id);
+        """
+    )
+    conn.executemany(
+        "INSERT INTO messages(store_id, session_id) VALUES(?, ?)",
+        ((index + 1, f"session-{index}") for index in range(3)),
+    )
+    conn.executemany(
+        "INSERT INTO summary_nodes(node_id, session_id, depth) VALUES(?, ?, 0)",
+        ((index + 1, f"session-{index % 3}") for index in range(600)),
+    )
+    conn.execute(
+        "INSERT INTO lcm_lifecycle_state VALUES('delete-me', 'session-0', 'session-1')"
+    )
+    conn.execute(
+        "INSERT INTO lcm_lifecycle_state VALUES('skip-me', 'session-0', 'outside')"
+    )
+    conn.commit()
+    batches: list[list[int]] = []
+
+    def purge(batch, *, connection):
+        assert connection is conn
+        batches.append(list(batch))
+
+    engine = SimpleNamespace(
+        _store=SimpleNamespace(connection=conn),
+        _session_id="",
+        _purge_embeddings_for_nodes=purge,
+    )
+    session_ids = {f"session-{index}" for index in range(250_001)}
+    try:
+        deleted = command_mod._delete_clean_candidates_atomically(engine, session_ids)
+        assert deleted == {
+            "messages_deleted": 3,
+            "nodes_deleted": 600,
+            "lifecycle_deleted": 1,
+            "lifecycle_skipped": 1,
+        }
+        assert batches
+        assert max(map(len, batches)) <= 256
+        assert sorted(node_id for batch in batches for node_id in batch) == list(
+            range(1, 601)
+        )
+    finally:
+        conn.close()
 
 
 def test_lcm_doctor_clean_apply_denied_by_default(tmp_path):

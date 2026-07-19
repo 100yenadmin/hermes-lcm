@@ -3,17 +3,29 @@
 LCM_GREP = {
     "name": "lcm_grep",
     "description": (
-        "Search the plugin-local LCM database for past conversation content. "
+        "Search the plugin-local LCM database for past conversation content using full-text, semantic, or hybrid retrieval. "
         "Default scope is the active session and returns both raw messages and summary nodes across all depths. "
         "Broader scopes ('all' or 'session') must be requested explicitly and exist for bounded archive recovery "
         "over rows already present in lcm.db, including externally backfilled rows that may carry source strings "
         "such as openclaw-lcm:* . In broader scopes only raw-message hits are returned; cross-session summary "
         "node expansion is intentionally deferred. Use lcm_expand(store_id=...) on a cross-session message hit "
-        "to drill into its full content. For Hermes-tracked session history outside the LCM database, use session_search."
+        "to drill into its full content. Set content_scope='externalized' or 'both' to opt into bounded, active-session "
+        "search over recoverable payload sidecars. For Hermes-tracked session history outside the LCM database, use session_search. "
+        "For open-ended cross-conversation recall by meaning ('have we ever discussed…'), prefer lcm_recall."
     ),
     "parameters": {
         "type": "object",
         "properties": {
+            "mode": {
+                "type": "string",
+                "enum": ["full_text", "semantic", "hybrid"],
+                "description": (
+                    "Retrieval mode. 'full_text' preserves the historical FTS behavior byte-for-byte. "
+                    "'semantic' searches embedded summaries and degrades to full-text on provider timeout or transient unavailability. "
+                    "'hybrid' fuses full-text and semantic ranks with reciprocal-rank fusion (RRF)."
+                ),
+                "default": "full_text",
+            },
             "query": {
                 "type": "string",
                 "description": (
@@ -38,6 +50,25 @@ LCM_GREP = {
                     "and 'hybrid' keeps strong older matches competitive while still boosting newer context."
                 ),
                 "default": "recency",
+            },
+            "content_scope": {
+                "type": "string",
+                "enum": ["history", "externalized", "both"],
+                "description": (
+                    "Content stores to search. 'history' (default) preserves current raw-message and summary behavior. "
+                    "'externalized' searches only bounded externalized-payload prefixes owned by the active session. "
+                    "'both' searches history and those payloads. Externalized search supports session_scope='current' only."
+                ),
+                "default": "history",
+            },
+            "externalized_refs": {
+                "type": "array",
+                "items": {"type": "string"},
+                "maxItems": 256,
+                "description": (
+                    "Optional externalized ref filenames to search. Valid only with content_scope='externalized' or 'both'. "
+                    "Every ref must be a regular payload owned by the active session."
+                ),
             },
             "session_scope": {
                 "type": "string",
@@ -95,6 +126,94 @@ LCM_GREP = {
             },
         },
         "required": ["query"],
+    },
+}
+
+LCM_RECALL = {
+    "name": "lcm_recall",
+    "description": (
+        "Search the agent's entire memory across ALL conversations and all time by meaning. "
+        "Returns the most relevant memories — summaries and verbatim excerpts — ranked by relevance, "
+        "recency, and relatedness to the current conversation, each with an expand_hint handle to the "
+        "original content: verbatim/current-session hits get lcm_expand(...), while cross-session summary "
+        "hits get lcm_load_session(...) (lcm_expand's node_id mode is current-session only, so it cannot "
+        "expand a cross-session summary). Not for retrieving exact/verbatim text within a known time range — "
+        "use lcm_grep(mode='full_text') for that. Not for full transcripts — after locating the right "
+        "conversation, use lcm_load_session(session_id). Recency and current-conversation preference are soft "
+        "ranking boosts, not filters; for hard time bounds use lcm_grep time_from/time_to."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": (
+                    "Natural-language description of what to recall. Searched by meaning across every "
+                    "conversation and keyword-matched over raw history; distinctive phrasing recalls best."
+                ),
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Max memories to return (default 8, hard upper bound 25).",
+                "default": 8,
+            },
+            "scope_bias": {
+                "type": "number",
+                "description": (
+                    "Soft preference for the current conversation, 0..1 (default 0.5). 0 = global-neutral, "
+                    "1 = strongly prefer memories from the current conversation. This is a ranking boost, "
+                    "never a hard filter — cross-conversation memories always remain eligible."
+                ),
+                "default": 0.5,
+            },
+            "include": {
+                "type": "string",
+                "enum": ["all", "summaries", "verbatim"],
+                "description": (
+                    "Which memory kinds to return. 'all' (default) mixes summaries and verbatim excerpts, "
+                    "'summaries' returns compacted summary memories only, 'verbatim' returns raw message "
+                    "excerpts only."
+                ),
+                "default": "all",
+            },
+        },
+        "required": ["query"],
+    },
+}
+
+LCM_RECENT = {
+    "name": "lcm_recent",
+    "description": (
+        "Retrieve recent conversation summaries by a natural UTC time period. "
+        "Ready temporal rollups are served when available; otherwise the tool "
+        "transparently falls back to existing leaf summaries in the same window."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "period": {
+                "type": "string",
+                "description": (
+                    "UTC period: today, yesterday, Nd (for example 7d), week, "
+                    "month, date:YYYY-MM-DD, or last Nh (for example last 6h)."
+                ),
+            },
+            "scope": {
+                "type": "string",
+                "enum": ["conversation"],
+                "description": "Use the active conversation. Cross-session rollups are future work.",
+                "default": "conversation",
+            },
+            "limit": {
+                "type": "integer",
+                "description": (
+                    "Maximum sections to return (default 10, hard upper bound 200). "
+                    "Values above the cap are clamped and reported."
+                ),
+                "default": 10,
+            },
+        },
+        "required": ["period"],
     },
 }
 

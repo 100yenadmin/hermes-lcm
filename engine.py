@@ -77,6 +77,11 @@ from .runtime_identity import (
     _git_runtime_identity,
     _plugin_metadata,
 )
+from .rollup_builder import (
+    initialize_rollup_invalidation_outbox,
+    mark_stale_for_published_summary,
+    run_rollup_maintenance,
+)
 from .schemas import (
     LCM_DESCRIBE,
     LCM_DOCTOR,
@@ -85,6 +90,8 @@ from .schemas import (
     LCM_GREP,
     LCM_INSPECT,
     LCM_LOAD_SESSION,
+    LCM_RECALL,
+    LCM_RECENT,
     LCM_STATUS,
 )
 from .sanitize import (
@@ -284,6 +291,20 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         )
         self._last_overflow_recovery_failed = False
         self._last_condensation_suppressed_reason = ""
+        self._last_threshold_full_sweep: dict[str, Any] = {
+            "status": "never_run",
+            "leaf_passes": 0,
+            "condensation_passes": 0,
+            "total_passes": 0,
+            "duration_ms": 0.0,
+            "tokens_before": 0,
+            "tokens_after": 0,
+            "summary_prefix_tokens_before": 0,
+            "summary_prefix_tokens_after": 0,
+            "summary_prefix_target_tokens": 0,
+            "stop_reason": "",
+            "budget_exhausted": False,
+        }
         self._last_compression_status = "idle"
         self._last_compression_noop_reason = ""
         # Ingest-failure tracking. The core promise is that nothing is ever
@@ -294,6 +315,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # not session-scoped, so it is not cleared on session reset.
         self._ingest_failure_count = 0
         self._consecutive_ingest_failures = 0
+        # Proactive-recall injection telemetry (SPEC F). Store-scoped counters so
+        # a session reset does not zero the operator's running totals; surfaced
+        # through lcm_status. injected = a block was placed this assembly;
+        # skipped = ran but nothing survived the floor/dedupe; timeout = the
+        # recall query hit its deadline (inject nothing, never block assembly).
+        self._proactive_recall_injected_count = 0
+        self._proactive_recall_skipped_count = 0
+        self._proactive_recall_timeout_count = 0
         self._last_ingest_error = ""
         self._last_ingest_error_time: float = 0
         # Cooldown timestamp to prevent compression cascade after boundary skip.
@@ -424,6 +453,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             hermes_home=hermes_home,
         )
         self._dag = SummaryDAG(db_path)
+        if self._config.temporal_rollups_enabled:
+            # Install the transaction-coupled summary mutation triggers before
+            # this engine can publish or delete a DAG node.
+            initialize_rollup_invalidation_outbox(self._dag)
         self._lifecycle = LifecycleStateStore(db_path)
 
     def _close_storage(self) -> None:
@@ -1253,6 +1286,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self,
         initial_chunk: List[Dict[str, Any]],
         focus_topic: Optional[str] = None,
+        deadline: Optional[float] = None,
     ) -> tuple[List[Dict[str, Any]], int, str, int, int]:
         attempt_chunk = list(initial_chunk)
         max_attempts = 3
@@ -1266,6 +1300,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             token_budget = min(token_budget, 12000)
 
             try:
+                timeout_seconds = self._config.summary_timeout_ms / 1000
+                if deadline is not None:
+                    remaining_seconds = deadline - time.monotonic()
+                    if remaining_seconds <= 0:
+                        raise TimeoutError("threshold full sweep time budget exhausted")
+                    timeout_seconds = min(timeout_seconds, remaining_seconds)
                 summary_text, level = summarize_with_escalation(
                     text=serialized,
                     source_tokens=source_tokens,
@@ -1275,7 +1315,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     fallback_models=self._config.summary_fallback_models,
                     circuit_breaker=self._summary_circuit_breaker,
                     spend_guard=self._summary_spend_guard,
-                    timeout=self._config.summary_timeout_ms / 1000,
+                    timeout=timeout_seconds,
                     l2_budget_ratio=self._config.l2_budget_ratio,
                     l3_truncate_tokens=self._config.l3_truncate_tokens,
                     focus_topic=focus_topic or "",
@@ -1344,6 +1384,41 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     deleted,
                     self._config.empty_lifecycle_gc_threshold,
                 )
+        # Bypassed/stateless sessions skip every LCM write, so they must also skip
+        # rollup maintenance — otherwise the bind-time hook would build rollups for
+        # a session whose ingest is suppressed (maintainer #388: gate on the same
+        # not-bypassed condition the ingest write uses).
+        if (
+            self._config.temporal_rollups_enabled
+            and not self._session_ignored
+            and not self._session_stateless
+        ):
+            run_rollup_maintenance(
+                self._dag, self._config, session_id,
+                circuit_breaker=self._summary_circuit_breaker,
+                spend_guard=self._summary_spend_guard,
+            )
+
+    def _invalidate_rollups_for_published_node(self, node: "SummaryNode") -> None:
+        """Stale the rollups covering EVERY UTC day a just-published node spans.
+
+        Rollups consume published summary nodes, so publication — not raw ingest
+        — is the load-bearing staleness signal (maintainer #388 blocker 1). This
+        is called after every ``_dag.add_node`` on the engine so a later summary
+        cannot leave an older rollup ``ready`` and apparently current. The node's
+        ``earliest_at``/``latest_at`` coverage span is passed through so a summary
+        crossing midnight stales BOTH days, not only its newest (maintainer #388
+        blocker 2 / B2).
+        """
+        if not self._config.temporal_rollups_enabled:
+            return
+        mark_stale_for_published_summary(
+            self._dag,
+            str(node.session_id or ""),
+            node.latest_at,
+            node.created_at,
+            earliest_at=node.earliest_at,
+        )
 
     def _register_active_engine_binding(self) -> None:
         session_id = str(self._session_id or "")
@@ -3027,9 +3102,86 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         retain = self._config.new_session_retain_depth
         if self._session_id and retain != -1:
             if retain == 0:
-                self._dag.delete_session_nodes(self._session_id)
+                self._dag.delete_session_nodes(
+                    self._session_id,
+                    on_deleted_batch=self._purge_embeddings_for_nodes,
+                )
             else:
-                self._dag.delete_below_depth(self._session_id, retain)
+                self._dag.delete_below_depth(
+                    self._session_id,
+                    retain,
+                    on_deleted_batch=self._purge_embeddings_for_nodes,
+                )
+
+    def _purge_embeddings_for_nodes(
+        self,
+        node_ids: "list[int]",
+        *,
+        connection: "sqlite3.Connection | None" = None,
+    ) -> None:
+        """Purge stored embeddings for deleted summary nodes (best effort).
+
+        No-op unless embeddings are enabled. Opens a short-lived VectorStore on
+        the shared DB; any failure is swallowed so a purge problem never breaks
+        session reset — the summary_nodes join still keeps orphaned vectors out
+        of ranking.
+        """
+        if not node_ids:
+            return
+        if not bool(getattr(self._config, "embeddings_enabled", False)):
+            return
+        try:
+            from .vector_store import VectorStore
+
+            if connection is not None:
+                VectorStore.purge_embedding_batch_on_connection(connection, node_ids)
+                return
+            store = VectorStore(self._store.db_path, config=self._config)
+            try:
+                store.purge_embeddings_for_nodes(node_ids)
+            finally:
+                store.close()
+        except Exception:  # pragma: no cover - defensive; purge is best-effort
+            logger.debug(
+                "LCM embedding purge for deleted nodes failed", exc_info=True
+            )
+
+    def _archive_chunks_for_messages(
+        self,
+        store_ids: "list[int]",
+        *,
+        connection: "sqlite3.Connection | None" = None,
+    ) -> None:
+        """Soft-archive raw-history chunks for purged/GC'd messages (best effort).
+
+        Mirrors ``_purge_embeddings_for_nodes`` but for the chunk corpus: when a
+        message is deleted or its content is GC-rewritten, its chunks no longer
+        map to live content, so they are archived (dropped from ranking, rows
+        retained). No-op unless embeddings are enabled; any failure is swallowed
+        so a chunk-archive problem never breaks purge/GC.
+        """
+        if not store_ids:
+            return
+        if not bool(getattr(self._config, "embeddings_enabled", False)):
+            return
+        try:
+            from .vector_store import VectorStore
+
+            if connection is not None:
+                for offset in range(0, len(store_ids), 256):
+                    VectorStore.archive_chunks_for_messages_on_connection(
+                        connection, store_ids[offset:offset + 256]
+                    )
+                return
+            store = VectorStore(self._store.db_path, config=self._config)
+            try:
+                store.archive_chunks_for_messages(store_ids)
+            finally:
+                store.close()
+        except Exception:  # pragma: no cover - defensive; archive is best-effort
+            logger.debug(
+                "LCM chunk archive for purged messages failed", exc_info=True
+            )
 
     def carry_over_new_session_context(self, old_session_id: str, new_session_id: str) -> int:
         """Move retained summaries from the old session into the new one.
@@ -3039,6 +3191,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         ``session_scope='current'`` may therefore include a carried-over node in
         the new session, while ``source`` filtering still evaluates against the
         node's original descendant message sources.
+
+        Temporal rollups are deliberately NOT re-scoped here: they are keyed by
+        (period_kind, period_start, scope=session_id) with a UNIQUE constraint, so
+        rewriting scope on rollover could collide with the new session's own
+        rollups and would need a core-schema change to do safely. Rotation is the
+        documented rollup scope boundary; ``lcm_recent`` compensates at read time
+        by spanning the same current + last-finalized sessions its leaf fallback
+        uses (see ``_recent_ready_rollups``), so no window content is dropped.
         """
         if not old_session_id or not new_session_id or old_session_id == new_session_id:
             return 0
@@ -3120,6 +3280,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return [
             LCM_GREP,
+            LCM_RECALL,
+            LCM_RECENT,
             LCM_LOAD_SESSION,
             LCM_DESCRIBE,
             LCM_EXPAND,
@@ -3148,6 +3310,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
         handlers = {
             "lcm_grep": lcm_tools.lcm_grep,
+            "lcm_recall": lcm_tools.lcm_recall,
+            "lcm_recent": lcm_tools.lcm_recent,
             "lcm_load_session": lcm_tools.lcm_load_session,
             "lcm_describe": lcm_tools.lcm_describe,
             "lcm_expand": lcm_tools.lcm_expand,
@@ -3240,6 +3404,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "threshold_tokens": self.threshold_tokens,
             "last_compression_status": self._last_compression_status,
             "last_compression_noop_reason": self._last_compression_noop_reason,
+            "threshold_full_sweep": dict(self._last_threshold_full_sweep),
             "ingest_failure_count": self._ingest_failure_count,
             "consecutive_ingest_failures": self._consecutive_ingest_failures,
             "last_ingest_error": self._last_ingest_error,
@@ -4194,6 +4359,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             source=self._session_platform,
             conversation_id=self._conversation_id,
         )
+        # Rollup staleness is driven by summary-node PUBLICATION
+        # (_invalidate_rollups_for_published_node at every add_node site), not by
+        # raw ingest: marking a period stale before its covering summary exists
+        # would let a rebuild publish 'ready' from old sources and omit the leaf
+        # (maintainer #388 P1).
         self._ingest_cursor = n
         self._compression_boundary_ingest_pending = False
         self._compression_boundary_active_placeholder_digest_budget = {}
@@ -4220,7 +4390,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     # -- Internal: summarization -------------------------------------------
 
-    def _run_pre_compaction_extraction(self, messages: List[Dict[str, Any]]) -> None:
+    def _run_pre_compaction_extraction(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        timeout_seconds: Optional[float] = None,
+    ) -> None:
         """Best-effort extraction of decisions before compaction."""
         try:
             serialized = self._serialize_messages(messages)
@@ -4234,7 +4409,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 output_path=output_path,
                 session_id=self._session_id or "",
                 model=extraction_model,
-                timeout=self._config.summary_timeout_ms / 1000,
+                timeout=(
+                    timeout_seconds
+                    if timeout_seconds is not None
+                    else self._config.summary_timeout_ms / 1000
+                ),
             )
         except Exception as e:
             logger.warning("Pre-compaction extraction failed (non-blocking): %s", e)
@@ -4250,6 +4429,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             return
 
         stored_by_id = self._store.get_batch(source_store_ids)
+
+        def _archive_in_rewrite_txn(conn: "sqlite3.Connection", sid: int) -> None:
+            # Runs inside gc_externalized_tool_result's write transaction, right
+            # after the content rewrite and before its commit: archive this row's
+            # now-stale chunks ATOMICALLY with the rewrite so a recall can never
+            # slice the new (short) content at the old chunk offsets (F2).
+            self._archive_chunks_for_messages([sid], connection=conn)
+
         for store_id in source_store_ids:
             stored = stored_by_id.get(store_id)
             if not stored or stored.get("session_id") != self._session_id:
@@ -4276,7 +4463,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 )
                 if externalized is not None and externalized.get("kind", "tool_result") == "tool_result":
                     placeholder = build_transcript_gc_placeholder(externalized)
-                    self._store.gc_externalized_tool_result(store_id, placeholder)
+                    self._store.gc_externalized_tool_result(
+                        store_id, placeholder, before_commit=_archive_in_rewrite_txn
+                    )
                     continue
 
             lookup_candidates = []
@@ -4300,7 +4489,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 continue
 
             placeholder = build_transcript_gc_placeholder(externalized)
-            self._store.gc_externalized_tool_result(store_id, placeholder)
+            self._store.gc_externalized_tool_result(
+                store_id, placeholder, before_commit=_archive_in_rewrite_txn
+            )
 
     def _serialize_messages(self, messages: List[Dict[str, Any]]) -> str:
         """Serialize messages into labeled text for the summarizer."""
@@ -4728,12 +4919,13 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
         condensed_any = False
         suppression_reason = ""
+        fanin = max(1, self._config.condensation_fanin)
 
         for depth in range(upper):
             uncondensed = self._dag.get_uncondensed_at_depth(
                 self._session_id, depth
             )
-            if len(uncondensed) < self._config.condensation_fanin:
+            if len(uncondensed) < fanin:
                 continue
 
             allow_condense, reason = self._should_allow_follow_on_condensation(
@@ -4747,48 +4939,17 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 continue
 
             # Take the first fanin nodes and condense
-            to_condense = uncondensed[:self._config.condensation_fanin]
-            combined_text = "\n\n---\n\n".join(n.summary for n in to_condense)
-            source_tokens = sum(n.token_count for n in to_condense)
-            token_budget = max(1000, int(source_tokens * 0.40))
-
-            summary_text, level = summarize_with_escalation(
-                text=combined_text,
-                source_tokens=source_tokens,
-                token_budget=token_budget,
-                depth=depth + 1,
-                model=self._config.summary_model,
-                fallback_models=self._config.summary_fallback_models,
-                circuit_breaker=self._summary_circuit_breaker,
-                spend_guard=self._summary_spend_guard,
-                timeout=self._config.summary_timeout_ms / 1000,
-                l2_budget_ratio=self._config.l2_budget_ratio,
-                l3_truncate_tokens=self._config.l3_truncate_tokens,
-                focus_topic=focus_topic or "",
-                custom_instructions=self._config.custom_instructions,
+            to_condense = uncondensed[:fanin]
+            source_tokens, summary_tokens, level = self._condense_summary_nodes(
+                to_condense,
+                focus_topic=focus_topic,
             )
-
-            earliest_at, latest_at = self._dag.get_source_time_window([n.node_id for n in to_condense])
-            node = SummaryNode(
-                session_id=self._session_id,
-                depth=depth + 1,
-                summary=summary_text,
-                token_count=count_tokens(summary_text),
-                source_token_count=source_tokens,
-                source_ids=[n.node_id for n in to_condense],
-                source_type="nodes",
-                created_at=time.time(),
-                earliest_at=earliest_at,
-                latest_at=latest_at,
-                expand_hint=self._extract_expand_hint(summary_text),
-            )
-            self._dag.add_node(node)
             condensed_any = True
 
             logger.info(
                 "LCM condensation: d%d × %d → d%d (L%d, %d→%d tokens)",
                 depth, len(to_condense), depth + 1, level,
-                source_tokens, count_tokens(summary_text),
+                source_tokens, summary_tokens,
             )
 
             if leaf_compacted_this_turn and self._config.cache_friendly_condensation_enabled:
@@ -4796,6 +4957,139 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
         if not condensed_any and leaf_compacted_this_turn and self._config.cache_friendly_condensation_enabled:
             self._last_condensation_suppressed_reason = suppression_reason
+
+    def _condense_summary_nodes(
+        self,
+        nodes: List[SummaryNode],
+        *,
+        focus_topic: Optional[str] = None,
+        deadline: Optional[float] = None,
+    ) -> tuple[int, int, int]:
+        """Persist one same-depth condensation and return source/output tokens and level."""
+        if not nodes:
+            raise ValueError("condensation requires at least one summary node")
+        depth = nodes[0].depth
+        if any(node.depth != depth for node in nodes):
+            raise ValueError("condensation requires same-depth summary nodes")
+        combined_text = "\n\n---\n\n".join(node.summary for node in nodes)
+        source_tokens = sum(node.token_count for node in nodes)
+        token_budget = max(1000, int(source_tokens * 0.40))
+        timeout_seconds = self._config.summary_timeout_ms / 1000
+        if deadline is not None:
+            remaining_seconds = deadline - time.monotonic()
+            if remaining_seconds <= 0:
+                raise TimeoutError("threshold full sweep time budget exhausted")
+            timeout_seconds = min(timeout_seconds, remaining_seconds)
+        summary_text, level = summarize_with_escalation(
+            text=combined_text,
+            source_tokens=source_tokens,
+            token_budget=token_budget,
+            depth=depth + 1,
+            model=self._config.summary_model,
+            fallback_models=self._config.summary_fallback_models,
+            circuit_breaker=self._summary_circuit_breaker,
+            spend_guard=self._summary_spend_guard,
+            timeout=timeout_seconds,
+            l2_budget_ratio=self._config.l2_budget_ratio,
+            l3_truncate_tokens=self._config.l3_truncate_tokens,
+            focus_topic=focus_topic or "",
+            custom_instructions=self._config.custom_instructions,
+        )
+        earliest_at, latest_at = self._dag.get_source_time_window(
+            [node.node_id for node in nodes]
+        )
+        summary_tokens = count_tokens(summary_text)
+        condensed_node = SummaryNode(
+            session_id=self._session_id,
+            depth=depth + 1,
+            summary=summary_text,
+            token_count=summary_tokens,
+            source_token_count=source_tokens,
+            source_ids=[node.node_id for node in nodes],
+            source_type="nodes",
+            created_at=time.time(),
+            earliest_at=earliest_at,
+            latest_at=latest_at,
+            expand_hint=self._extract_expand_hint(summary_text),
+        )
+        self._dag.add_node(condensed_node)
+        self._invalidate_rollups_for_published_node(condensed_node)
+        return source_tokens, summary_tokens, level
+
+    def _summary_frontier_nodes(self) -> List[SummaryNode]:
+        """Return all provider-visible summary frontier nodes for the active session."""
+        all_nodes = self._dag.get_session_nodes(self._session_id, limit=100_000)
+        referenced = {
+            source_id
+            for node in all_nodes
+            if node.source_type == "nodes"
+            for source_id in node.source_ids
+        }
+        return [node for node in all_nodes if node.node_id not in referenced]
+
+    def _summary_frontier_tokens(self) -> int:
+        return sum(node.token_count for node in self._summary_frontier_nodes())
+
+    def _select_threshold_sweep_condensation_group(self) -> List[SummaryNode]:
+        """Prefer routine fanin/depth, then allow bounded pressure condensation."""
+        by_depth: dict[int, list[SummaryNode]] = {}
+        for node in self._summary_frontier_nodes():
+            by_depth.setdefault(node.depth, []).append(node)
+        if not by_depth:
+            return []
+        fanin = max(2, self._config.condensation_fanin)
+        preferred_max_depth = self._config.incremental_max_depth
+        for depth in sorted(by_depth):
+            nodes = by_depth[depth]
+            within_preferred_depth = preferred_max_depth < 0 or depth < preferred_max_depth
+            if within_preferred_depth and len(nodes) >= fanin:
+                return nodes[:fanin]
+        # The frontier still exceeds its sweep target but no routine group is
+        # available. Permit a same-depth partial group or depth beyond the
+        # preferred routine maximum; the outer sweep budget keeps this bounded.
+        for depth in sorted(by_depth):
+            nodes = by_depth[depth]
+            if len(nodes) >= 2:
+                return nodes[: min(fanin, len(nodes))]
+        return []
+
+    def _run_threshold_sweep_condensation(
+        self,
+        *,
+        target_tokens: int,
+        pass_budget: int,
+        deadline: float,
+        focus_topic: Optional[str] = None,
+    ) -> tuple[int, str]:
+        """Condense an oversized summary frontier within the remaining sweep budget."""
+        passes = 0
+        while self._summary_frontier_tokens() > target_tokens:
+            if passes >= pass_budget:
+                return passes, "pass_budget_exhausted"
+            if time.monotonic() >= deadline:
+                return passes, "time_budget_exhausted"
+            group = self._select_threshold_sweep_condensation_group()
+            if not group:
+                return passes, "no_same_depth_condensation_group"
+            before = self._summary_frontier_tokens()
+            try:
+                self._condense_summary_nodes(
+                    group,
+                    focus_topic=focus_topic,
+                    deadline=deadline,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "LCM threshold full sweep condensation stopped after %d pass(es): %s",
+                    passes,
+                    exc,
+                )
+                return passes, "condensation_error"
+            passes += 1
+            after = self._summary_frontier_tokens()
+            if after >= before:
+                return passes, "condensation_no_progress"
+        return passes, "summary_prefix_target_reached"
 
     # -- Internal: context assembly ----------------------------------------
 
@@ -4908,6 +5202,143 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             return self._build_preserved_objective_summary_part(message)
         return None
 
+    @staticmethod
+    def _newest_user_message_text(messages: List[Dict[str, Any]]) -> str:
+        """Return the newest real user turn's text (SPEC F injection query).
+
+        Scans from the tail so the block reflects the turn the host is about to
+        answer. Returns "" when the tail carries no user text (e.g. a tool-only
+        continuation) — the caller then leaves the feature inert.
+        """
+        for message in reversed(messages):
+            if not isinstance(message, dict) or message.get("role") != "user":
+                continue
+            text = (text_content_for_pattern_matching(message.get("content")) or "").strip()
+            if text:
+                return text
+        return ""
+
+    def _build_proactive_recall_message(
+        self,
+        tail_messages: List[Dict[str, Any]],
+        summary_role: str,
+        active_node_ids: set,
+    ) -> Optional[Dict[str, Any]]:
+        """Build the single proactive "relevant memories" block, or None.
+
+        SPEC F: at assembly time embed the newest user message, run the
+        lcm_recall pipeline (k=6, moderate scope bias), drop hits already in the
+        active context (summary-prefix node ids + current session) and hits
+        below the relevance floor, then render ONE budget-capped block. Any
+        failure or timeout injects nothing — assembly is never blocked. Wrapped
+        in <relevant-memories> so it is stripped before ingest/summarization and
+        never re-enters the lossless store as a real turn.
+        """
+        config = self._config
+        if not getattr(config, "proactive_recall_enabled", False):
+            return None
+        # Injection is an embedding-query feature: silently inert when embeddings
+        # are disabled/unwarmed (no provider to embed the newest message).
+        if not getattr(config, "embeddings_enabled", False):
+            return None
+
+        query = self._newest_user_message_text(tail_messages)
+        if not query:
+            return None
+
+        # SPEC F retrieval constants: small k, moderate scope bias (favor — never
+        # hard-filter — the current conversation).
+        recall_k = 6
+        scope_bias = 0.3
+        min_score = float(getattr(config, "proactive_recall_min_score", 0.01) or 0.0)
+        budget_tokens = int(getattr(config, "proactive_recall_budget_tokens", 500) or 0)
+        if budget_tokens <= 0:
+            return None
+        provider_override = getattr(config, "proactive_recall_provider", "") or ""
+
+        try:
+            raw = lcm_tools.lcm_recall(
+                {
+                    "query": query,
+                    "limit": recall_k,
+                    "scope_bias": scope_bias,
+                    "include": "all",
+                },
+                engine=self,
+                provider_override=provider_override,
+            )
+            payload = json.loads(raw)
+        except Exception:  # noqa: BLE001 - never let recall break assembly
+            logger.debug("LCM proactive recall failed; injecting nothing", exc_info=True)
+            self._proactive_recall_skipped_count += 1
+            return None
+
+        if payload.get("timeout"):
+            # Deadline hit: inject nothing this turn (contract), count it.
+            self._proactive_recall_timeout_count += 1
+            return None
+
+        surviving: list[dict] = []
+        for hit in payload.get("hits", []):
+            if not isinstance(hit, dict):
+                continue
+            # Dedupe: skip anything already represented in the active context —
+            # the current session (its summary prefix + recent tail window) and
+            # any summary node already placed in the prefix.
+            if hit.get("from_current_session"):
+                continue
+            node_id = hit.get("node_id")
+            if node_id is not None and node_id in active_node_ids:
+                continue
+            # Relevance floor.
+            if float(hit.get("score") or 0.0) < min_score:
+                continue
+            snippet = (hit.get("snippet") or "").strip()
+            if not snippet:
+                continue
+            surviving.append(hit)
+
+        if not surviving:
+            self._proactive_recall_skipped_count += 1
+            return None
+
+        # Render 1-3 items inside the token budget. The header labels the block
+        # as retrieved memory (provenance-honest, never asserted as fact).
+        header = (
+            "Possibly relevant memories (retrieved from earlier conversations — "
+            "context only, not asserted as fact):"
+        )
+        rendered_lines: list[str] = []
+        for hit in surviving[:3]:
+            ts = hit.get("timestamp") or 0
+            try:
+                when = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(float(ts))) if ts else "unknown time"
+            except (TypeError, ValueError, OSError):
+                when = "unknown time"
+            snippet = (hit.get("snippet") or "").strip().replace("\n", " ")
+            expand = hit.get("expand_hint") or ""
+            line = f"- [{when}] {snippet}"
+            if expand:
+                line += f" (expand: {expand})"
+            candidate_lines = rendered_lines + [line]
+            block = self._wrap_relevant_memories(header, candidate_lines)
+            if count_message_tokens({"role": summary_role, "content": block}) > budget_tokens:
+                break
+            rendered_lines = candidate_lines
+
+        if not rendered_lines:
+            self._proactive_recall_skipped_count += 1
+            return None
+
+        content = self._wrap_relevant_memories(header, rendered_lines)
+        self._proactive_recall_injected_count += 1
+        return {"role": summary_role, "content": content}
+
+    @staticmethod
+    def _wrap_relevant_memories(header: str, lines: List[str]) -> str:
+        body = "\n".join([header, *lines])
+        return f"<relevant-memories>\n{body}\n</relevant-memories>"
+
     def _assemble_context(
         self,
         system_msg: Optional[Dict[str, Any]],
@@ -4998,6 +5429,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             if summary_budget is None or count_message_tokens(anchor_msg) <= summary_budget:
                 summary_parts.append(anchor_part)
 
+        # Node ids placed in the summary prefix — used to dedupe proactive-recall
+        # injection against summaries already visible in the active context.
+        active_summary_node_ids: set = set()
         all_nodes = self._dag.get_session_nodes(self._session_id)
         if all_nodes:
             # Group by depth, take the most recent uncondensed at each level
@@ -5007,6 +5441,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             for d in depths:
                 uncondensed = self._dag.get_uncondensed_at_depth(self._session_id, d)
                 for node in uncondensed:
+                    active_summary_node_ids.add(node.node_id)
                     depth_label = {
                         0: "Recent",
                         1: "Session Arc",
@@ -5033,6 +5468,17 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             if selected_parts:
                 combined = "\n\n---\n\n".join(selected_parts)
                 result.append({"role": summary_role, "content": combined})
+
+        # Proactive memory injection (SPEC F, default-off). One bounded block is
+        # placed adjacent to the summary prefix — a stable position below the
+        # cache-stable summaries and above the volatile fresh tail — so the
+        # already-volatile tail region absorbs its per-turn variability and the
+        # cached summary prefix is left intact. Never inside the fresh tail.
+        proactive_msg = self._build_proactive_recall_message(
+            tail_messages, summary_role, active_summary_node_ids
+        )
+        if proactive_msg is not None:
+            result.append(proactive_msg)
 
         # Fresh tail
         result.extend(tail_selected)

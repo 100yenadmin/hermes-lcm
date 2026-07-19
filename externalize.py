@@ -8,19 +8,24 @@ recoverable through the LCM inspection and expansion tools.
 
 from __future__ import annotations
 
+import codecs
 import hashlib
 import json
 import logging
+import math
 import os
 import re
+import stat
 import time
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, BinaryIO, Dict
 
 DEFAULT_LARGE_OUTPUT_DIRNAME = "lcm-large-outputs"
 _EXTERNALIZED_REF_RE = re.compile(
     r"\[(?:Externalized|GC'd externalized) (?:tool output|payload):.*?;\s*ref=([^;\]\s]+)\]"
 )
+_EXTERNALIZED_SEARCH_HEADER_BYTES = 64 * 1024
+_EXTERNALIZED_SEARCH_TAIL_BYTES = 64 * 1024
 
 
 def _placeholder_metadata(value: Any) -> str:
@@ -602,6 +607,272 @@ def load_externalized_payload(ref: str, *, config, hermes_home: str = "") -> Dic
     summary = _externalized_summary(path, payload)
     summary["content"] = payload.get("content", "")
     return summary
+
+
+def _decode_json_string_fragment(raw: bytes) -> str:
+    """Decode a possibly truncated JSON string without reading beyond its bound."""
+    candidate = raw
+    while candidate:
+        try:
+            value = json.loads(b'"' + candidate + b'"')
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            candidate = candidate[:-1]
+            continue
+        return value if isinstance(value, str) else ""
+    return ""
+
+
+def _numeric_json_field(data: bytes, field: str) -> int | float | None:
+    pattern = re.compile(rb'"' + re.escape(field.encode("ascii")) + rb'"\s*:\s*(-?[0-9]+(?:\.[0-9]+)?)')
+    match = pattern.search(data)
+    if match is None:
+        return None
+    text = match.group(1).decode("ascii")
+    try:
+        return float(text) if "." in text else int(text)
+    except ValueError:
+        return None
+
+
+def _normalized_content_size(value: int | float | None) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            return None
+    try:
+        normalized = int(value)
+    except (OverflowError, TypeError, ValueError):
+        return None
+    return normalized if normalized >= 0 else None
+
+
+def _parse_top_level_json_string_fields_before_content(text: str) -> tuple[dict[str, str], int | None]:
+    decoder = json.JSONDecoder()
+    fields: dict[str, str] = {}
+    length = len(text)
+    index = 0
+
+    def skip_json_whitespace(pos: int) -> int:
+        while pos < length and text[pos] in " \t\n\r":
+            pos += 1
+        return pos
+
+    index = skip_json_whitespace(index)
+    if index >= length or text[index] != "{":
+        return fields, None
+    index += 1
+
+    while True:
+        index = skip_json_whitespace(index)
+        if index >= length or text[index] == "}":
+            return fields, None
+        if text[index] != '"':
+            return fields, None
+        try:
+            key, index = decoder.raw_decode(text, index)
+        except json.JSONDecodeError:
+            return fields, None
+        if not isinstance(key, str):
+            return fields, None
+        index = skip_json_whitespace(index)
+        if index >= length or text[index] != ":":
+            return fields, None
+        index += 1
+        index = skip_json_whitespace(index)
+        if key == "content":
+            return fields, index if index < length and text[index] == '"' else None
+        if index >= length:
+            return fields, None
+        try:
+            value, index = decoder.raw_decode(text, index)
+        except json.JSONDecodeError:
+            return fields, None
+        if isinstance(value, str):
+            fields[key] = value
+        elif key == "session_id":
+            fields.pop(key, None)
+        index = skip_json_whitespace(index)
+        if index >= length:
+            return fields, None
+        if text[index] == ",":
+            index += 1
+            continue
+        if text[index] == "}":
+            return fields, None
+        return fields, None
+
+
+def _inspect_top_level_json_string_fields_before_content(text: str) -> tuple[dict[str, str], bool]:
+    fields, content_quote_index = _parse_top_level_json_string_fields_before_content(text)
+    return fields, content_quote_index is not None
+
+
+def _read_externalized_payload_metadata_prefix_from_handle(
+    handle: BinaryIO,
+    *,
+    max_read_bytes: int,
+) -> tuple[str, dict[str, str], bool, bool]:
+    """Read through the opening quote of the top-level content string."""
+    prefix = bytearray()
+    text_parts: list[str] = []
+    decoder = codecs.getincrementaldecoder("utf-8")("strict")
+    prefix_truncated = False
+    read_limit = max(1, int(max_read_bytes))
+    fields: dict[str, str] = {}
+
+    while len(prefix) < read_limit:
+        chunk = handle.read(min(4096, read_limit - len(prefix)))
+        if not chunk:
+            break
+        prefix.extend(chunk)
+        try:
+            decoded = decoder.decode(chunk, final=False)
+        except UnicodeDecodeError as exc:
+            raise ValueError("invalid_payload") from exc
+        if decoded:
+            text_parts.append(decoded)
+        prefix_text = "".join(text_parts)
+        fields, content_quote_index = _parse_top_level_json_string_fields_before_content(prefix_text)
+        if content_quote_index is not None:
+            metadata_prefix_text = prefix_text[: content_quote_index + 1]
+            return metadata_prefix_text, fields, True, False
+
+    prefix_truncated = len(prefix) >= read_limit and bool(handle.read(1))
+    if not prefix_truncated:
+        try:
+            final_text = decoder.decode(b"", final=True)
+        except UnicodeDecodeError as exc:
+            raise ValueError("invalid_payload") from exc
+        if final_text:
+            text_parts.append(final_text)
+    return "".join(text_parts), fields, False, prefix_truncated
+
+
+def read_externalized_payload_metadata_prefix(
+    path: Path,
+    *,
+    max_read_bytes: int,
+) -> tuple[str, bool, bool]:
+    with path.open("rb") as handle:
+        prefix_text, _fields, content_key_seen, prefix_truncated = (
+            _read_externalized_payload_metadata_prefix_from_handle(
+                handle,
+                max_read_bytes=max_read_bytes,
+            )
+        )
+    return prefix_text, content_key_seen, prefix_truncated
+
+
+def read_externalized_payload_search_prefix(
+    ref: str,
+    *,
+    config,
+    hermes_home: str = "",
+    max_content_bytes: int = 512_000,
+) -> Dict[str, Any]:
+    """Read bounded metadata and the first bytes of one payload's content.
+
+    This deliberately does not deserialize the full sidecar. It reads at most a
+    small header, ``max_content_bytes`` from the JSON content string, and a
+    small tail for size metadata.
+    """
+    if (
+        not ref
+        or Path(ref).name != ref
+        or "/" in ref
+        or "\\" in ref
+        or not ref.endswith(".json")
+    ):
+        return {"status": "invalid_ref", "ref": ref}
+    storage_dir = get_large_output_storage_dir(config, hermes_home=hermes_home, create=False)
+    path = storage_dir / ref
+    try:
+        expected_stat = os.lstat(path)
+    except FileNotFoundError:
+        return {"status": "missing", "ref": ref}
+    except OSError:
+        return {"status": "unreadable", "ref": ref}
+    if stat.S_ISLNK(expected_stat.st_mode):
+        return {"status": "symlink", "ref": ref}
+    if not stat.S_ISREG(expected_stat.st_mode):
+        return {"status": "missing", "ref": ref}
+
+    content_limit = max(1, min(int(max_content_bytes), 512_000))
+    fd = -1
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        flags |= getattr(os, "O_BINARY", 0)
+        fd = os.open(path, flags)
+        opened_stat = os.fstat(fd)
+        if (
+            not stat.S_ISREG(opened_stat.st_mode)
+            or (opened_stat.st_dev, opened_stat.st_ino)
+            != (expected_stat.st_dev, expected_stat.st_ino)
+        ):
+            return {"status": "unreadable", "ref": ref}
+        file_size = opened_stat.st_size
+        with os.fdopen(fd, "rb") as handle:
+            fd = -1
+            metadata_prefix_text, metadata_fields, content_key_seen, _prefix_truncated = (
+                _read_externalized_payload_metadata_prefix_from_handle(
+                    handle,
+                    max_read_bytes=_EXTERNALIZED_SEARCH_HEADER_BYTES,
+                )
+            )
+            if not content_key_seen:
+                return {"status": "unsupported_payload", "ref": ref}
+            handle.seek(len(metadata_prefix_text.encode("utf-8")))
+            raw = bytearray()
+            escaped = False
+            closed = False
+            while len(raw) < content_limit:
+                chunk = handle.read(min(64 * 1024, content_limit - len(raw)))
+                if not chunk:
+                    break
+                for byte in chunk:
+                    if not escaped and byte == 0x22:
+                        closed = True
+                        break
+                    raw.append(byte)
+                    if escaped:
+                        escaped = False
+                    elif byte == 0x5C:
+                        escaped = True
+                if closed:
+                    break
+            handle.seek(max(0, file_size - _EXTERNALIZED_SEARCH_TAIL_BYTES))
+            tail = handle.read(_EXTERNALIZED_SEARCH_TAIL_BYTES)
+    except (OSError, ValueError):
+        return {"status": "unreadable", "ref": ref}
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+    content = _decode_json_string_fragment(bytes(raw))
+    original_bytes = _numeric_json_field(tail, "content_bytes")
+    original_chars = _numeric_json_field(tail, "content_chars")
+    created_at = _numeric_json_field(tail, "created_at")
+    try:
+        created_at_float = float(created_at or 0)
+    except (OverflowError, ValueError):
+        created_at_float = 0.0
+    if not math.isfinite(created_at_float):
+        created_at_float = 0.0
+    return {
+        "status": "ok",
+        "ref": ref,
+        "kind": metadata_fields.get("kind") or "tool_result",
+        "tool_call_id": metadata_fields.get("tool_call_id", ""),
+        "role": metadata_fields.get("role", ""),
+        "session_id": metadata_fields.get("session_id", ""),
+        "content": content,
+        "content_scanned_bytes": len(raw),
+        "original_content_bytes": _normalized_content_size(original_bytes),
+        "original_content_chars": _normalized_content_size(original_chars),
+        "created_at": created_at_float,
+        "scan_truncated": not closed,
+    }
 
 
 def externalized_tool_result_has_persisted_output_marker(ref: str, *, config, hermes_home: str = "") -> bool:

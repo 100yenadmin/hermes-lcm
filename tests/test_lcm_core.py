@@ -23,7 +23,11 @@ from hermes_lcm.escalation import (
     _deterministic_truncate,
 )
 from hermes_lcm.lifecycle_state import LifecycleStateStore
-from hermes_lcm.db_bootstrap import ExternalContentFtsSpec, ensure_external_content_fts
+from hermes_lcm.db_bootstrap import (
+    ExternalContentFtsSpec,
+    SCHEMA_VERSION,
+    ensure_external_content_fts,
+)
 from hermes_lcm.search_query import sanitize_fts5_query
 from hermes_lcm.session_patterns import (
     build_session_match_keys,
@@ -557,6 +561,8 @@ class TestConfig:
         assert c.deferred_maintenance_enabled is False
         assert c.deferred_maintenance_max_passes == 4
         assert c.critical_budget_pressure_ratio == 0.0
+        assert c.threshold_full_sweep_enabled is False
+        assert c.summary_prefix_target_tokens == 0
         assert c.ignore_session_patterns == []
         assert c.stateless_session_patterns == []
         assert c.ignore_message_patterns == []
@@ -594,6 +600,8 @@ class TestConfig:
         monkeypatch.setenv("LCM_CACHE_FRIENDLY_CONDENSATION_ENABLED", "1")
         monkeypatch.setenv("LCM_CACHE_FRIENDLY_MIN_DEBT_GROUPS", "3")
         monkeypatch.setenv("LCM_CRITICAL_BUDGET_PRESSURE_RATIO", "0.92")
+        monkeypatch.setenv("LCM_THRESHOLD_FULL_SWEEP_ENABLED", "true")
+        monkeypatch.setenv("LCM_SUMMARY_PREFIX_TARGET_TOKENS", "18000")
         monkeypatch.setenv("LCM_CUSTOM_INSTRUCTIONS", "Write as a neutral documenter.")
         monkeypatch.setenv("LCM_EXTRACTION_ENABLED", "true")
         monkeypatch.setenv("LCM_EXTRACTION_MODEL", "openai/gpt-5.4-mini")
@@ -631,6 +639,8 @@ class TestConfig:
         assert c.cache_friendly_condensation_enabled is True
         assert c.cache_friendly_min_debt_groups == 3
         assert c.critical_budget_pressure_ratio == 0.92
+        assert c.threshold_full_sweep_enabled is True
+        assert c.summary_prefix_target_tokens == 18_000
         assert c.custom_instructions == "Write as a neutral documenter."
         assert c.extraction_enabled is True
         assert c.extraction_model == "openai/gpt-5.4-mini"
@@ -1664,6 +1674,48 @@ class TestMessageStore:
         assert rewritten is False
         assert store.get(store_id)["content"] == "raw payload blob should stay"
 
+    def test_gc_before_commit_hook_runs_atomically_with_rewrite(self, store):
+        """before_commit runs after the rewrite, before the single commit (F2).
+
+        The chunk archive must be atomic with the content rewrite: at hook time
+        the content is already the placeholder and the connection is still in the
+        rewrite's open transaction, so the hook's writes commit together with it.
+        """
+        placeholder = "[GC'd externalized tool output: tool_call_id=call_gc; ref=payload.json]"
+        store_id = store.append(
+            "sess1",
+            {"role": "tool", "tool_call_id": "call_gc", "content": "raw payload blob"},
+            token_estimate=50,
+        )
+
+        observed = {}
+
+        def hook(conn, sid):
+            row = conn.execute(
+                "SELECT content FROM messages WHERE store_id = ?", (sid,)
+            ).fetchone()
+            observed["content_at_hook"] = row[0]
+            observed["in_transaction"] = conn.in_transaction
+            conn.execute(
+                "INSERT INTO metadata(key, value) VALUES('gc_hook_marker', ?)",
+                (str(sid),),
+            )
+
+        rewritten = store.gc_externalized_tool_result(
+            store_id, placeholder, before_commit=hook
+        )
+
+        assert rewritten is True
+        # The rewrite was already applied when the hook ran, in the same open txn.
+        assert observed["content_at_hook"] == placeholder
+        assert observed["in_transaction"] is True
+        # The hook's sibling write committed atomically with the rewrite.
+        assert store.get(store_id)["content"] == placeholder
+        marker = store.connection.execute(
+            "SELECT value FROM metadata WHERE key = 'gc_hook_marker'"
+        ).fetchone()
+        assert marker is not None and marker[0] == str(store_id)
+
     def test_init_repairs_malformed_message_fts_and_sets_schema_version(self, tmp_path):
         db_path = tmp_path / "legacy-store.db"
         conn = sqlite3.connect(db_path)
@@ -1701,7 +1753,7 @@ class TestMessageStore:
         version = store._conn.execute(
             "SELECT value FROM metadata WHERE key = 'schema_version'"
         ).fetchone()
-        assert version == ("5",)
+        assert version == (str(SCHEMA_VERSION),)
 
         results = store.search("docker", session_id="sess1")
         assert len(results) == 1
@@ -1750,7 +1802,7 @@ class TestMessageStore:
         version = store._conn.execute(
             "SELECT value FROM metadata WHERE key = 'schema_version'"
         ).fetchone()
-        assert version == ("5",)
+        assert version == (str(SCHEMA_VERSION),)
 
         migration_state = store._conn.execute(
             "SELECT step_name FROM lcm_migration_state ORDER BY step_name"
@@ -2718,7 +2770,7 @@ class TestLifecycleStateStore:
         version = state._conn.execute(
             "SELECT value FROM metadata WHERE key = 'schema_version'"
         ).fetchone()[0]
-        assert version == "5"
+        assert version == str(SCHEMA_VERSION)
 
         tables = {
             row[0]
@@ -3298,7 +3350,7 @@ class TestSummaryDAG:
         version = dag._conn.execute(
             "SELECT value FROM metadata WHERE key = 'schema_version'"
         ).fetchone()
-        assert version == ("5",)
+        assert version == (str(SCHEMA_VERSION),)
 
         results = dag.search("docker", session_id="s1")
         assert len(results) == 1
@@ -3350,7 +3402,7 @@ class TestSummaryDAG:
         version = dag._conn.execute(
             "SELECT value FROM metadata WHERE key = 'schema_version'"
         ).fetchone()
-        assert version == ("5",)
+        assert version == (str(SCHEMA_VERSION),)
 
         migration_state = dag._conn.execute(
             "SELECT step_name FROM lcm_migration_state ORDER BY step_name"

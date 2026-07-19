@@ -1,4 +1,5 @@
 """LCM configuration with defaults and env var overrides."""
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -10,8 +11,60 @@ except Exception:  # pragma: no cover - optional fallback for minimal installs
     yaml = None
 
 
+logger = logging.getLogger(__name__)
+
+
 def _parse_pattern_list(raw: str) -> list[str]:
     return [part.strip() for part in raw.split(",") if part.strip()]
+
+
+# Default lcm_recall RRF arm weights. Conservative down-weight of the weak FTS
+# arm (the LongMemEval harness will tune from here); summary/chunk vector arms
+# keep full say. See docs/retrieval-tools.md.
+_DEFAULT_RECALL_ARM_WEIGHTS: dict[str, float] = {
+    "fts": 0.5,
+    "summary": 1.0,
+    "chunk": 1.0,
+}
+
+
+def _parse_arm_weights(raw: str, defaults: dict[str, float]) -> dict[str, float]:
+    """Leniently parse ``arm=weight`` pairs (e.g. ``fts=0.5,summary=1.0``).
+
+    Unknown arm names, malformed pairs, and non-finite/non-numeric weights are
+    skipped; any arm not overridden keeps its default. A wholly unparsable value
+    therefore degrades to the defaults rather than erroring the tool.
+
+    A negative weight is invalid -- it would invert RRF rank-monotonicity (a
+    rank-1 hit scoring below a rank-2 hit) -- so it is rejected and the arm keeps
+    its default with a logged warning. ``0.0`` is legal and cleanly drops the arm.
+    """
+    weights = dict(defaults)
+    for part in raw.split(","):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        name, _, value = part.partition("=")
+        name = name.strip().lower()
+        if name not in defaults:
+            continue
+        try:
+            parsed = float(value.strip())
+        except (TypeError, ValueError):
+            continue
+        if parsed != parsed or parsed in (float("inf"), float("-inf")):
+            continue
+        if parsed < 0.0:
+            logger.warning(
+                "LCM_RECALL_ARM_WEIGHTS: negative weight %r for arm %r is "
+                "invalid; using default %r",
+                parsed,
+                name,
+                defaults[name],
+            )
+            continue
+        weights[name] = parsed
+    return weights
 
 
 def _parse_int_env(key: str, default: int) -> int:
@@ -269,6 +322,8 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("deferred_maintenance_enabled", "LCM_DEFERRED_MAINTENANCE_ENABLED", bool),
     _EnvFieldSpec("deferred_maintenance_max_passes", "LCM_DEFERRED_MAINTENANCE_MAX_PASSES", int),
     _EnvFieldSpec("critical_budget_pressure_ratio", "LCM_CRITICAL_BUDGET_PRESSURE_RATIO", float),
+    _EnvFieldSpec("threshold_full_sweep_enabled", "LCM_THRESHOLD_FULL_SWEEP_ENABLED", bool),
+    _EnvFieldSpec("summary_prefix_target_tokens", "LCM_SUMMARY_PREFIX_TARGET_TOKENS", int),
     _EnvFieldSpec("l2_budget_ratio", "LCM_L2_BUDGET_RATIO", float),
     _EnvFieldSpec("l3_truncate_tokens", "LCM_L3_TRUNCATE_TOKENS", int),
     _EnvFieldSpec("max_assembly_tokens", "LCM_MAX_ASSEMBLY_TOKENS", int),
@@ -295,10 +350,36 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("summary_timeout_ms", "LCM_SUMMARY_TIMEOUT_MS", int),
     _EnvFieldSpec("expansion_timeout_ms", "LCM_EXPANSION_TIMEOUT_MS", int),
     _EnvFieldSpec("database_path", "LCM_DATABASE_PATH", str),
+    _EnvFieldSpec("embeddings_enabled", "LCM_EMBEDDINGS_ENABLED", bool),
+    _EnvFieldSpec("rerank_enabled", "LCM_RERANK_ENABLED", bool),
+    _EnvFieldSpec("recall_scan_rows", "LCM_RECALL_SCAN_ROWS", int),
+    _EnvFieldSpec("proactive_recall_enabled", "LCM_PROACTIVE_RECALL_ENABLED", bool),
+    _EnvFieldSpec("proactive_recall_min_score", "LCM_PROACTIVE_RECALL_MIN_SCORE", float),
+    _EnvFieldSpec("proactive_recall_budget_tokens", "LCM_PROACTIVE_RECALL_BUDGET_TOKENS", int),
+    _EnvFieldSpec("proactive_recall_provider", "LCM_PROACTIVE_RECALL_PROVIDER", str),
+    _EnvFieldSpec("embedding_bounded_scan_rows", "LCM_EMBEDDING_BOUNDED_SCAN_ROWS", int),
+    _EnvFieldSpec("embedding_storage_dtype", "LCM_EMBEDDING_STORAGE_DTYPE", str),
+    _EnvFieldSpec("embedding_store_dim", "LCM_EMBEDDING_STORE_DIM", int),
+    _EnvFieldSpec("embedding_binary_prescreen", "LCM_EMBEDDING_BINARY_PRESCREEN", bool),
+    _EnvFieldSpec("knn_prescreen_multiplier", "LCM_KNN_PRESCREEN_MULTIPLIER", int),
+    _EnvFieldSpec("embedding_provider", "LCM_EMBEDDING_PROVIDER", str),
+    _EnvFieldSpec("embedding_model", "LCM_EMBEDDING_MODEL", str),
+    _EnvFieldSpec("embedding_content_policy", "LCM_EMBED_CONTENT_POLICY", str),
+    _EnvFieldSpec("ollama_base_url", "LCM_OLLAMA_BASE_URL", str),
+    _EnvFieldSpec("embedding_query_timeout_s", "LCM_EMBEDDING_QUERY_TIMEOUT_S", float),
+    _EnvFieldSpec("recall_query_timeout_s", "LCM_RECALL_QUERY_TIMEOUT_S", float),
+    _EnvFieldSpec("embedding_backfill_timeout_s", "LCM_EMBEDDING_BACKFILL_TIMEOUT_S", float),
+    _EnvFieldSpec("embedding_max_batch_items", "LCM_EMBEDDING_MAX_BATCH_ITEMS", int),
     _EnvFieldSpec("new_session_retain_depth", "LCM_NEW_SESSION_RETAIN_DEPTH", int),
     _EnvFieldSpec("doctor_clean_apply_enabled", "LCM_DOCTOR_CLEAN_APPLY_ENABLED", bool),
     _EnvFieldSpec("empty_lifecycle_gc_enabled", "LCM_EMPTY_LIFECYCLE_GC_ENABLED", bool),
     _EnvFieldSpec("empty_lifecycle_gc_threshold", "LCM_EMPTY_LIFECYCLE_GC_THRESHOLD", int),
+    _EnvFieldSpec("temporal_rollups_enabled", "LCM_TEMPORAL_ROLLUPS_ENABLED", bool),
+    _EnvFieldSpec("rollup_daily_target_tokens", "LCM_ROLLUP_DAILY_TARGET_TOKENS", int),
+    _EnvFieldSpec("rollup_daily_max_tokens", "LCM_ROLLUP_DAILY_MAX_TOKENS", int),
+    _EnvFieldSpec("rollup_aggregate_max_tokens", "LCM_ROLLUP_AGGREGATE_MAX_TOKENS", int),
+    _EnvFieldSpec("rollup_builds_per_pass", "LCM_ROLLUP_BUILDS_PER_PASS", int),
+    _EnvFieldSpec("rollup_maintenance_budget_ms", "LCM_ROLLUP_MAINTENANCE_BUDGET_MS", int),
 )
 
 _PARSER_BY_TYPE = {
@@ -372,6 +453,10 @@ class LCMConfig:
     # Disabled at 0.0. When set, only bypass cache-friendly/deferred polite
     # gates once prompt pressure reaches this fraction of the context window.
     critical_budget_pressure_ratio: float = 0.0
+    # Opt into one bounded synchronous sweep after threshold pressure is reached.
+    threshold_full_sweep_enabled: bool = False
+    # Target frontier-summary size after a sweep (0 = derive one leaf budget).
+    summary_prefix_target_tokens: int = 0
 
     # -- Escalation ---
     # L2 bullet budget as fraction of L1
@@ -468,6 +553,90 @@ class LCMConfig:
     # -- Storage ---
     database_path: str = ""       # empty = HERMES_HOME/lcm.db; LCM_DATABASE_PATH may override
 
+    # -- Embeddings (default-off until a provider/model are configured) ---
+    embeddings_enabled: bool = False
+    # lcm_recall cross-encoder rerank stage (voyage rerank-2.5-lite over the top
+    # fused candidates). Default-off: recall ships value on RRF order alone, and
+    # rerank is one extra billable API call the operator opts into.
+    rerank_enabled: bool = False
+    embedding_bounded_scan_rows: int = 2_000
+    # Vector storage dtype for NEWLY-registered embedding profiles: float32
+    # (default; a stock install keeps summary vectors byte-identical) or int8
+    # (per-vector symmetric quantization + a binary sign-bit prescreen column,
+    # unlocking full-corpus two-stage KNN). dtype is part of the profile identity
+    # hash, so an int8 identity never mixes with existing float32 vectors.
+    embedding_storage_dtype: str = "float32"
+    # Optional Matryoshka store dimension for newly-registered profiles (0 =
+    # full profile dim). When >0 and < the provider dim, vectors are truncated
+    # to this many leading dims and renormalized before storage/quantization.
+    # Also a profile-identity component (the stored dim is hashed), so truncated
+    # vectors never mix with full-dim ones.
+    embedding_store_dim: int = 0
+    # Write the sign-bit prescreen for float32 identities too (int8 always writes
+    # it). float32-vec + prescreen = the full-corpus two-stage KNN with EXACT
+    # float rescore of survivors (highest recall, ~10x less query RAM than a full
+    # float32 scan). Default-off keeps stock float32 identities byte-identical and
+    # binary-free (legacy bounded path); enable it on a DISTINCT identity so
+    # prescreen rows never mix into a legacy float32 identity.
+    embedding_binary_prescreen: bool = False
+    # Stage-1 prescreen breadth for the two-stage (binary Hamming -> int8/float
+    # rescore) KNN: M = knn_prescreen_multiplier x k survivors are rescored.
+    # Larger widens the approximate prescreen toward exact recall at more cost.
+    knn_prescreen_multiplier: int = 4
+    # lcm_recall candidate-scan bound. lcm_recall promises "all conversations,
+    # all time", so it must NOT inherit the small recency-truncating grep bound
+    # above (that structurally hides the oldest memories). This larger bound
+    # (still deadline-guarded) lets recall cover a realistic forever-memory
+    # corpus while capping worst-case cost on a very large one.
+    recall_scan_rows: int = 25_000
+    # Per-arm RRF fusion weights for lcm_recall's 3-arm hybrid (fts/summary/chunk).
+    # Down-weighting the weak FTS arm keeps naive equal-weight fusion from dragging
+    # fused recall below its best (vector) arm — measured −21 R@5 on LongMemEval.
+    # Override via LCM_RECALL_ARM_WEIGHTS ("fts=0.5,summary=1.0,chunk=1.0").
+    recall_arm_weights: dict[str, float] = field(
+        default_factory=lambda: dict(_DEFAULT_RECALL_ARM_WEIGHTS)
+    )
+    # -- Proactive memory injection (SPEC F, default-OFF) ---
+    # At active-context assembly, embed the newest user message and run the
+    # lcm_recall pipeline to surface cross-session memories the model would
+    # otherwise have to lcm_recall by hand. Default-off => byte-identical
+    # assembly; when disabled the whole path is skipped before any work.
+    proactive_recall_enabled: bool = False
+    # Relevance floor on the lcm_recall composite score. Two regimes:
+    #  - rerank OFF (default): the score is RRF-scale (~0.014-0.05); a single
+    #    top-ranked arm hit is ~0.016, so this floor mainly drops ancient or
+    #    low-ranked hits. The default keeps fresh top-of-arm hits.
+    #  - rerank ON: a cross-encoder relevance in [0,1] dominates the score;
+    #    raise this floor (e.g. ~0.3) for a true semantic gate.
+    proactive_recall_min_score: float = 0.01
+    # Hard token budget for the single injected "relevant memories" block.
+    proactive_recall_budget_tokens: int = 500
+    # Optional embedding-provider override for the injection query only (e.g.
+    # keep a local fastembed provider for the offline injection path even when
+    # interactive search uses voyage). Empty => reuse the main provider/model.
+    proactive_recall_provider: str = ""
+    embedding_provider: str = ""
+    embedding_model: str = ""
+    # Content-aware chunk policy for the raw-history chunk corpus:
+    # conversational (default) | heads | full. Unknown values degrade to the
+    # default in the chunker's normalize_content_policy.
+    embedding_content_policy: str = "conversational"
+    ollama_base_url: str = "http://localhost:11434"
+    embedding_query_timeout_s: float = 3.0
+    # Dedicated deadline for lcm_recall. It fans out three sequential arms (FTS +
+    # summary KNN + chunk KNN) plus fusion, hydration, and an optional rerank, so
+    # it needs more headroom than lcm_grep's single-arm query deadline above
+    # (which stays 3.0s). sprint-opt-2.
+    recall_query_timeout_s: float = 8.0
+    # Per-provider-operation deadline for bulk document embedding. This is
+    # deliberately separate from the latency-sensitive query deadline; the
+    # whole backfill invocation is additionally governed by
+    # LCM_EMBEDDING_BACKFILL_BUDGET_S (0 = unlimited, checked between batches).
+    embedding_backfill_timeout_s: float = 120.0
+    # Voyage caps a single embeddings request at 1000 input items; document
+    # batches split at this many items in addition to the token budget.
+    embedding_max_batch_items: int = 1000
+
     # -- Session carry-over ---
     # Depth retained after /new (-1 = all, 0 = nothing, 2 = keep d2+)
     new_session_retain_depth: int = 2
@@ -488,6 +657,17 @@ class LCMConfig:
     # ingested its first message yet. Set to 0 only in trusted/test
     # environments that intentionally want immediate empty-row pruning.
     empty_lifecycle_gc_max_age_hours: float | None = 24.0
+
+    # -- Temporal rollups ---
+    # Disabled by default; the engine's ingest/build hooks are flag-gated.
+    temporal_rollups_enabled: bool = False
+    rollup_daily_target_tokens: int = 5_000
+    rollup_daily_max_tokens: int = 15_000
+    rollup_aggregate_max_tokens: int = 20_000
+    rollup_builds_per_pass: int = 2
+    # Best-effort wall-clock budget checked between builds. A slow summarizer
+    # may finish its current build and leave later rollups lagging until a future pass.
+    rollup_maintenance_budget_ms: int = 5_000
 
     # -- Diagnostics ---
     # Field-level provenance for values loaded through from_env(). Manual
@@ -583,6 +763,12 @@ class LCMConfig:
                 c.empty_lifecycle_gc_max_age_hours = float(raw_max_age)
             except (TypeError, ValueError):
                 pass
+
+        raw_arm_weights = os.environ.get("LCM_RECALL_ARM_WEIGHTS")
+        if raw_arm_weights is not None:
+            c.recall_arm_weights = _parse_arm_weights(
+                raw_arm_weights, _DEFAULT_RECALL_ARM_WEIGHTS
+            )
 
         raw_ignore = os.environ.get("LCM_IGNORE_SESSION_PATTERNS")
         if raw_ignore is not None:

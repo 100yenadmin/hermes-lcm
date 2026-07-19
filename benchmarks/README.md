@@ -1,6 +1,6 @@
 # hermes-lcm deterministic benchmarks
 
-This directory contains deterministic replay fixtures and policy files for benchmark-driven LCM preset work.
+This directory contains deterministic replay fixtures and policy files for benchmark-driven LCM preset work. For the retrieval-quality and judged-QA-accuracy benchmarks (LongMemEval harnesses, fairness rules, reproduction, results index), see [`METHODOLOGY.md`](METHODOLOGY.md).
 
 The benchmark harness is offline by default:
 
@@ -24,6 +24,19 @@ python benchmarks/benchmark_active_tool_stubbing.py \
 
 The result measures provider-visible prompt tokens and local assembly latency.
 It is not a provider billing-cost measurement and contains no raw payload text.
+
+## Threshold full-sweep benchmark
+
+For the opt-in threshold full-sweep policy, compare one ordinary incremental
+invocation with one sweep using an offline synthetic workload:
+
+```bash
+python scripts/benchmark_threshold_full_sweep.py
+```
+
+The JSON report compares prompt-prefix publication count, summary-call count,
+compression ratio, latency, and retained/recoverable synthetic facts. It never
+includes message contents, temporary paths, or session identifiers.
 
 ## Run the default replay suite
 
@@ -262,3 +275,154 @@ Use benchmark output and `lcm_status`, not guesswork:
 | Large tool outputs dominate token pressure | externalization status, payload sizes | Enable large-output externalization before tuning compaction thresholds |
 
 Hard gates for promoting a preset: no replay failures, no raw transcript leakage in exports, stable retrieval recall, explainable fixture/provenance metadata, and no conflict with explicit operator config.
+
+## LongMemEval retrieval harness
+
+`scripts/lcm_longmemeval.py` measures retrieval quality (recall@k / NDCG@10)
+on **LongMemEval_S** (Wu et al., ICLR 2025) for the LCM retrieval arms —
+`fts` (raw-message FTS5), `summary_vectors` (summary embeddings), `hybrid_rrf`
+(reciprocal-rank fusion, k=60), `hybrid_rerank` (a reranker over the fused pool,
+see below), `chunk_vectors` (raw-chunk KNN), `hybrid_rrf3` (FTS + summary +
+chunk fusion), and `lcm_recall` (the **production tool users actually call** — see
+below). There is **no LLM judge**: the dataset labels the evidence
+session(s) per question (`answer_session_ids`), so recall is computable offline.
+It ingests each question's history into a fresh temporary LCM store (reusing the
+`store`/`dag`/`vector_store` APIs directly, no live Hermes host), builds one
+deterministic summary per session, optionally backfills embeddings, then scores
+each arm against the labeled evidence.
+
+### Session-level and turn-level scoring
+
+Every arm reports metrics at **two granularities**. Session-level recall/NDCG ask
+"did the arm retrieve the evidence *session*?" Turn-level recall/NDCG ask "did it
+retrieve the evidence *turns*?" — a hit is a retrieved item whose `(session,
+turn-range)` intersects the labeled evidence turns (`has_answer` markers). Raw
+FTS message hits and raw chunk hits localize to a single turn via `store_id →
+(session, turn_index)`. A **summary** covers a whole session and cannot localize a
+turn, so summary hits score at **session granularity** — a retrieved evidence-
+session summary credits every evidence turn of that session at once. Arms whose
+ranking contains summary items are flagged with an asterisk (`*`) in the markdown
+table and `session_granularity: true` in the JSON, so the coarse turn-level number
+is never mistaken for exact localization. The `t*` columns in the table are the
+turn-level metrics.
+
+### The rerank arm (`hybrid_rerank`)
+
+By default the rerank arm is a **deterministic embedding-cosine reranker** over
+the fused candidate pool (`rerank_mode: "placeholder-cosine"`) — clearly labeled
+as a placeholder for a real cross-encoder, and safe offline. With `--provider
+voyage --rerank`, the arm instead calls **`VoyageProvider.rerank`
+(rerank-2.5-lite)** on the top `RERANK_CANDIDATE_WINDOW` (=20) fused sessions in a
+single API call under an absolute `RERANK_TIMEOUT_S` (=10s) budget; the remaining
+fused tail is appended unchanged. Any provider error falls back to the placeholder.
+The mode actually used is recorded in the JSON (`rerank.mode`) and the markdown
+header so no one mistakes a placeholder run for a real-reranker run.
+
+### The production arm (`lcm_recall`)
+
+The other arms measure retrieval *primitives* — the harness reimplements each
+arm's ranking (its own FTS query builder, its own RRF fusion). `lcm_recall`
+instead scores the **actual `tools.lcm_recall` tool** end-to-end: weighted RRF
+over the FTS + summary + chunk arms (`retrieval_core.rrf_fuse` with the
+`LCM_RECALL_ARM_WEIGHTS` down-weighting of the FTS arm), the scope/recency prior,
+chunk-vs-FTS dedup by `store_id`, and `include`-filtering — the full path a caller
+gets, none of which the per-arm numbers exercise. It is invoked per question
+against the same per-question temp store via a `SimpleNamespace` engine (the proven
+smoke-test stand-in), with the warmed harness embedder injected through the tool's
+provider cache so no second model load or network call occurs.
+
+Two honesty notes on how the production behavior shows up in these numbers:
+
+- **Scope prior is neutral, recency prior is not.** The probe engine uses a
+  *fresh* current-session id that is disjoint from the dataset's sessions (see
+  `fresh_recall_session_id`), so the scope prior — which boosts hits from the
+  *current conversation* — never fires on a dataset session. The **recency prior
+  still applies** to every hit (newer hits are boosted by a half-life multiplier);
+  that is the real production behavior and is deliberately left in rather than
+  stubbed out, so the number reflects the tool as shipped.
+- **`limit` is clamped to the production ceiling.** `lcm_recall` caps its response
+  at `_LCM_RECALL_LIMIT_CAP` (=25) hits, so its session ranking is only as deep as
+  the tool will ever surface; recall@10 is measured over the deduped sessions of
+  those top hits. Its per-question latency is also the *real* tool cost (thread
+  pool, read-only connection setup, provider resolution, KNN pooling), so it is
+  much higher than the reimplemented arms' microbenchmark timings.
+
+### Ingest batching (F7)
+
+Two ingest optimizations (measured per-question in `ingest.per_question_ms`):
+each question's session summaries are embedded in **one** batched `embed_documents`
+call instead of one call per session (sub-batched at `EMBED_BATCH_SIZE`=64 only to
+guard against a pathologically large haystack), and a single pre-migrated SQLite
+**template DB is cloned per question** rather than re-running the schema bootstrap
+500×. Pass `--no-db-template` to disable template reuse (for A/B measurement).
+
+The summary-call collapse is the win that matters for **network/live providers**
+(e.g. Voyage), where per-call round-trip latency dominates: tens of summary calls
+per question become one, and a full-haystack run's embed round-trips drop by the
+session count — comfortably past the ≥3× F7 target on the live path. Raw chunks
+are deliberately **not** batched: for a **local** ONNX provider (fastembed),
+`embed_documents` pads every text in a batch to the batch's longest sequence, so
+batching hundreds of variable-length chunks is *slower* than embedding them one at
+a time (measured ~0.4× on `bge-small`). Local ONNX ingest is compute-bound, so the
+portable local win is the DB-template reuse, not embed batching.
+
+The dataset is downloaded **once** by an explicit operator command, never during
+a run. The canonical source is the Hugging Face dataset `xiaowu0162/longmemeval`,
+file `longmemeval_s` (~278 MB, 500 questions), pinned to revision
+`2ec2a557f339b6c0369619b1ed5793734cc87533`:
+
+```bash
+python scripts/lcm_longmemeval.py fetch --output /path/to/longmemeval-data
+```
+
+Deterministic plumbing proof (offline, `<60s`, scores are meaningless with the
+hash-based stub embedder):
+
+```bash
+python scripts/lcm_longmemeval.py run \
+  --dataset /path/to/longmemeval-data/longmemeval_s \
+  --provider stub --limit 5 \
+  --output benchmarks/runs/longmemeval-stub
+```
+
+CI-grade local run with the deterministic FastEmbed provider (the model is
+downloaded once into the FastEmbed cache; the query path is local thereafter).
+`fastembed` is an optional dependency — install it into a virtualenv, and point
+its model cache at a roomy volume with `LCM_LONGMEMEVAL_FASTEMBED_CACHE`:
+
+```bash
+python -m venv .venv-fastembed
+.venv-fastembed/bin/pip install fastembed
+LCM_LONGMEMEVAL_FASTEMBED_CACHE=/path/to/fastembed-cache \
+  .venv-fastembed/bin/python scripts/lcm_longmemeval.py run \
+    --dataset /path/to/longmemeval-data/longmemeval_s \
+    --provider fastembed --model BAAI/bge-small-en-v1.5 --limit 25 \
+    --output benchmarks/runs/longmemeval-fastembed
+```
+
+`--provider voyage --model <voyage-model>` is allowed for an explicit
+live-provider run (network + spend); add `--rerank` to exercise the real
+`VoyageProvider.rerank` arm (see "The rerank arm" above). Use `--limit N` to bound
+cost; the full 500-question run over all six arms with `bge-small` takes on the
+order of minutes on a laptop.
+
+Output is **aggregate-only**, matching the export hygiene of
+`scripts/lcm_benchmark.py`: `longmemeval_metrics.json` (per-arm and per-category
+recall@1/5/10, NDCG@10 at both session and turn granularity — the latter under a
+`turn` block with a `session_granularity` flag — per-arm latency percentiles, plus
+top-level `rerank` mode/window/budget and `ingest` timing/provenance) plus a
+`longmemeval_metrics.md` table. It contains no transcript content, session ids,
+or local paths. Abstention questions (`question_id` ending in `_abs`) have no
+evidence session and are excluded from recall (`abstention_excluded` counts
+them). Categories: single-session-user / -assistant / -preference,
+multi-session, temporal (temporal-reasoning), and knowledge-update.
+
+**Honest caveat — this is our configuration, not a universal verdict.** MemDelta
+(arXiv:2606.29914) shows that memory-benchmark rankings **flip** with the choice
+of embedding model and base model: an arm that wins under one embedder can lose
+under another. So these numbers gate the LCM rerank and embed-policy defaults
+*for the precise configuration recorded in the metrics JSON* (provider, model,
+dataset revision) and must not be read as an absolute claim that one arm is
+better than another. Re-run with your intended production embedder before
+trusting the ordering, and always publish the exact configuration alongside the
+scores.

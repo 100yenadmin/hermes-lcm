@@ -26,6 +26,9 @@ from .tokens import count_message_tokens, count_messages_tokens, count_tokens
 
 logger = logging.getLogger(__name__)
 
+_THRESHOLD_FULL_SWEEP_MAX_PASSES = 12
+_THRESHOLD_FULL_SWEEP_MAX_SECONDS = 120.0
+
 
 class CompactionMixin:
     def _maybe_reclassify_late_auxiliary_before_compaction_write(self) -> None:
@@ -90,7 +93,10 @@ class CompactionMixin:
                 for msg in messages
             )
         ):
-            eligible, reason = self._leaf_compaction_candidate_status(messages)
+            eligible, reason = self._leaf_compaction_candidate_status(
+                messages,
+                allow_partial_leaf=self._config.threshold_full_sweep_enabled,
+            )
             pre_ingest_placeholder_ambiguous_noop = not eligible
             pre_ingest_noop_reason = reason
         replay_messages = None
@@ -143,7 +149,14 @@ class CompactionMixin:
                 self._last_compression_noop_reason = pre_ingest_noop_reason
                 logger.info("LCM preflight compression no-op: %s", pre_ingest_noop_reason)
                 return False
-            eligible, reason = self._leaf_compaction_candidate_status(replay_messages)
+            eligible, reason = self._leaf_compaction_candidate_status(
+                replay_messages,
+                allow_partial_leaf=bool(
+                    self._config.threshold_full_sweep_enabled
+                    and self.threshold_tokens > 0
+                    and replay_rough >= self.threshold_tokens
+                ),
+            )
             if eligible:
                 return self._mark_preflight_compression_requested()
             if self._has_ignored_backlog_outside_fresh_tail(replay_messages):
@@ -169,7 +182,10 @@ class CompactionMixin:
                 self._last_compression_noop_reason = pre_ingest_noop_reason
                 logger.info("LCM preflight compression no-op: %s", pre_ingest_noop_reason)
                 return False
-            eligible, reason = self._leaf_compaction_candidate_status(messages)
+            eligible, reason = self._leaf_compaction_candidate_status(
+                messages,
+                allow_partial_leaf=self._config.threshold_full_sweep_enabled,
+            )
             if eligible:
                 return self._mark_preflight_compression_requested()
             if self._has_ignored_backlog_outside_fresh_tail(messages):
@@ -243,6 +259,7 @@ class CompactionMixin:
         messages: List[Dict[str, Any]],
         *,
         force_overflow: bool = False,
+        allow_partial_leaf: bool = False,
     ) -> tuple[bool, str]:
         """Return whether a normal leaf compaction pass can actually run.
 
@@ -295,6 +312,8 @@ class CompactionMixin:
             return True, "forced overflow recovery"
 
         raw_tokens_outside_tail = count_messages_tokens(candidate_raw)
+        if allow_partial_leaf:
+            return True, "eligible partial threshold-sweep leaf"
         if self._config.dynamic_leaf_chunk_enabled:
             working_leaf_chunk_tokens = self._working_leaf_chunk_tokens(raw_tokens_outside_tail)
         else:
@@ -425,12 +444,50 @@ class CompactionMixin:
         leaf_compacted_this_turn = False
         dropped_replayed_scaffold_messages = False
         leaf_passes = 0
+        estimated_active_tokens = (
+            observed_prompt_tokens
+            if observed_prompt_tokens is not None and observed_prompt_tokens > 0
+            else count_messages_tokens(messages)
+        )
+        threshold_full_sweep_active = bool(
+            self._config.threshold_full_sweep_enabled
+            and not force_overflow
+            and self.threshold_tokens > 0
+            and estimated_active_tokens >= self.threshold_tokens
+        )
+        sweep_deadline = time.monotonic() + _THRESHOLD_FULL_SWEEP_MAX_SECONDS
+        configured_sweep_target = int(self._config.summary_prefix_target_tokens)
+        sweep_target_tokens = max(
+            1,
+            configured_sweep_target
+            if configured_sweep_target > 0
+            else int(self._config.leaf_chunk_tokens),
+        )
+        sweep_summary_prefix_before = (
+            self._summary_frontier_tokens() if threshold_full_sweep_active else 0
+        )
+        if threshold_full_sweep_active:
+            self._last_threshold_full_sweep = {
+                "status": "running",
+                "leaf_passes": 0,
+                "condensation_passes": 0,
+                "total_passes": 0,
+                "duration_ms": 0.0,
+                "tokens_before": estimated_active_tokens,
+                "tokens_after": estimated_active_tokens,
+                "summary_prefix_tokens_before": sweep_summary_prefix_before,
+                "summary_prefix_tokens_after": sweep_summary_prefix_before,
+                "summary_prefix_target_tokens": sweep_target_tokens,
+                "stop_reason": "",
+                "budget_exhausted": False,
+            }
         critical_budget_pressure = self._critical_budget_pressure_reached(
             observed_tokens=observed_prompt_tokens,
             messages=working_messages,
         )
         deferred_maintenance_active = (
             not force_overflow
+            and not threshold_full_sweep_active
             and self._should_run_deferred_maintenance(
                 working_messages,
                 observed_tokens=observed_prompt_tokens,
@@ -440,21 +497,23 @@ class CompactionMixin:
             self._lifecycle.record_maintenance_attempt(self._conversation_id)
         base_max_leaf_passes = 4 if self._config.dynamic_leaf_chunk_enabled else 1
         max_leaf_passes = base_max_leaf_passes
+        if threshold_full_sweep_active:
+            max_leaf_passes = _THRESHOLD_FULL_SWEEP_MAX_PASSES
         if deferred_maintenance_active:
             max_leaf_passes = max(1, self._config.deferred_maintenance_max_passes)
-        estimated_active_tokens = (
-            observed_prompt_tokens
-            if observed_prompt_tokens is not None and observed_prompt_tokens > 0
-            else count_messages_tokens(messages)
-        )
 
         explicit_focus_topic = focus_topic is not None
 
         noop_reason = "no eligible raw backlog outside fresh tail"
+        sweep_stop_reason = ""
+        sweep_raw_drained = False
         dependent_reply_message_ids: set[int] = set()
         preexisting_dependent_reply_records = self._load_generated_ignored_dependent_reply_records()
 
         while leaf_passes < max_leaf_passes:
+            if threshold_full_sweep_active and time.monotonic() >= sweep_deadline:
+                sweep_stop_reason = "time_budget_exhausted"
+                break
             fresh_tail_start = self._fresh_tail_start(pressure_messages)
 
             # Keep only a real system prompt anchored. Gateway sessions may
@@ -464,6 +523,9 @@ class CompactionMixin:
             leading_anchor_count = self._leading_anchor_count(working_messages)
             if fresh_tail_start <= leading_anchor_count:
                 noop_reason = "no eligible raw backlog outside fresh tail"
+                if threshold_full_sweep_active:
+                    sweep_raw_drained = True
+                    sweep_stop_reason = "raw_prefix_drained"
                 break
 
             candidate_start = leading_anchor_count
@@ -577,11 +639,22 @@ class CompactionMixin:
             candidate_raw = working_messages[leading_anchor_count:fresh_tail_start]
             if not candidate_raw:
                 noop_reason = "no eligible raw backlog outside fresh tail"
+                if threshold_full_sweep_active:
+                    sweep_raw_drained = True
+                    sweep_stop_reason = "raw_prefix_drained"
                 break
 
             pressure_candidate_raw = pressure_messages[leading_anchor_count:fresh_tail_start]
             raw_tokens_outside_tail = count_messages_tokens(pressure_candidate_raw)
-            if self._config.dynamic_leaf_chunk_enabled:
+            if threshold_full_sweep_active:
+                working_leaf_chunk_tokens = self._working_leaf_chunk_tokens(
+                    raw_tokens_outside_tail
+                )
+                to_compact = self._select_oldest_leaf_chunk(
+                    candidate_raw,
+                    working_leaf_chunk_tokens,
+                )
+            elif self._config.dynamic_leaf_chunk_enabled:
                 working_leaf_chunk_tokens = self._working_leaf_chunk_tokens(raw_tokens_outside_tail)
                 if raw_tokens_outside_tail < working_leaf_chunk_tokens and not force_overflow:
                     if not (deferred_maintenance_active and critical_budget_pressure):
@@ -624,12 +697,38 @@ class CompactionMixin:
                 # Use the same dependency-filtered view as summarization so ignored
                 # turns cannot leak through derived assistant/tool replies.
                 if self._config.extraction_enabled:
-                    self._run_pre_compaction_extraction(summary_input_chunk)
+                    extraction_timeout = None
+                    if threshold_full_sweep_active:
+                        extraction_timeout = max(0.001, sweep_deadline - time.monotonic())
+                    self._run_pre_compaction_extraction(
+                        summary_input_chunk,
+                        timeout_seconds=extraction_timeout,
+                    )
 
-                compacted_chunk, source_tokens, summary_text, _level, _rescue_attempts = self._summarize_leaf_chunk_with_rescue(
-                    summary_input_chunk,
-                    focus_topic=focus_topic,
-                )
+                try:
+                    summary_kwargs: dict[str, Any] = {"focus_topic": focus_topic}
+                    if threshold_full_sweep_active:
+                        summary_kwargs["deadline"] = sweep_deadline
+                    (
+                        compacted_chunk,
+                        source_tokens,
+                        summary_text,
+                        _level,
+                        _rescue_attempts,
+                    ) = self._summarize_leaf_chunk_with_rescue(
+                        summary_input_chunk,
+                        **summary_kwargs,
+                    )
+                except Exception as exc:
+                    if threshold_full_sweep_active and leaf_compacted_this_turn:
+                        sweep_stop_reason = "leaf_summary_error"
+                        logger.warning(
+                            "LCM threshold full sweep stopped after %d persisted leaf pass(es): %s",
+                            leaf_passes,
+                            exc,
+                        )
+                        break
+                    raise
             compacted_summary_ids = {id(message) for message in compacted_chunk}
             compacted_positions = [
                 idx for idx, message in enumerate(selected_raw_chunk) if id(message) in compacted_summary_ids
@@ -670,6 +769,7 @@ class CompactionMixin:
                 expand_hint=self._extract_expand_hint(summary_text),
             )
             self._dag.add_node(node)
+            self._invalidate_rollups_for_published_node(node)
             self._maybe_gc_compacted_tool_results(compacted_chunk, source_store_ids)
             self._last_compacted_store_id = max(consumed_store_ids) if consumed_store_ids else 0
             self._persist_frontier_marker()
@@ -680,6 +780,18 @@ class CompactionMixin:
             leaf_compacted_this_turn = True
             leaf_passes += 1
             estimated_active_tokens = max(0, estimated_active_tokens - source_tokens + summary_tokens)
+
+            if threshold_full_sweep_active:
+                leading_anchor_count = self._leading_anchor_count(working_messages)
+                remaining_fresh_tail_start = self._fresh_tail_start(pressure_messages)
+                remaining_raw = working_messages[
+                    leading_anchor_count:remaining_fresh_tail_start
+                ]
+                if not remaining_raw:
+                    sweep_raw_drained = True
+                    sweep_stop_reason = "raw_prefix_drained"
+                    break
+                continue
 
             if not self._config.dynamic_leaf_chunk_enabled:
                 break
@@ -702,6 +814,14 @@ class CompactionMixin:
                 if remaining_raw_tokens < remaining_threshold:
                     if not (deferred_maintenance_active and critical_budget_pressure):
                         break
+
+        if (
+            threshold_full_sweep_active
+            and not sweep_raw_drained
+            and not sweep_stop_reason
+            and leaf_passes >= max_leaf_passes
+        ):
+            sweep_stop_reason = "pass_budget_exhausted"
 
         if not leaf_compacted_this_turn:
             self._refresh_raw_backlog_debt(
@@ -760,6 +880,16 @@ class CompactionMixin:
                 self._last_compression_status = "noop"
                 self._last_compression_noop_reason = noop_reason
                 logger.info("LCM compression no-op: %s", noop_reason)
+            if threshold_full_sweep_active:
+                duration_ms = (time.perf_counter() - _compress_started) * 1000.0
+                self._last_threshold_full_sweep = {
+                    **self._last_threshold_full_sweep,
+                    "status": "noop",
+                    "duration_ms": round(duration_ms, 3),
+                    "stop_reason": sweep_stop_reason or noop_reason,
+                    "budget_exhausted": sweep_stop_reason
+                    in {"pass_budget_exhausted", "time_budget_exhausted"},
+                }
             self._write_generated_ignored_placeholder_hash_counts(
                 self._generated_placeholder_digest_budget_for_active_replay(sanitized_messages)
             )
@@ -768,13 +898,31 @@ class CompactionMixin:
             )
             return sanitized_messages
 
-        # Step 6: Check if condensation is needed
-        self._maybe_condense(
-            focus_topic=focus_topic,
-            leaf_compacted_this_turn=True,
-            force_overflow=force_overflow,
-            critical_budget_pressure=critical_budget_pressure,
-        )
+        # Step 6: Check if condensation is needed. A threshold full sweep only
+        # condenses after the eligible raw prefix has been drained, and shares
+        # the same total pass/deadline budget as its leaf work.
+        condensation_passes = 0
+        if threshold_full_sweep_active:
+            if sweep_raw_drained:
+                remaining_passes = max(
+                    0,
+                    _THRESHOLD_FULL_SWEEP_MAX_PASSES - leaf_passes,
+                )
+                condensation_passes, sweep_stop_reason = (
+                    self._run_threshold_sweep_condensation(
+                        target_tokens=sweep_target_tokens,
+                        pass_budget=remaining_passes,
+                        deadline=sweep_deadline,
+                        focus_topic=focus_topic,
+                    )
+                )
+        else:
+            self._maybe_condense(
+                focus_topic=focus_topic,
+                leaf_compacted_this_turn=True,
+                force_overflow=force_overflow,
+                critical_budget_pressure=critical_budget_pressure,
+            )
 
         # Step 7: Assemble new active context
         self._refresh_raw_backlog_debt(
@@ -831,6 +979,33 @@ class CompactionMixin:
         # compress() output is consumed directly by the main loop in some
         # edge cases (e.g. forced overflow recovery bypassing _assemble_context).
         compressed = self._sanitize_active_context_messages(compressed)
+        if threshold_full_sweep_active:
+            total_passes = leaf_passes + condensation_passes
+            duration_ms = (time.perf_counter() - _compress_started) * 1000.0
+            final_stop_reason = sweep_stop_reason or "raw_prefix_drained"
+            partial_stop_reasons = {
+                "pass_budget_exhausted",
+                "time_budget_exhausted",
+                "leaf_summary_error",
+                "condensation_error",
+                "condensation_no_progress",
+                "no_same_depth_condensation_group",
+            }
+            self._last_threshold_full_sweep = {
+                "status": "partial" if final_stop_reason in partial_stop_reasons else "completed",
+                "leaf_passes": leaf_passes,
+                "condensation_passes": condensation_passes,
+                "total_passes": total_passes,
+                "duration_ms": round(duration_ms, 3),
+                "tokens_before": self._last_threshold_full_sweep["tokens_before"],
+                "tokens_after": count_messages_tokens(compressed),
+                "summary_prefix_tokens_before": sweep_summary_prefix_before,
+                "summary_prefix_tokens_after": self._summary_frontier_tokens(),
+                "summary_prefix_target_tokens": sweep_target_tokens,
+                "stop_reason": final_stop_reason,
+                "budget_exhausted": final_stop_reason
+                in {"pass_budget_exhausted", "time_budget_exhausted"},
+            }
         self._write_generated_ignored_placeholder_hash_counts(
             self._generated_placeholder_digest_budget_for_active_replay(compressed)
         )

@@ -41,6 +41,22 @@ def engine(tmp_path):
         e.shutdown()
 
 
+@pytest.fixture
+def externalized_search_engine(tmp_path):
+    home = tmp_path / "hermes-search"
+    config = LCMConfig(
+        database_path=str(tmp_path / "lcm_externalized_search.db"),
+        large_output_externalization_enabled=True,
+        large_output_externalization_threshold_chars=200,
+    )
+    instance = LCMEngine(config=config, hermes_home=str(home))
+    instance._session_id = "test-session"
+    try:
+        yield instance
+    finally:
+        instance.shutdown()
+
+
 def test_shutdown_closes_lifecycle_store(tmp_path):
     config = LCMConfig(database_path=str(tmp_path / "shutdown-lifecycle.db"))
     engine = LCMEngine(config=config)
@@ -11295,6 +11311,288 @@ class TestEngineCompress:
 
         assert call_count == 1
         assert engine._dag.get_session_nodes("test-session") == []
+
+    def test_threshold_full_sweep_drains_chunked_prefix_and_publishes_once(self, tmp_path, monkeypatch):
+        config = LCMConfig(
+            fresh_tail_count=2,
+            leaf_chunk_tokens=120,
+            threshold_full_sweep_enabled=True,
+            summary_prefix_target_tokens=10_000,
+            database_path=str(tmp_path / "lcm_threshold_sweep.db"),
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "test-session"
+        instance.threshold_tokens = 1
+        messages = [{"role": "system", "content": "system"}]
+        for index in range(10):
+            role = "user" if index % 2 == 0 else "assistant"
+            messages.append({
+                "role": role,
+                "content": f"FACT-{index} " + (f"dense-{index} " * 35),
+            })
+        calls: list[tuple[int, list[str]]] = []
+
+        def fake_leaf(chunk, focus_topic=None, deadline=None):
+            del focus_topic, deadline
+            source_tokens = count_messages_tokens(chunk)
+            calls.append((source_tokens, [message["content"].split()[0] for message in chunk]))
+            summary = "retained " + " ".join(calls[-1][1])
+            return chunk, source_tokens, summary, 1, 0
+
+        publications = 0
+        original_assemble = instance._assemble_context
+
+        def count_publication(*args, **kwargs):
+            nonlocal publications
+            publications += 1
+            return original_assemble(*args, **kwargs)
+
+        monkeypatch.setattr(instance, "_summarize_leaf_chunk_with_rescue", fake_leaf)
+        monkeypatch.setattr(instance, "_assemble_context", count_publication)
+        try:
+            tokens_before = count_messages_tokens(messages)
+            compressed = instance.compress(messages, current_tokens=tokens_before)
+            telemetry = instance.get_status()["threshold_full_sweep"]
+
+            assert len(calls) > 1
+            assert all(tokens <= config.leaf_chunk_tokens or len(labels) == 1 for tokens, labels in calls)
+            assert publications == 1
+            assert compressed[-2:] == messages[-2:]
+            compressed_text = "\n".join(str(message.get("content") or "") for message in compressed)
+            assert all(f"FACT-{index}" in compressed_text for index in range(8))
+            assert "dense-0" not in compressed_text
+            assert telemetry["leaf_passes"] == len(calls)
+            assert telemetry["condensation_passes"] == 0
+            assert telemetry["total_passes"] == len(calls)
+            assert telemetry["status"] == "completed"
+            assert telemetry["stop_reason"] == "summary_prefix_target_reached"
+            assert telemetry["budget_exhausted"] is False
+            assert telemetry["tokens_before"] == tokens_before
+            assert telemetry["tokens_after"] < tokens_before
+        finally:
+            instance.shutdown()
+
+    def test_threshold_full_sweep_preflight_accepts_partial_leaf_at_threshold(self, tmp_path):
+        config = LCMConfig(
+            fresh_tail_count=2,
+            leaf_chunk_tokens=20_000,
+            threshold_full_sweep_enabled=True,
+            database_path=str(tmp_path / "lcm_threshold_sweep_partial_preflight.db"),
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "test-session"
+        messages = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "small historical message"},
+            {"role": "user", "content": "fresh request"},
+            {"role": "assistant", "content": "fresh response"},
+        ]
+        instance.threshold_tokens = count_messages_tokens(messages)
+        try:
+            assert instance.should_compress_preflight(messages) is True
+        finally:
+            instance.shutdown()
+
+    def test_threshold_full_sweep_total_pass_budget_is_shared_and_reported(self, tmp_path, monkeypatch):
+        config = LCMConfig(
+            fresh_tail_count=2,
+            leaf_chunk_tokens=1,
+            threshold_full_sweep_enabled=True,
+            database_path=str(tmp_path / "lcm_threshold_sweep_pass_budget.db"),
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "test-session"
+        instance.threshold_tokens = 1
+        messages = [{"role": "system", "content": "system"}]
+        for index in range(20):
+            messages.append({
+                "role": "user" if index % 2 == 0 else "assistant",
+                "content": f"budget-{index} " + ("token " * 20),
+            })
+
+        def fake_leaf(chunk, focus_topic=None, deadline=None):
+            del focus_topic, deadline
+            return chunk, count_messages_tokens(chunk), "bounded", 1, 0
+
+        monkeypatch.setattr(instance, "_summarize_leaf_chunk_with_rescue", fake_leaf)
+        try:
+            instance.compress(messages, current_tokens=count_messages_tokens(messages))
+            telemetry = instance.get_status()["threshold_full_sweep"]
+
+            assert telemetry["leaf_passes"] == 12
+            assert telemetry["condensation_passes"] == 0
+            assert telemetry["total_passes"] == 12
+            assert telemetry["status"] == "partial"
+            assert telemetry["stop_reason"] == "pass_budget_exhausted"
+            assert telemetry["budget_exhausted"] is True
+        finally:
+            instance.shutdown()
+
+    def test_threshold_full_sweep_condenses_frontier_to_target_and_beyond_preferred_depth(self, tmp_path, monkeypatch):
+        config = LCMConfig(
+            fresh_tail_count=2,
+            leaf_chunk_tokens=200,
+            threshold_full_sweep_enabled=True,
+            summary_prefix_target_tokens=1500,
+            incremental_max_depth=1,
+            condensation_fanin=4,
+            database_path=str(tmp_path / "lcm_threshold_sweep_condense.db"),
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "test-session"
+        instance.threshold_tokens = 1
+        for index in range(4):
+            instance._dag.add_node(SummaryNode(
+                session_id="test-session",
+                depth=1,
+                summary=f"durable fact group {index}",
+                token_count=1000,
+                source_token_count=2000,
+                source_ids=[],
+                source_type="messages",
+                created_at=index,
+            ))
+        messages = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "raw retained fact " + ("detail " * 80)},
+            {"role": "user", "content": "fresh request"},
+            {"role": "assistant", "content": "fresh answer"},
+        ]
+
+        def fake_leaf(chunk, focus_topic=None, deadline=None):
+            del focus_topic, deadline
+            return chunk, count_messages_tokens(chunk), "raw retained fact", 1, 0
+
+        import hermes_lcm.engine as engine_module
+
+        monkeypatch.setattr(instance, "_summarize_leaf_chunk_with_rescue", fake_leaf)
+        monkeypatch.setattr(
+            engine_module,
+            "summarize_with_escalation",
+            lambda **kwargs: ("condensed durable facts", 1),
+        )
+        try:
+            instance.compress(messages, current_tokens=count_messages_tokens(messages))
+            telemetry = instance.get_status()["threshold_full_sweep"]
+
+            assert telemetry["condensation_passes"] == 1
+            assert telemetry["summary_prefix_tokens_before"] == 4000
+            assert telemetry["summary_prefix_tokens_after"] <= 1500
+            assert telemetry["stop_reason"] == "summary_prefix_target_reached"
+            assert any(node.depth == 2 for node in instance._dag.get_session_nodes("test-session"))
+        finally:
+            instance.shutdown()
+
+    def test_threshold_full_sweep_stops_between_calls_at_time_budget(self, tmp_path, monkeypatch):
+        config = LCMConfig(
+            fresh_tail_count=2,
+            leaf_chunk_tokens=1,
+            threshold_full_sweep_enabled=True,
+            database_path=str(tmp_path / "lcm_threshold_sweep_time_budget.db"),
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "test-session"
+        instance.threshold_tokens = 1
+        messages = [{"role": "system", "content": "system"}] + [
+            {"role": "user", "content": f"timed-{index} " + ("token " * 20)}
+            for index in range(5)
+        ] + [
+            {"role": "user", "content": "fresh"},
+            {"role": "assistant", "content": "answer"},
+        ]
+        monotonic_calls = 0
+
+        def fake_monotonic():
+            nonlocal monotonic_calls
+            monotonic_calls += 1
+            return 0.0 if monotonic_calls <= 2 else 121.0
+
+        def fake_leaf(chunk, focus_topic=None, deadline=None):
+            del focus_topic, deadline
+            return chunk, count_messages_tokens(chunk), "timed summary", 1, 0
+
+        import hermes_lcm.compaction as compaction_module
+
+        monkeypatch.setattr(compaction_module.time, "monotonic", fake_monotonic)
+        monkeypatch.setattr(instance, "_summarize_leaf_chunk_with_rescue", fake_leaf)
+        try:
+            instance.compress(messages, current_tokens=count_messages_tokens(messages))
+            telemetry = instance.get_status()["threshold_full_sweep"]
+
+            assert telemetry["leaf_passes"] == 1
+            assert telemetry["status"] == "partial"
+            assert telemetry["stop_reason"] == "time_budget_exhausted"
+            assert telemetry["budget_exhausted"] is True
+        finally:
+            instance.shutdown()
+
+    def test_threshold_full_sweep_publishes_persisted_progress_after_later_leaf_error(self, tmp_path, monkeypatch):
+        config = LCMConfig(
+            fresh_tail_count=2,
+            leaf_chunk_tokens=1,
+            threshold_full_sweep_enabled=True,
+            database_path=str(tmp_path / "lcm_threshold_sweep_partial.db"),
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "test-session"
+        instance.threshold_tokens = 1
+        messages = [{"role": "system", "content": "system"}] + [
+            {"role": "user", "content": f"partial-{index} " + ("token " * 20)}
+            for index in range(4)
+        ] + [
+            {"role": "user", "content": "fresh"},
+            {"role": "assistant", "content": "answer"},
+        ]
+        calls = 0
+
+        def flaky_leaf(chunk, focus_topic=None, deadline=None):
+            del focus_topic, deadline
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                raise RuntimeError("later summary failed")
+            return chunk, count_messages_tokens(chunk), "persisted first pass", 1, 0
+
+        monkeypatch.setattr(instance, "_summarize_leaf_chunk_with_rescue", flaky_leaf)
+        try:
+            compressed = instance.compress(messages, current_tokens=count_messages_tokens(messages))
+            telemetry = instance.get_status()["threshold_full_sweep"]
+
+            assert compressed
+            assert len(instance._dag.get_session_nodes("test-session")) == 1
+            assert telemetry["leaf_passes"] == 1
+            assert telemetry["status"] == "partial"
+            assert telemetry["stop_reason"] == "leaf_summary_error"
+            assert telemetry["budget_exhausted"] is False
+        finally:
+            instance.shutdown()
+
+    def test_threshold_full_sweep_caps_provider_timeout_to_remaining_wall_budget(self, tmp_path, monkeypatch):
+        config = LCMConfig(
+            summary_timeout_ms=300_000,
+            database_path=str(tmp_path / "lcm_threshold_sweep_timeout_cap.db"),
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "test-session"
+        observed_timeout = None
+
+        import hermes_lcm.engine as engine_module
+
+        def capture_timeout(**kwargs):
+            nonlocal observed_timeout
+            observed_timeout = kwargs["timeout"]
+            return "bounded summary", 1
+
+        monkeypatch.setattr(engine_module.time, "monotonic", lambda: 10.0)
+        monkeypatch.setattr(engine_module, "summarize_with_escalation", capture_timeout)
+        try:
+            instance._summarize_leaf_chunk_with_rescue(
+                [{"role": "user", "content": "synthetic input"}],
+                deadline=110.0,
+            )
+            assert observed_timeout == 100.0
+        finally:
+            instance.shutdown()
 
     def test_cache_friendly_gating_suppresses_follow_on_condensation_for_single_fanin_group(self, tmp_path, monkeypatch):
         config = LCMConfig(
@@ -25653,6 +25951,735 @@ class TestHandleGrepCrossSession:
         sessions_seen = {hit["session_id"] for hit in result["results"]}
         assert sessions_seen == {"test-session"}
 
+
+class TestHandleGrepExternalizedPayloads:
+    def _externalize(self, engine, content, tool_call_id="call-search"):
+        before = set(Path(engine._hermes_home, "lcm-large-outputs").glob("*.json"))
+        engine._serialize_messages([
+            {"role": "tool", "tool_call_id": tool_call_id, "content": content}
+        ])
+        created = set(Path(engine._hermes_home, "lcm-large-outputs").glob("*.json")) - before
+        return next(path.name for path in created)
+
+    def _write_payload_with_created_at(self, engine, ref, created_at):
+        storage = Path(engine._hermes_home, "lcm-large-outputs")
+        storage.mkdir(parents=True, exist_ok=True)
+        (storage / ref).write_text(
+            '{"kind":"tool_result","role":"tool","session_id":"test-session",'
+            '"tool_call_id":"call-created-at","content_chars":14,"content_bytes":14,'
+            f'"created_at":{created_at},"content":"needle payload"}}',
+            encoding="utf-8",
+        )
+        return ref
+
+    def _write_payload_with_content_size(self, engine, ref, size_field):
+        storage = Path(engine._hermes_home, "lcm-large-outputs")
+        storage.mkdir(parents=True, exist_ok=True)
+        content = "needle payload"
+        sizes = {
+            "content_chars": str(len(content)),
+            "content_bytes": str(len(content.encode("utf-8"))),
+        }
+        sizes[size_field] = ("9" * 400) + ".0"
+        (storage / ref).write_text(
+            '{"kind":"tool_result","role":"tool","session_id":"test-session",'
+            '"tool_call_id":"call-content-size",'
+            f'"content_chars":{sizes["content_chars"]},'
+            f'"content_bytes":{sizes["content_bytes"]},'
+            f'"created_at":1.0,"content":{json.dumps(content)}}}',
+            encoding="utf-8",
+        )
+        return ref
+
+    def _write_payload_with_nested_content(self, engine, ref):
+        storage = Path(engine._hermes_home, "lcm-large-outputs")
+        storage.mkdir(parents=True, exist_ok=True)
+        content = "real payload target"
+        payload = {
+            "metadata": {
+                "session_id": "foreign-session",
+                "content": "nested decoy target",
+            },
+            "kind": "tool_result",
+            "role": "tool",
+            "session_id": "test-session",
+            "tool_call_id": "call-nested-content",
+            "content": content,
+            "content_chars": len(content),
+            "content_bytes": len(content.encode("utf-8")),
+            "created_at": 1.0,
+        }
+        (storage / ref).write_text(json.dumps(payload), encoding="utf-8")
+        return ref, content
+    def test_default_history_scope_does_not_scan_sidecars(self, externalized_search_engine):
+        self._externalize(externalized_search_engine, "private external needle " * 20)
+
+        result = json.loads(externalized_search_engine.handle_tool_call("lcm_grep", {"query": "needle"}))
+
+        assert result["content_scope"] == "history"
+        assert result["total_results"] == 0
+        assert "externalized_scan" not in result
+
+    def test_externalized_scope_returns_bounded_recoverable_match(self, externalized_search_engine):
+        content = "first line\nsecond needle line\n" + ("tail " * 100)
+        ref = self._externalize(externalized_search_engine, content)
+
+        result = json.loads(
+            externalized_search_engine.handle_tool_call(
+                "lcm_grep", {"query": "needle", "content_scope": "externalized"}
+            )
+        )
+
+        assert result["total_results"] == 1
+        hit = result["results"][0]
+        assert hit["type"] == "externalized"
+        assert hit["ref"] == ref
+        assert hit["tool_call_id"] == "call-search"
+        assert hit["line"] == 2
+        assert hit["byte_position"] == len("first line\nsecond ".encode("utf-8"))
+        assert hit["original_content_bytes"] == len(content.encode("utf-8"))
+        assert hit["scan_truncated"] is False
+        recovered = json.loads(
+            externalized_search_engine.handle_tool_call(
+                "lcm_expand", {"externalized_ref": ref, "max_tokens": 100_000}
+            )
+        )
+        assert recovered["content"] == content
+
+    @pytest.mark.parametrize(
+        ("label", "created_at"),
+        [
+            ("oversized-integer", "9" * 401),
+            ("non-finite-decimal", ("9" * 400) + ".0"),
+        ],
+    )
+    def test_explicit_ref_search_ignores_unrepresentable_created_at(
+        self,
+        externalized_search_engine,
+        label,
+        created_at,
+    ):
+        ref = self._write_payload_with_created_at(
+            externalized_search_engine,
+            f"explicit-{label}.json",
+            created_at,
+        )
+        valid_ref = self._write_payload_with_created_at(
+            externalized_search_engine,
+            f"explicit-valid-{label}.json",
+            "1.0",
+        )
+
+        result = json.loads(
+            externalized_search_engine.handle_tool_call(
+                "lcm_grep",
+                {
+                    "query": "needle",
+                    "content_scope": "externalized",
+                    "externalized_refs": [ref, valid_ref],
+                    "sort": "recency",
+                },
+            )
+        )
+
+        assert [item["ref"] for item in result["results"]] == [valid_ref, ref]
+        assert result["externalized_scan"]["candidate_files"] == 2
+        assert result["externalized_scan"]["scanned_files"] == 2
+        assert result["externalized_scan"]["matched_files"] == 2
+
+    @pytest.mark.parametrize(
+        ("label", "created_at"),
+        [
+            ("oversized-integer", "9" * 401),
+            ("non-finite-decimal", ("9" * 400) + ".0"),
+        ],
+    )
+    def test_auto_discovery_ignores_unrepresentable_created_at(
+        self,
+        externalized_search_engine,
+        label,
+        created_at,
+    ):
+        ref = self._write_payload_with_created_at(
+            externalized_search_engine,
+            f"auto-{label}.json",
+            created_at,
+        )
+        valid_ref = self._write_payload_with_created_at(
+            externalized_search_engine,
+            f"auto-valid-{label}.json",
+            "1.0",
+        )
+
+        result = json.loads(
+            externalized_search_engine.handle_tool_call(
+                "lcm_grep",
+                {
+                    "query": "needle",
+                    "content_scope": "externalized",
+                    "sort": "recency",
+                },
+            )
+        )
+
+        assert [item["ref"] for item in result["results"]] == [valid_ref, ref]
+        assert result["externalized_scan"]["candidate_files"] == 2
+        assert result["externalized_scan"]["scanned_files"] == 2
+        assert result["externalized_scan"]["matched_files"] == 2
+
+    @pytest.mark.parametrize("explicit_refs", [False, True], ids=["auto", "explicit"])
+    @pytest.mark.parametrize("size_field", ["content_bytes", "content_chars"])
+    def test_externalized_search_ignores_non_finite_content_size(
+        self,
+        externalized_search_engine,
+        explicit_refs,
+        size_field,
+    ):
+        ref = self._write_payload_with_content_size(
+            externalized_search_engine,
+            f"non-finite-{size_field}.json",
+            size_field,
+        )
+        args: dict[str, object] = {"query": "needle", "content_scope": "externalized"}
+        if explicit_refs:
+            args["externalized_refs"] = [ref]
+
+        result = json.loads(externalized_search_engine.handle_tool_call("lcm_grep", args))
+
+        assert [item["ref"] for item in result["results"]] == [ref]
+        assert result["results"][0][f"original_{size_field}"] is None
+        assert result["externalized_scan"]["scanned_files"] == 1
+        assert result["externalized_scan"]["matched_files"] == 1
+
+    @pytest.mark.parametrize("explicit_refs", [False, True], ids=["auto", "explicit"])
+    def test_externalized_search_uses_top_level_content_and_remains_expandable(
+        self,
+        externalized_search_engine,
+        explicit_refs,
+    ):
+        ref, content = self._write_payload_with_nested_content(
+            externalized_search_engine,
+            f"nested-content-{'explicit' if explicit_refs else 'auto'}.json",
+        )
+        args: dict[str, object] = {"query": "real payload", "content_scope": "externalized"}
+        if explicit_refs:
+            args["externalized_refs"] = [ref]
+
+        matched = json.loads(externalized_search_engine.handle_tool_call("lcm_grep", args))
+        decoy = json.loads(
+            externalized_search_engine.handle_tool_call(
+                "lcm_grep",
+                {
+                    **args,
+                    "query": "nested decoy",
+                },
+            )
+        )
+        expanded = json.loads(
+            externalized_search_engine.handle_tool_call(
+                "lcm_expand",
+                {"externalized_ref": ref, "max_tokens": 100_000},
+            )
+        )
+
+        assert [item["ref"] for item in matched["results"]] == [ref]
+        assert matched["results"][0]["snippet"] == content
+        assert decoy["total_results"] == 0
+        assert expanded["content"] == content
+    def test_both_scope_combines_history_and_payload_hits(self, externalized_search_engine):
+        externalized_search_engine._store.append(
+            "test-session", {"role": "user", "content": "combined needle in history"}
+        )
+        self._externalize(externalized_search_engine, "combined needle in payload " * 20)
+
+        result = json.loads(
+            externalized_search_engine.handle_tool_call(
+                "lcm_grep", {"query": "needle", "content_scope": "both"}
+            )
+        )
+
+        assert {item["type"] for item in result["results"]} == {"message", "externalized"}
+
+    @pytest.mark.parametrize("sort", ["relevance", "hybrid"])
+    def test_both_scope_preserves_message_only_ordering(self, externalized_search_engine, sort):
+        for role, content in (
+            ("user", "needle alpha"),
+            ("assistant", "needle needle beta"),
+            ("tool", "needle gamma"),
+        ):
+            externalized_search_engine._store.append(
+                "test-session",
+                {"role": role, "content": content},
+            )
+
+        history = json.loads(
+            externalized_search_engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "needle", "content_scope": "history", "sort": sort},
+            )
+        )
+        self._externalize(externalized_search_engine, "needle in payload " * 20)
+        combined = json.loads(
+            externalized_search_engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "needle", "content_scope": "both", "sort": sort},
+            )
+        )
+
+        combined_messages = [item for item in combined["results"] if item["type"] == "message"]
+        assert json.dumps(combined_messages, ensure_ascii=False) == json.dumps(
+            history["results"],
+            ensure_ascii=False,
+        )
+
+    @pytest.mark.parametrize("sort", ["relevance", "hybrid", "recency"])
+    def test_combined_sort_tiers_externalized_native_rank(self, sort):
+        message = {
+            "type": "message",
+            "role": "user",
+            "_sort_rank": 50.0,
+            "_sort_ts": 1.0,
+        }
+        externalized = {
+            "type": "externalized",
+            "_sort_rank": 0,
+            "_sort_ts": 2.0,
+        }
+
+        ordered = sorted(
+            [externalized, message],
+            key=lambda item: lcm_tools._combined_result_sort_key(item, sort),
+        )
+
+        assert ordered == [message, externalized]
+
+    def test_auto_discovery_bounds_directory_iteration_before_sorting(
+        self,
+        externalized_search_engine,
+        monkeypatch,
+    ):
+        storage = Path(externalized_search_engine._hermes_home, "lcm-large-outputs")
+        real_iterdir = Path.iterdir
+        entries_consumed = 0
+        refs_probed = []
+
+        def many_payloads(path):
+            nonlocal entries_consumed
+            if path != storage:
+                yield from real_iterdir(path)
+                return
+            for index in range(10_000):
+                entries_consumed += 1
+                suffix = ".json" if index % 2 else ".tmp"
+                yield storage / f"payload-{index:05d}{suffix}"
+
+        def reject_probe(_engine, ref, _session_id, **_kwargs):
+            refs_probed.append(ref)
+            return {"readable": False, "error": "missing"}
+
+        monkeypatch.setattr(Path, "iterdir", many_payloads)
+        monkeypatch.setattr(lcm_tools, "_inspect_externalized_payload_metadata", reject_probe)
+
+        result = json.loads(
+            externalized_search_engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "needle", "content_scope": "externalized"},
+            )
+        )
+
+        assert entries_consumed == lcm_tools._LCM_GREP_EXTERNALIZED_DISCOVERY_CAP + 1
+        assert len(refs_probed) == lcm_tools._LCM_GREP_EXTERNALIZED_DISCOVERY_CAP // 2
+        assert result["externalized_scan"]["discovery_files"] == len(refs_probed)
+        assert result["externalized_scan"]["discovery_truncated"] is True
+        assert result["externalized_scan"]["candidate_files"] == 0
+    def test_auto_discovery_filters_session_before_candidate_cap(self, externalized_search_engine):
+        owned_refs = {
+            self._externalize(
+                externalized_search_engine,
+                f"owned needle {index} " * 20,
+                f"call-owned-{index}",
+            )
+            for index in range(2)
+        }
+        storage = Path(externalized_search_engine._hermes_home, "lcm-large-outputs")
+        foreign_payload = {
+            "kind": "tool_result",
+            "role": "tool",
+            "session_id": "foreign-session",
+            "tool_call_id": "call-foreign",
+            "content": "foreign needle",
+            "content_chars": len("foreign needle"),
+            "content_bytes": len("foreign needle".encode()),
+            "created_at": 1.0,
+        }
+        for index in range(257):
+            (storage / f"zzzz-foreign-{index:03d}.json").write_text(
+                json.dumps(foreign_payload),
+                encoding="utf-8",
+            )
+        first_256 = sorted(
+            (path.name for path in storage.glob("*.json")),
+            reverse=True,
+        )[:256]
+        assert owned_refs.isdisjoint(first_256)
+
+        result = json.loads(
+            externalized_search_engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "needle", "content_scope": "externalized"},
+            )
+        )
+
+        assert {item["ref"] for item in result["results"]} == owned_refs
+        assert result["externalized_scan"]["candidate_files"] == len(owned_refs)
+        assert result["externalized_scan"]["rejected_session_mismatch"] == 257
+
+    def test_auto_discovery_accepts_owned_payload_with_long_precontent_metadata(
+        self,
+        externalized_search_engine,
+    ):
+        written = externalize_ingest_payload(
+            "needle payload",
+            role="user",
+            session_id=externalized_search_engine.current_session_id,
+            field_path="x" * 20_000,
+            config=externalized_search_engine._config,
+            hermes_home=externalized_search_engine._hermes_home,
+        )
+        assert written is not None
+        ref = written["path"].name
+        metadata = lcm_tools._inspect_externalized_payload_metadata(
+            externalized_search_engine,
+            ref,
+            externalized_search_engine.current_session_id,
+        )
+        assert metadata == {"readable": False, "error": "metadata_prefix_truncated"}
+
+        result = json.loads(
+            externalized_search_engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "needle", "content_scope": "externalized"},
+            )
+        )
+
+        assert [item["ref"] for item in result["results"]] == [ref]
+
+    def test_auto_discovery_keeps_malformed_symlink_and_foreign_payloads_fail_closed(
+        self,
+        externalized_search_engine,
+    ):
+        valid_ref = self._externalize(externalized_search_engine, "valid needle " * 20)
+        storage = Path(externalized_search_engine._hermes_home, "lcm-large-outputs")
+        (storage / "malformed.json").write_text(
+            'not-json "session_id": "test-session", "content": "needle"',
+            encoding="utf-8",
+        )
+        (storage / "foreign.json").write_text(
+            json.dumps({"session_id": "foreign-session", "content": "needle"}),
+            encoding="utf-8",
+        )
+        (storage / "linked.json").symlink_to(storage / valid_ref)
+
+        result = json.loads(
+            externalized_search_engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "needle", "content_scope": "externalized"},
+            )
+        )
+
+        assert [item["ref"] for item in result["results"]] == [valid_ref]
+        assert result["externalized_scan"]["rejected_invalid_or_unreadable"] == 1
+        assert result["externalized_scan"]["rejected_session_mismatch"] == 1
+        assert result["externalized_scan"]["rejected_symlink"] == 1
+    def test_explicit_refs_filter_and_rejects_cross_session_payload(self, externalized_search_engine):
+        current_ref = self._externalize(externalized_search_engine, "current needle " * 20, "call-current")
+        externalized_search_engine._session_id = "other-session"
+        other_ref = self._externalize(externalized_search_engine, "other needle " * 20, "call-other")
+        externalized_search_engine._session_id = "test-session"
+
+        filtered = json.loads(
+            externalized_search_engine.handle_tool_call(
+                "lcm_grep",
+                {
+                    "query": "needle",
+                    "content_scope": "externalized",
+                    "externalized_refs": [current_ref],
+                },
+            )
+        )
+        rejected = json.loads(
+            externalized_search_engine.handle_tool_call(
+                "lcm_grep",
+                {
+                    "query": "needle",
+                    "content_scope": "externalized",
+                    "externalized_refs": [other_ref],
+                },
+            )
+        )
+
+        assert [item["ref"] for item in filtered["results"]] == [current_ref]
+        assert "not owned by the active session" in rejected["error"]
+
+    def test_explicit_refs_reject_invalid_and_symlink_refs(self, externalized_search_engine):
+        invalid = json.loads(
+            externalized_search_engine.handle_tool_call(
+                "lcm_grep",
+                {
+                    "query": "needle",
+                    "content_scope": "externalized",
+                    "externalized_refs": ["../escape.json"],
+                },
+            )
+        )
+        ref = self._externalize(externalized_search_engine, "needle target " * 20)
+        storage = Path(externalized_search_engine._hermes_home, "lcm-large-outputs")
+        link = storage / "linked.json"
+        link.symlink_to(storage / ref)
+        symlink = json.loads(
+            externalized_search_engine.handle_tool_call(
+                "lcm_grep",
+                {
+                    "query": "needle",
+                    "content_scope": "externalized",
+                    "externalized_refs": [link.name],
+                },
+            )
+        )
+
+        assert "Invalid externalized ref" in invalid["error"]
+        assert "symlink" in symlink["error"]
+
+    @pytest.mark.parametrize(
+        "payload_text",
+        [
+            '{"session_id":"test-session","content":"needle"',
+            '{"session_id":"test-session","content":"needle"} trailing',
+        ],
+        ids=["truncated-tail", "trailing-garbage"],
+    )
+    def test_explicit_refs_reject_malformed_payloads_that_expand_cannot_load(
+        self,
+        externalized_search_engine,
+        payload_text,
+    ):
+        storage = Path(externalized_search_engine._hermes_home, "lcm-large-outputs")
+        storage.mkdir(parents=True, exist_ok=True)
+        ref = "malformed-explicit.json"
+        (storage / ref).write_text(payload_text, encoding="utf-8")
+
+        searched = json.loads(
+            externalized_search_engine.handle_tool_call(
+                "lcm_grep",
+                {
+                    "query": "needle",
+                    "content_scope": "externalized",
+                    "externalized_refs": [ref],
+                },
+            )
+        )
+        expanded = json.loads(
+            externalized_search_engine.handle_tool_call(
+                "lcm_expand",
+                {"externalized_ref": ref},
+            )
+        )
+
+        assert "error" in searched
+        assert "not readable" in searched["error"]
+        assert "not found" in expanded["error"]
+
+    @pytest.mark.parametrize("sort", ["relevance", "hybrid"])
+    def test_explicit_payload_limit_applies_after_native_byte_position_ordering(
+        self,
+        externalized_search_engine,
+        sort,
+    ):
+        late_match_ref = self._externalize(
+            externalized_search_engine,
+            ("prefix " * 40) + "needle late",
+            "call-late-match",
+        )
+        early_match_ref = self._externalize(
+            externalized_search_engine,
+            "needle early " + ("tail " * 40),
+            "call-early-match",
+        )
+
+        result = json.loads(
+            externalized_search_engine.handle_tool_call(
+                "lcm_grep",
+                {
+                    "query": "needle",
+                    "content_scope": "externalized",
+                    "externalized_refs": [late_match_ref, early_match_ref],
+                    "sort": sort,
+                    "limit": 1,
+                },
+            )
+        )
+
+        assert result["results"][0]["ref"] == early_match_ref
+        assert result["results"][0]["byte_position"] == 0
+        assert result["externalized_scan"]["matched_files"] == 2
+
+    def test_externalized_storage_containment_failure_returns_structured_error(
+        self,
+        externalized_search_engine,
+        tmp_path,
+        monkeypatch,
+    ):
+        monkeypatch.setenv("LCM_HERMES_BASE_DIR", str(tmp_path / "different-base"))
+
+        result = json.loads(
+            externalized_search_engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "needle", "content_scope": "externalized"},
+            )
+        )
+
+        assert "error" in result
+        assert "Externalized payload storage is unavailable" in result["error"]
+
+    def test_scan_never_reaches_content_after_512000_encoded_bytes(
+        self,
+        externalized_search_engine,
+        monkeypatch,
+    ):
+        content = ("a" * 520_000) + " unreachable-needle"
+        ref = self._externalize(externalized_search_engine, content)
+        monkeypatch.setattr(
+            lcm_tools,
+            "load_externalized_payload",
+            lambda *args, **kwargs: pytest.fail("grep validation must not deserialize full payloads"),
+        )
+
+        missed = json.loads(
+            externalized_search_engine.handle_tool_call(
+                "lcm_grep",
+                {
+                    "query": "unreachable-needle",
+                    "content_scope": "externalized",
+                    "externalized_refs": [ref],
+                },
+            )
+        )
+        bounded_hit = json.loads(
+            externalized_search_engine.handle_tool_call(
+                "lcm_grep",
+                {
+                    "query": "aaaa",
+                    "content_scope": "externalized",
+                    "externalized_refs": [ref],
+                },
+            )
+        )
+
+        assert missed["total_results"] == 0
+        assert bounded_hit["results"][0]["scan_truncated"] is True
+        assert bounded_hit["results"][0]["content_scanned_bytes"] == 512_000
+
+    def test_explicit_ref_tail_validation_reads_only_a_bounded_window(
+        self,
+        externalized_search_engine,
+        monkeypatch,
+    ):
+        ref = self._externalize(externalized_search_engine, ("a" * 2_000_000) + "\x00needle")
+        payload_path = Path(externalized_search_engine._hermes_home, "lcm-large-outputs", ref)
+        metadata_prefix, content_key_seen, prefix_truncated = (
+            lcm_tools._read_externalized_payload_metadata_prefix(
+                payload_path,
+                max_read_bytes=lcm_tools._LCM_GREP_EXTERNALIZED_METADATA_READ_BYTES,
+            )
+        )
+        assert content_key_seen is True
+        assert prefix_truncated is False
+
+        real_open = Path.open
+        bytes_read = []
+
+        class TrackedHandle:
+            def __init__(self, handle):
+                self._handle = handle
+
+            def __enter__(self):
+                self._handle.__enter__()
+                return self
+
+            def __exit__(self, *args):
+                return self._handle.__exit__(*args)
+
+            def seek(self, *args):
+                return self._handle.seek(*args)
+
+            def read(self, size=-1):
+                assert 0 <= size <= lcm_tools._LCM_GREP_EXTERNALIZED_DOCUMENT_TAIL_BYTES + 1
+                data = self._handle.read(size)
+                bytes_read.append(len(data))
+                return data
+
+        def tracked_open(path, *args, **kwargs):
+            handle = real_open(path, *args, **kwargs)
+            return TrackedHandle(handle) if path == payload_path else handle
+
+        monkeypatch.setattr(Path, "open", tracked_open)
+
+        payload = lcm_tools._validate_externalized_payload_json_tail(payload_path, metadata_prefix)
+
+        assert payload is not None
+        assert payload["session_id"] == "test-session"
+        assert sum(bytes_read) <= lcm_tools._LCM_GREP_EXTERNALIZED_DOCUMENT_TAIL_BYTES
+    def test_externalized_scope_rejects_cross_session_search(self, externalized_search_engine):
+        result = json.loads(
+            externalized_search_engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "needle", "content_scope": "externalized", "session_scope": "all"},
+            )
+        )
+
+        assert "session_scope=current only" in result["error"]
+
+    @pytest.mark.parametrize("content_scope", ["externalized", "both"])
+    @pytest.mark.parametrize(
+        ("filter_name", "filter_args"),
+        [
+            ("role", {"role": "user"}),
+            ("time_from", {"time_from": 0}),
+            ("time_to", {"time_to": 4_102_444_800}),
+            ("source", {"source": "discord"}),
+            ("conversation_id", {"conversation_id": "lane-123"}),
+        ],
+    )
+    def test_raw_message_filters_omit_externalized_sidecar_hits(
+        self,
+        externalized_search_engine,
+        content_scope,
+        filter_name,
+        filter_args,
+    ):
+        raw_store_id = externalized_search_engine._store.append(
+            "test-session",
+            {"role": "user", "content": "history needle from user"},
+            source="discord",
+            conversation_id="lane-123",
+        )
+        self._externalize(externalized_search_engine, "tool payload needle " * 20)
+
+        result = json.loads(
+            externalized_search_engine.handle_tool_call(
+                "lcm_grep",
+                {
+                    "query": "needle",
+                    "content_scope": content_scope,
+                    **filter_args,
+                },
+            )
+        )
+
+        expected_store_ids = [raw_store_id] if content_scope == "both" else []
+        assert [item["store_id"] for item in result["results"]] == expected_store_ids, filter_name
+        assert result["externalized_results_omitted"] is True
+        assert "externalized_scan" not in result
 
 class TestHandleExpandStoreId:
     """lcm_expand store_id mode for cross-session raw expansion."""
