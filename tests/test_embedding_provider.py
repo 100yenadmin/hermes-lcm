@@ -1002,6 +1002,8 @@ def test_fastembed_normal_operation_is_deadline_bounded(monkeypatch, tmp_path):
 
 def test_fastembed_timeout_capacity_is_bounded_until_worker_exits(monkeypatch, tmp_path):
     calls = 0
+    worker_started = threading.Event()
+    release_worker = threading.Event()
 
     class SlowFastembedModel:
         def __init__(self, **_kwargs):
@@ -1010,7 +1012,8 @@ def test_fastembed_timeout_capacity_is_bounded_until_worker_exits(monkeypatch, t
         def query_embed(self, texts):
             nonlocal calls
             calls += 1
-            time.sleep(0.08)
+            worker_started.set()
+            assert release_worker.wait(timeout=1.0)
             return ([1.0, 0.0] for _ in texts)
 
     monkeypatch.setattr(provider_mod, "_load_fastembed", lambda: SlowFastembedModel)
@@ -1020,15 +1023,18 @@ def test_fastembed_timeout_capacity_is_bounded_until_worker_exits(monkeypatch, t
     first = FastembedProvider("local", cache_dir=tmp_path, timeout=0.01)
     second = FastembedProvider("local", cache_dir=tmp_path, timeout=0.01)
 
-    with pytest.raises(EmbeddingProviderError, match="deadline exceeded"):
-        first.embed_query("slow")
-    started = time.monotonic()
-    with pytest.raises(EmbeddingProviderError, match="worker capacity exhausted"):
-        second.embed_query("must-not-start")
+    try:
+        with pytest.raises(EmbeddingProviderError, match="deadline exceeded"):
+            first.embed_query("slow")
+        assert worker_started.is_set()
+        started = time.monotonic()
+        with pytest.raises(EmbeddingProviderError, match="worker capacity exhausted"):
+            second.embed_query("must-not-start")
 
-    assert time.monotonic() - started < 0.03
-    assert calls == 1
-    time.sleep(0.09)
+        assert time.monotonic() - started < 0.03
+        assert calls == 1
+    finally:
+        release_worker.set()
 
 
 def test_fastembed_preflight_and_capacity_fail_before_dispatch(monkeypatch, tmp_path):
