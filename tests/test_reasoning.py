@@ -1,0 +1,418 @@
+"""Provider-neutral operation, grounding, and immutable-result tests."""
+
+from __future__ import annotations
+
+from dataclasses import replace
+from datetime import date, datetime, timezone
+import json
+from types import SimpleNamespace
+
+import pytest
+
+from hermes_lcm.assertion_store import (
+    AssertionCandidate,
+    AssertionRelationCandidate,
+    AssertionStore,
+)
+from hermes_lcm.reasoning import (
+    compile_evidence_plan,
+    execute_plan,
+    ground_evidence,
+    question_date_as_of_epoch,
+    resolve_temporal_window,
+    validate_selector_alignment,
+    verify_final_answer,
+)
+from hermes_lcm.store import MessageStore
+from hermes_lcm.tools import lcm_compute
+
+
+def _epoch(day: str) -> float:
+    return datetime.fromisoformat(f"{day}T12:00:00+00:00").timestamp()
+
+
+@pytest.fixture
+def evidence_db(tmp_path):
+    db_path = tmp_path / "lcm.db"
+    messages = MessageStore(db_path)
+    assertions = AssertionStore(db_path)
+    try:
+        yield messages, assertions
+    finally:
+        assertions.close()
+        messages.close()
+
+
+def _message(messages, content: str, day: str) -> int:
+    store_id = messages.append("session-a", {"role": "user", "content": content})
+    messages._conn.execute(
+        "UPDATE messages SET timestamp = ? WHERE store_id = ?",
+        (_epoch(day), store_id),
+    )
+    messages._conn.commit()
+    return store_id
+
+
+def _raw(store_id: int, content: str, quote: str, **extra):
+    start = content.index(quote)
+    return {
+        "store_id": store_id,
+        "span_start": start,
+        "span_end": start + len(quote),
+        "quote": quote,
+        **extra,
+    }
+
+
+def _ground(messages, assertions, operands, *, question_date="2024-12-31"):
+    decision = ground_evidence(
+        operands,
+        messages=messages,
+        assertions=assertions,
+        as_of=question_date_as_of_epoch(question_date),
+    )
+    assert decision.status == "grounded", decision.reason
+    return decision.operands
+
+
+def test_activation_uses_only_question_language_and_fails_closed():
+    assert compile_evidence_plan("Tell me about the trip").status == "not_applicable"
+    assert compile_evidence_plan("What is the average price?").status == "fallback"
+    assert compile_evidence_plan("What happened 5 days ago?").status == "fallback"
+    temporal = compile_evidence_plan("What happened 5 days ago?", "2024-03-20")
+    assert temporal.status == "planned"
+    assert temporal.plan.operation == "date_filter"
+    assert temporal.plan.temporal_window.start == date(2024, 3, 15)
+
+
+@pytest.mark.parametrize(
+    ("question_date", "question", "start", "end"),
+    [
+        ("2024-03-31", "What happened 1 month ago?", "2024-02-29", "2024-03-01"),
+        ("2023-03-31", "What happened 1 month ago?", "2023-02-28", "2023-03-01"),
+        ("2024-03-18", "What happened last Monday?", "2024-03-11", "2024-03-12"),
+        ("2024-03-20", "What happened last month?", "2024-02-01", "2024-03-01"),
+    ],
+)
+def test_temporal_windows_clamp_and_reanchor(question_date, question, start, end):
+    window = resolve_temporal_window(question, question_date)
+    assert window is not None
+    assert (window.start.isoformat(), window.end.isoformat()) == (start, end)
+
+
+def test_grounding_rejects_unproven_values_labels_keys_and_refs(evidence_db):
+    messages, assertions = evidence_db
+    content = "Alice read 120 pages of Dune on 2024-03-15."
+    store_id = _message(messages, content, "2024-03-15")
+    base = _raw(
+        store_id,
+        content,
+        "Alice read 120 pages of Dune on 2024-03-15",
+        value=120,
+        unit="pages",
+        label="Alice",
+        key="Alice Dune",
+        date="2024-03-15",
+    )
+    assert ground_evidence(
+        [base], messages=messages, assertions=assertions
+    ).status == "grounded"
+
+    for mutation, reason in [
+        ({"value": 121}, "numeric value"),
+        ({"unit": "hours"}, "unit hour"),
+        ({"label": "Bob"}, "label"),
+        ({"key": "Alice Foundation"}, "canonical key"),
+        ({"span_start": 1}, "quote does not match"),
+    ]:
+        decision = ground_evidence(
+            [{**base, **mutation}], messages=messages, assertions=assertions
+        )
+        assert decision.status == "fallback"
+        assert reason in decision.reason
+
+
+def test_sum_difference_count_and_mixed_unit_fallback(evidence_db):
+    messages, assertions = evidence_db
+    first = "Alice spent $30 on Dune."
+    second = "Bob spent $18 on Foundation."
+    first_id = _message(messages, first, "2024-02-01")
+    second_id = _message(messages, second, "2024-02-02")
+    operands = _ground(
+        messages,
+        assertions,
+        [
+            _raw(first_id, first, "$30", value=30, unit="usd", label="$30"),
+            _raw(second_id, second, "$18", value=18, unit="usd", label="$18"),
+        ],
+    )
+
+    sum_plan = compile_evidence_plan("What was the combined total?").plan
+    summed = execute_plan(sum_plan, operands)
+    assert summed.trace.result == "$48"
+
+    difference_plan = compile_evidence_plan("What is the difference?").plan
+    difference = execute_plan(difference_plan, operands)
+    assert difference.trace.result == "$12"
+
+    mixed = replace(operands[1], unit="page")
+    assert execute_plan(sum_plan, (operands[0], mixed)).status == "fallback"
+    hidden_units = tuple(replace(operand, unit=None) for operand in operands)
+    assert execute_plan(sum_plan, hidden_units).status == "fallback"
+
+    counted = replace(operands[0], key="dune", unit="item")
+    counted_again = replace(operands[1], key="dune", unit="item")
+    count_plan = compile_evidence_plan("How many distinct items were there?").plan
+    count = execute_plan(count_plan, (counted, counted_again))
+    assert count.trace.result == "1 item"
+
+
+def test_directed_difference_validates_question_order(evidence_db):
+    messages, assertions = evidence_db
+    first = "Alice spent $30."
+    second = "Bob spent $18."
+    first_id = _message(messages, first, "2024-02-01")
+    second_id = _message(messages, second, "2024-02-02")
+    operands = _ground(
+        messages,
+        assertions,
+        [
+            _raw(first_id, first, first, value=30, unit="usd", label="Alice"),
+            _raw(second_id, second, second, value=18, unit="usd", label="Bob"),
+        ],
+    )
+    question = "How much more did Alice spend than Bob?"
+    plan = compile_evidence_plan(question).plan
+    assert plan.difference_direction == "first_minus_second"
+    assert validate_selector_alignment(question, plan, operands) is None
+    assert execute_plan(plan, operands).trace.result == "$12"
+    assert "question mention order" in validate_selector_alignment(
+        question, plan, tuple(reversed(operands))
+    )
+    contradicted = (replace(operands[0], value=10), operands[1])
+    assert execute_plan(plan, contradicted).status == "fallback"
+
+
+def test_date_filter_interval_order_and_cardinality(evidence_db):
+    messages, assertions = evidence_db
+    first = "The PlankChallenge happened on 2023-03-15."
+    second = "The launch happened on 2023-03-18."
+    first_id = _message(messages, first, "2023-03-15")
+    second_id = _message(messages, second, "2023-03-18")
+    operands = _ground(
+        messages,
+        assertions,
+        [
+            _raw(
+                first_id,
+                first,
+                first,
+                label="PlankChallenge",
+                date="2023-03-15",
+            ),
+            _raw(
+                second_id,
+                second,
+                second,
+                label="launch",
+                date="2023-03-18",
+            ),
+        ],
+        question_date="2023-03-20",
+    )
+    filtered_plan = compile_evidence_plan(
+        "What happened 5 days ago?", "2023-03-20"
+    ).plan
+    filtered = execute_plan(filtered_plan, operands)
+    assert filtered.trace.result == "PlankChallenge"
+
+    interval_plan = compile_evidence_plan(
+        "How many days between the PlankChallenge and launch?", "2023-03-20"
+    ).plan
+    assert interval_plan.operation == "date_interval"
+    assert execute_plan(interval_plan, operands).trace.result == "3 days"
+
+    ago_plan = compile_evidence_plan(
+        "How many days ago did the launch happen?", "2023-03-20"
+    ).plan
+    assert execute_plan(ago_plan, (operands[1],)).trace.result == "2 days"
+
+    order_plan = compile_evidence_plan("Put the events in chronological order").plan
+    assert execute_plan(order_plan, tuple(reversed(operands))).trace.result == (
+        "PlankChallenge -> launch"
+    )
+    assert execute_plan(interval_plan, operands[:1]).status == "fallback"
+
+
+def test_latest_fact_requires_complete_nonconflicting_assertion_state(evidence_db):
+    messages, assertions = evidence_db
+    first = "My current city is Paris."
+    second = "My current city is Berlin."
+    first_id = _message(messages, first, "2024-01-01")
+    second_id = _message(messages, second, "2024-02-01")
+    snapshots = [assertions.snapshot_source(first_id), assertions.snapshot_source(second_id)]
+    assertion_ids = []
+    for snapshot, city, day in zip(snapshots, ("Paris", "Berlin"), ("2024-01-01", "2024-02-01")):
+        start = snapshot.content.index(city)
+        result = assertions.publish_source(
+            snapshot,
+            [AssertionCandidate(
+                source_span_start=start,
+                source_span_end=start + len(city),
+                subject_key="user:self",
+                predicate_key="location.city",
+                object_value=city,
+                value_text=city,
+                kind="status",
+                event_at=_epoch(day),
+            )],
+        )
+        assertion_ids.append(result.assertion_ids[0])
+
+    grounded = _ground(
+        messages,
+        assertions,
+        [
+            {"assertion_id": assertion_ids[0], "value": "Paris", "label": "Paris"},
+            {"assertion_id": assertion_ids[1], "value": "Berlin", "label": "Berlin"},
+        ],
+    )
+    plan = compile_evidence_plan("What is my current city?").plan
+    decision = execute_plan(plan, grounded)
+    assert decision.status == "fallback"
+    assert "unresolved conflicting" in decision.reason
+
+    third = "My current city is now Rome, replacing Paris and Berlin."
+    third_id = _message(messages, third, "2024-03-01")
+    third_snapshot = assertions.snapshot_source(third_id)
+    start = third.index("Rome")
+    third_candidate = AssertionCandidate(
+        source_span_start=start,
+        source_span_end=start + len("Rome"),
+        subject_key="user:self",
+        predicate_key="location.city",
+        object_value="Rome",
+        value_text="Rome",
+        kind="status",
+        event_at=_epoch("2024-03-01"),
+    )
+    third_assertion_id = assertions.assertion_id_for(third_snapshot, third_candidate)
+    relation_start = third.index("replacing")
+    relations = [
+        AssertionRelationCandidate(
+            source_span_start=relation_start,
+            source_span_end=len(third),
+            from_assertion_id=third_assertion_id,
+            relation_type="supersedes",
+            to_assertion_id=old_id,
+        )
+        for old_id in assertion_ids
+    ]
+    assertions.publish_source(
+        third_snapshot,
+        [third_candidate],
+        relations=relations,
+    )
+    resolved = _ground(
+        messages,
+        assertions,
+        [
+            {"assertion_id": assertion_ids[0], "value": "Paris", "label": "Paris"},
+            {"assertion_id": assertion_ids[1], "value": "Berlin", "label": "Berlin"},
+            {"assertion_id": third_assertion_id, "value": "Rome", "label": "Rome"},
+        ],
+    )
+    latest = execute_plan(plan, resolved)
+    assert latest.status == "computed"
+    assert latest.trace.result == "Rome"
+
+
+def test_verifier_preserves_result_entities_units_and_exact_citations(evidence_db):
+    messages, assertions = evidence_db
+    first = "Alice spent $30."
+    second = "Bob spent $18."
+    first_id = _message(messages, first, "2024-02-01")
+    second_id = _message(messages, second, "2024-02-02")
+    operands = _ground(
+        messages,
+        assertions,
+        [
+            _raw(first_id, first, first, value=30, unit="usd", label="Alice"),
+            _raw(second_id, second, second, value=18, unit="usd", label="Bob"),
+        ],
+    )
+    plan = compile_evidence_plan("How much more did Alice spend than Bob?").plan
+    trace = execute_plan(plan, operands).trace
+    assert verify_final_answer(trace.answer, trace).status == "verified"
+    cited = " ".join(f"[{citation}]" for citation in trace.citations)
+    assert verify_final_answer(f"Alice spent $12 more than Bob. {cited}", trace).status == "verified"
+    for candidate in (
+        f"Alice spent $13 more than Bob. {cited}",
+        f"Alice spent 12 pages more than Bob. {cited}",
+        f"Charlie spent $12 more than Bob. {cited}",
+        "Alice spent $12 more than Bob. [lcm:999:0-1]",
+    ):
+        assert verify_final_answer(candidate, trace).status == "fallback"
+
+
+def test_question_date_boundary_is_utc_end_of_day():
+    boundary = question_date_as_of_epoch("2024-02-29")
+    assert datetime.fromtimestamp(boundary, tz=timezone.utc).date() == date(2024, 2, 29)
+    assert question_date_as_of_epoch("2024-02-30") is None
+
+
+def test_public_compute_tool_reports_stages_and_discards_mutated_candidate(evidence_db):
+    messages, assertions = evidence_db
+    first = "Alice spent $30."
+    second = "Bob spent $18."
+    first_id = _message(messages, first, "2024-02-01")
+    second_id = _message(messages, second, "2024-02-02")
+    args = {
+        "question": "How much more did Alice spend than Bob?",
+        "question_date": "2024-03-01",
+        "operands": [
+            _raw(first_id, first, first, value=30, unit="usd", label="Alice"),
+            _raw(second_id, second, second, value=18, unit="usd", label="Bob"),
+        ],
+    }
+    engine = SimpleNamespace(_store=messages, _assertions=assertions)
+    computed = json.loads(lcm_compute(args, engine=engine))
+    assert computed["status"] == "computed"
+    assert computed["answer"].startswith("$12 ")
+    assert set(computed["provenance"]["stages"]) == {
+        "planner",
+        "selector",
+        "executor",
+        "final_answerer",
+    }
+    assert computed["provenance"]["stages"]["planner"]["provider"] == "none"
+    assert computed["provenance"]["stages"]["selector"]["provider"] == (
+        "unknown_to_plugin"
+    )
+
+    cited = " ".join(f"[{value}]" for value in computed["trace"]["citations"])
+    mutated = json.loads(lcm_compute(
+        {**args, "candidate_answer": f"Charlie spent $12 more than Bob. {cited}"},
+        engine=engine,
+    ))
+    assert mutated["status"] == "computed"
+    assert mutated["candidate_verification"]["status"] == "fallback"
+    assert mutated["answer"] == mutated["trace"]["answer"]
+    assert mutated["provenance"]["stages"]["final_answerer"]["candidate_used"] is False
+
+
+def test_public_compute_tool_requires_closed_cardinality(evidence_db):
+    messages, assertions = evidence_db
+    content = "I visited Paris."
+    store_id = _message(messages, content, "2024-02-01")
+    response = json.loads(lcm_compute(
+        {
+            "question": "How many cities did I visit?",
+            "operands": [
+                _raw(store_id, content, content, key="Paris", label="Paris")
+            ],
+        },
+        engine=SimpleNamespace(_store=messages, _assertions=assertions),
+    ))
+    assert response["status"] == "fallback"
+    assert response["reason"] == "operation requires explicit evidence_complete=true"

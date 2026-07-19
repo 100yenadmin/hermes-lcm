@@ -262,6 +262,100 @@ LCM_QUERY_STATE = {
     },
 }
 
+LCM_COMPUTE = {
+    "name": "lcm_compute",
+    "description": (
+        "Execute a supported date, count, compatible-unit sum, directed/absolute "
+        "difference, ordering, or latest-state operation over exact cited LCM evidence. "
+        "The operation is inferred from the question; this tool never calls a model. "
+        "Supply only exact message spans (or assertion IDs) whose values, units, labels, "
+        "keys, and dates are explicit in the cited evidence. Unsupported, incomplete, "
+        "mixed-unit, conflicting, or unverifiable inputs fail closed to the ordinary "
+        "evidence-only answer path."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "question": {
+                "type": "string",
+                "description": "The user's question, unchanged.",
+            },
+            "question_date": {
+                "type": "string",
+                "description": (
+                    "Optional ISO date anchoring relative-time and historical questions."
+                ),
+            },
+            "evidence_complete": {
+                "type": "boolean",
+                "description": (
+                    "Set true only after the current retrieval turn has closed all "
+                    "evidence slots for open-cardinality operations."
+                ),
+                "default": False,
+            },
+            "operands": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 50,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "assertion_id": {
+                            "type": "string",
+                            "description": "Optional exact V4 assertion SHA-256 ID.",
+                        },
+                        "store_id": {"type": "integer"},
+                        "span_start": {"type": "integer"},
+                        "span_end": {"type": "integer"},
+                        "quote": {"type": "string"},
+                        "value": {
+                            "anyOf": [
+                                {"type": "number"},
+                                {"type": "string"},
+                                {"type": "null"},
+                            ],
+                            "description": "Explicit numeric or string operand value."
+                        },
+                        "unit": {"type": "string"},
+                        "key": {
+                            "type": "string",
+                            "description": (
+                                "Canonical distinct-event/entity key whose tokens occur "
+                                "in the exact quote."
+                            ),
+                        },
+                        "label": {
+                            "type": "string",
+                            "description": (
+                                "Exact source-grounded label. Directed differences must "
+                                "supply labels in question mention order."
+                            ),
+                        },
+                        "date": {
+                            "type": "string",
+                            "description": (
+                                "Optional evidence date supported by source metadata or "
+                                "the exact quote."
+                            ),
+                        },
+                    },
+                    "additionalProperties": False,
+                },
+            },
+            "candidate_answer": {
+                "type": "string",
+                "description": (
+                    "Optional narrative answer to verify against the immutable trace. "
+                    "A failed verification is discarded in favor of canonical output."
+                ),
+            },
+        },
+        "required": ["question", "operands"],
+        "additionalProperties": False,
+    },
+}
+
 LCM_RECENT = {
     "name": "lcm_recent",
     "description": (

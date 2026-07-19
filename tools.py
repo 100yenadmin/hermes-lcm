@@ -47,6 +47,14 @@ from .ingest_protection import (
 from .model_routing import apply_lcm_model_route
 from .assertion_state import query_assertion_state
 from .assertion_store import ASSERTION_KINDS
+from .reasoning import (
+    compile_evidence_plan,
+    execute_plan,
+    ground_evidence,
+    question_date_as_of_epoch,
+    validate_selector_alignment,
+    verify_final_answer,
+)
 from .presets import preset_status_payload
 from .rollup_periods import (
     CoverageNode,
@@ -269,6 +277,7 @@ _LCM_RECALL_RESPONSE_CHAR_CAP = 64_000
 _LCM_QUERY_STATE_DEFAULT_LIMIT = 25
 _LCM_QUERY_STATE_LIMIT_CAP = 50
 _LCM_QUERY_STATE_RESPONSE_CHAR_CAP = 64_000
+_LCM_COMPUTE_RESPONSE_CHAR_CAP = 64_000
 _LCM_RECALL_VALID_INCLUDE = frozenset({"all", "summaries", "verbatim"})
 _LCM_RECALL_VALID_DETAIL = frozenset({"snippets", "answer_ready"})
 _LCM_RECALL_ANSWER_READY_PER_SESSION_LIMIT = 5
@@ -562,6 +571,269 @@ def _bounded_inspect_json(response: dict[str, Any]) -> str:
         omitted.append(key)
         compact["truncation"]["omitted_top_level_sections"] = omitted
         encoded = json.dumps(compact, ensure_ascii=False)
+    return encoded
+
+
+def _compute_stage(
+    transport: str,
+    started_at: float,
+    *,
+    provider: str,
+    model: str,
+    **details: Any,
+) -> dict[str, Any]:
+    return {
+        "transport": transport,
+        "provider": provider,
+        "model": model,
+        "latency_ms": round((time.perf_counter() - started_at) * 1_000.0, 3),
+        **details,
+    }
+
+
+def lcm_compute(args: Dict[str, Any], **kwargs) -> str:
+    """Run a pure operation over exact, selector-supplied evidence refs."""
+    total_started = time.perf_counter()
+    engine = _require_engine(kwargs)
+    if engine is None:
+        return json.dumps({"error": "LCM engine not initialized"})
+
+    question = str(args.get("question") or "").strip()
+    question_date = args.get("question_date")
+    stages: dict[str, Any] = {}
+    planner_started = time.perf_counter()
+    as_of: float | None = None
+    if question_date is not None:
+        as_of = question_date_as_of_epoch(question_date)
+        if as_of is None:
+            stages["planner"] = _compute_stage(
+                "deterministic_local",
+                planner_started,
+                provider="none",
+                model="none",
+                status="fallback",
+            )
+            return json.dumps({
+                "status": "fallback",
+                "reason": "question_date must be a valid timezone-unambiguous ISO date",
+                "next_path": "evidence_only",
+                "provenance": {"stages": stages},
+                "metrics": {
+                    "total_latency_ms": round(
+                        (time.perf_counter() - total_started) * 1_000.0, 3
+                    )
+                },
+            })
+
+    plan_decision = compile_evidence_plan(question, question_date)
+    stages["planner"] = _compute_stage(
+        "deterministic_local",
+        planner_started,
+        provider="none",
+        model="none",
+        status=plan_decision.status,
+    )
+    if plan_decision.status != "planned" or plan_decision.plan is None:
+        return json.dumps({
+            "status": plan_decision.status,
+            "reason": plan_decision.reason,
+            "next_path": "evidence_only",
+            "provenance": {"stages": stages},
+            "metrics": {
+                "total_latency_ms": round(
+                    (time.perf_counter() - total_started) * 1_000.0, 3
+                )
+            },
+        })
+    plan = plan_decision.plan
+
+    selector_started = time.perf_counter()
+    if plan.requires_complete_evidence and args.get("evidence_complete") is not True:
+        stages["selector"] = _compute_stage(
+            "host_tool_arguments",
+            selector_started,
+            provider="unknown_to_plugin",
+            model="unknown_to_plugin",
+            status="fallback",
+            evidence_complete=False,
+        )
+        return json.dumps({
+            "status": "fallback",
+            "reason": "operation requires explicit evidence_complete=true",
+            "plan": plan.as_dict(),
+            "next_path": "evidence_only",
+            "provenance": {"stages": stages},
+            "metrics": {
+                "total_latency_ms": round(
+                    (time.perf_counter() - total_started) * 1_000.0, 3
+                )
+            },
+        })
+
+    raw_operands = args.get("operands")
+    try:
+        grounding = ground_evidence(
+            raw_operands,
+            messages=engine._store,
+            assertions=getattr(engine, "_assertions", None),
+            as_of=as_of,
+        )
+    except (TypeError, ValueError, sqlite3.Error) as exc:
+        grounding = None
+        grounding_reason = f"selector validation failed: {exc}"
+    else:
+        grounding_reason = grounding.reason
+    if grounding is None or grounding.status != "grounded":
+        stages["selector"] = _compute_stage(
+            "host_tool_arguments",
+            selector_started,
+            provider="unknown_to_plugin",
+            model="unknown_to_plugin",
+            status="fallback",
+            evidence_complete=bool(args.get("evidence_complete") is True),
+            operand_count=(len(raw_operands) if isinstance(raw_operands, list) else 0),
+        )
+        return json.dumps({
+            "status": "fallback",
+            "reason": grounding_reason,
+            "plan": plan.as_dict(),
+            "next_path": "evidence_only",
+            "provenance": {"stages": stages},
+            "metrics": {
+                "total_latency_ms": round(
+                    (time.perf_counter() - total_started) * 1_000.0, 3
+                )
+            },
+        })
+    alignment_error = validate_selector_alignment(question, plan, grounding.operands)
+    if alignment_error:
+        stages["selector"] = _compute_stage(
+            "host_tool_arguments",
+            selector_started,
+            provider="unknown_to_plugin",
+            model="unknown_to_plugin",
+            status="fallback",
+            evidence_complete=bool(args.get("evidence_complete") is True),
+            operand_count=len(grounding.operands),
+        )
+        return json.dumps({
+            "status": "fallback",
+            "reason": alignment_error,
+            "plan": plan.as_dict(),
+            "next_path": "evidence_only",
+            "provenance": {"stages": stages},
+            "metrics": {
+                "total_latency_ms": round(
+                    (time.perf_counter() - total_started) * 1_000.0, 3
+                )
+            },
+        })
+    stages["selector"] = _compute_stage(
+        "host_tool_arguments",
+        selector_started,
+        provider="unknown_to_plugin",
+        model="unknown_to_plugin",
+        status="validated",
+        evidence_complete=bool(args.get("evidence_complete") is True),
+        operand_count=len(grounding.operands),
+    )
+
+    executor_started = time.perf_counter()
+    computed = execute_plan(plan, grounding.operands)
+    stages["executor"] = _compute_stage(
+        "deterministic_local",
+        executor_started,
+        provider="none",
+        model="none",
+        status=computed.status,
+        operation=plan.operation,
+    )
+    if computed.status != "computed" or computed.trace is None:
+        return json.dumps({
+            "status": "fallback",
+            "reason": computed.reason,
+            "plan": plan.as_dict(),
+            "next_path": "evidence_only",
+            "provenance": {"stages": stages},
+            "metrics": {
+                "operand_count": len(grounding.operands),
+                "total_latency_ms": round(
+                    (time.perf_counter() - total_started) * 1_000.0, 3
+                ),
+            },
+        })
+
+    trace = computed.trace
+    candidate_present = "candidate_answer" in args
+    candidate = str(args.get("candidate_answer") or "")
+    verification_payload: dict[str, Any]
+    answer = trace.answer
+    candidate_used = False
+    if candidate_present:
+        verifier_started = time.perf_counter()
+        verification = verify_final_answer(candidate, trace)
+        stages["verifier"] = _compute_stage(
+            "deterministic_local",
+            verifier_started,
+            provider="none",
+            model="none",
+            status=verification.status,
+        )
+        verification_payload = {
+            "status": verification.status,
+            "reason": verification.reason,
+        }
+        if verification.status == "verified":
+            answer = candidate.strip()
+            candidate_used = True
+    else:
+        verification_payload = {"status": "not_requested", "reason": ""}
+
+    final_started = time.perf_counter()
+    if candidate_used:
+        final_stage = {
+            "transport": "host_supplied_candidate",
+            "provider": "unknown_to_plugin",
+            "model": "unknown_to_plugin",
+        }
+    else:
+        final_stage = {
+            "transport": "deterministic_canonical",
+            "provider": "none",
+            "model": "none",
+        }
+    stages["final_answerer"] = {
+        **final_stage,
+        "latency_ms": round((time.perf_counter() - final_started) * 1_000.0, 3),
+        "candidate_used": candidate_used,
+    }
+    response = {
+        "status": "computed",
+        "plan": plan.as_dict(),
+        "trace": trace.as_dict(),
+        "answer": answer,
+        "candidate_verification": verification_payload,
+        "provenance": {
+            "runtime_inputs": ["question", "question_date", "exact_retrieved_evidence"],
+            "stages": stages,
+        },
+        "metrics": {
+            "operand_count": len(grounding.operands),
+            "answer_chars": len(answer),
+            "total_latency_ms": round(
+                (time.perf_counter() - total_started) * 1_000.0, 3
+            ),
+        },
+        "response_char_cap": _LCM_COMPUTE_RESPONSE_CHAR_CAP,
+    }
+    encoded = json.dumps(response, ensure_ascii=False)
+    if len(encoded) > _LCM_COMPUTE_RESPONSE_CHAR_CAP:
+        return json.dumps({
+            "status": "fallback",
+            "reason": "deterministic response exceeded its bounded response cap",
+            "next_path": "evidence_only",
+            "provenance": {"stages": stages},
+        })
     return encoded
 _TEMPORAL_ROLLUP_PERIOD_KINDS = ("day", "week", "month")
 _TEMPORAL_ROLLUP_STATUSES = ("ready", "stale", "building", "failed")
