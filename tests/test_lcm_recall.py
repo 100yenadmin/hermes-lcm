@@ -437,6 +437,104 @@ def test_answer_ready_is_opt_in_and_default_response_is_byte_compatible(
     assert "answer_ready" not in payload["provenance"]
 
 
+def test_answer_ready_delta_is_opt_in_and_returns_only_novel_exact_refs(
+    recall_engine, monkeypatch
+):
+    first = recall_engine._store.append(
+        "session-a", {"role": "user", "content": "kanban dashboard sprint alpha"}
+    )
+    second = recall_engine._store.append(
+        "session-b", {"role": "user", "content": "kanban dashboard sprint beta"}
+    )
+    monkeypatch.setattr(lcm_tools, "resolve_provider", lambda _config: MockProvider())
+    monkeypatch.setattr(lcm_tools, "_lcm_recall_summary_arm", lambda *_a, **_k: ([], "none", 0, 0))
+    monkeypatch.setattr(lcm_tools, "_lcm_recall_chunk_arm", lambda *_a, **_k: ([], "none", 0, 0))
+
+    primary = _recall(
+        recall_engine,
+        monkeypatch,
+        include="verbatim",
+        detail="answer_ready",
+        limit=2,
+        seen_refs=[],
+    )
+    refs = [hit["exact_ref"] for hit in primary["hits"]]
+    assert {hit["store_id"] for hit in primary["hits"]} == {first, second}
+    assert len(refs) == len(set(refs)) == 2
+
+    delta = _recall(
+        recall_engine,
+        monkeypatch,
+        include="verbatim",
+        detail="answer_ready",
+        limit=2,
+        seen_refs=[refs[0]],
+    )
+    assert [hit["exact_ref"] for hit in delta["hits"]] == [refs[1]]
+    assert delta["delta"]["novel_refs"] == [refs[1]]
+    assert delta["delta"]["progress"] is True
+
+    exhausted = _recall(
+        recall_engine,
+        monkeypatch,
+        include="verbatim",
+        detail="answer_ready",
+        limit=2,
+        seen_refs=refs,
+    )
+    assert exhausted["hits"] == []
+    assert exhausted["delta"]["termination_reason"] == "no_novel_exact_ref"
+
+
+def test_answer_ready_baseline_bytes_ignore_disabled_occurrence_extension(
+    recall_engine, monkeypatch
+):
+    recall_engine._store.append(
+        "session-a", {"role": "user", "content": "kanban dashboard sprint alpha"}
+    )
+    monkeypatch.setattr(lcm_tools, "resolve_provider", lambda _config: MockProvider())
+    monkeypatch.setattr(lcm_tools.time, "time", lambda: 10.0)
+    args = {
+        "query": "kanban dashboard sprint",
+        "include": "verbatim",
+        "detail": "answer_ready",
+        "limit": 1,
+    }
+    baseline = lcm_tools.lcm_recall(args, engine=recall_engine)
+    explicitly_disabled = lcm_tools.lcm_recall(
+        {**args, "include_occurrence_time": False}, engine=recall_engine
+    )
+    assert baseline == explicitly_disabled
+    assert "occurrence_time" not in baseline
+    assert "exact-ref-delta-v1" not in baseline
+
+
+def test_occurrence_time_is_opt_in_and_uses_source_session_date(
+    recall_engine, monkeypatch
+):
+    recall_engine._store.append(
+        "session-a",
+        {
+            "role": "user",
+            "content": "I finished the kanban dashboard sprint 5 days ago.",
+        },
+    )
+    recall_engine._session_occurrence_dates = {"session-a": "2023-03-20"}
+    payload = _recall(
+        recall_engine,
+        monkeypatch,
+        include="verbatim",
+        detail="answer_ready",
+        limit=1,
+        seen_refs=[],
+        include_occurrence_time=True,
+    )
+    occurrence = payload["hits"][0]["occurrence_time"]
+    assert occurrence["event_date"] == "2023-03-15"
+    assert occurrence["event_time_source"] == "relative_to_session"
+    assert occurrence["observed_at"] != occurrence["event_at"]
+
+
 def test_invalid_recall_detail_is_rejected(recall_engine):
     payload = json.loads(
         lcm_tools.lcm_recall(

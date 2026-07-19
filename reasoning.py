@@ -71,6 +71,13 @@ _MONTHS.update({
 })
 
 
+def resolve_occurrence_time(text: Any, *, observed_at: Any, session_date: Any = None):
+    """Lazy import keeps plugin bootstrap order independent of this optional parser."""
+    from .occurrence_time import resolve_occurrence_time as _resolve
+
+    return _resolve(text, observed_at=observed_at, session_date=session_date)
+
+
 @dataclass(frozen=True)
 class TemporalWindow:
     start: date
@@ -665,32 +672,71 @@ def _ground_one(
         if not _quote_supports_key(quote, key):
             return None, "canonical key is not token-supported by its exact quote"
 
-    observed_day = _day_from_epoch(stored.get("timestamp"))
-    if as_of is not None:
-        try:
-            observed_at = float(stored.get("timestamp"))
-        except (TypeError, ValueError, OverflowError):
-            return None, "source observation timestamp is invalid"
-        if not math.isfinite(observed_at) or observed_at > as_of:
-            return None, "source was observed after the question-date boundary"
     assertion_day = None
     if assertion_row is not None:
-        assertion_day = _day_from_epoch(
-            assertion_row.get("event_at")
-            if assertion_row.get("event_at") is not None
-            else assertion_row.get("observed_at")
+        assertion_day = _day_from_epoch(assertion_row.get("event_at"))
+    evidence_day = assertion_day
+
+    occurrence_day = None
+    raw_occurrence = raw.get("occurrence_time")
+    if raw_occurrence is not None:
+        if not isinstance(raw_occurrence, dict):
+            return None, "occurrence_time must be an object"
+        resolved = resolve_occurrence_time(
+            quote,
+            observed_at=stored.get("timestamp"),
+            session_date=raw_occurrence.get("session_date"),
         )
-    evidence_day = assertion_day or observed_day
+        supplied_source = str(raw_occurrence.get("event_time_source") or "")
+        if supplied_source != resolved["event_time_source"]:
+            return None, "occurrence_time source is not supported by the exact quote"
+        supplied_date = str(raw_occurrence.get("event_date") or "").strip()
+        if supplied_date and supplied_date != str(resolved.get("event_date") or ""):
+            return None, "occurrence_time date is not supported by the exact quote"
+        occurrence_day = _parse_day(str(resolved.get("event_date") or ""))
+        evidence_day = occurrence_day or evidence_day
+
     raw_date = str(raw.get("date") or "").strip()
     if raw_date:
         claimed_day = _parse_day(raw_date)
         if claimed_day is None:
             return None, f"date {raw_date!r} is invalid or timezone-ambiguous"
-        if claimed_day not in {assertion_day, observed_day} and not _quote_supports_day(
+        if claimed_day not in {assertion_day, occurrence_day} and not _quote_supports_day(
             quote, claimed_day, raw_date
         ):
             return None, f"date {raw_date!r} is not supported by metadata or exact quote"
         evidence_day = claimed_day
+
+    if as_of is not None:
+        if assertion_row is not None:
+            try:
+                assertion_observed_at = float(assertion_row.get("observed_at"))
+            except (TypeError, ValueError, OverflowError):
+                return None, "assertion observation timestamp is invalid"
+            if not math.isfinite(assertion_observed_at) or assertion_observed_at > as_of:
+                return None, "assertion was observed after the question-date boundary"
+        elif raw_occurrence is not None and raw_occurrence.get("session_date"):
+            source_observed_day = _parse_day(str(raw_occurrence.get("session_date")))
+            if source_observed_day is None:
+                return None, "occurrence_time session_date is invalid"
+            source_observed_epoch = datetime.combine(
+                source_observed_day, datetime.max.time(), tzinfo=timezone.utc
+            ).timestamp()
+            if source_observed_epoch > as_of:
+                return None, "source was observed after the question-date boundary"
+        if evidence_day is not None:
+            evidence_epoch = datetime.combine(
+                evidence_day, datetime.max.time(), tzinfo=timezone.utc
+            ).timestamp()
+            if evidence_epoch > as_of:
+                return None, "source occurrence was after the question-date boundary"
+        else:
+            try:
+                observed_at = float(stored.get("timestamp"))
+            except (TypeError, ValueError, OverflowError):
+                return None, "source observation timestamp is invalid"
+            if not math.isfinite(observed_at) or observed_at > as_of:
+                return None, "source was observed after the question-date boundary"
 
     return GroundedEvidence(
         citation=f"lcm:{store_id}:{span_start}-{span_end}",

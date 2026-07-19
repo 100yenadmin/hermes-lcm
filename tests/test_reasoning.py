@@ -132,6 +132,57 @@ def test_grounding_rejects_unproven_values_labels_keys_and_refs(evidence_db):
         assert reason in decision.reason
 
 
+def test_relative_occurrence_time_grounds_without_aliasing_late_observation(evidence_db):
+    messages, assertions = evidence_db
+    content = "I completed the plank challenge 5 days ago."
+    store_id = _message(messages, content, "2026-07-19")
+    occurrence = {
+        "observed_at": _epoch("2026-07-19"),
+        "event_at": _epoch("2023-03-15"),
+        "event_date": "2023-03-15",
+        "event_time_source": "relative_to_session",
+        "session_date": "2023-03-20",
+        "precision": "day",
+        "policy_version": "occurrence-time-v1",
+    }
+    decision = ground_evidence(
+        [_raw(store_id, content, content, date="2023-03-15", occurrence_time=occurrence)],
+        messages=messages,
+        assertions=assertions,
+        as_of=question_date_as_of_epoch("2023-03-20"),
+    )
+    assert decision.status == "grounded", decision.reason
+    assert decision.operands[0].evidence_date == date(2023, 3, 15)
+
+
+def test_assertion_observation_time_is_not_silently_used_as_event_time(evidence_db):
+    messages, assertions = evidence_db
+    content = "The status is green."
+    store_id = _message(messages, content, "2024-03-01")
+    snapshot = assertions.snapshot_source(store_id)
+    start = content.index("green")
+    result = assertions.publish_source(
+        snapshot,
+        [AssertionCandidate(
+            source_span_start=start,
+            source_span_end=start + len("green"),
+            subject_key="project:test",
+            predicate_key="status.color",
+            object_value="green",
+            value_text="green",
+            kind="status",
+            event_at=None,
+        )],
+    )
+    decision = ground_evidence(
+        [{"assertion_id": result.assertion_ids[0], "value": "green"}],
+        messages=messages,
+        assertions=assertions,
+    )
+    assert decision.status == "grounded", decision.reason
+    assert decision.operands[0].evidence_date is None
+
+
 def test_sum_difference_count_and_mixed_unit_fallback(evidence_db):
     messages, assertions = evidence_db
     first = "Alice spent $30 on Dune."

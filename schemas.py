@@ -190,6 +190,25 @@ LCM_RECALL = {
                 ),
                 "default": "snippets",
             },
+            "seen_refs": {
+                "type": "array",
+                "items": {"type": "string"},
+                "maxItems": 100,
+                "description": (
+                    "Optional stateless answer-ready delta cursor. When supplied with "
+                    "detail='answer_ready', only evidence whose exact ref is not in this "
+                    "list is returned. Omitting it preserves the baseline response bytes."
+                ),
+            },
+            "include_occurrence_time": {
+                "type": "boolean",
+                "default": False,
+                "description": (
+                    "Opt in to source-backed occurrence-time fields on exact message "
+                    "evidence. Unknown remains valid and observation time is never "
+                    "silently used as event time."
+                ),
+            },
         },
         "required": ["query"],
     },
@@ -338,6 +357,31 @@ LCM_COMPUTE = {
                                 "Optional evidence date supported by source metadata or "
                                 "the exact quote."
                             ),
+                        },
+                        "occurrence_time": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "observed_at": {"type": "number"},
+                                "stored_at": {"type": "number"},
+                                "event_at": {"anyOf": [{"type": "number"}, {"type": "null"}]},
+                                "event_date": {"type": "string"},
+                                "event_time_source": {
+                                    "type": "string",
+                                    "enum": [
+                                        "explicit",
+                                        "relative_to_session",
+                                        "derived_assertion",
+                                        "unknown",
+                                    ],
+                                },
+                                "session_date": {"type": "string"},
+                                "precision": {"type": "string"},
+                                "policy_version": {"type": "string"},
+                                "reason": {"type": "string"},
+                                "support": {"type": "object"},
+                            },
+                            "required": ["event_time_source"],
                         },
                     },
                     "additionalProperties": False,
@@ -516,6 +560,7 @@ LCM_RETRIEVE = {
                                 "key": {"type": "string"},
                                 "label": {"type": "string"},
                                 "date": {"type": "string"},
+                                "occurrence_time": {"type": "object"},
                             },
                             "required": ["quote"],
                             "anyOf": [

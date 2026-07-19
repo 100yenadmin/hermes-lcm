@@ -54,6 +54,7 @@ from .reasoning import (
     question_date_as_of_epoch,
     validate_selector_alignment,
     verify_final_answer,
+    resolve_occurrence_time,
 )
 from .presets import preset_status_payload
 from .rollup_periods import (
@@ -3451,9 +3452,10 @@ def _lcm_recall_answer_ready_content(
     entries: list[dict[str, Any]],
     *,
     query: str,
+    expanded_limit: int = _LCM_RECALL_ANSWER_READY_EXPANDED_HIT_LIMIT,
 ) -> dict[tuple, dict[str, Any]]:
     """Hydrate selected exact refs with bounded reads and no retrieval search."""
-    selected = entries[:_LCM_RECALL_ANSWER_READY_EXPANDED_HIT_LIMIT]
+    selected = entries[:expanded_limit]
     store_ids = [
         int(entry["hit"]["store_id"])
         for entry in selected
@@ -3515,6 +3517,19 @@ def _lcm_recall_answer_ready_content(
             "source": stored.get("source") or "",
         }
     return hydrated
+
+
+def _lcm_recall_exact_ref(hit: dict[str, Any], hydrated: dict[str, Any] | None) -> str | None:
+    """Return the exact identity for an opt-in delta item."""
+    if hit.get("kind") == "summary":
+        node_id = hit.get("node_id")
+        return f"lcm-summary:{node_id}" if node_id is not None else None
+    store_id = hit.get("store_id")
+    if store_id is None or hydrated is None or "content" not in hydrated:
+        return None
+    start = int(hydrated.get("content_offset") or 0)
+    end = start + len(str(hydrated.get("content") or ""))
+    return f"lcm:{int(store_id)}:{start}-{end}"
 
 
 def _lcm_recall_bounded_reason(
@@ -3798,6 +3813,19 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
     if detail not in _LCM_RECALL_VALID_DETAIL:
         return json.dumps({"error": "detail must be one of: snippets, answer_ready"})
 
+    delta_requested = "seen_refs" in args
+    raw_seen_refs = args.get("seen_refs")
+    if delta_requested and detail != "answer_ready":
+        return json.dumps({"error": "seen_refs requires detail='answer_ready'"})
+    if delta_requested and not isinstance(raw_seen_refs, list):
+        return json.dumps({"error": "seen_refs must be an array"})
+    if delta_requested and len(raw_seen_refs) > 100:
+        return json.dumps({"error": "seen_refs accepts at most 100 refs"})
+    seen_refs = {str(value) for value in (raw_seen_refs or [])}
+    include_occurrence_time = bool(args.get("include_occurrence_time", False))
+    if include_occurrence_time and detail != "answer_ready":
+        return json.dumps({"error": "include_occurrence_time requires detail='answer_ready'"})
+
     # lcm_recall fans out three arms + fusion/hydration/rerank, so it uses its own
     # (larger) budget rather than lcm_grep's single-arm query deadline (sprint-opt-2).
     timeout_s = max(0.001, float(getattr(engine._config, "recall_query_timeout_s", 8.0)))
@@ -4060,14 +4088,30 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
     if detail == "answer_ready":
         selected_entries, diversity_dropped = _lcm_recall_diverse_entries(
             ordered,
-            limit=limit,
+            limit=_LCM_RECALL_LIMIT_CAP if delta_requested else limit,
             per_session_limit=_LCM_RECALL_ANSWER_READY_PER_SESSION_LIMIT,
         )
         answer_ready_content = _lcm_recall_answer_ready_content(
             engine,
             selected_entries,
             query=query,
+            expanded_limit=(
+                _LCM_RECALL_LIMIT_CAP
+                if delta_requested
+                else _LCM_RECALL_ANSWER_READY_EXPANDED_HIT_LIMIT
+            ),
         )
+        if delta_requested:
+            selected_entries = [
+                entry
+                for entry in selected_entries
+                if entry["hit"].get("kind") != "summary"
+                if (exact_ref := _lcm_recall_exact_ref(
+                        entry["hit"],
+                        answer_ready_content.get(_hit_identity(entry["hit"])),
+                    )) is not None
+                and exact_ref not in seen_refs
+            ][:limit]
     else:
         selected_entries = ordered
         diversity_dropped = 0
@@ -4102,6 +4146,17 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
             hydrated = answer_ready_content.get(_hit_identity(hit))
             if hydrated is not None:
                 item.update(hydrated)
+            if delta_requested:
+                exact_ref = _lcm_recall_exact_ref(hit, hydrated)
+                if exact_ref is not None:
+                    item["exact_ref"] = exact_ref
+            if include_occurrence_time and hit.get("kind") != "summary":
+                session_dates = getattr(engine, "_session_occurrence_dates", {}) or {}
+                item["occurrence_time"] = resolve_occurrence_time(
+                    (hydrated or {}).get("content") or hit.get("snippet") or "",
+                    observed_at=hit.get("timestamp") or 0,
+                    session_date=session_dates.get(str(hit.get("session_id"))),
+                )
         item_chars = len(json.dumps(item, ensure_ascii=False))
         if hits_out and response_chars + item_chars > _LCM_RECALL_RESPONSE_CHAR_CAP:
             response_cap_truncated = True
@@ -4168,6 +4223,22 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
         response["detail"] = detail
         response["provenance"]["detail"] = detail
         response["provenance"]["answer_ready"] = expansion
+        if delta_requested:
+            novel_refs = [hit["exact_ref"] for hit in hits_out if hit.get("exact_ref")]
+            response["delta"] = {
+                "protocol": "exact-ref-delta-v1",
+                "seen_ref_count": len(seen_refs),
+                "novel_ref_count": len(novel_refs),
+                "novel_refs": novel_refs,
+                "progress": bool(novel_refs),
+                "termination_reason": None if novel_refs else "no_novel_exact_ref",
+            }
+        if include_occurrence_time:
+            response["provenance"]["occurrence_time"] = {
+                "policy_version": "occurrence-time-v1",
+                "anchor_source": "engine session metadata when available",
+                "observation_is_not_occurrence": True,
+            }
 
         encoded = json.dumps(response, ensure_ascii=False)
         if len(encoded) > _LCM_RECALL_RESPONSE_CHAR_CAP:
