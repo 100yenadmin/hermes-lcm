@@ -356,6 +356,148 @@ LCM_COMPUTE = {
     },
 }
 
+LCM_RETRIEVE = {
+    "name": "lcm_retrieve",
+    "description": (
+        "Coordinate a bounded evidence-retrieval episode inside the current "
+        "answerer's existing tool turn. Start with a typed intent and named "
+        "evidence requirements, make at most three targeted calls to existing "
+        "LCM retrieval tools, then finish with exact selected refs and an optional "
+        "provider-neutral lcm_compute trace. The controller contains no model "
+        "client; dispatched retrieval tools retain their own provider behavior "
+        "and provenance. It never accepts benchmark metadata or persists final prose. It is "
+        "available only when LCM_ADAPTIVE_RETRIEVAL_ENABLED is true."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["start", "search", "finish", "status", "abandon"],
+            },
+            "retrieval_id": {
+                "type": "string",
+                "description": "Controller ID returned by the start action.",
+            },
+            "question": {
+                "type": "string",
+                "description": "The user's question, unchanged.",
+            },
+            "question_date": {
+                "type": "string",
+                "description": "Optional ISO date anchoring relative-time intent.",
+            },
+            "identity": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "intent_type": {"type": "string"},
+                    "operation": {
+                        "type": "string",
+                        "enum": [
+                            "evidence_only",
+                            "date_interval",
+                            "date_filter",
+                            "count_distinct",
+                            "sum",
+                            "difference",
+                            "order",
+                            "latest_fact",
+                        ],
+                    },
+                    "subject_key": {"type": "string"},
+                    "predicate_key": {"type": "string"},
+                    "role_key": {"type": "string"},
+                    "scope_key": {"type": "string"},
+                    "conversation_id": {"type": "string"},
+                    "unit": {"type": "string"},
+                    "distinct_policy": {"type": "string"},
+                    "time_mode": {
+                        "type": "string",
+                        "enum": ["none", "absolute", "relative"],
+                    },
+                    "question_anchor": {"type": "string"},
+                    "window_start": {"type": "string"},
+                    "window_end": {"type": "string"},
+                    "policy_version": {"type": "string"},
+                },
+                "required": ["intent_type"],
+            },
+            "requirements": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 12,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "slot_id": {"type": "string"},
+                        "description": {"type": "string"},
+                        "minimum_refs": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 40,
+                            "default": 1,
+                        },
+                    },
+                    "required": ["slot_id", "description"],
+                },
+            },
+            "missing_slot": {"type": "string"},
+            "tool": {
+                "type": "string",
+                "enum": [
+                    "lcm_recall",
+                    "lcm_recent",
+                    "lcm_query_state",
+                    "lcm_load_session",
+                    "lcm_expand",
+                ],
+            },
+            "tool_args": {"type": "object"},
+            "resolved_slots": {
+                "type": "array",
+                "maxItems": 12,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "slot_id": {"type": "string"},
+                        "evidence_refs": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": 40,
+                            "items": {"type": "string"},
+                        },
+                    },
+                    "required": ["slot_id", "evidence_refs"],
+                },
+            },
+            "selected_refs": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 40,
+                "items": {"type": "string"},
+            },
+            "computation": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "operands": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 50,
+                        "items": {"type": "object"},
+                    },
+                    "candidate_answer": {"type": "string"},
+                },
+                "required": ["operands"],
+            },
+        },
+        "required": ["action"],
+    },
+}
+
 LCM_RECENT = {
     "name": "lcm_recent",
     "description": (

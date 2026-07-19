@@ -55,6 +55,21 @@ def _identity(**changes) -> QueryViewIdentity:
     return replace(base, **changes)
 
 
+def test_requirements_digest_is_part_of_strict_identity(view_db):
+    messages, views = view_db
+    content = "I prefer jasmine tea."
+    store_id = _append(messages, content)
+    digest_a = "a" * 64
+    digest_b = "b" * 64
+    identity = _identity(requirements_digest=digest_a)
+    _publish(views, identity, [_dependency(views, store_id, content)])
+
+    assert views.lookup(identity).status == "hit"
+    assert views.lookup(_identity(requirements_digest=digest_b)).status == "miss"
+    with pytest.raises(ValueError, match="64-character SHA-256"):
+        _identity(requirements_digest="not-a-digest").normalized()
+
+
 def _dependency(views: QueryViewStore, store_id: int, content: str, quote=None):
     exact = content if quote is None else quote
     start = content.index(exact)

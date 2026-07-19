@@ -335,6 +335,9 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("assertions_enabled", "LCM_ASSERTIONS_ENABLED", bool),
     _EnvFieldSpec("query_views_enabled", "LCM_QUERY_VIEWS_ENABLED", bool),
     _EnvFieldSpec(
+        "adaptive_retrieval_enabled", "LCM_ADAPTIVE_RETRIEVAL_ENABLED", bool
+    ),
+    _EnvFieldSpec(
         "assertion_extraction_enabled", "LCM_ASSERTION_EXTRACTION_ENABLED", bool
     ),
     _EnvFieldSpec("assertion_extraction_model", "LCM_ASSERTION_EXTRACTION_MODEL", str),
@@ -518,6 +521,10 @@ class LCMConfig:
     # Materializes demand-shaped query evidence views in the same profile DB.
     # Default off; enabling this store does not invoke a model or retrieval provider.
     query_views_enabled: bool = False
+    # Exposes the bounded single-turn retrieval controller. Enabling it also
+    # binds the same-database query-view store needed for warm evidence reuse.
+    # The controller itself never invokes a model or provider.
+    adaptive_retrieval_enabled: bool = False
     # Enables the separate structured exact-row extractor. Default off: merely
     # enabling the assertion store never performs a model/provider call.
     assertion_extraction_enabled: bool = False

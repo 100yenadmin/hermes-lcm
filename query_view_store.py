@@ -125,6 +125,7 @@ class QueryViewIdentity:
     conversation_id: str = ""
     unit: str = ""
     distinct_policy: str = ""
+    requirements_digest: str = ""
     time_mode: Literal["none", "absolute", "relative"] = "none"
     question_anchor: str = ""
     window_start: str = ""
@@ -158,6 +159,12 @@ class QueryViewIdentity:
             )
         if time_mode == "none" and (anchor or start or end):
             raise ValueError("time_mode=none cannot carry an anchor or window")
+        digest = str(self.requirements_digest or "").strip().casefold()
+        if digest and (
+            len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise ValueError("requirements_digest must be a 64-character SHA-256 value")
         return QueryViewIdentity(
             intent_type=intent_type,
             operation=operation,
@@ -168,6 +175,7 @@ class QueryViewIdentity:
             conversation_id=_bounded_text(self.conversation_id, "conversation_id"),
             unit=_bounded_key(self.unit, "unit"),
             distinct_policy=_bounded_key(self.distinct_policy, "distinct_policy"),
+            requirements_digest=digest,
             time_mode=time_mode,  # type: ignore[arg-type]
             question_anchor=anchor,
             window_start=start,
@@ -189,6 +197,7 @@ class QueryViewIdentity:
             "conversation_id": normalized.conversation_id,
             "unit": normalized.unit,
             "distinct_policy": normalized.distinct_policy,
+            "requirements_digest": normalized.requirements_digest,
             "time_mode": normalized.time_mode,
             "question_anchor": normalized.question_anchor,
             "window_start": normalized.window_start,

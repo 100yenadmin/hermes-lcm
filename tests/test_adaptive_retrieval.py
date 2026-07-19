@@ -1,0 +1,512 @@
+"""Bounded one-turn retrieval controller and warm evidence-view fixtures."""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+import json
+
+import pytest
+
+from hermes_lcm.adaptive_retrieval import (
+    MAX_CANDIDATE_REFS,
+    MAX_CONTEXT_CHARS,
+    MAX_CONTEXT_TOKENS,
+    MAX_RETRIEVAL_ROUNDS,
+)
+from hermes_lcm.config import LCMConfig
+from hermes_lcm.engine import LCMEngine
+import hermes_lcm.tools as lcm_tools
+
+
+def _engine(tmp_path, *, enabled=True, name="lcm.db") -> LCMEngine:
+    engine = LCMEngine(
+        config=LCMConfig(
+            database_path=str(tmp_path / name),
+            adaptive_retrieval_enabled=enabled,
+        )
+    )
+    engine.on_session_start("session-a", conversation_id="conversation-a")
+    return engine
+
+
+def _append(engine: LCMEngine, content: str, *, day="2024-03-01") -> int:
+    store_id = engine._store.append("session-a", {
+        "role": "user",
+        "content": content,
+        "source": "cli",
+        "conversation_id": "conversation-a",
+    })
+    timestamp = datetime.fromisoformat(
+        f"{day}T12:00:00+00:00"
+    ).astimezone(timezone.utc).timestamp()
+    engine._store._conn.execute(
+        "UPDATE messages SET timestamp=? WHERE store_id=?", (timestamp, store_id)
+    )
+    engine._store._conn.commit()
+    return store_id
+
+
+def _identity(*, operation="evidence_only", **changes):
+    value = {
+        "intent_type": "travel memory",
+        "operation": operation,
+        "subject_key": "user:self",
+        "predicate_key": "travel.visit",
+        "scope_key": "personal",
+        "conversation_id": "conversation-a",
+        "time_mode": "none",
+        "policy_version": "adaptive-v1",
+    }
+    value.update(changes)
+    return value
+
+
+def _requirements(*, minimum_refs=1, description="visited places"):
+    return [{
+        "slot_id": "visits",
+        "description": description,
+        "minimum_refs": minimum_refs,
+    }]
+
+
+def _call(engine: LCMEngine, **args):
+    return json.loads(engine.handle_tool_call("lcm_retrieve", args))
+
+
+def _start(
+    engine: LCMEngine,
+    *,
+    question="Where did I travel?",
+    operation="evidence_only",
+    minimum_refs=1,
+    description="visited places",
+    identity_changes=None,
+):
+    identity = _identity(operation=operation, **(identity_changes or {}))
+    return _call(
+        engine,
+        action="start",
+        question=question,
+        identity=identity,
+        requirements=_requirements(
+            minimum_refs=minimum_refs, description=description
+        ),
+    )
+
+
+def _search(engine: LCMEngine, retrieval_id: str, store_id: int, **extra):
+    return _call(
+        engine,
+        action="search",
+        retrieval_id=retrieval_id,
+        missing_slot="visits",
+        tool="lcm_expand",
+        tool_args={"store_id": store_id},
+        **extra,
+    )
+
+
+def _operand(evidence: dict, *, key: str):
+    return {
+        "store_id": evidence["store_id"],
+        "span_start": evidence["span_start"],
+        "span_end": evidence["span_end"],
+        "quote": evidence["quote"],
+        "key": key,
+        "label": key,
+    }
+
+
+def test_default_off_and_env_opt_in_are_provider_neutral(monkeypatch, tmp_path):
+    monkeypatch.delenv("LCM_ADAPTIVE_RETRIEVAL_ENABLED", raising=False)
+    assert LCMConfig().adaptive_retrieval_enabled is False
+    assert LCMConfig.from_env().adaptive_retrieval_enabled is False
+
+    disabled = _engine(tmp_path, enabled=False, name="disabled.db")
+    try:
+        assert disabled._adaptive_retrieval is None
+        assert disabled._query_views is None
+        assert _call(disabled, action="status", retrieval_id="missing")[
+            "status"
+        ] == "disabled"
+    finally:
+        disabled.shutdown()
+
+    def provider_call_forbidden(*args, **kwargs):
+        raise AssertionError("controller initialization must not call a provider")
+
+    monkeypatch.setattr(lcm_tools, "resolve_provider", provider_call_forbidden)
+    monkeypatch.setenv("LCM_ADAPTIVE_RETRIEVAL_ENABLED", "true")
+    config = LCMConfig.from_env()
+    assert config.adaptive_retrieval_enabled is True
+    enabled = LCMEngine(config=LCMConfig(
+        database_path=str(tmp_path / "enabled.db"),
+        adaptive_retrieval_enabled=True,
+    ))
+    try:
+        assert enabled._adaptive_retrieval is not None
+        assert enabled._query_views is not None
+    finally:
+        enabled.shutdown()
+
+
+def test_exact_slot_closure_compute_finish_and_warm_reuse(tmp_path):
+    engine = _engine(tmp_path)
+    try:
+        paris_id = _append(engine, "I visited Paris.")
+        rome_id = _append(engine, "I visited Rome.")
+        started = _start(
+            engine,
+            question="How many distinct cities did I visit?",
+            operation="count_distinct",
+            minimum_refs=2,
+        )
+        assert started["status"] == "active"
+        assert started["query_view"]["status"] == "miss"
+        retrieval_id = started["retrieval_id"]
+
+        first = _search(engine, retrieval_id, paris_id)
+        assert first["status"] == "active"
+        assert len(first["evidence"]) == 1
+        first_ref = first["evidence"][0]["citation"]
+        status = _call(
+            engine, action="status", retrieval_id=retrieval_id
+        )
+        assert [item["citation"] for item in status["evidence"]] == [first_ref]
+
+        second = _search(
+            engine,
+            retrieval_id,
+            rome_id,
+            resolved_slots=[{
+                "slot_id": "visits",
+                "evidence_refs": [first_ref],
+            }],
+        )
+        assert second["status"] == "active"
+        second_ref = second["evidence"][0]["citation"]
+        evidence = {
+            first_ref: first["evidence"][0],
+            second_ref: second["evidence"][0],
+        }
+
+        finished = _call(
+            engine,
+            action="finish",
+            retrieval_id=retrieval_id,
+            resolved_slots=[{
+                "slot_id": "visits",
+                "evidence_refs": [second_ref],
+            }],
+            selected_refs=[first_ref, second_ref],
+            computation={
+                "operands": [
+                    _operand(evidence[first_ref], key="Paris"),
+                    _operand(evidence[second_ref], key="Rome"),
+                ]
+            },
+        )
+        assert finished["status"] == "finished"
+        assert finished["computation"]["status"] == "computed"
+        assert finished["computation"]["trace"]["result_value"] == 2
+        assert finished["query_view"]["persistence"]["status"] == "published"
+
+        state = engine._adaptive_retrieval._states[retrieval_id]
+        persisted = engine._query_views.lookup(state.identity, record_hit=False)
+        assert persisted.status == "hit"
+        encoded_manifest = json.dumps(persisted.view["manifest"]).casefold()
+        assert "final_answer" not in encoded_manifest
+        assert "candidate_answer" not in encoded_manifest
+        assert "answer" not in persisted.view["computation_trace"]
+
+        warm = _start(
+            engine,
+            question="How many different cities have I visited?",
+            operation="count_distinct",
+            minimum_refs=2,
+            description="distinct destinations",
+        )
+        assert warm["status"] == "ready"
+        assert warm["query_view"]["status"] == "hit"
+        assert len(warm["evidence"]) == 2
+        assert warm["query_view"]["cached_computation_trace"][
+            "result_value"
+        ] == 2
+
+        different_cardinality = _start(
+            engine,
+            question="Name a city I visited.",
+            operation="count_distinct",
+            minimum_refs=1,
+        )
+        assert different_cardinality["status"] == "active"
+        assert different_cardinality["query_view"]["status"] == "miss"
+    finally:
+        engine.shutdown()
+
+
+def test_corpus_advance_requires_bounded_delta_search(tmp_path):
+    engine = _engine(tmp_path)
+    try:
+        paris_id = _append(engine, "I visited Paris.")
+        started = _start(engine)
+        found = _search(engine, started["retrieval_id"], paris_id)
+        citation = found["evidence"][0]["citation"]
+        finished = _call(
+            engine,
+            action="finish",
+            retrieval_id=started["retrieval_id"],
+            resolved_slots=[{
+                "slot_id": "visits",
+                "evidence_refs": [citation],
+            }],
+            selected_refs=[citation],
+        )
+        assert finished["query_view"]["persistence"]["status"] == "published"
+
+        _append(engine, "I also visited Rome.")
+        stale = _start(engine)
+        assert stale["status"] == "active"
+        assert stale["query_view"]["status"] == "delta_required"
+        assert stale["query_view"]["delta_events"]
+        assert stale["evidence"] == []
+    finally:
+        engine.shutdown()
+
+
+def test_no_progress_terminates_and_incomplete_finish_falls_back(tmp_path):
+    engine = _engine(tmp_path)
+    try:
+        started = _start(engine)
+        result = _search(engine, started["retrieval_id"], 999_999_999)
+        assert result["status"] == "fallback"
+        assert result["rounds"][0]["status"] == "no_progress"
+        assert "no exact-evidence progress" in result["termination_reason"]
+
+        finished = _call(
+            engine,
+            action="finish",
+            retrieval_id=started["retrieval_id"],
+        )
+        assert finished["status"] == "fallback"
+        assert "remain open" in finished["termination_reason"]
+    finally:
+        engine.shutdown()
+
+
+def test_invalid_computation_returns_evidence_only_fallback(tmp_path):
+    engine = _engine(tmp_path)
+    try:
+        store_id = _append(engine, "I spent $10 on lunch.")
+        started = _start(
+            engine,
+            question="What was the average price?",
+            operation="sum",
+        )
+        found = _search(engine, started["retrieval_id"], store_id)
+        evidence = found["evidence"][0]
+        citation = evidence["citation"]
+        result = _call(
+            engine,
+            action="finish",
+            retrieval_id=started["retrieval_id"],
+            resolved_slots=[{
+                "slot_id": "visits",
+                "evidence_refs": [citation],
+            }],
+            selected_refs=[citation],
+            computation={
+                "operands": [{
+                    **_operand(evidence, key="$10"),
+                    "value": 10,
+                    "unit": "usd",
+                }]
+            },
+        )
+        assert result["status"] == "fallback"
+        assert result["next_path"] == "evidence_only"
+        assert result["computation"]["status"] == "fallback"
+        assert result["query_view"]["persistence"]["status"] == "skipped"
+        assert result["evidence"][0]["citation"] == citation
+    finally:
+        engine.shutdown()
+
+
+def test_summary_handle_is_bounded_lead_progress_not_evidence(
+    monkeypatch, tmp_path
+):
+    engine = _engine(tmp_path)
+    try:
+        def summary_only(args, *, engine):
+            return json.dumps({
+                "sections": [{
+                    "node_id": "node-123",
+                    "session_id": "session-a",
+                    "summary": "Travel was discussed, but exact sources need expansion.",
+                    "expand_hint": "lcm_expand(node_id=node-123)",
+                }],
+                "provenance": {
+                    "provider": "voyage",
+                    "model": "voyage-code-3",
+                    "api_key": "must-not-escape",
+                },
+                "metrics": {"query_count": 1},
+            })
+
+        monkeypatch.setattr(lcm_tools, "lcm_recent", summary_only)
+        started = _start(engine)
+        result = _call(
+            engine,
+            action="search",
+            retrieval_id=started["retrieval_id"],
+            missing_slot="visits",
+            tool="lcm_recent",
+            tool_args={"period": "month", "scope": "global"},
+        )
+        assert result["status"] == "active"
+        assert result["evidence"] == []
+        assert result["rounds"][0]["status"] == "lead_progress"
+        assert result["rounds"][0]["new_lead_count"] >= 1
+        assert result["rounds"][0]["tool_provenance"] == {
+            "model": "voyage-code-3",
+            "provider": "voyage",
+        }
+        assert result["rounds"][0]["tool_metrics"]["query_count"] == 1
+        assert result["leads"][0]["evidence_eligible"] is False
+        assert result["leads"][0]["node_id"] == "node-123"
+        assert result["requirements"][0]["closed"] is False
+    finally:
+        engine.shutdown()
+
+
+def test_round_budget_and_session_ownership_are_enforced(tmp_path):
+    engine = _engine(tmp_path)
+    try:
+        store_ids = [_append(engine, f"I visited City{index}.") for index in range(4)]
+        started = _start(engine, minimum_refs=4)
+        retrieval_id = started["retrieval_id"]
+        resolved = []
+        for index in range(MAX_RETRIEVAL_ROUNDS):
+            result = _search(
+                engine,
+                retrieval_id,
+                store_ids[index],
+                resolved_slots=(
+                    [{"slot_id": "visits", "evidence_refs": resolved}]
+                    if resolved
+                    else []
+                ),
+            )
+            resolved.append(result["evidence"][0]["citation"])
+        assert result["budgets"]["exhausted"] is True
+        assert result["budgets"]["retrieval_rounds"] == MAX_RETRIEVAL_ROUNDS
+        over_budget = _search(
+            engine,
+            retrieval_id,
+            store_ids[-1],
+            resolved_slots=[{
+                "slot_id": "visits",
+                "evidence_refs": resolved,
+            }],
+        )
+        assert over_budget["status"] == "error"
+        assert "budget exhausted" in over_budget["error"]
+
+        another = _start(engine)
+        engine.on_session_start("session-b", conversation_id="conversation-b")
+        foreign = _call(
+            engine,
+            action="status",
+            retrieval_id=another["retrieval_id"],
+        )
+        assert foreign["status"] == "error"
+        assert "another active session" in foreign["error"]
+    finally:
+        engine.shutdown()
+
+
+def test_profile_rebind_clears_ephemeral_controller_state(tmp_path):
+    home_a = tmp_path / "profile-a"
+    home_b = tmp_path / "profile-b"
+    engine = LCMEngine(
+        config=LCMConfig(adaptive_retrieval_enabled=True),
+        hermes_home=str(home_a),
+    )
+    try:
+        engine.on_session_start("session-a", conversation_id="conversation-a")
+        started = _start(engine)
+        assert engine._adaptive_retrieval._states
+
+        assert engine._rebind_storage_for_home(str(home_b)) is True
+        assert engine._adaptive_retrieval._states == {}
+        expired = _call(
+            engine,
+            action="status",
+            retrieval_id=started["retrieval_id"],
+        )
+        assert expired["status"] == "error"
+        assert "unknown or expired" in expired["error"]
+        assert engine._query_views.db_path == home_b / "lcm.db"
+    finally:
+        engine.shutdown()
+
+
+def test_candidate_and_context_caps_apply_before_return(monkeypatch, tmp_path):
+    engine = _engine(tmp_path)
+    try:
+        content = "x" * 2_400
+        store_ids = [_append(engine, content) for _ in range(25)]
+
+        def many_exact_refs(args, *, engine):
+            return json.dumps({
+                "results": [
+                    {"store_id": store_id, "content": content, "content_offset": 0}
+                    for store_id in store_ids
+                ]
+            })
+
+        monkeypatch.setattr(lcm_tools, "lcm_query_state", many_exact_refs)
+        started = _start(engine, minimum_refs=25)
+        result = _call(
+            engine,
+            action="search",
+            retrieval_id=started["retrieval_id"],
+            missing_slot="visits",
+            tool="lcm_query_state",
+            tool_args={"subject_key": "user:self", "limit": 500},
+        )
+        assert result["budgets"]["candidate_refs"] <= MAX_CANDIDATE_REFS
+        assert result["budgets"]["context_tokens"] <= MAX_CONTEXT_TOKENS
+        assert result["budgets"]["context_chars"] <= MAX_CONTEXT_CHARS
+        assert result["budgets"]["exhausted"] is True
+        assert result["rounds"][0]["result_truncated"] is True
+        assert result["rounds"][0]["tool_args"]["limit"] == 20
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize(
+    "mutation, expected",
+    [
+        ({"question_id": "forbidden"}, "unsupported lcm_retrieve arguments"),
+        ({"identity": {"intent_type": "travel", "reference_answer": "Paris"}},
+         "unsupported fields"),
+    ],
+)
+def test_benchmark_metadata_and_unknown_fields_fail_closed(
+    tmp_path, mutation, expected
+):
+    engine = _engine(tmp_path)
+    try:
+        args = {
+            "action": "start",
+            "question": "Where did I travel?",
+            "identity": _identity(),
+            "requirements": _requirements(),
+            **mutation,
+        }
+        result = _call(engine, **args)
+        assert result["status"] == "error"
+        assert expected in result["error"]
+    finally:
+        engine.shutdown()

@@ -13,6 +13,7 @@ for earlier separate sessions or broad cross-session history.
 | `lcm_recall` | Search the agent's entire memory across ALL conversations and all time by meaning. Runs three arms over the whole local database — full-text raw messages, embedded summary KNN, and verbatim chunk KNN (all cross-session, no filter) — fuses them with RRF, dedupes chunk hits against FTS by `store_id`, and applies a soft prior `final_score = rank_score × (1 + scope_bias × is_current_conversation) × recency_boost(half_life=30d, floor 0.5)`. `scope_bias` (0..1, default 0.5) and recency are ranking BOOSTS, never filters. `include` selects `all`/`summaries`/`verbatim`. An optional voyage `rerank-2.5-lite` stage (`LCM_RERANK_ENABLED`, default off) reorders the top window of candidates AFTER the scope/recency prior, as a pure rank-reorder (voyage relevance is never spliced onto the RRF scale); any failure skips silently to RRF order. When embeddings are disabled or the vector corpora are empty the tool degrades to the full-text arm — including for `include='summaries'`, whose only vector arm is dead in that state, so a summaries request still returns full-text hits rather than nothing. Each hit carries an `expand_hint`: verbatim/current-session hits get an `lcm_expand(...)` handle, while cross-session summary hits get an `lcm_load_session(...)` handle (`lcm_expand`'s `node_id` mode is current-session only). Use `lcm_grep(mode='full_text')` for exact text in a known range and `lcm_load_session` for full transcripts. |
 | `lcm_query_state` | Query the feature-flagged same-DB V4 assertion sidecar by canonical subject, optional predicate/kind/scope/speaker, and optional as-of boundary. Returns typed lifecycle state with exact message store IDs, character spans, hashes, and quotes. It preserves unresolved conflicts and never treats recency alone as supersession. |
 | `lcm_compute` | Execute a question-derived, provider-neutral date/count/sum/difference/order/latest-state operation over exact raw spans or assertion IDs. Values, units, labels, keys, dates, operand order, completeness, and final wording are validated; unsupported or ambiguous inputs return an evidence-only fallback. |
+| `lcm_retrieve` | With `LCM_ADAPTIVE_RETRIEVAL_ENABLED=true`, coordinate one bounded retrieval episode inside the existing answerer turn. Named evidence requirements close only against exact observed refs; at most three calls to `lcm_recall`, `lcm_recent`, `lcm_query_state`, `lcm_load_session`, or `lcm_expand` are allowed. Warm reuse validates exact positive dependencies and the corpus coverage watermark. Final prose is never cached. |
 | `lcm_recent` | Retrieve recent summaries with natural UTC periods. Ready temporal rollups are preferred; missing, stale, disabled, and sub-day windows transparently use leaf summaries instead. |
 | `lcm_load_session` | Load one ordered raw-message transcript page for an explicit `session_id`. This is not search: it returns raw rows in `store_id` order, bounded by `limit`, with per-message content bounded by `max_content_chars`, and continues with `after_store_id` from `next_cursor`. |
 | `lcm_describe` | Inspect the current-session DAG or preview an `externalized_ref` without loading full content. |
@@ -30,6 +31,21 @@ bounded archive search over rows already present in `lcm.db` (raw-message hits
 only). Once a session id is known, `lcm_load_session` can enumerate that session's
 raw transcript in chronological `store_id` pages without a search query. Use
 Hermes `session_search` for broad cross-session history outside the LCM database.
+
+`lcm_retrieve` is a policy envelope around those existing tools, not another
+answering model. Its controller logic has no provider client; a dispatched
+`lcm_recall` still uses its configured embedding provider and returns that stage's
+bounded provenance. The answerer starts an episode with a typed identity and named
+evidence slots, calls `search` only for an open slot, and explicitly assigns
+returned exact citations to slots before `finish`. The controller stops after
+three rounds, after any no-progress call, at 40 candidate refs, at 7,500 context
+tokens, or at its bounded character limit. Unsupported tool arguments and
+benchmark/reference metadata fail closed. `finish` can pass selector-supplied
+operands through `lcm_compute`; values, units, citations, and final wording are
+then verified by the pure engine. Enabling adaptive retrieval also binds the
+same-`lcm.db` query-view store. Warm views reuse evidence and immutable
+computation traces only when typed intent, requirement cardinality, exact source
+dependencies, and negative-space coverage still match.
 
 Within the current session, `source` filters raw rows directly and filters
 summary nodes by descendant raw-message source lineage. `unknown` is a real

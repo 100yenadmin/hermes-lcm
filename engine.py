@@ -84,6 +84,7 @@ from .rollup_builder import (
 )
 from .assertion_extraction import ModelAssertionExtractor
 from .assertion_store import AssertionStore, SourceSnapshot
+from .adaptive_retrieval import AdaptiveRetrievalRegistry
 from .query_view_store import QueryViewStore
 from .schemas import (
     LCM_DESCRIBE,
@@ -97,6 +98,7 @@ from .schemas import (
     LCM_QUERY_STATE,
     LCM_RECALL,
     LCM_RECENT,
+    LCM_RETRIEVE,
     LCM_STATUS,
 )
 from .sanitize import (
@@ -470,6 +472,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         """Bind store/DAG/lifecycle helpers to one SQLite database."""
         self._assertions = None
         self._query_views = None
+        self._adaptive_retrieval = None
         self._assertion_extractor = None
         try:
             self._store = MessageStore(
@@ -491,6 +494,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._query_views = (
                 QueryViewStore(db_path)
                 if bool(getattr(self._config, "query_views_enabled", False))
+                or bool(getattr(self._config, "adaptive_retrieval_enabled", False))
+                else None
+            )
+            self._adaptive_retrieval = (
+                AdaptiveRetrievalRegistry(self._query_views)
+                if bool(
+                    getattr(self._config, "adaptive_retrieval_enabled", False)
+                )
                 else None
             )
             if (
@@ -508,7 +519,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     def _close_storage(self) -> None:
         """Best-effort close of currently bound SQLite helpers."""
-        for attr in ("_store", "_dag", "_lifecycle", "_assertions", "_query_views"):
+        for attr in (
+            "_adaptive_retrieval",
+            "_store",
+            "_dag",
+            "_lifecycle",
+            "_assertions",
+            "_query_views",
+        ):
             helper = getattr(self, attr, None)
             close = getattr(helper, "close", None)
             if callable(close):
@@ -533,6 +551,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     def _reset_profile_runtime_state(self) -> None:
         """Clear process-local session state that cannot cross profile homes."""
+        if self._adaptive_retrieval is not None:
+            self._adaptive_retrieval.clear()
         self._unregister_active_engine_binding()
         self._session_id = ""
         self._session_platform = ""
@@ -3344,6 +3364,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             LCM_RECALL,
             LCM_QUERY_STATE,
             LCM_COMPUTE,
+            LCM_RETRIEVE,
             LCM_RECENT,
             LCM_LOAD_SESSION,
             LCM_DESCRIBE,
@@ -3376,6 +3397,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "lcm_recall": lcm_tools.lcm_recall,
             "lcm_query_state": lcm_tools.lcm_query_state,
             "lcm_compute": lcm_tools.lcm_compute,
+            "lcm_retrieve": lcm_tools.lcm_retrieve,
             "lcm_recent": lcm_tools.lcm_recent,
             "lcm_load_session": lcm_tools.lcm_load_session,
             "lcm_describe": lcm_tools.lcm_describe,
@@ -6219,6 +6241,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     def shutdown(self):
         self._unregister_active_engine_binding()
+        if self._adaptive_retrieval is not None:
+            self._adaptive_retrieval.close()
         self._store.close()
         self._dag.close()
         self._lifecycle.close()

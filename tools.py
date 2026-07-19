@@ -835,6 +835,121 @@ def lcm_compute(args: Dict[str, Any], **kwargs) -> str:
             "provenance": {"stages": stages},
         })
     return encoded
+
+
+_LCM_RETRIEVE_RESPONSE_CHAR_CAP = 64_000
+_LCM_RETRIEVE_ARGUMENTS = frozenset({
+    "action",
+    "retrieval_id",
+    "question",
+    "question_date",
+    "identity",
+    "requirements",
+    "missing_slot",
+    "tool",
+    "tool_args",
+    "resolved_slots",
+    "selected_refs",
+    "computation",
+})
+
+
+def lcm_retrieve(args: Dict[str, Any], **kwargs) -> str:
+    """Drive one bounded retrieval episode inside the answerer's tool turn."""
+    engine = _require_engine(kwargs)
+    if engine is None:
+        return json.dumps({"error": "LCM engine not initialized"})
+    controller = getattr(engine, "_adaptive_retrieval", None)
+    if controller is None:
+        return json.dumps({
+            "status": "disabled",
+            "reason": "adaptive retrieval is disabled",
+            "enable_with": "LCM_ADAPTIVE_RETRIEVAL_ENABLED=true",
+            "provenance": {
+                "controller": {
+                    "transport": "deterministic_local",
+                    "provider": "none",
+                    "model": "none",
+                }
+            },
+        })
+    if not isinstance(args, dict):
+        return json.dumps({"status": "error", "error": "arguments must be an object"})
+    unknown = set(args) - _LCM_RETRIEVE_ARGUMENTS
+    if unknown:
+        return json.dumps({
+            "status": "error",
+            "error": (
+                "unsupported lcm_retrieve arguments: "
+                + ", ".join(sorted(str(value) for value in unknown))
+            ),
+        })
+
+    action = str(args.get("action") or "").strip().casefold()
+    def dispatch(name: str, payload: dict[str, Any]) -> str:
+        return engine.handle_tool_call(name, payload)
+    try:
+        if action == "start":
+            result = controller.start(
+                question=args.get("question"),
+                question_date=args.get("question_date"),
+                identity=args.get("identity"),
+                requirements=args.get("requirements"),
+                engine=engine,
+            )
+        elif action == "search":
+            result = controller.search(
+                retrieval_id=args.get("retrieval_id"),
+                missing_slot=args.get("missing_slot"),
+                tool=args.get("tool"),
+                tool_args=args.get("tool_args"),
+                resolved_slots=args.get("resolved_slots"),
+                engine=engine,
+                dispatch=dispatch,
+            )
+        elif action == "finish":
+            result = controller.finish(
+                retrieval_id=args.get("retrieval_id"),
+                resolved_slots=args.get("resolved_slots"),
+                selected_refs=args.get("selected_refs"),
+                computation=args.get("computation"),
+                engine=engine,
+                dispatch=dispatch,
+            )
+        elif action == "status":
+            result = controller.status(
+                retrieval_id=args.get("retrieval_id"), engine=engine
+            )
+        elif action == "abandon":
+            result = controller.abandon(
+                retrieval_id=args.get("retrieval_id"), engine=engine
+            )
+        else:
+            raise ValueError(
+                "action must be one of: start, search, finish, status, abandon"
+            )
+    except (TypeError, ValueError, sqlite3.Error) as exc:
+        result = {
+            "status": "error",
+            "error": str(exc)[:1_000],
+            "provenance": {
+                "controller": {
+                    "transport": "deterministic_local",
+                    "provider": "none",
+                    "model": "none",
+                }
+            },
+        }
+    encoded = json.dumps(result, ensure_ascii=False)
+    if len(encoded) > _LCM_RETRIEVE_RESPONSE_CHAR_CAP:
+        return json.dumps({
+            "status": "error",
+            "error": "adaptive retrieval response exceeded its bounded response cap",
+            "response_char_cap": _LCM_RETRIEVE_RESPONSE_CHAR_CAP,
+        })
+    return encoded
+
+
 _TEMPORAL_ROLLUP_PERIOD_KINDS = ("day", "week", "month")
 _TEMPORAL_ROLLUP_STATUSES = ("ready", "stale", "building", "failed")
 
