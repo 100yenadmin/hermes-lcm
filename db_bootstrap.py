@@ -313,10 +313,28 @@ _NEWER_BUILD_FINDING_PREFIXES = (
     "unexpected-trigger:",
 )
 
+# The assertion family has no shipped legacy shape. A same-name table, index,
+# or trigger whose semantics differ from this build therefore cannot be safely
+# identified as an early, rebuildable variant: it may belong to a future build.
+# Missing assertion objects remain an allowlisted interim signature, while
+# malformed same-name objects fail closed and are never dropped by downgrade
+# remediation. Older embedding/chunk families retain their established rename
+# handling.
+_ASSERTION_NEWER_BUILD_FINDING_PREFIXES = (
+    "malformed table:",
+    "malformed index:",
+    "malformed trigger:",
+)
 
-def _family_reports_newer_shape(findings: Iterable[str]) -> bool:
-    """True when any verifier finding is an extra/unknown-piece (newer) signature."""
-    return any(str(finding).startswith(_NEWER_BUILD_FINDING_PREFIXES) for finding in findings)
+
+def _family_reports_newer_shape(
+    findings: Iterable[str], *, family_prefix: str | None = None
+) -> bool:
+    """True when verifier findings cannot be safely treated as an early shape."""
+    prefixes = _NEWER_BUILD_FINDING_PREFIXES
+    if family_prefix == "lcm_assertion":
+        prefixes += _ASSERTION_NEWER_BUILD_FINDING_PREFIXES
+    return any(str(finding).startswith(prefixes) for finding in findings)
 
 
 def _user_table_names(conn: sqlite3.Connection) -> set[str]:
@@ -404,7 +422,7 @@ def classify_version_mismatch(conn: sqlite3.Connection) -> str:
             findings = verify(conn)
         except sqlite3.DatabaseError:
             return VERSION_MISMATCH_GENUINELY_NEWER
-        if _family_reports_newer_shape(findings):
+        if _family_reports_newer_shape(findings, family_prefix=prefix):
             return VERSION_MISMATCH_GENUINELY_NEWER
 
     return VERSION_MISMATCH_INTERIM_STAMP
@@ -436,7 +454,7 @@ def _interim_family_drops(conn: sqlite3.Connection) -> list[dict[str, object]]:
         if not findings:
             # Verifier clean — the family is at the final shape; keep it.
             continue
-        if _family_reports_newer_shape(findings):
+        if _family_reports_newer_shape(findings, family_prefix=prefix):
             # An extra/unknown column is a newer-build signature, never an early
             # interim variant — never drop it (defense in depth; the DB is
             # already classified genuinely-newer and remediation has refused).

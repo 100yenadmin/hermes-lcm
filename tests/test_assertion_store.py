@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 import sqlite3
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -22,12 +23,17 @@ from hermes_lcm.dag import SummaryDAG
 from hermes_lcm.db_bootstrap import (
     ASSERTION_MIGRATION_STEP,
     SCHEMA_VERSION,
+    VERSION_MISMATCH_GENUINELY_NEWER,
     VERSION_MISMATCH_INTERIM_STAMP,
     classify_version_mismatch,
     remediate_interim_schema_stamp,
     verify_assertion_schema,
 )
-from hermes_lcm.maintenance import backup_database, rotate_backup_database
+from hermes_lcm.maintenance import (
+    backup_database,
+    flush_engine_connections,
+    rotate_backup_database,
+)
 from hermes_lcm.lifecycle_state import LifecycleStateStore
 from hermes_lcm.store import MessageStore
 
@@ -226,6 +232,60 @@ def test_schema_stamp_remediation_keeps_valid_family_and_drops_malformed_family(
     ).fetchone()[0] == 0
     malformed_assertions.close()
     malformed_messages.close()
+
+
+def test_schema_stamp_remediation_refuses_same_name_future_assertion_shape(tmp_path):
+    db_path = tmp_path / "future-assertion-shape.db"
+    messages = MessageStore(db_path)
+    dag = SummaryDAG(db_path)
+    lifecycle = LifecycleStateStore(db_path)
+    dag.close()
+    lifecycle.close()
+    assertions = AssertionStore(db_path)
+    try:
+        content = "I prefer tea."
+        store_id = messages.append(
+            "session-a", {"role": "user", "content": content}
+        )
+        assertions.publish_source(
+            assertions.snapshot_source(store_id), [_candidate(content, "tea")]
+        )
+        assertions.connection.execute("DROP TRIGGER lcm_assertion_message_update")
+        assertions.connection.execute(
+            """
+            CREATE TRIGGER lcm_assertion_message_update
+            AFTER UPDATE OF content ON messages
+            BEGIN
+                SELECT 1;
+            END
+            """
+        )
+        assertions.connection.execute(
+            "UPDATE metadata SET value = ? WHERE key = 'schema_version'",
+            (str(SCHEMA_VERSION + 1),),
+        )
+        assertions.connection.commit()
+
+        findings = verify_assertion_schema(assertions.connection)
+        assert "malformed trigger:lcm_assertion_message_update" in findings
+        assert (
+            classify_version_mismatch(assertions.connection)
+            == VERSION_MISMATCH_GENUINELY_NEWER
+        )
+        objects_before = _assertion_objects(assertions.connection)
+        result = remediate_interim_schema_stamp(
+            assertions.connection, apply=True
+        )
+
+        assert result["status"] == "refused"
+        assert result["applied"] is False
+        assert _assertion_objects(assertions.connection) == objects_before
+        assert assertions.connection.execute(
+            "SELECT COUNT(*) FROM lcm_assertions"
+        ).fetchone()[0] == 1
+    finally:
+        assertions.close()
+        messages.close()
 
 
 def test_concurrent_lazy_initialization_is_idempotent(tmp_path):
@@ -581,3 +641,84 @@ def test_backup_restore_and_rotation_include_same_db_assertions(assertion_db, tm
             restored.close()
     assert db_path.exists()
 
+
+def test_maintenance_flush_waits_for_atomic_assertion_publication(
+    assertion_db, monkeypatch
+):
+    _db_path, messages, assertions = assertion_db
+    content = "I prefer tea."
+    store_id = messages.append(
+        "session-a", {"role": "user", "content": content}
+    )
+    snapshot = assertions.snapshot_source(store_id)
+    candidate = _candidate(content, "tea")
+    candidate_id = assertions.assertion_id_for(snapshot, candidate)
+    invalid_relation = AssertionRelationCandidate(
+        source_span_start=content.index("tea"),
+        source_span_end=content.index("tea") + len("tea"),
+        from_assertion_id=candidate_id,
+        relation_type="confirms",
+        to_assertion_id="f" * 64,
+    )
+    transaction_started = threading.Event()
+    release_publication = threading.Event()
+    original_begin_write = assertions._begin_write
+
+    def paused_begin_write():
+        original_begin_write()
+        transaction_started.set()
+        assert release_publication.wait(timeout=5)
+
+    monkeypatch.setattr(assertions, "_begin_write", paused_begin_write)
+    engine = SimpleNamespace(
+        _store=messages,
+        _dag=SimpleNamespace(_conn=messages._conn),
+        _lifecycle=None,
+        _assertions=assertions,
+    )
+    publish_errors: list[BaseException] = []
+    flush_errors: list[BaseException] = []
+    flush_finished = threading.Event()
+
+    def publish():
+        try:
+            assertions.publish_source(
+                snapshot, [candidate], relations=[invalid_relation]
+            )
+        except BaseException as exc:  # noqa: BLE001 - thread result is asserted below
+            publish_errors.append(exc)
+
+    def flush():
+        try:
+            flush_engine_connections(engine)
+        except BaseException as exc:  # noqa: BLE001 - thread result is asserted below
+            flush_errors.append(exc)
+        finally:
+            flush_finished.set()
+
+    publish_thread = threading.Thread(target=publish)
+    publish_thread.start()
+    assert transaction_started.wait(timeout=5)
+    flush_thread = threading.Thread(target=flush)
+    flush_thread.start()
+    assert not flush_finished.wait(timeout=0.1)
+
+    release_publication.set()
+    publish_thread.join(timeout=5)
+    flush_thread.join(timeout=5)
+
+    assert not publish_thread.is_alive()
+    assert not flush_thread.is_alive()
+    assert len(publish_errors) == 1
+    assert isinstance(publish_errors[0], ValueError)
+    assert "missing or invalidated" in str(publish_errors[0])
+    assert flush_errors == []
+    assert assertions.connection.execute(
+        "SELECT COUNT(*) FROM lcm_assertion_sources"
+    ).fetchone()[0] == 0
+    assert assertions.connection.execute(
+        "SELECT COUNT(*) FROM lcm_assertions"
+    ).fetchone()[0] == 0
+    assert assertions.connection.execute(
+        "SELECT COUNT(*) FROM lcm_assertion_relations"
+    ).fetchone()[0] == 0

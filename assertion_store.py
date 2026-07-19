@@ -286,19 +286,22 @@ class AssertionStore:
         return self._conn
 
     def close(self) -> None:
-        conn = self._conn
-        if conn is None:
-            return
-        try:
-            if not self.read_only:
-                conn.commit()
-        finally:
-            conn.close()
-            self._conn = None  # type: ignore[assignment]
+        with self._write_lock:
+            conn = self._conn
+            if conn is None:
+                return
+            try:
+                if not self.read_only:
+                    conn.commit()
+            finally:
+                conn.close()
+                self._conn = None  # type: ignore[assignment]
 
     def commit(self) -> None:
-        if not self.read_only and self._conn is not None:
-            self._conn.commit()
+        """Flush completed assertion work without splitting an active publish."""
+        with self._write_lock:
+            if not self.read_only and self._conn is not None:
+                self._conn.commit()
 
     def _require_writable(self) -> None:
         if self.read_only:
