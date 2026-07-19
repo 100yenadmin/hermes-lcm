@@ -427,6 +427,10 @@ LCM_RETRIEVE = {
                 "type": "array",
                 "minItems": 1,
                 "maxItems": 12,
+                "description": (
+                    "Required only for action=start. Use this exact top-level key; "
+                    "each item names one evidence slot and its exact-reference cardinality."
+                ),
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
@@ -482,12 +486,49 @@ LCM_RETRIEVE = {
             "computation": {
                 "type": "object",
                 "additionalProperties": False,
+                "description": (
+                    "Optional only for action=finish. Every operand must copy the exact "
+                    "quote and either its assertion_id or its raw store_id/span offsets "
+                    "from evidence returned by this retrieval episode."
+                ),
                 "properties": {
                     "operands": {
                         "type": "array",
                         "minItems": 1,
                         "maxItems": 50,
-                        "items": {"type": "object"},
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "assertion_id": {"type": "string"},
+                                "store_id": {"type": "integer"},
+                                "span_start": {"type": "integer"},
+                                "span_end": {"type": "integer"},
+                                "quote": {"type": "string"},
+                                "value": {
+                                    "anyOf": [
+                                        {"type": "number"},
+                                        {"type": "string"},
+                                        {"type": "null"},
+                                    ],
+                                },
+                                "unit": {"type": "string"},
+                                "key": {"type": "string"},
+                                "label": {"type": "string"},
+                                "date": {"type": "string"},
+                            },
+                            "required": ["quote"],
+                            "anyOf": [
+                                {"required": ["assertion_id"]},
+                                {
+                                    "required": [
+                                        "store_id",
+                                        "span_start",
+                                        "span_end",
+                                    ]
+                                },
+                            ],
+                        },
                     },
                     "candidate_answer": {"type": "string"},
                 },
@@ -495,6 +536,7 @@ LCM_RETRIEVE = {
             },
         },
         "required": ["action"],
+        "additionalProperties": False,
     },
 }
 

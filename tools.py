@@ -2831,6 +2831,20 @@ def _lcm_grep_embed_query(
     return [float(value) for value in vector]
 
 
+def _lcm_embedding_query_metric(provider: Any) -> dict[str, Any]:
+    """Return non-secret provider accounting for one completed query embed."""
+    raw_tokens = getattr(provider, "last_usage_tokens", None)
+    try:
+        usage_tokens = max(0, int(raw_tokens)) if raw_tokens is not None else None
+    except (TypeError, ValueError, OverflowError):
+        usage_tokens = None
+    return {
+        "provider": str(getattr(provider, "provider_id", "") or "unknown"),
+        "model": str(getattr(provider, "model_id", "") or "unknown"),
+        "usage_tokens": usage_tokens,
+    }
+
+
 def _lcm_grep_resolve_provider(
     engine: "LCMEngine", *, deadline: float | None = None
 ) -> Any:
@@ -3804,6 +3818,7 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
     arm_hits: dict[str, list[dict[str, Any]]] = {}
     coverage: dict[str, str] = {}
     degraded_reasons: list[str] = []
+    embedding_query_metrics: list[dict[str, Any]] = []
     timed_out = False
     provider: Any = None
 
@@ -3855,6 +3870,9 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
                     query_vector = _lcm_grep_embed_query(
                         provider, query, remaining_s=deadline - time.monotonic()
                     )
+                    embedding_query_metrics.append(
+                        _lcm_embedding_query_metric(provider)
+                    )
             except VoyageError as exc:
                 provider = None
                 degraded_reasons.append(f"query embedding failed: {exc}")
@@ -3889,6 +3907,9 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
                             chunk_provider,
                             query,
                             remaining_s=deadline - time.monotonic(),
+                        )
+                        embedding_query_metrics.append(
+                            _lcm_embedding_query_metric(chunk_provider)
                         )
                 except VoyageError as exc:
                     degraded_reasons.append(f"chunk query embedding failed: {exc}")
@@ -4109,6 +4130,16 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
                 "rerank (when applied) only permutes the top window without "
                 "replacing that score"
             ),
+        },
+        "metrics": {
+            "embedding_query_calls": len(embedding_query_metrics),
+            "embedding_query_tokens": sum(
+                int(item["usage_tokens"] or 0) for item in embedding_query_metrics
+            ),
+            "embedding_query_tokens_complete": all(
+                item["usage_tokens"] is not None for item in embedding_query_metrics
+            ),
+            "embedding_queries": embedding_query_metrics,
         },
         "degraded": degraded,
     }

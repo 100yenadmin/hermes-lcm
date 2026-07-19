@@ -117,6 +117,25 @@ def _operand(evidence: dict, *, key: str):
     }
 
 
+def test_retrieve_schema_matches_strict_runtime_contract():
+    from hermes_lcm.schemas import LCM_RETRIEVE
+
+    parameters = LCM_RETRIEVE["parameters"]
+    assert parameters["additionalProperties"] is False
+    assert "requirements" in parameters["properties"]
+
+    operand = parameters["properties"]["computation"]["properties"]["operands"]["items"]
+    assert operand["additionalProperties"] is False
+    assert operand["required"] == ["quote"]
+    assert {"assertion_id", "store_id", "span_start", "span_end", "quote"} <= set(
+        operand["properties"]
+    )
+    assert {tuple(branch["required"]) for branch in operand["anyOf"]} == {
+        ("assertion_id",),
+        ("store_id", "span_start", "span_end"),
+    }
+
+
 def test_default_off_and_env_opt_in_are_provider_neutral(monkeypatch, tmp_path):
     monkeypatch.delenv("LCM_ADAPTIVE_RETRIEVAL_ENABLED", raising=False)
     assert LCMConfig().adaptive_retrieval_enabled is False

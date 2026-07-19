@@ -31,6 +31,7 @@ class MockProvider:
     def __init__(self, vector=(1.0, 0.0)):
         self.vector = list(vector)
         self.queries: list[str] = []
+        self.last_usage_tokens = 7
 
     def embed_query(self, text: str) -> list[float]:
         self.queries.append(text)
@@ -452,6 +453,25 @@ def test_recall_schema_exposes_answer_ready_as_opt_in():
     detail = LCM_RECALL["parameters"]["properties"]["detail"]
     assert detail["enum"] == ["snippets", "answer_ready"]
     assert detail["default"] == "snippets"
+
+
+def test_recall_reports_query_embedding_provider_and_usage(recall_engine, monkeypatch):
+    provider = MockProvider()
+    payload = _recall(
+        recall_engine,
+        monkeypatch,
+        provider=provider,
+        include="summaries",
+    )
+
+    assert payload["metrics"] == {
+        "embedding_query_calls": 1,
+        "embedding_query_tokens": 7,
+        "embedding_query_tokens_complete": True,
+        "embedding_queries": [
+            {"provider": "mock", "model": "mock-model", "usage_tokens": 7}
+        ],
+    }
 
 
 def test_answer_ready_applies_stable_post_rank_session_diversity(
