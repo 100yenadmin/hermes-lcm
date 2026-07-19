@@ -195,6 +195,73 @@ LCM_RECALL = {
     },
 }
 
+LCM_QUERY_STATE = {
+    "name": "lcm_query_state",
+    "description": (
+        "Query the opt-in V4 assertion sidecar for bounded, typed, source-cited state. "
+        "Use this when a question needs attributable current or historical facts, preferences, "
+        "recommendations, commitments, actions, or status. Every returned assertion includes an "
+        "exact message store_id, character span, and quote. Conflicting state is preserved rather "
+        "than resolved by recency. Returns status=disabled when assertions are not enabled."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "subject_key": {
+                "type": "string",
+                "description": (
+                    "Required canonical assertion subject, for example user:self, "
+                    "assistant:self, person:alex, or project:apollo."
+                ),
+            },
+            "predicate_key": {
+                "type": "string",
+                "description": "Optional canonical lowercase dotted predicate filter.",
+            },
+            "kinds": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "enum": [
+                        "fact",
+                        "event",
+                        "preference",
+                        "recommendation",
+                        "commitment",
+                        "action",
+                        "status",
+                        "quotation",
+                    ],
+                },
+                "maxItems": 8,
+                "description": "Optional assertion-kind filter.",
+            },
+            "scope_key": {
+                "type": "string",
+                "description": "Optional exact canonical scope filter; empty means unscoped.",
+            },
+            "speaker_role": {
+                "type": "string",
+                "enum": ["system", "user", "assistant", "tool", "unknown"],
+                "description": "Optional exact source-message role filter.",
+            },
+            "as_of": {
+                "anyOf": [{"type": "number"}, {"type": "string"}],
+                "description": (
+                    "Optional historical knowledge/validity boundary as Unix seconds or a "
+                    "timezone-aware ISO 8601 timestamp."
+                ),
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Maximum assertion rows (default 25, hard upper bound 50).",
+                "default": 25,
+            },
+        },
+        "required": ["subject_key"],
+    },
+}
+
 LCM_RECENT = {
     "name": "lcm_recent",
     "description": (

@@ -8,6 +8,7 @@ from pathlib import Path
 EXPECTED_LCM_TOOLS = {
     "lcm_grep",
     "lcm_recall",
+    "lcm_query_state",
     "lcm_recent",
     "lcm_load_session",
     "lcm_describe",

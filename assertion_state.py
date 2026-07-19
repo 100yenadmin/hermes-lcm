@@ -16,6 +16,9 @@ _INACTIVE_RELATION_STATUS = {
     "supersedes": "superseded",
 }
 
+_RECOMMENDATION_ACCEPT_RELATIONS = frozenset({"confirms"})
+_RECOMMENDATION_DECLINE_RELATIONS = frozenset({"cancels", "contradicts", "reverses"})
+
 
 @dataclass(frozen=True)
 class AssertionStateResult:
@@ -42,6 +45,44 @@ def _object_identity(row: dict[str, Any]) -> str:
         separators=(",", ":"),
         allow_nan=False,
     )
+
+
+def _attribution(row: dict[str, Any]) -> str:
+    speaker = str(row.get("speaker_role") or "")
+    subject = str(row.get("subject_key") or "")
+    if speaker in {"user", "assistant"} and subject == f"{speaker}:self":
+        return "first_person"
+    addressee = {"user": "assistant:self", "assistant": "user:self"}.get(speaker)
+    if addressee and subject == addressee:
+        return "addressee"
+    return "third_party"
+
+
+def _semantic_state(
+    row: dict[str, Any],
+    lifecycle_status: set[str],
+    recommendation_dispositions: set[str],
+) -> str:
+    kind = str(row.get("kind") or "")
+    if kind == "recommendation":
+        if len(recommendation_dispositions) > 1:
+            return "conflicting_disposition"
+        if recommendation_dispositions:
+            return next(iter(recommendation_dispositions))
+        if lifecycle_status:
+            return sorted(lifecycle_status)[0]
+        return "unanswered"
+    if kind == "commitment":
+        if "fulfilled" in lifecycle_status:
+            return "fulfilled"
+        if "cancelled" in lifecycle_status:
+            return "cancelled"
+        if lifecycle_status:
+            return sorted(lifecycle_status)[0]
+        return "pending"
+    if lifecycle_status:
+        return sorted(lifecycle_status)[0]
+    return "current"
 
 
 def query_assertion_state(
@@ -77,23 +118,32 @@ def query_assertion_state(
     )
     relations_truncated = len(raw_relations) == 500
     id_set = set(ids)
-    relations = [
-        relation
-        for relation in raw_relations
-        if relation["from_assertion_id"] in id_set
-        and relation["to_assertion_id"] in id_set
-    ]
+    # ``query_relations(assertion_ids=...)`` already guarantees at least one
+    # endpoint is selected. Keep the other endpoint visible so a kind-filtered
+    # recommendation or commitment still carries its explicit disposition.
+    relations = raw_relations
 
     lifecycle: dict[str, set[str]] = {assertion_id: set() for assertion_id in ids}
+    rows_by_id = {str(row["assertion_id"]): row for row in rows}
+    recommendation_dispositions: dict[str, set[str]] = {
+        assertion_id: set()
+        for assertion_id, row in rows_by_id.items()
+        if str(row.get("kind") or "") == "recommendation"
+    }
     explicit_conflicts: set[str] = set()
     for relation in relations:
         relation_type = str(relation["relation_type"])
         from_id = str(relation["from_assertion_id"])
         to_id = str(relation["to_assertion_id"])
-        if relation_type in _INACTIVE_RELATION_STATUS:
+        if relation_type in _INACTIVE_RELATION_STATUS and to_id in lifecycle:
             lifecycle[to_id].add(_INACTIVE_RELATION_STATUS[relation_type])
         if relation_type == "contradicts":
-            explicit_conflicts.update((from_id, to_id))
+            explicit_conflicts.update({from_id, to_id} & id_set)
+        if to_id in recommendation_dispositions:
+            if relation_type in _RECOMMENDATION_ACCEPT_RELATIONS:
+                recommendation_dispositions[to_id].add("accepted")
+            if relation_type in _RECOMMENDATION_DECLINE_RELATIONS:
+                recommendation_dispositions[to_id].add("declined")
 
     active_ids = {
         assertion_id
@@ -125,6 +175,12 @@ def query_assertion_state(
         item["active"] = assertion_id in active_ids
         item["lifecycle_status"] = tuple(sorted(lifecycle[assertion_id]))
         item["unresolved_conflict"] = assertion_id in unresolved_conflicts
+        item["attribution"] = _attribution(item)
+        item["semantic_state"] = _semantic_state(
+            item,
+            lifecycle[assertion_id],
+            recommendation_dispositions.get(assertion_id, set()),
+        )
         annotated.append(item)
     return AssertionStateResult(
         subject_key=normalized_subject,

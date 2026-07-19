@@ -209,7 +209,7 @@ def build_structured_assertion_prompt(
         "source_span_end": "integer, exclusive Python character offset",
         "source_quote": "exact source substring at those offsets",
         "subject_key": "canonical namespace:value identity",
-        "subject_resolution": "self or explicit",
+        "subject_resolution": "self, addressee, or explicit",
         "predicate_key": "canonical lowercase dotted predicate",
         "object_value": "finite JSON value",
         "value_text": "concise source-grounded text",
@@ -238,9 +238,12 @@ def build_structured_assertion_prompt(
         "Return one JSON object only, matching OUTPUT_SKELETON and the strict rules.",
         "Every assertion/relation must cite exact Python character offsets and the exact source_quote.",
         "Use canonical lowercase namespace:value subject keys and lowercase dotted predicates.",
-        "Use subject_resolution self only for role:self; use explicit only for an unambiguous named subject.",
+        "Use subject_resolution self only for role:self; use addressee only for a direct user<->assistant you; use explicit only for an unambiguous named subject.",
         "Use null for unknown event_at, valid_from, or valid_to; never substitute observed_at.",
         "Create supersedes/reverses/cancels only for explicit update words and only against a matching prior assertion id.",
+        "For an assistant recommendation directed to the user, use subject user:self with subject_resolution addressee and kind recommendation.",
+        "Represent explicit user acceptance with confirms and explicit decline with contradicts; never infer either from silence.",
+        "Use fulfills only when an explicit action/event/status completes a same-subject, same-predicate commitment.",
         "Do not infer lifecycle relations from recency. Return empty lists when unsupported or ambiguous.",
         "Allowed kinds: fact, event, preference, recommendation, commitment, action, status, quotation.",
         "Allowed relation evidence value: explicit.",
@@ -441,6 +444,13 @@ def _assertion_candidate(
         expected = f"{snapshot.role}:self"
         if snapshot.role not in {"user", "assistant"} or subject != expected:
             raise ValueError(f"{label} self identity does not match the exact source role")
+    elif resolution == "addressee":
+        addressee = {"user": "assistant", "assistant": "user"}.get(snapshot.role)
+        expected = f"{addressee}:self" if addressee else ""
+        if not expected or subject != expected:
+            raise ValueError(
+                f"{label} addressee identity does not match the exact source role"
+            )
     elif resolution == "explicit":
         if subject.endswith(":self"):
             raise ValueError(f"{label} explicit identity cannot use a self key")
@@ -545,6 +555,8 @@ def parse_assertion_extraction(
             ),
             "subject_key": candidate.subject_key,
             "predicate_key": candidate.predicate_key,
+            "kind": candidate.kind,
+            "speaker_role": snapshot.role,
             "observed_at": snapshot.timestamp,
         }
         for candidate in assertions
@@ -575,8 +587,30 @@ def parse_assertion_extraction(
             raise ValueError(f"{label} cannot transfer state across identities")
         if relation_type == "fulfills" and (
             from_row["subject_key"] != to_row["subject_key"]
+            or from_row["predicate_key"] != to_row["predicate_key"]
         ):
-            raise ValueError(f"{label} cannot fulfill another subject's commitment")
+            raise ValueError(
+                f"{label} cannot fulfill another subject or predicate's commitment"
+            )
+        if relation_type == "fulfills" and (
+            to_row.get("kind") != "commitment"
+            or from_row.get("kind") not in {"action", "event", "status"}
+        ):
+            raise ValueError(
+                f"{label} fulfills requires action/event/status evidence targeting a commitment"
+            )
+        if relation_type in {"confirms", "contradicts"} and (
+            to_row.get("kind") == "recommendation"
+        ):
+            if (
+                to_row.get("speaker_role") != "assistant"
+                or from_row.get("speaker_role") != "user"
+                or from_row.get("kind")
+                not in {"action", "commitment", "preference", "status"}
+            ):
+                raise ValueError(
+                    f"{label} recommendation disposition requires explicit user state targeting an assistant recommendation"
+                )
         if relation_type in _STATE_CHANGING_RELATIONS and (
             float(from_row["observed_at"]) < float(to_row["observed_at"])
         ):

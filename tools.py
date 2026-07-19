@@ -45,6 +45,8 @@ from .ingest_protection import (
     sensitive_pattern_status,
 )
 from .model_routing import apply_lcm_model_route
+from .assertion_state import query_assertion_state
+from .assertion_store import ASSERTION_KINDS
 from .presets import preset_status_payload
 from .rollup_periods import (
     CoverageNode,
@@ -264,6 +266,9 @@ _LCM_RECALL_LIMIT_CAP = 25
 _LCM_RECALL_DEFAULT_SCOPE_BIAS = 0.5
 _LCM_RECALL_SNIPPET_CHARS = 300
 _LCM_RECALL_RESPONSE_CHAR_CAP = 64_000
+_LCM_QUERY_STATE_DEFAULT_LIMIT = 25
+_LCM_QUERY_STATE_LIMIT_CAP = 50
+_LCM_QUERY_STATE_RESPONSE_CHAR_CAP = 64_000
 _LCM_RECALL_VALID_INCLUDE = frozenset({"all", "summaries", "verbatim"})
 _LCM_RECALL_VALID_DETAIL = frozenset({"snippets", "answer_ready"})
 _LCM_RECALL_ANSWER_READY_PER_SESSION_LIMIT = 5
@@ -286,6 +291,177 @@ _LCM_INSPECT_REF_SCAN_MESSAGE_LIMIT = 10_000
 _LCM_INSPECT_PAYLOAD_METADATA_READ_BYTES = 16_384
 _LCM_INSPECT_MAX_RESPONSE_CHARS = 20_000
 _OPERATOR_TEXT_FIELD_MAX_CHARS = 1_000
+
+
+def _shape_assertion_state_row(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "assertion_id": row["assertion_id"],
+        "subject_key": row["subject_key"],
+        "predicate_key": row["predicate_key"],
+        "object_value": row["object_value"],
+        "value_text": row["value_text"],
+        "kind": row["kind"],
+        "polarity": row["polarity"],
+        "strength": row["strength"],
+        "scope_key": row["scope_key"],
+        "speaker_role": row["speaker_role"],
+        "observed_at": row["observed_at"],
+        "event_at": row["event_at"],
+        "valid_from": row["valid_from"],
+        "valid_to": row["valid_to"],
+        "confidence": row["confidence"],
+        "active": row["active"],
+        "lifecycle_status": list(row["lifecycle_status"]),
+        "unresolved_conflict": row["unresolved_conflict"],
+        "attribution": row["attribution"],
+        "semantic_state": row["semantic_state"],
+        "source_ref": {
+            "store_id": row["source_store_id"],
+            "session_id": row["source_session_id"],
+            "source": row["source_name"],
+            "role": row["source_role"],
+            "span_start": row["source_span_start"],
+            "span_end": row["source_span_end"],
+            "quote": row["source_quote"],
+            "content_sha256": row["source_content_sha256"],
+        },
+    }
+
+
+def _shape_assertion_state_relation(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "relation_id": row["relation_id"],
+        "relation_type": row["relation_type"],
+        "from_assertion_id": row["from_assertion_id"],
+        "to_assertion_id": row["to_assertion_id"],
+        "confidence": row["confidence"],
+        "source_ref": {
+            "store_id": row["source_store_id"],
+            "session_id": row["source_session_id"],
+            "span_start": row["source_span_start"],
+            "span_end": row["source_span_end"],
+            "quote": row["source_quote"],
+            "content_sha256": row["source_content_sha256"],
+        },
+    }
+
+
+def lcm_query_state(args: Dict[str, Any], **kwargs) -> str:
+    """Return bounded typed assertion state with exact source provenance."""
+    engine = _require_engine(kwargs)
+    if engine is None:
+        return json.dumps({"error": "LCM engine not initialized"})
+    store = getattr(engine, "_assertions", None)
+    if store is None:
+        return json.dumps({
+            "status": "disabled",
+            "error": "V4 assertions are not enabled for this profile",
+        })
+
+    subject_key = str(args.get("subject_key") or "").strip()
+    if not subject_key:
+        return json.dumps({"error": "subject_key is required"})
+    predicate_key = str(args.get("predicate_key") or "").strip() or None
+    scope_key = None
+    if "scope_key" in args:
+        scope_key = str(args.get("scope_key") or "").strip()
+
+    raw_kinds = args.get("kinds")
+    kinds: list[str] | None = None
+    if raw_kinds is not None:
+        if not isinstance(raw_kinds, list) or not raw_kinds:
+            return json.dumps({"error": "kinds must be a non-empty array"})
+        kinds = [str(value or "").strip().lower() for value in raw_kinds]
+        if len(kinds) > len(ASSERTION_KINDS) or any(
+            value not in ASSERTION_KINDS for value in kinds
+        ):
+            return json.dumps({"error": "kinds contains an unsupported assertion kind"})
+
+    speaker_role, role_error = _parse_grep_role(args.get("speaker_role"))
+    if role_error:
+        return json.dumps({"error": role_error.replace("role", "speaker_role", 1)})
+    as_of, as_of_error = _parse_optional_timestamp(args.get("as_of"), "as_of")
+    if as_of_error:
+        return json.dumps({"error": as_of_error})
+    parsed_limit, limit_error = _parse_strict_int(
+        args.get("limit", _LCM_QUERY_STATE_DEFAULT_LIMIT),
+        "limit",
+    )
+    if limit_error:
+        return json.dumps({"error": limit_error})
+    if parsed_limit is None or parsed_limit <= 0:
+        return json.dumps({"error": "limit must be a positive integer"})
+    requested_limit = parsed_limit
+    limit = min(requested_limit, _LCM_QUERY_STATE_LIMIT_CAP)
+
+    try:
+        result = query_assertion_state(
+            store,
+            subject_key=subject_key,
+            predicate_key=predicate_key,
+            kinds=kinds,
+            scope_key=scope_key,
+            speaker_role=speaker_role,
+            as_of=as_of,
+            limit=limit,
+        )
+    except (TypeError, ValueError, sqlite3.Error) as exc:
+        return json.dumps({"error": f"state query failed: {exc}"})
+
+    assertions = [_shape_assertion_state_row(row) for row in result.assertions]
+    relations = [_shape_assertion_state_relation(row) for row in result.relations]
+    response: dict[str, Any] = {
+        "status": "ok",
+        "query": {
+            "subject_key": subject_key,
+            "predicate_key": predicate_key,
+            "kinds": kinds,
+            "scope_key": scope_key,
+            "speaker_role": speaker_role,
+            "as_of": as_of,
+        },
+        "limit": limit,
+        "assertions": assertions,
+        "relations": relations,
+        "active_assertion_ids": list(result.active_assertion_ids),
+        "conflict_assertion_ids": list(result.conflict_assertion_ids),
+        "assertions_truncated": result.assertions_truncated,
+        "relations_truncated": result.relations_truncated,
+        "response_truncated": False,
+        "response_char_cap": _LCM_QUERY_STATE_RESPONSE_CHAR_CAP,
+        "provenance": {
+            "store": "same_profile_lcm.db",
+            "evidence": "exact_source_spans",
+            "recency_resolution": "disabled",
+        },
+    }
+    if requested_limit > _LCM_QUERY_STATE_LIMIT_CAP:
+        response["limit_clamped_from"] = requested_limit
+
+    omitted = 0
+    while assertions:
+        encoded = json.dumps(response, ensure_ascii=False, separators=(",", ":"))
+        if len(encoded) <= _LCM_QUERY_STATE_RESPONSE_CHAR_CAP:
+            return encoded
+        assertions.pop()
+        omitted += 1
+        retained_ids = {row["assertion_id"] for row in assertions}
+        relations[:] = [
+            relation
+            for relation in relations
+            if relation["from_assertion_id"] in retained_ids
+            or relation["to_assertion_id"] in retained_ids
+        ]
+        response["active_assertion_ids"] = [
+            value for value in response["active_assertion_ids"] if value in retained_ids
+        ]
+        response["conflict_assertion_ids"] = [
+            value for value in response["conflict_assertion_ids"] if value in retained_ids
+        ]
+        response["response_truncated"] = True
+        response["assertions_truncated"] = True
+        response["assertions_omitted_by_response_cap"] = omitted
+    return json.dumps(response, ensure_ascii=False, separators=(",", ":"))
 
 
 def _bounded_operator_field(value: object) -> tuple[str, bool]:
