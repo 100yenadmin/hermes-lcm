@@ -314,7 +314,8 @@ class AssertionStore:
     def _source_row(self, store_id: int) -> sqlite3.Row | None:
         return self._conn.execute(
             """
-            SELECT store_id, session_id, source, role, content, timestamp
+            SELECT store_id, session_id, source, role, content, timestamp,
+                   observed_at
             FROM messages
             WHERE store_id = ?
             """,
@@ -330,7 +331,11 @@ class AssertionStore:
             source=str(row["source"] or ""),
             role=str(row["role"] or ""),
             content=content,
-            timestamp=float(row["timestamp"]),
+            timestamp=float(
+                row["observed_at"]
+                if row["observed_at"] is not None
+                else row["timestamp"]
+            ),
             content_sha256=_sha256_text(content),
         )
 
@@ -384,7 +389,8 @@ class AssertionStore:
         )
         rows = self._conn.execute(
             f"""
-            SELECT m.store_id, m.session_id, m.source, m.role, m.content, m.timestamp
+            SELECT m.store_id, m.session_id, m.source, m.role, m.content,
+                   m.timestamp, m.observed_at
             FROM messages AS m
             {join}
             WHERE s.source_store_id IS NULL

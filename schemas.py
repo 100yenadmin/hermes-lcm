@@ -400,6 +400,106 @@ LCM_COMPUTE = {
     },
 }
 
+LCM_EVIDENCE_PACK = {
+    "name": "lcm_evidence_pack",
+    "description": (
+        "Build a bounded, same-database evidence packet from baseline exact LCM refs. "
+        "It returns no prose answer: the tool normalizes the question-date anchor, "
+        "hydrates exact source spans, validates proposed facets, keeps occurrence time "
+        "distinct from observation time, deduplicates refs, and emits a canonical "
+        "lcm_compute trace only when product-verified grounding and cardinality close. "
+        "A quote may narrow a declared ref only when it occurs exactly once inside it; "
+        "open cardinality never closes from a caller assertion alone."
+    ),
+    "parameters": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "question": {"type": "string"},
+            "question_date": {
+                "type": "string",
+                "description": (
+                    "Optional calendar-date anchor. A local ISO timestamp is reduced "
+                    "to its validated date component."
+                ),
+            },
+            "baseline_refs": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 50,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "exact_ref": {"type": "string"},
+                        "store_id": {"type": "integer"},
+                        "span_start": {"type": "integer"},
+                        "span_end": {"type": "integer"},
+                        "quote": {"type": "string"},
+                        "value": {
+                            "anyOf": [
+                                {"type": "number"},
+                                {"type": "string"},
+                                {"type": "null"},
+                            ],
+                        },
+                        "unit": {"type": "string"},
+                        "key": {"type": "string"},
+                        "label": {"type": "string"},
+                    },
+                },
+            },
+            "budgets": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "max_refs": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 50,
+                        "default": 25,
+                    },
+                    "max_quote_chars": {
+                        "type": "integer",
+                        "minimum": 64,
+                        "maximum": 2400,
+                        "default": 2400,
+                    },
+                    "max_retrieval_calls": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 1,
+                        "default": 0,
+                        "description": (
+                            "Optional single product recall probe for novel exact refs. "
+                            "It never turns no-novel into open-world completeness."
+                        ),
+                    },
+                    "max_novel_refs": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 8,
+                        "default": 4,
+                    },
+                    "max_per_session": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 5,
+                        "default": 5,
+                    },
+                    "max_per_date": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 8,
+                        "default": 5,
+                    },
+                },
+            },
+        },
+        "required": ["question", "baseline_refs"],
+    },
+}
+
 LCM_RETRIEVE = {
     "name": "lcm_retrieve",
     "description": (

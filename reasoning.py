@@ -100,6 +100,7 @@ class EvidencePlan:
     exact_operands: int | None = None
     temporal_window: TemporalWindow | None = None
     question_anchor: date | None = None
+    interval_unit: Literal["day", "week", "month"] = "day"
     difference_direction: Literal[
         "absolute", "first_minus_second", "second_minus_first"
     ] | None = None
@@ -118,6 +119,7 @@ class EvidencePlan:
             "question_anchor": (
                 self.question_anchor.isoformat() if self.question_anchor else None
             ),
+            "interval_unit": self.interval_unit,
             "difference_direction": self.difference_direction,
             "order_direction": self.order_direction,
             "requires_complete_evidence": self.requires_complete_evidence,
@@ -266,9 +268,17 @@ def resolve_temporal_window(question: str, question_date: Any) -> TemporalWindow
     if anchor is None:
         return None
     normalized = question.casefold()
-    match = re.search(r"\b(\d+)\s+(day|week|month)s?\s+ago\b", normalized)
+    match = re.search(
+        r"\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+"
+        r"(day|week|month)s?\s+ago\b",
+        normalized,
+    )
     if match:
-        amount = int(match.group(1))
+        amount = (
+            int(match.group(1))
+            if match.group(1).isdigit()
+            else _WORD_NUMBERS[match.group(1)]
+        )
         unit = match.group(2)
         try:
             if unit == "day":
@@ -323,7 +333,7 @@ def _bounded_sum_count(question: str) -> int | None:
         r"\b(?:of\s+(?:the\s+)?|(?:the\s+)?)(one|two|three|four|five|six|"
         r"seven|eight|nine|ten|\d+)\s+(?:actual\s+)?(?:novels?|books?|items?|"
         r"events?|purchases?|trips?|sessions?|amounts?|values?|scores?|costs?|"
-        r"prices?|durations?|people|persons?)\b",
+        r"prices?|durations?|vacations?|holidays?|people|persons?)\b",
         question.casefold(),
     )
     if not match:
@@ -351,18 +361,26 @@ def compile_evidence_plan(question: str, question_date: Any = None) -> PlanDecis
     ] | None = None
     order: Literal["ascending", "descending"] | None = None
     requires_complete = False
+    interval_unit: Literal["day", "week", "month"] = "day"
     if re.search(
         r"\b(how long|time between|interval between|how many\s+(?:calendar\s+)?days?\s+between|since when)\b",
         normalized,
     ):
         operation, exact, minimum = "date_interval", 2, 2
-    elif re.search(r"\bhow many\s+(?:calendar\s+)?days?\s+ago\b", normalized):
+    elif (interval_match := re.search(
+        r"\bhow many\s+(?:calendar\s+)?(days?|weeks?|months?)\b.*\b(?:ago|since|between|passed)\b",
+        normalized,
+    )):
+        interval_unit = interval_match.group(1).rstrip("s")  # type: ignore[assignment]
         if question_anchor is None:
             return PlanDecision(
                 "fallback",
                 reason="question needs a valid question date for deterministic temporal planning",
             )
-        operation, exact, minimum = "date_interval", 1, 1
+        if re.search(r"\b(?:between|since)\b.*\b(?:when|and)\b", normalized):
+            operation, exact, minimum = "date_interval", 2, 2
+        else:
+            operation, exact, minimum = "date_interval", 1, 1
     elif re.search(
         r"\b(difference|how much (?:more|less)|how much .*\b(?:save|saved|short|"
         r"need|left|remain)|more than|less than)\b",
@@ -384,9 +402,17 @@ def compile_evidence_plan(question: str, question_date: Any = None) -> PlanDecis
         minimum = exact or 2
         requires_complete = exact is None
     elif re.search(r"\b(how many|count|number of)\b", normalized):
-        operation, minimum = "count_distinct", 1
-        requires_complete = True
-    elif re.search(r"\b(current|currently|now|latest|most recent|usually|these days)\b", normalized):
+        operation = "count_distinct"
+        exact = _bounded_sum_count(text)
+        minimum = exact or 1
+        requires_complete = exact is None
+    elif (
+        re.search(r"\b(current|currently|now|latest|most recent|usually|these days)\b", normalized)
+        and not re.search(
+            r"\b(chronolog(?:ical|ically|y)?|in order|order of|earliest|first|second|third)\b",
+            normalized,
+        )
+    ):
         operation, minimum = "latest_fact", 1
         requires_complete = True
     elif re.search(
@@ -395,10 +421,19 @@ def compile_evidence_plan(question: str, question_date: Any = None) -> PlanDecis
     ):
         operation, minimum = "order", 2
         requires_complete = True
+        exact = _bounded_sum_count(text)
+        if exact is not None:
+            minimum = exact
+            requires_complete = False
         order = "descending" if re.search(r"\b(reverse|latest first|newest first|descending)\b", normalized) else "ascending"
     elif temporal is not None:
-        operation, minimum = "date_filter", 1
-        requires_complete = True
+        operation = "date_filter"
+        exact = _bounded_sum_count(text)
+        minimum = exact or 1
+        # Grammar such as "what happened" or singular "who" never proves
+        # that a temporal window contains only one event/person. The filter is
+        # open unless the question itself declares a finite cardinality.
+        requires_complete = exact is None
 
     if operation is None:
         if _COMPUTATION_TRIGGER_RE.search(normalized):
@@ -417,6 +452,7 @@ def compile_evidence_plan(question: str, question_date: Any = None) -> PlanDecis
         exact_operands=exact,
         temporal_window=temporal,
         question_anchor=question_anchor,
+        interval_unit=interval_unit,
         difference_direction=direction,
         order_direction=order,
         requires_complete_evidence=requires_complete,
@@ -684,7 +720,11 @@ def _ground_one(
             return None, "occurrence_time must be an object"
         resolved = resolve_occurrence_time(
             quote,
-            observed_at=stored.get("timestamp"),
+            observed_at=(
+                stored.get("observed_at")
+                if stored.get("observed_at") is not None
+                else stored.get("timestamp")
+            ),
             session_date=raw_occurrence.get("session_date"),
         )
         supplied_source = str(raw_occurrence.get("event_time_source") or "")
@@ -708,6 +748,7 @@ def _ground_one(
         evidence_day = claimed_day
 
     if as_of is not None:
+        source_observation_grounded = False
         if assertion_row is not None:
             try:
                 assertion_observed_at = float(assertion_row.get("observed_at"))
@@ -715,6 +756,15 @@ def _ground_one(
                 return None, "assertion observation timestamp is invalid"
             if not math.isfinite(assertion_observed_at) or assertion_observed_at > as_of:
                 return None, "assertion was observed after the question-date boundary"
+            source_observation_grounded = True
+        elif stored.get("observed_at") is not None:
+            try:
+                stored_observed_at = float(stored.get("observed_at"))
+            except (TypeError, ValueError, OverflowError):
+                return None, "source observation timestamp is invalid"
+            if not math.isfinite(stored_observed_at) or stored_observed_at > as_of:
+                return None, "source was observed after the question-date boundary"
+            source_observation_grounded = True
         elif raw_occurrence is not None and raw_occurrence.get("session_date"):
             source_observed_day = _parse_day(str(raw_occurrence.get("session_date")))
             if source_observed_day is None:
@@ -724,19 +774,25 @@ def _ground_one(
             ).timestamp()
             if source_observed_epoch > as_of:
                 return None, "source was observed after the question-date boundary"
+            source_observation_grounded = True
+        if not source_observation_grounded:
+            source_observed_at = (
+                stored.get("observed_at")
+                if stored.get("observed_at") is not None
+                else stored.get("ingested_at", stored.get("timestamp"))
+            )
+            try:
+                observed_at = float(source_observed_at)
+            except (TypeError, ValueError, OverflowError):
+                return None, "source observation timestamp is invalid"
+            if not math.isfinite(observed_at) or observed_at > as_of:
+                return None, "source was observed after the question-date boundary"
         if evidence_day is not None:
             evidence_epoch = datetime.combine(
                 evidence_day, datetime.max.time(), tzinfo=timezone.utc
             ).timestamp()
             if evidence_epoch > as_of:
                 return None, "source occurrence was after the question-date boundary"
-        else:
-            try:
-                observed_at = float(stored.get("timestamp"))
-            except (TypeError, ValueError, OverflowError):
-                return None, "source observation timestamp is invalid"
-            if not math.isfinite(observed_at) or observed_at > as_of:
-                return None, "source was observed after the question-date boundary"
 
     return GroundedEvidence(
         citation=f"lcm:{store_id}:{span_start}-{span_end}",
@@ -1024,14 +1080,28 @@ def execute_plan(
                 f"Absolute interval from {selected[0].evidence_date.isoformat()} "
                 f"to {selected[1].evidence_date.isoformat()} is {days} days"  # type: ignore[union-attr]
             )
-        result = _format_quantity(float(days), "day")
+        if plan.interval_unit == "week":
+            result_value = days // 7
+        elif plan.interval_unit == "month":
+            if len(selected) == 1:
+                first_day, second_day = selected[0].evidence_date, plan.question_anchor
+            else:
+                first_day, second_day = selected[0].evidence_date, selected[1].evidence_date
+            assert first_day is not None and second_day is not None
+            earlier, later = sorted((first_day, second_day))
+            result_value = (later.year - earlier.year) * 12 + later.month - earlier.month
+            if later.day < earlier.day:
+                result_value -= 1
+        else:
+            result_value = days
+        result = _format_quantity(float(result_value), plan.interval_unit)
         return _trace(
             plan,
             selected,
             result=result,
-            result_value=days,
-            unit="day",
-            steps=[interval_step],
+            result_value=result_value,
+            unit=plan.interval_unit,
+            steps=[interval_step, f"Reported interval in {plan.interval_unit}s"],
         )
 
     if plan.operation == "date_filter":

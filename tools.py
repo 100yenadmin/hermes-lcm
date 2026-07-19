@@ -838,6 +838,20 @@ def lcm_compute(args: Dict[str, Any], **kwargs) -> str:
     return encoded
 
 
+def lcm_evidence_pack(args: Dict[str, Any], **kwargs) -> str:
+    """Build a bounded exact-evidence packet and optional canonical trace."""
+    engine = _require_engine(kwargs)
+    if engine is None:
+        return json.dumps({"error": "LCM engine not initialized"})
+    # Lazy import preserves the plugin's order-independent module bootstrap.
+    from .evidence_pack import build_evidence_pack
+    return build_evidence_pack(
+        args,
+        engine=engine,
+        retrieve=lambda recall_args: lcm_recall(recall_args, engine=engine),
+    )
+
+
 _LCM_RETRIEVE_RESPONSE_CHAR_CAP = 64_000
 _LCM_RETRIEVE_ARGUMENTS = frozenset({
     "action",
@@ -4152,11 +4166,35 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
                     item["exact_ref"] = exact_ref
             if include_occurrence_time and hit.get("kind") != "summary":
                 session_dates = getattr(engine, "_session_occurrence_dates", {}) or {}
-                item["occurrence_time"] = resolve_occurrence_time(
+                source_row = engine._store.get(int(hit.get("store_id") or 0))
+                source_row = source_row or {}
+                source_observed_at = source_row.get("observed_at")
+                session_date = session_dates.get(str(hit.get("session_id")))
+                if session_date is None and source_observed_at is not None:
+                    try:
+                        session_date = datetime.fromtimestamp(
+                            float(source_observed_at), tz=timezone.utc
+                        ).date().isoformat()
+                    except (TypeError, ValueError, OverflowError, OSError):
+                        session_date = None
+                occurrence = resolve_occurrence_time(
                     (hydrated or {}).get("content") or hit.get("snippet") or "",
-                    observed_at=hit.get("timestamp") or 0,
-                    session_date=session_dates.get(str(hit.get("session_id"))),
+                    observed_at=source_observed_at or 0,
+                    session_date=session_date,
                 )
+                occurrence["stored_at"] = source_row.get("ingested_at") or source_row.get("timestamp")
+                item["occurrence_time"] = occurrence
+                item["observation_time"] = {
+                    "observed_at": occurrence.get("observed_at") or None,
+                    "ingested_at": source_row.get("ingested_at") or source_row.get("timestamp"),
+                    "source": (
+                        "benchmark_session_date"
+                        if str(hit.get("session_id")) in session_dates
+                        else "host_message_timestamp"
+                        if source_observed_at is not None
+                        else "ingest_fallback"
+                    ),
+                }
         item_chars = len(json.dumps(item, ensure_ascii=False))
         if hits_out and response_chars + item_chars > _LCM_RECALL_RESPONSE_CHAR_CAP:
             response_cap_truncated = True

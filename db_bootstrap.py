@@ -238,6 +238,14 @@ _V5_CORE_TABLE_COLUMNS: dict[str, frozenset[str]] = {
     }),
 }
 
+# Marker-gated, backward-compatible source-time sidecars. They are optional in
+# the v5 core-shape classifier because a legitimate pre-V4.2 database will not
+# have them until MessageStore opens it. Their presence is recognised, but an
+# unrelated extra core column still fails closed as a genuinely newer shape.
+_V5_CORE_OPTIONAL_COLUMNS: dict[str, frozenset[str]] = {
+    "messages": frozenset({"ingested_at", "observed_at", "observed_at_source"}),
+}
+
 # Core FTS5 virtual tables: presence is enough — their column layout is owned by
 # the FTS5 module, not by this schema contract.
 _V5_CORE_PRESENCE_ONLY = ("messages_fts", "nodes_fts")
@@ -379,8 +387,8 @@ def classify_version_mismatch(conn: sqlite3.Connection) -> str:
         if table not in tables:
             return VERSION_MISMATCH_GENUINELY_NEWER
 
-    # Core tables must match the v5 column contract exactly — a missing or an
-    # unexpected column both mean this is not a v5-shaped DB.
+    # Core tables must contain every v5 column. Only explicitly recognised,
+    # backward-compatible sidecars may additionally be present.
     for table, expected in _V5_CORE_TABLE_COLUMNS.items():
         try:
             actual = {
@@ -389,7 +397,8 @@ def classify_version_mismatch(conn: sqlite3.Connection) -> str:
             }
         except sqlite3.DatabaseError:
             return VERSION_MISMATCH_GENUINELY_NEWER
-        if actual != set(expected):
+        optional = set(_V5_CORE_OPTIONAL_COLUMNS.get(table, ()))
+        if not set(expected).issubset(actual) or not actual.issubset(set(expected) | optional):
             return VERSION_MISMATCH_GENUINELY_NEWER
 
     # Any extra table must belong to a known feature family or be an FTS5 shadow.
@@ -1753,6 +1762,7 @@ _ASSERTION_TRIGGER_FRAGMENTS: dict[str, tuple[str, ...]] = {
     "lcm_assertion_source_insert_guard": (
         "before insert on lcm_assertion_sources",
         "from messages",
+        "coalesce(m.observed_at, m.timestamp) = new.source_timestamp",
         "raise(abort, 'assertion source row is missing or metadata changed')",
     ),
     "lcm_assertion_row_insert_guard": (
@@ -1785,6 +1795,10 @@ _ASSERTION_TRIGGER_FRAGMENTS: dict[str, tuple[str, ...]] = {
 
 def ensure_assertion_tables(conn: sqlite3.Connection) -> None:
     """Materialize the opt-in V4 assertion family in the existing ``lcm.db``."""
+    # This guard is owned by the rebuildable assertion family. Recreate it so
+    # databases opened after the optional source-time migration compare the
+    # derived observation time, with the legacy write timestamp as fallback.
+    conn.execute("DROP TRIGGER IF EXISTS lcm_assertion_source_insert_guard")
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS lcm_assertion_sources (
@@ -1882,7 +1896,7 @@ def ensure_assertion_tables(conn: sqlite3.Connection) -> None:
               AND m.session_id = NEW.source_session_id
               AND m.role = NEW.source_role
               AND m.source = NEW.source_name
-              AND m.timestamp = NEW.source_timestamp
+              AND COALESCE(m.observed_at, m.timestamp) = NEW.source_timestamp
         )
         BEGIN
             SELECT RAISE(ABORT, 'assertion source row is missing or metadata changed');

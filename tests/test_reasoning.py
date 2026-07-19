@@ -44,13 +44,10 @@ def evidence_db(tmp_path):
 
 
 def _message(messages, content: str, day: str) -> int:
-    store_id = messages.append("session-a", {"role": "user", "content": content})
-    messages._conn.execute(
-        "UPDATE messages SET timestamp = ? WHERE store_id = ?",
-        (_epoch(day), store_id),
+    return messages.append(
+        "session-a",
+        {"role": "user", "content": content, "timestamp": _epoch(day)},
     )
-    messages._conn.commit()
-    return store_id
 
 
 def _raw(store_id: int, content: str, quote: str, **extra):
@@ -83,6 +80,33 @@ def test_activation_uses_only_question_language_and_fails_closed():
     assert temporal.status == "planned"
     assert temporal.plan.operation == "date_filter"
     assert temporal.plan.temporal_window.start == date(2024, 3, 15)
+
+
+def test_planner_uses_explicit_cardinality_and_interval_units():
+    interval = compile_evidence_plan(
+        "How many weeks had passed since I recovered when I went jogging?",
+        "2024-03-20",
+    )
+    assert interval.status == "planned"
+    assert interval.plan.operation == "date_interval"
+    assert interval.plan.exact_operands == 2
+    assert interval.plan.interval_unit == "week"
+
+    ordered = compile_evidence_plan(
+        "What is the order of the three trips from earliest to latest?"
+    )
+    assert ordered.status == "planned"
+    assert ordered.plan.operation == "order"
+    assert ordered.plan.exact_operands == 3
+    assert ordered.plan.requires_complete_evidence is False
+
+    singular = compile_evidence_plan(
+        "What kitchen appliance did I buy 10 days ago?", "2023-03-25"
+    )
+    assert singular.status == "planned"
+    assert singular.plan.operation == "date_filter"
+    assert singular.plan.exact_operands is None
+    assert singular.plan.requires_complete_evidence is True
 
 
 @pytest.mark.parametrize(
@@ -135,7 +159,9 @@ def test_grounding_rejects_unproven_values_labels_keys_and_refs(evidence_db):
 def test_relative_occurrence_time_grounds_without_aliasing_late_observation(evidence_db):
     messages, assertions = evidence_db
     content = "I completed the plank challenge 5 days ago."
-    store_id = _message(messages, content, "2026-07-19")
+    # Legacy/benchmark rows have no trustworthy host observation time. The
+    # adapter sidecar may anchor relative text without relabelling ingest time.
+    store_id = messages.append("session-a", {"role": "user", "content": content})
     occurrence = {
         "observed_at": _epoch("2026-07-19"),
         "event_at": _epoch("2023-03-15"),
@@ -153,6 +179,29 @@ def test_relative_occurrence_time_grounds_without_aliasing_late_observation(evid
     )
     assert decision.status == "grounded", decision.reason
     assert decision.operands[0].evidence_date == date(2023, 3, 15)
+
+
+def test_session_sidecar_cannot_override_real_host_observation_after_as_of(evidence_db):
+    messages, assertions = evidence_db
+    content = "I completed the plank challenge 5 days ago."
+    store_id = _message(messages, content, "2026-07-19")
+    occurrence = {
+        "observed_at": _epoch("2023-03-20"),
+        "event_at": _epoch("2023-03-15"),
+        "event_date": "2023-03-15",
+        "event_time_source": "relative_to_session",
+        "session_date": "2023-03-20",
+        "precision": "day",
+        "policy_version": "occurrence-time-v1",
+    }
+    decision = ground_evidence(
+        [_raw(store_id, content, content, date="2023-03-15", occurrence_time=occurrence)],
+        messages=messages,
+        assertions=assertions,
+        as_of=question_date_as_of_epoch("2023-03-20"),
+    )
+    assert decision.status == "fallback"
+    assert "observed after the question-date boundary" in decision.reason
 
 
 def test_assertion_observation_time_is_not_silently_used_as_event_time(evidence_db):

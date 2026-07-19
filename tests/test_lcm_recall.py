@@ -8,6 +8,7 @@ degrade matrix (embeddings-off) still returns the FTS arm.
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
 import time
 from types import SimpleNamespace
@@ -533,6 +534,59 @@ def test_occurrence_time_is_opt_in_and_uses_source_session_date(
     assert occurrence["event_date"] == "2023-03-15"
     assert occurrence["event_time_source"] == "relative_to_session"
     assert occurrence["observed_at"] != occurrence["event_at"]
+
+
+def test_occurrence_time_uses_host_observation_without_benchmark_sidecar(
+    recall_engine, monkeypatch
+):
+    observed_at = datetime(2024, 3, 20, tzinfo=timezone.utc).timestamp()
+    recall_engine._store.append(
+        "session-a",
+        {
+            "role": "user",
+            "content": "I finished the kanban dashboard sprint 5 days ago.",
+            "timestamp": observed_at,
+        },
+    )
+    payload = _recall(
+        recall_engine,
+        monkeypatch,
+        include="verbatim",
+        detail="answer_ready",
+        limit=1,
+        seen_refs=[],
+        include_occurrence_time=True,
+    )
+    hit = payload["hits"][0]
+    assert hit["occurrence_time"]["event_date"] == "2024-03-15"
+    assert hit["observation_time"]["observed_at"] == observed_at
+    assert hit["observation_time"]["source"] == "host_message_timestamp"
+
+
+def test_occurrence_time_legacy_row_uses_ingest_fallback_without_relative_event(
+    recall_engine, monkeypatch
+):
+    recall_engine._store.append(
+        "session-a",
+        {
+            "role": "user",
+            "content": "I finished the kanban dashboard sprint 5 days ago.",
+        },
+    )
+    payload = _recall(
+        recall_engine,
+        monkeypatch,
+        include="verbatim",
+        detail="answer_ready",
+        limit=1,
+        seen_refs=[],
+        include_occurrence_time=True,
+    )
+    hit = payload["hits"][0]
+    assert hit["occurrence_time"]["event_time_source"] == "unknown"
+    assert hit["occurrence_time"]["event_date"] is None
+    assert hit["observation_time"]["observed_at"] is None
+    assert hit["observation_time"]["source"] == "ingest_fallback"
 
 
 def test_invalid_recall_detail_is_rejected(recall_engine):
