@@ -140,7 +140,9 @@ LCM_RECALL = {
         "expand a cross-session summary). Not for retrieving exact/verbatim text within a known time range — "
         "use lcm_grep(mode='full_text') for that. Not for full transcripts — after locating the right "
         "conversation, use lcm_load_session(session_id). Recency and current-conversation preference are soft "
-        "ranking boosts, not filters; for hard time bounds use lcm_grep time_from/time_to."
+        "ranking boosts, not filters; for hard time bounds use lcm_grep time_from/time_to. "
+        "Set detail='answer_ready' to apply bounded per-session diversity and hydrate exact "
+        "refs into answer-ready evidence windows without running another search."
     ),
     "parameters": {
         "type": "object",
@@ -175,6 +177,18 @@ LCM_RECALL = {
                     "excerpts only."
                 ),
                 "default": "all",
+            },
+            "detail": {
+                "type": "string",
+                "enum": ["snippets", "answer_ready"],
+                "description": (
+                    "Response detail. 'snippets' (default) preserves the existing compact "
+                    "hit response byte-for-byte. 'answer_ready' keeps at most five hits per "
+                    "session and hydrates the first eight selected exact refs into bounded "
+                    "windows of at most 2400 characters each; the complete response remains "
+                    "capped at 64000 characters."
+                ),
+                "default": "snippets",
             },
         },
         "required": ["query"],

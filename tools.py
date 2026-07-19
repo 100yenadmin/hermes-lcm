@@ -265,6 +265,10 @@ _LCM_RECALL_DEFAULT_SCOPE_BIAS = 0.5
 _LCM_RECALL_SNIPPET_CHARS = 300
 _LCM_RECALL_RESPONSE_CHAR_CAP = 64_000
 _LCM_RECALL_VALID_INCLUDE = frozenset({"all", "summaries", "verbatim"})
+_LCM_RECALL_VALID_DETAIL = frozenset({"snippets", "answer_ready"})
+_LCM_RECALL_ANSWER_READY_PER_SESSION_LIMIT = 5
+_LCM_RECALL_ANSWER_READY_EXPANDED_HIT_LIMIT = 8
+_LCM_RECALL_ANSWER_READY_CONTENT_CHARS = 2_400
 # Recency boost half-life (30 days) and its floor: a memory's rank_score is
 # multiplied by 2**(-age/half_life), clamped so age never zeroes an otherwise
 # strong hit — it only nudges toward newer memories.
@@ -2807,6 +2811,135 @@ def _lcm_recall_excerpt_expand_hint(hit: dict[str, Any]) -> str:
     return f"lcm_expand(store_id={hit.get('store_id')}, content_offset={offset})"
 
 
+def _lcm_recall_diverse_entries(
+    ordered: list[dict[str, Any]],
+    *,
+    limit: int,
+    per_session_limit: int,
+) -> tuple[list[dict[str, Any]], int]:
+    """Select a stable rank-preserving result set with bounded session density."""
+    selected: list[dict[str, Any]] = []
+    session_counts: dict[str, int] = {}
+    dropped = 0
+    for entry in ordered:
+        hit = entry["hit"]
+        raw_session_id = hit.get("session_id")
+        # Missing session identities must not collapse into one synthetic session.
+        # Exact refs remain independently eligible in their existing rank order.
+        session_key = (
+            str(raw_session_id)
+            if raw_session_id not in {None, ""}
+            else f"missing:{_hit_identity(hit)!r}"
+        )
+        if session_counts.get(session_key, 0) >= per_session_limit:
+            dropped += 1
+            continue
+        session_counts[session_key] = session_counts.get(session_key, 0) + 1
+        selected.append(entry)
+        if len(selected) >= limit:
+            break
+    return selected, dropped
+
+
+def _lcm_recall_content_window(
+    content: Any,
+    *,
+    match_start: int,
+    match_end: int,
+    char_cap: int,
+) -> dict[str, Any]:
+    """Return a bounded window centered on the selected evidence span."""
+    text = str(content or "")
+    content_chars = len(text)
+    start = min(max(0, int(match_start)), content_chars)
+    end = min(max(start, int(match_end)), content_chars)
+    if content_chars <= char_cap:
+        offset = 0
+    else:
+        midpoint = (start + end) // 2
+        offset = min(max(0, midpoint - char_cap // 2), content_chars - char_cap)
+    bounded = text[offset:offset + char_cap]
+    return {
+        "content": bounded,
+        "content_chars": content_chars,
+        "content_offset": offset,
+        "content_returned_chars": len(bounded),
+        "content_truncated": len(bounded) < content_chars,
+        "evidence_span": {"char_start": start, "char_end": end},
+    }
+
+
+def _lcm_recall_answer_ready_content(
+    engine: "LCMEngine",
+    entries: list[dict[str, Any]],
+    *,
+    query: str,
+) -> dict[tuple, dict[str, Any]]:
+    """Hydrate selected exact refs with bounded reads and no retrieval search."""
+    selected = entries[:_LCM_RECALL_ANSWER_READY_EXPANDED_HIT_LIMIT]
+    store_ids = [
+        int(entry["hit"]["store_id"])
+        for entry in selected
+        if entry["hit"].get("kind") == "message_excerpt"
+        and entry["hit"].get("store_id") is not None
+    ]
+    stored_by_id = engine._store.get_batch(store_ids)
+    hydrated: dict[tuple, dict[str, Any]] = {}
+
+    for entry in selected:
+        hit = entry["hit"]
+        identity = _hit_identity(hit)
+        if hit.get("kind") == "summary":
+            raw_node_id = hit.get("node_id")
+            if raw_node_id is None:
+                continue
+            node = engine._dag.get_node(int(raw_node_id))
+            if node is None:
+                continue
+            content = node.summary or ""
+            window = _lcm_recall_content_window(
+                content,
+                match_start=0,
+                match_end=min(len(content), _LCM_RECALL_SNIPPET_CHARS),
+                char_cap=_LCM_RECALL_ANSWER_READY_CONTENT_CHARS,
+            )
+            hydrated[identity] = {
+                **window,
+                "content_source": "summary",
+            }
+            continue
+
+        raw_store_id = hit.get("store_id")
+        if raw_store_id is None:
+            continue
+        stored = stored_by_id.get(int(raw_store_id))
+        if stored is None:
+            continue
+        content = str(stored.get("content") or "")
+        span = hit.get("chunk_span") or {}
+        try:
+            match_start = int(span["char_start"])
+            match_end = int(span["char_end"])
+        except (KeyError, TypeError, ValueError):
+            match_start = _content_offset_for_query_match(content, query)
+            match_end = match_start + min(
+                max(1, len(query)), _LCM_RECALL_SNIPPET_CHARS
+            )
+        window = _lcm_recall_content_window(
+            content,
+            match_start=match_start,
+            match_end=match_end,
+            char_cap=_LCM_RECALL_ANSWER_READY_CONTENT_CHARS,
+        )
+        hydrated[identity] = {
+            **window,
+            "content_source": "message",
+            "role": stored.get("role"),
+            "source": stored.get("source") or "",
+        }
+    return hydrated
+
+
 def _lcm_recall_bounded_reason(
     arm: str, scanned: int | None, total: int | None
 ) -> str:
@@ -3084,6 +3217,10 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
     if include not in _LCM_RECALL_VALID_INCLUDE:
         return json.dumps({"error": "include must be one of: all, summaries, verbatim"})
 
+    detail = str(args.get("detail") or "snippets").strip().lower()
+    if detail not in _LCM_RECALL_VALID_DETAIL:
+        return json.dumps({"error": "detail must be one of: snippets, answer_ready"})
+
     # lcm_recall fans out three arms + fusion/hydration/rerank, so it uses its own
     # (larger) budget rather than lcm_grep's single-arm query deadline (sprint-opt-2).
     timeout_s = max(0.001, float(getattr(engine._config, "recall_query_timeout_s", 8.0)))
@@ -3333,10 +3470,28 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
         provider, query, ordered, window=rerank_window, deadline=deadline, config=engine._config
     )
 
-    # -- Response shaping (char-capped) --
+    # -- Response shaping (char-capped). The default snippets path retains the
+    # historical order and serialized response exactly. answer_ready applies
+    # stable post-rank diversity before bounded exact-ref hydration.
+    if detail == "answer_ready":
+        selected_entries, diversity_dropped = _lcm_recall_diverse_entries(
+            ordered,
+            limit=limit,
+            per_session_limit=_LCM_RECALL_ANSWER_READY_PER_SESSION_LIMIT,
+        )
+        answer_ready_content = _lcm_recall_answer_ready_content(
+            engine,
+            selected_entries,
+            query=query,
+        )
+    else:
+        selected_entries = ordered
+        diversity_dropped = 0
+        answer_ready_content = {}
     hits_out: list[dict[str, Any]] = []
     response_chars = 0
-    for entry in ordered:
+    response_cap_truncated = False
+    for entry in selected_entries:
         hit = entry["hit"]
         arms = sorted({arm_order[index] for index in entry["ranks"].keys()})
         item: dict[str, Any] = {
@@ -3355,8 +3510,17 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
             item["store_id"] = hit.get("store_id")
             if hit.get("chunk_span"):
                 item["chunk_span"] = hit["chunk_span"]
+        if detail == "answer_ready":
+            item["role"] = hit.get("role")
+            item["source"] = hit.get("source") or (
+                "summary" if hit.get("kind") == "summary" else ""
+            )
+            hydrated = answer_ready_content.get(_hit_identity(hit))
+            if hydrated is not None:
+                item.update(hydrated)
         item_chars = len(json.dumps(item, ensure_ascii=False))
         if hits_out and response_chars + item_chars > _LCM_RECALL_RESPONSE_CHAR_CAP:
+            response_cap_truncated = True
             break
         response_chars += item_chars
         hits_out.append(item)
@@ -3391,6 +3555,41 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
         response["timeout"] = True
     if requested_limit > _LCM_RECALL_LIMIT_CAP:
         response["limit_clamped_from"] = requested_limit
+    if detail == "answer_ready":
+        expansion = {
+            "expanded_hit_count": sum("content" in hit for hit in hits_out),
+            "expanded_hit_limit": _LCM_RECALL_ANSWER_READY_EXPANDED_HIT_LIMIT,
+            "per_session_limit": _LCM_RECALL_ANSWER_READY_PER_SESSION_LIMIT,
+            "diversity_dropped_count": diversity_dropped,
+            "per_hit_char_cap": _LCM_RECALL_ANSWER_READY_CONTENT_CHARS,
+            "snippet_char_cap": _LCM_RECALL_SNIPPET_CHARS,
+            "response_char_cap": _LCM_RECALL_RESPONSE_CHAR_CAP,
+            "response_policy": (
+                "rank-preserving session diversity, then exact-ref hydration; "
+                "whole hits only when enforcing the response cap"
+            ),
+            "hydration_policy": "bounded exact reads only; no additional retrieval search",
+            "response_truncated": response_cap_truncated,
+        }
+        response["detail"] = detail
+        response["provenance"]["detail"] = detail
+        response["provenance"]["answer_ready"] = expansion
+
+        encoded = json.dumps(response, ensure_ascii=False)
+        if len(encoded) > _LCM_RECALL_RESPONSE_CHAR_CAP:
+            original_query = response["query"]
+            response["query"] = original_query[:4_096]
+            expansion["query_truncated"] = len(response["query"]) < len(original_query)
+            encoded = json.dumps(response, ensure_ascii=False)
+        while len(encoded) > _LCM_RECALL_RESPONSE_CHAR_CAP and response["hits"]:
+            response["hits"].pop()
+            response["total_results"] = len(response["hits"])
+            expansion["response_truncated"] = True
+            expansion["expanded_hit_count"] = sum(
+                "content" in hit for hit in response["hits"]
+            )
+            encoded = json.dumps(response, ensure_ascii=False)
+        return encoded
     return json.dumps(response)
 
 
