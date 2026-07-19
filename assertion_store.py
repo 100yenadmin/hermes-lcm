@@ -340,6 +340,24 @@ class AssertionStore:
             raise KeyError(f"message store_id {store_id} does not exist")
         return self._snapshot_from_row(row)
 
+    def has_current_receipt(
+        self,
+        snapshot: SourceSnapshot,
+        *,
+        extraction_version: str = CURRENT_EXTRACTION_VERSION,
+    ) -> bool:
+        """Return whether this exact source hash already has an active receipt."""
+        version = _validated_version(extraction_version)
+        return self._conn.execute(
+            """
+            SELECT 1
+            FROM lcm_assertion_sources
+            WHERE source_store_id = ? AND extraction_version = ?
+              AND source_content_sha256 = ? AND invalidated_at IS NULL
+            """,
+            (snapshot.store_id, version, snapshot.content_sha256),
+        ).fetchone() is not None
+
     def plan_rebuild(
         self,
         *,

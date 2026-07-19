@@ -333,6 +333,20 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("extraction_model", "LCM_EXTRACTION_MODEL", str),
     _EnvFieldSpec("extraction_output_path", "LCM_EXTRACTION_OUTPUT_PATH", str),
     _EnvFieldSpec("assertions_enabled", "LCM_ASSERTIONS_ENABLED", bool),
+    _EnvFieldSpec(
+        "assertion_extraction_enabled", "LCM_ASSERTION_EXTRACTION_ENABLED", bool
+    ),
+    _EnvFieldSpec("assertion_extraction_model", "LCM_ASSERTION_EXTRACTION_MODEL", str),
+    _EnvFieldSpec(
+        "assertion_extraction_max_sources_per_pass",
+        "LCM_ASSERTION_EXTRACTION_MAX_SOURCES_PER_PASS",
+        int,
+    ),
+    _EnvFieldSpec(
+        "assertion_extraction_timeout_seconds",
+        "LCM_ASSERTION_EXTRACTION_TIMEOUT_SECONDS",
+        float,
+    ),
     _EnvFieldSpec("sensitive_patterns_enabled", "LCM_SENSITIVE_PATTERNS_ENABLED", bool),
     _EnvFieldSpec("large_output_externalization_enabled", "LCM_LARGE_OUTPUT_EXTERNALIZATION_ENABLED", bool),
     _EnvFieldSpec("large_output_externalization_threshold_chars", "LCM_LARGE_OUTPUT_EXTERNALIZATION_THRESHOLD_CHARS", int),
@@ -500,6 +514,15 @@ class LCMConfig:
     # Materializes the rebuildable assertion tables in the same profile lcm.db.
     # This does not enable extraction or backfill; it only binds schema/read APIs.
     assertions_enabled: bool = False
+    # Enables the separate structured exact-row extractor. Default off: merely
+    # enabling the assertion store never performs a model/provider call.
+    assertion_extraction_enabled: bool = False
+    # Empty falls back to extraction_model, then summary_model.
+    assertion_extraction_model: str = ""
+    # Per pre-compaction batch. Runtime clamps to [1, 8].
+    assertion_extraction_max_sources_per_pass: int = 4
+    # Per exact source provider call. Runtime clamps to [0.1, 120] seconds.
+    assertion_extraction_timeout_seconds: float = 30.0
 
     # -- Sensitive-pattern handling ---
     # Disabled by default. When enabled, named patterns redact matching secrets
