@@ -1,0 +1,395 @@
+"""Strict, provider-neutral wire contract for exact-row assertion extraction.
+
+This module validates already-produced structured data. It does not call a
+model or provider. Unknown time stays ``None``; exact source spans and hashes
+must match the immutable ``SourceSnapshot``; entity ambiguity and implicit
+recency-based supersession fail closed.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from datetime import date, datetime, time as datetime_time, timezone
+import json
+import math
+import re
+from typing import Any
+
+from .assertion_rebuild import AssertionExtraction
+from .assertion_store import (
+    ASSERTION_RELATION_TYPES,
+    CURRENT_EXTRACTION_VERSION,
+    AssertionCandidate,
+    AssertionRelationCandidate,
+    AssertionStore,
+    SourceSnapshot,
+)
+
+
+ASSERTION_EXTRACTION_SCHEMA_VERSION = 1
+_MAX_PAYLOAD_CHARS = 65_536
+_MAX_EXTRACTED_ASSERTIONS = 100
+_MAX_EXTRACTED_RELATIONS = 100
+_SUBJECT_NAMESPACES = frozenset({
+    "account",
+    "assistant",
+    "conversation",
+    "document",
+    "event",
+    "object",
+    "organization",
+    "person",
+    "place",
+    "project",
+    "user",
+})
+_PREDICATE_RE = re.compile(r"^[a-z][a-z0-9_.-]{0,127}$")
+_IDENTITY_RELATIONS = frozenset({
+    "cancels",
+    "confirms",
+    "contradicts",
+    "narrows",
+    "reverses",
+    "supersedes",
+    "weakens",
+})
+_STATE_CHANGING_RELATIONS = frozenset({
+    "cancels",
+    "reverses",
+    "supersedes",
+})
+
+_PAYLOAD_KEYS = frozenset({
+    "schema_version",
+    "source_store_id",
+    "source_content_sha256",
+    "assertions",
+    "relations",
+})
+_ASSERTION_KEYS = frozenset({
+    "source_span_start",
+    "source_span_end",
+    "source_quote",
+    "subject_key",
+    "subject_resolution",
+    "predicate_key",
+    "object_value",
+    "value_text",
+    "kind",
+    "polarity",
+    "strength",
+    "scope_key",
+    "event_at",
+    "valid_from",
+    "valid_to",
+    "confidence",
+})
+_ASSERTION_REQUIRED_KEYS = _ASSERTION_KEYS - {"strength", "scope_key"}
+_RELATION_KEYS = frozenset({
+    "source_span_start",
+    "source_span_end",
+    "source_quote",
+    "from_index",
+    "from_assertion_id",
+    "relation_type",
+    "to_index",
+    "to_assertion_id",
+    "evidence",
+    "confidence",
+})
+_RELATION_REQUIRED_KEYS = frozenset({
+    "source_span_start",
+    "source_span_end",
+    "source_quote",
+    "relation_type",
+    "evidence",
+    "confidence",
+})
+
+
+def decode_assertion_payload(payload: str | Mapping[str, Any]) -> dict[str, Any]:
+    """Decode one bounded JSON object, accepting an optional outer code fence."""
+
+    if isinstance(payload, Mapping):
+        return dict(payload)
+    if not isinstance(payload, str):
+        raise TypeError("assertion extraction payload must be a JSON object or string")
+    if len(payload) > _MAX_PAYLOAD_CHARS:
+        raise ValueError(
+            f"assertion extraction payload exceeds {_MAX_PAYLOAD_CHARS} characters"
+        )
+    text = payload.strip()
+    if text.startswith("```") and text.endswith("```"):
+        lines = text.splitlines()
+        if len(lines) < 3:
+            raise ValueError("assertion extraction code fence is empty")
+        text = "\n".join(lines[1:-1]).strip()
+    try:
+        decoded = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError("assertion extraction payload is not valid JSON") from exc
+    if not isinstance(decoded, dict):
+        raise ValueError("assertion extraction payload must decode to an object")
+    return decoded
+
+
+def _strict_object(
+    value: Any,
+    *,
+    allowed: frozenset[str],
+    required: frozenset[str],
+    label: str,
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{label} must be an object")
+    output = dict(value)
+    unknown = sorted(set(output) - allowed)
+    missing = sorted(required - set(output))
+    if unknown:
+        raise ValueError(f"{label} contains unsupported fields: {', '.join(unknown)}")
+    if missing:
+        raise ValueError(f"{label} is missing required fields: {', '.join(missing)}")
+    return output
+
+
+def _exact_span(
+    snapshot: SourceSnapshot, row: Mapping[str, Any], *, label: str
+) -> tuple[int, int]:
+    start = row.get("source_span_start")
+    end = row.get("source_span_end")
+    if isinstance(start, bool) or isinstance(end, bool):
+        raise ValueError(f"{label} source span must use integer character offsets")
+    try:
+        start = int(start)
+        end = int(end)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} source span must use integer character offsets") from exc
+    if start < 0 or end <= start or end > len(snapshot.content):
+        raise ValueError(f"{label} source span is outside the exact source row")
+    quote = row.get("source_quote")
+    if not isinstance(quote, str) or snapshot.content[start:end] != quote:
+        raise ValueError(f"{label} source quote does not match the exact source span")
+    return start, end
+
+
+def _canonical_subject(value: Any) -> str:
+    text = str(value or "")
+    if ":" not in text:
+        raise ValueError("subject_key must use a supported namespace:value identity")
+    namespace, identity = text.split(":", 1)
+    normalized = f"{namespace.strip().lower()}:{' '.join(identity.split()).lower()}"
+    if text != normalized or not identity.strip():
+        raise ValueError("subject_key must already be canonical lowercase namespace:value")
+    if namespace not in _SUBJECT_NAMESPACES:
+        raise ValueError(f"unsupported subject namespace: {namespace}")
+    return normalized
+
+
+def _canonical_predicate(value: Any) -> str:
+    text = str(value or "")
+    if not _PREDICATE_RE.fullmatch(text):
+        raise ValueError("predicate_key must be canonical lowercase dotted text")
+    return text
+
+
+def _canonical_scope(value: Any) -> str:
+    text = str(value or "")
+    normalized = " ".join(text.split()).lower()
+    if text != normalized:
+        raise ValueError("scope_key must already be canonical lowercase text")
+    return text
+
+
+def _timestamp(value: Any, field: str) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"{field} must be null, a finite epoch, or ISO-8601")
+    if isinstance(value, (int, float)):
+        result = float(value)
+        if not math.isfinite(result):
+            raise ValueError(f"{field} must be finite")
+        return result
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field} must be null, a finite epoch, or ISO-8601")
+    text = value.strip()
+    try:
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+            parsed = datetime.combine(
+                date.fromisoformat(text), datetime_time.min, tzinfo=timezone.utc
+            )
+        else:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                raise ValueError("timezone required")
+        return parsed.timestamp()
+    except ValueError as exc:
+        raise ValueError(f"{field} must be unambiguous ISO-8601") from exc
+
+
+def _assertion_candidate(
+    snapshot: SourceSnapshot, raw: Any, *, index: int
+) -> AssertionCandidate:
+    label = f"assertions[{index}]"
+    row = _strict_object(
+        raw,
+        allowed=_ASSERTION_KEYS,
+        required=_ASSERTION_REQUIRED_KEYS,
+        label=label,
+    )
+    start, end = _exact_span(snapshot, row, label=label)
+    subject = _canonical_subject(row["subject_key"])
+    resolution = str(row["subject_resolution"] or "").strip().lower()
+    if resolution == "self":
+        expected = f"{snapshot.role}:self"
+        if snapshot.role not in {"user", "assistant"} or subject != expected:
+            raise ValueError(f"{label} self identity does not match the exact source role")
+    elif resolution == "explicit":
+        if subject.endswith(":self"):
+            raise ValueError(f"{label} explicit identity cannot use a self key")
+    else:
+        raise ValueError(f"{label} subject identity is ambiguous or unsupported")
+    return AssertionCandidate(
+        source_span_start=start,
+        source_span_end=end,
+        subject_key=subject,
+        predicate_key=_canonical_predicate(row["predicate_key"]),
+        object_value=row["object_value"],
+        value_text=str(row["value_text"] or ""),
+        kind=str(row["kind"] or "").strip().lower(),
+        polarity=str(row["polarity"] or "").strip().lower(),
+        strength=row.get("strength"),
+        scope_key=_canonical_scope(row.get("scope_key", "")),
+        event_at=_timestamp(row["event_at"], f"{label}.event_at"),
+        valid_from=_timestamp(row["valid_from"], f"{label}.valid_from"),
+        valid_to=_timestamp(row["valid_to"], f"{label}.valid_to"),
+        confidence=row["confidence"],
+    )
+
+
+def _endpoint(
+    row: Mapping[str, Any],
+    prefix: str,
+    candidates: list[dict[str, Any]],
+    store: AssertionStore,
+) -> tuple[dict[str, Any], bool]:
+    index_key = f"{prefix}_index"
+    id_key = f"{prefix}_assertion_id"
+    has_index = index_key in row
+    has_id = id_key in row
+    if has_index == has_id:
+        raise ValueError(f"relation must provide exactly one of {index_key} or {id_key}")
+    if has_index:
+        value = row[index_key]
+        if isinstance(value, bool):
+            raise ValueError(f"{index_key} must be an assertion array index")
+        try:
+            index = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{index_key} must be an assertion array index") from exc
+        if index < 0 or index >= len(candidates):
+            raise ValueError(f"{index_key} is outside the assertion array")
+        return candidates[index], True
+
+    assertion_id = str(row[id_key] or "").strip().lower()
+    matches = store.query_assertions(assertion_id=assertion_id, limit=1)
+    if not matches:
+        raise ValueError(f"{id_key} is missing, invalidated, or from another version")
+    return matches[0], False
+
+
+def parse_assertion_extraction(
+    snapshot: SourceSnapshot,
+    payload: str | Mapping[str, Any],
+    *,
+    store: AssertionStore,
+) -> AssertionExtraction:
+    """Validate one strict payload against an exact persisted source snapshot."""
+
+    decoded = _strict_object(
+        decode_assertion_payload(payload),
+        allowed=_PAYLOAD_KEYS,
+        required=_PAYLOAD_KEYS,
+        label="payload",
+    )
+    if (
+        isinstance(decoded["schema_version"], bool)
+        or decoded["schema_version"] != ASSERTION_EXTRACTION_SCHEMA_VERSION
+    ):
+        raise ValueError("unsupported assertion extraction schema_version")
+    if (
+        isinstance(decoded["source_store_id"], bool)
+        or decoded["source_store_id"] != snapshot.store_id
+    ):
+        raise ValueError("payload source_store_id does not match the exact source")
+    if decoded["source_content_sha256"] != snapshot.content_sha256:
+        raise ValueError("payload source_content_sha256 does not match the exact source")
+    raw_assertions = decoded["assertions"]
+    raw_relations = decoded["relations"]
+    if not isinstance(raw_assertions, list) or len(raw_assertions) > _MAX_EXTRACTED_ASSERTIONS:
+        raise ValueError(
+            f"assertions must be a list with at most {_MAX_EXTRACTED_ASSERTIONS} items"
+        )
+    if not isinstance(raw_relations, list) or len(raw_relations) > _MAX_EXTRACTED_RELATIONS:
+        raise ValueError(
+            f"relations must be a list with at most {_MAX_EXTRACTED_RELATIONS} items"
+        )
+
+    assertions = [
+        _assertion_candidate(snapshot, raw, index=index)
+        for index, raw in enumerate(raw_assertions)
+    ]
+    candidate_rows = [
+        {
+            "assertion_id": store.assertion_id_for(
+                snapshot,
+                candidate,
+                extraction_version=CURRENT_EXTRACTION_VERSION,
+            ),
+            "subject_key": candidate.subject_key,
+            "predicate_key": candidate.predicate_key,
+            "observed_at": snapshot.timestamp,
+        }
+        for candidate in assertions
+    ]
+    relations: list[AssertionRelationCandidate] = []
+    for index, raw in enumerate(raw_relations):
+        label = f"relations[{index}]"
+        row = _strict_object(
+            raw,
+            allowed=_RELATION_KEYS,
+            required=_RELATION_REQUIRED_KEYS,
+            label=label,
+        )
+        start, end = _exact_span(snapshot, row, label=label)
+        relation_type = str(row["relation_type"] or "").strip().lower()
+        if relation_type not in ASSERTION_RELATION_TYPES:
+            raise ValueError(f"{label} contains an unsupported relation type")
+        if str(row["evidence"] or "").strip().lower() != "explicit":
+            raise ValueError(f"{label} relation evidence must be explicit")
+        from_row, from_current = _endpoint(row, "from", candidate_rows, store)
+        to_row, _to_current = _endpoint(row, "to", candidate_rows, store)
+        if relation_type != "quotes" and not from_current:
+            raise ValueError(f"{label} must originate from this exact source batch")
+        if relation_type in _IDENTITY_RELATIONS and (
+            from_row["subject_key"] != to_row["subject_key"]
+            or from_row["predicate_key"] != to_row["predicate_key"]
+        ):
+            raise ValueError(f"{label} cannot transfer state across identities")
+        if relation_type == "fulfills" and (
+            from_row["subject_key"] != to_row["subject_key"]
+        ):
+            raise ValueError(f"{label} cannot fulfill another subject's commitment")
+        if relation_type in _STATE_CHANGING_RELATIONS and (
+            float(from_row["observed_at"]) < float(to_row["observed_at"])
+        ):
+            raise ValueError(f"{label} state change cannot precede its target evidence")
+        relations.append(AssertionRelationCandidate(
+            source_span_start=start,
+            source_span_end=end,
+            from_assertion_id=str(from_row["assertion_id"]),
+            relation_type=relation_type,
+            to_assertion_id=str(to_row["assertion_id"]),
+            confidence=row["confidence"],
+        ))
+    return AssertionExtraction(tuple(assertions), tuple(relations))

@@ -763,6 +763,7 @@ class AssertionStore:
         scope_key: str | None = None,
         speaker_role: str | None = None,
         source_store_id: int | None = None,
+        assertion_id: str | None = None,
         as_of: float | None = None,
         include_invalidated: bool = False,
         limit: int = 100,
@@ -791,6 +792,12 @@ class AssertionStore:
         if source_store_id is not None:
             where.append("a.source_store_id = ?")
             args.append(int(source_store_id))
+        if assertion_id is not None:
+            normalized_assertion_id = str(assertion_id).strip().lower()
+            if not _is_sha256_hex(normalized_assertion_id):
+                raise ValueError("assertion_id must be a 64-character SHA-256 hex value")
+            where.append("a.assertion_id = ?")
+            args.append(normalized_assertion_id)
         if kinds is not None:
             normalized_kinds = [str(kind).strip().lower() for kind in kinds]
             if not normalized_kinds or any(kind not in ASSERTION_KINDS for kind in normalized_kinds):
@@ -850,7 +857,9 @@ class AssertionStore:
         *,
         extraction_version: str = CURRENT_EXTRACTION_VERSION,
         assertion_id: str | None = None,
+        assertion_ids: Iterable[str] | None = None,
         relation_types: Iterable[str] | None = None,
+        as_of: float | None = None,
         include_invalidated: bool = False,
         limit: int = 100,
     ) -> list[dict[str, Any]]:
@@ -870,8 +879,30 @@ class AssertionStore:
                 "to_message.store_id IS NOT NULL",
             ])
         if assertion_id is not None:
+            if assertion_ids is not None:
+                raise ValueError("use assertion_id or assertion_ids, not both")
+            normalized_assertion_id = str(assertion_id).strip().lower()
+            if not _is_sha256_hex(normalized_assertion_id):
+                raise ValueError("assertion_id must be a 64-character SHA-256 hex value")
             where.append("(r.from_assertion_id = ? OR r.to_assertion_id = ?)")
-            args.extend([str(assertion_id), str(assertion_id)])
+            args.extend([normalized_assertion_id, normalized_assertion_id])
+        if assertion_ids is not None:
+            normalized_ids = sorted({str(value).strip().lower() for value in assertion_ids})
+            if not normalized_ids or len(normalized_ids) > _MAX_BATCH_SOURCES:
+                raise ValueError(
+                    f"assertion_ids must contain between 1 and {_MAX_BATCH_SOURCES} values"
+                )
+            if any(not _is_sha256_hex(value) for value in normalized_ids):
+                raise ValueError(
+                    "assertion_ids must contain 64-character SHA-256 hex values"
+                )
+            placeholders, id_args = self._in_clause(normalized_ids)
+            where.append(
+                f"(r.from_assertion_id IN ({placeholders}) "
+                f"OR r.to_assertion_id IN ({placeholders}))"
+            )
+            args.extend(id_args)
+            args.extend(id_args)
         if relation_types is not None:
             normalized = [str(value).strip().lower() for value in relation_types]
             if not normalized or any(value not in ASSERTION_RELATION_TYPES for value in normalized):
@@ -879,10 +910,23 @@ class AssertionStore:
             placeholders, relation_args = self._in_clause(normalized)
             where.append(f"r.relation_type IN ({placeholders})")
             args.extend(relation_args)
+        if as_of is not None:
+            boundary = _finite_number(as_of, "as_of")
+            where.extend([
+                "s.source_timestamp <= ?",
+                "from_assertion.observed_at <= ?",
+                "to_assertion.observed_at <= ?",
+                "(from_assertion.valid_from IS NULL OR from_assertion.valid_from <= ?)",
+                "(from_assertion.valid_to IS NULL OR from_assertion.valid_to > ?)",
+                "(to_assertion.valid_from IS NULL OR to_assertion.valid_from <= ?)",
+                "(to_assertion.valid_to IS NULL OR to_assertion.valid_to > ?)",
+            ])
+            args.extend([boundary] * 7)
         args.append(bounded_limit)
         rows = self._conn.execute(
             f"""
-            SELECT r.*, s.source_session_id, s.invalidated_at, s.invalidation_reason,
+            SELECT r.*, s.source_session_id, s.source_timestamp,
+                   s.invalidated_at, s.invalidation_reason,
                    relation_message.content AS current_relation_source_content,
                    from_assertion.source_store_id AS from_source_store_id,
                    from_assertion.source_content_sha256 AS from_source_sha256,
