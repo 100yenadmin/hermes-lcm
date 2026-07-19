@@ -33,6 +33,9 @@ def flush_engine_connections(engine) -> None:
         # lock-taking API must serialize this flush with publish_source() so a
         # backup cannot commit a half-written receipt behind the publisher.
         assertion_store.commit()
+    query_views = getattr(engine, "_query_views", None)
+    if query_views is not None:
+        query_views.commit()
 
 
 def backup_database(engine) -> dict[str, Any]:

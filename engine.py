@@ -84,6 +84,7 @@ from .rollup_builder import (
 )
 from .assertion_extraction import ModelAssertionExtractor
 from .assertion_store import AssertionStore, SourceSnapshot
+from .query_view_store import QueryViewStore
 from .schemas import (
     LCM_DESCRIBE,
     LCM_DOCTOR,
@@ -468,6 +469,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     def _bind_storage(self, db_path: str | Path, hermes_home: str = "") -> None:
         """Bind store/DAG/lifecycle helpers to one SQLite database."""
         self._assertions = None
+        self._query_views = None
         self._assertion_extractor = None
         try:
             self._store = MessageStore(
@@ -486,6 +488,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 if bool(getattr(self._config, "assertions_enabled", False))
                 else None
             )
+            self._query_views = (
+                QueryViewStore(db_path)
+                if bool(getattr(self._config, "query_views_enabled", False))
+                else None
+            )
             if (
                 self._assertions is not None
                 and bool(getattr(self._config, "assertion_extraction_enabled", False))
@@ -501,7 +508,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     def _close_storage(self) -> None:
         """Best-effort close of currently bound SQLite helpers."""
-        for attr in ("_store", "_dag", "_lifecycle", "_assertions"):
+        for attr in ("_store", "_dag", "_lifecycle", "_assertions", "_query_views"):
             helper = getattr(self, attr, None)
             close = getattr(helper, "close", None)
             if callable(close):
@@ -6217,3 +6224,5 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._lifecycle.close()
         if self._assertions is not None:
             self._assertions.close()
+        if self._query_views is not None:
+            self._query_views.close()

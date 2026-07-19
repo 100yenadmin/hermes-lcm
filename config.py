@@ -333,6 +333,7 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("extraction_model", "LCM_EXTRACTION_MODEL", str),
     _EnvFieldSpec("extraction_output_path", "LCM_EXTRACTION_OUTPUT_PATH", str),
     _EnvFieldSpec("assertions_enabled", "LCM_ASSERTIONS_ENABLED", bool),
+    _EnvFieldSpec("query_views_enabled", "LCM_QUERY_VIEWS_ENABLED", bool),
     _EnvFieldSpec(
         "assertion_extraction_enabled", "LCM_ASSERTION_EXTRACTION_ENABLED", bool
     ),
@@ -514,6 +515,9 @@ class LCMConfig:
     # Materializes the rebuildable assertion tables in the same profile lcm.db.
     # This does not enable extraction or backfill; it only binds schema/read APIs.
     assertions_enabled: bool = False
+    # Materializes demand-shaped query evidence views in the same profile DB.
+    # Default off; enabling this store does not invoke a model or retrieval provider.
+    query_views_enabled: bool = False
     # Enables the separate structured exact-row extractor. Default off: merely
     # enabling the assertion store never performs a model/provider call.
     assertion_extraction_enabled: bool = False
