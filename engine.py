@@ -82,6 +82,7 @@ from .rollup_builder import (
     mark_stale_for_published_summary,
     run_rollup_maintenance,
 )
+from .assertion_store import AssertionStore
 from .schemas import (
     LCM_DESCRIBE,
     LCM_DOCTOR,
@@ -447,21 +448,31 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     def _bind_storage(self, db_path: str | Path, hermes_home: str = "") -> None:
         """Bind store/DAG/lifecycle helpers to one SQLite database."""
-        self._store = MessageStore(
-            db_path,
-            ingest_protection_config=self._config,
-            hermes_home=hermes_home,
-        )
-        self._dag = SummaryDAG(db_path)
-        if self._config.temporal_rollups_enabled:
-            # Install the transaction-coupled summary mutation triggers before
-            # this engine can publish or delete a DAG node.
-            initialize_rollup_invalidation_outbox(self._dag)
-        self._lifecycle = LifecycleStateStore(db_path)
+        self._assertions = None
+        try:
+            self._store = MessageStore(
+                db_path,
+                ingest_protection_config=self._config,
+                hermes_home=hermes_home,
+            )
+            self._dag = SummaryDAG(db_path)
+            if self._config.temporal_rollups_enabled:
+                # Install the transaction-coupled summary mutation triggers before
+                # this engine can publish or delete a DAG node.
+                initialize_rollup_invalidation_outbox(self._dag)
+            self._lifecycle = LifecycleStateStore(db_path)
+            self._assertions = (
+                AssertionStore(db_path)
+                if bool(getattr(self._config, "assertions_enabled", False))
+                else None
+            )
+        except Exception:
+            self._close_storage()
+            raise
 
     def _close_storage(self) -> None:
         """Best-effort close of currently bound SQLite helpers."""
-        for attr in ("_store", "_dag", "_lifecycle"):
+        for attr in ("_store", "_dag", "_lifecycle", "_assertions"):
             helper = getattr(self, attr, None)
             close = getattr(helper, "close", None)
             if callable(close):
@@ -5990,3 +6001,5 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._store.close()
         self._dag.close()
         self._lifecycle.close()
+        if self._assertions is not None:
+            self._assertions.close()

@@ -332,6 +332,7 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("extraction_enabled", "LCM_EXTRACTION_ENABLED", bool),
     _EnvFieldSpec("extraction_model", "LCM_EXTRACTION_MODEL", str),
     _EnvFieldSpec("extraction_output_path", "LCM_EXTRACTION_OUTPUT_PATH", str),
+    _EnvFieldSpec("assertions_enabled", "LCM_ASSERTIONS_ENABLED", bool),
     _EnvFieldSpec("sensitive_patterns_enabled", "LCM_SENSITIVE_PATTERNS_ENABLED", bool),
     _EnvFieldSpec("large_output_externalization_enabled", "LCM_LARGE_OUTPUT_EXTERNALIZATION_ENABLED", bool),
     _EnvFieldSpec("large_output_externalization_threshold_chars", "LCM_LARGE_OUTPUT_EXTERNALIZATION_THRESHOLD_CHARS", int),
@@ -494,6 +495,11 @@ class LCMConfig:
     extraction_model: str = ""
     # Directory for daily extraction files (empty = auto: ~/.hermes/lcm-extractions/)
     extraction_output_path: str = ""
+
+    # -- V4 assertion sidecar --
+    # Materializes the rebuildable assertion tables in the same profile lcm.db.
+    # This does not enable extraction or backfill; it only binds schema/read APIs.
+    assertions_enabled: bool = False
 
     # -- Sensitive-pattern handling ---
     # Disabled by default. When enabled, named patterns redact matching secrets

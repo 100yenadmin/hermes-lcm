@@ -27,6 +27,9 @@ def flush_engine_connections(engine) -> None:
     lifecycle_conn = getattr(getattr(engine, "_lifecycle", None), "_conn", None)
     if lifecycle_conn is not None:
         lifecycle_conn.commit()
+    assertion_conn = getattr(getattr(engine, "_assertions", None), "_conn", None)
+    if assertion_conn is not None:
+        assertion_conn.commit()
 
 
 def backup_database(engine) -> dict[str, Any]:
