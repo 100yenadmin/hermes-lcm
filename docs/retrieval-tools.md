@@ -61,8 +61,15 @@ snippet provenance. Each hit adds `score`/`cosine_score` and a
 
 The response-level `coverage` value comes directly from the vector store:
 `full` means the complete current profile was scanned, `bounded` means the
-dependency-free bounded-scan fallback was used, and `none` means no usable
-profile/vector coverage was available.
+dependency-free bounded-scan fallback was used, `full_approx` means the
+two-stage binary-prescreen path reached the whole corpus but its stage-1
+Hamming prescreen kept only the closest `LCM_KNN_PRESCREEN_MULTIPLIER × k`
+survivors before the exact rescore — so, unlike exact-scan `full`, its top-k is
+an approximate result — and `none` means no usable profile/vector coverage was
+available. See the operator guide's
+[vector storage scale options](operator-guide.md#vector-storage-scale-options-v3)
+for how `LCM_EMBEDDING_BINARY_PRESCREEN` and the other v3 storage knobs produce
+`full_approx` coverage.
 
 Semantic and hybrid requests run under one absolute wall-clock deadline from
 `embedding_query_timeout_s` (3 seconds by default), started at `lcm_grep` entry.
@@ -142,6 +149,14 @@ erroring the tool. `lcm_grep`'s hybrid RRF is unaffected: it keeps implicit
 `1.0` weights (byte-identical to the unweighted formula above). The weights
 actually applied to the arms that ran are echoed back under
 `provenance.arm_weights`.
+
+If the summary or chunk arm ran under `coverage='bounded'` (recency-truncated
+candidate scan) or `coverage='full_approx'` (two-stage binary-prescreen KNN,
+see [vector storage scale options](operator-guide.md#vector-storage-scale-options-v3)),
+`lcm_recall` surfaces that in its response `degraded_reason`, naming the arm and
+the caveat — the same disclosure mechanism as `lcm_grep`'s `degraded_reason` —
+so a caller never mistakes a truncated or approximate arm's contribution to the
+fused ranking for an exhaustive exact one.
 
 ### Deterministic recall smoke evaluation
 

@@ -37,11 +37,33 @@ from .sqlite_util import _is_sqlite_locked_error
 
 logger = logging.getLogger(__name__)
 
-# Vectors are float32 in native little-endian order today. These are recorded as
-# part of the canonical profile identity so a future dtype/byteorder change is
-# detectable rather than silently reinterpreting stored bytes.
+# Vectors are float32 in native little-endian order by default. These are
+# recorded as part of the canonical profile identity so a dtype/byteorder change
+# is detectable rather than silently reinterpreting stored bytes.
 _VECTOR_DTYPE = "float32"
 _VECTOR_BYTEORDER = "little"
+# Opt-in int8 storage dtype (SPEC C1): vectors are stored per-vector
+# symmetrically quantized — ``dim`` signed int8 values followed by a little-endian
+# float32 scale in the SAME ``vec`` BLOB (total ``dim + 4`` bytes) — and a
+# sign-bit prescreen is written to the companion binary table. dtype is part of
+# the profile identity hash, so int8 vectors never mix with float32 ones (a
+# float32 reader's ``len(blob) == dim*4`` guard also rejects an int8 blob).
+_INT8_DTYPE = "int8"
+_SUPPORTED_DTYPES = frozenset({_VECTOR_DTYPE, _INT8_DTYPE})
+# int8 symmetric quantization uses the full signed range except -128 (kept out so
+# the range is symmetric and dequantization has no bias toward negatives).
+_INT8_MAX = 127
+# Per-byte set-bit counts for the binary Hamming prescreen (built once; converted
+# to a NumPy lookup array at query time). Indexing a uint8 XOR result into this
+# table and summing rows is the popcount without a per-element Python loop.
+_POPCOUNT_TABLE = tuple(bin(value).count("1") for value in range(256))
+# Revision tag that folds the float32 sign-bit prescreen opt-in
+# (LCM_EMBEDDING_BINARY_PRESCREEN) into the profile identity. A prescreen corpus
+# grows a companion sign-bit table that drives the two-stage KNN, so it MUST be a
+# distinct identity from a legacy binary-free float32 corpus — otherwise flipping
+# the flag on a populated identity leaves a mixed corpus the two-stage INNER JOIN
+# silently truncates. See VectorStore._prescreen_revision / FIX 1.
+_BINARY_PRESCREEN_REVISION_TAG = "binprescreen"
 _DEFAULT_TASK = "summary"
 _CHUNK_TASK = "chunk"
 # Tasks this store can encode. Summary and chunk corpora coexist in the shared
@@ -64,7 +86,7 @@ class _UnverifiableProvenance(RuntimeError):
 def _require_supported_identity(identity: "EmbeddingIdentity") -> None:
     """Reject profile representations this implementation cannot encode."""
     unsupported = []
-    if identity.dtype != _VECTOR_DTYPE:
+    if identity.dtype not in _SUPPORTED_DTYPES:
         unsupported.append(f"dtype={identity.dtype!r}")
     if identity.byteorder != _VECTOR_BYTEORDER:
         unsupported.append(f"byteorder={identity.byteorder!r}")
@@ -74,7 +96,7 @@ def _require_supported_identity(identity: "EmbeddingIdentity") -> None:
         raise ValueError(
             "unsupported embedding representation: "
             + ", ".join(unsupported)
-            + "; supported representation is float32/little/summary|chunk"
+            + "; supported representation is float32|int8/little/summary|chunk"
         )
 
 
@@ -150,6 +172,53 @@ def _load_numpy():
     return numpy
 
 
+def _encode_int8_vector(normalized: Sequence[float]) -> bytes:
+    """Symmetrically quantize a normalized vector to int8 + a float32 scale.
+
+    Layout is ``dim`` signed bytes followed by a little-endian float32 scale, so
+    dequantization is ``value_i = q_i * scale``. The scale is the per-vector max
+    magnitude divided by 127; a degenerate all-zero vector (never produced by the
+    non-zero-magnitude normalizer, but handled defensively) uses scale 0.
+    """
+    dim = len(normalized)
+    amax = max((abs(float(value)) for value in normalized), default=0.0)
+    scale = amax / _INT8_MAX if amax > 0.0 else 0.0
+    if scale > 0.0:
+        quantized = [
+            max(-_INT8_MAX, min(_INT8_MAX, int(round(float(value) / scale))))
+            for value in normalized
+        ]
+    else:
+        quantized = [0] * dim
+    return struct.pack(f"<{dim}b", *quantized) + struct.pack("<f", scale)
+
+
+def _decode_int8_vector(blob: bytes, dim: int) -> tuple[float, ...] | None:
+    """Dequantize an int8 ``vec`` BLOB (``dim`` bytes + float32 scale) to floats."""
+    if len(blob) != dim + 4:
+        return None
+    try:
+        quantized = struct.unpack(f"<{dim}b", blob[:dim])
+        (scale,) = struct.unpack("<f", blob[dim:dim + 4])
+    except struct.error:
+        return None
+    return tuple(value * scale for value in quantized)
+
+
+def _pack_sign_bits(normalized: Sequence[float]) -> bytes:
+    """Pack the sign bits of a vector MSB-first, ``ceil(dim/8)`` bytes.
+
+    Bit ``i`` is 1 when ``value_i >= 0``. Matches ``numpy.packbits`` (MSB-first),
+    so the query side can XOR-and-popcount against these bytes for a Hamming
+    prescreen without re-deriving the bit order.
+    """
+    out = bytearray((len(normalized) + 7) // 8)
+    for index, value in enumerate(normalized):
+        if float(value) >= 0.0:
+            out[index >> 3] |= 0x80 >> (index & 7)
+    return bytes(out)
+
+
 class KNNResult(list[tuple[str, float, str]]):
     """Ranked KNN rows with result-level vector coverage metadata."""
 
@@ -223,6 +292,22 @@ class VectorStore:
             if bounded_scan_rows is None
             else int(bounded_scan_rows)
         )
+        # Stage-1 prescreen breadth for the two-stage (binary Hamming -> int8
+        # rescore) KNN: M = max(1, multiplier) x k survivors are rescored. Read
+        # once at construction so a pooled store honors the configured value.
+        self.knn_prescreen_multiplier = max(
+            1, int(getattr(resolved_config, "knn_prescreen_multiplier", 4) or 4)
+        )
+        # Opt-in: also write the sign-bit prescreen for float32 identities (not
+        # just int8). A float32-vec identity carrying the prescreen gets the
+        # full-corpus two-stage path with EXACT float rescore of survivors — the
+        # high-recall, low-RAM config. Default-off keeps stock float32 identities
+        # byte-identical AND binary-free (legacy bounded path). Operators pick a
+        # distinct identity (e.g. via revision) so prescreen rows never mix into a
+        # legacy float32 identity.
+        self._write_binary_prescreen = bool(
+            getattr(resolved_config, "embedding_binary_prescreen", False)
+        )
         self._conn: Optional[sqlite3.Connection] = None
         self._write_lock = threading.RLock()
         self._cache_lock = threading.RLock()
@@ -242,6 +327,13 @@ class VectorStore:
         # loaders differ (chunk vectors join messages, summary vectors join
         # summary_nodes), so the two corpora keep independent matrix caches.
         self._chunk_matrix_cache: "OrderedDict[tuple[str, int, tuple[str, ...]], tuple[list[int], list[str], list[str], Any]]" = OrderedDict()
+        # Full-corpus binary prescreen matrices for the two-stage path, keyed by
+        # (identity_hash, data_version). Only the UNFILTERED full corpus is cached
+        # (filtered loads vary per call); this lets a pooled store's back-to-back
+        # recalls skip re-loading the whole sign-bit corpus (the dominant
+        # two-stage cost) — the same amortization the float matrix cache gives.
+        self._binary_matrix_cache: "OrderedDict[tuple[str, int], tuple[list[str], Any]]" = OrderedDict()
+        self._chunk_binary_matrix_cache: "OrderedDict[tuple[str, int], tuple[list[str], Any]]" = OrderedDict()
         self._chunk_schema_ready = False
         self._init_db()
 
@@ -343,6 +435,8 @@ class VectorStore:
                 finally:
                     self._txn_depth = 0
                     self._matrix_cache.clear()
+                    self._binary_matrix_cache.clear()
+                    self._chunk_binary_matrix_cache.clear()
         except sqlite3.Error as exc:
             if _is_sqlite_locked_error(exc):
                 logger.warning("Embedding write blocked by SQLite lock contention")
@@ -519,6 +613,28 @@ class VectorStore:
             raise ValueError(f"embedding profile is not registered: {target}")
         return self._identity_from_profile(profile)
 
+    def _prescreen_revision(self, revision: str, *, dtype: str) -> str:
+        """Fold the float32 sign-bit prescreen opt-in into the identity via revision.
+
+        ``LCM_EMBEDDING_BINARY_PRESCREEN`` changes a float32 identity's stored
+        corpus shape (it grows a companion sign-bit table that drives the
+        two-stage KNN), so a prescreen corpus MUST be a distinct identity from a
+        legacy binary-free one. Otherwise flipping the flag on a populated
+        float32 identity leaves a mixed corpus (a few post-flip rows with
+        sign-bits, the rest without) that the two-stage INNER JOIN silently
+        truncates while reporting coverage='full' (FIX 1).
+
+        Only the default (empty) revision is auto-tagged: an operator who set an
+        explicit revision has already taken ownership of identity separation (the
+        documented manual escape hatch), so their value is respected verbatim.
+        int8 identities always carry the prescreen and are already distinguished
+        by dtype, so the tag is float32-only — int8 identity hashes stay stable.
+        """
+        base = str(revision).strip()
+        if base or str(dtype).strip().lower() == _INT8_DTYPE:
+            return base
+        return _BINARY_PRESCREEN_REVISION_TAG if self._write_binary_prescreen else base
+
     def register_profile(
         self,
         model_name: str,
@@ -540,6 +656,7 @@ class VectorStore:
         needs no re-backfill). Exactly one profile is left active. Returns the
         identity hash.
         """
+        revision = self._prescreen_revision(revision, dtype=dtype)
         canonical = EmbeddingIdentity.canonical(
             provider, model_name, revision, dim, dtype, byteorder, task
         )
@@ -853,6 +970,38 @@ class VectorStore:
             )
         return profile
 
+    def _encode_stored_vector(
+        self, vec: Sequence[float], profile: sqlite3.Row
+    ) -> tuple[list[float], bytes, bytes | None]:
+        """Normalize (and, for a Matryoshka profile, truncate) then encode a vector.
+
+        Returns ``(normalized, vec_blob, sign_bits)``. For a float32 profile the
+        blob is the existing little-endian float32 wire format; ``sign_bits`` is
+        None unless the store opts into a float32 prescreen
+        (``LCM_EMBEDDING_BINARY_PRESCREEN``), which yields float32-vec + binary =
+        the two-stage path with EXACT float rescore. For an int8 profile the blob
+        is the quantized ``dim`` bytes + float32 scale and ``sign_bits`` is always
+        the packed prescreen row. When the incoming vector is longer than the
+        profile dim (Matryoshka ``LCM_EMBEDDING_STORE_DIM``), it is truncated to
+        the leading ``dim`` components and renormalized before encoding.
+        """
+        dim = int(profile["dim"])
+        source = list(vec)
+        if len(source) > dim:
+            source = source[:dim]
+        normalized = VectorStore._normalized(source, expected_dim=dim)
+        if str(profile["dtype"]) == _INT8_DTYPE:
+            return (
+                normalized,
+                _encode_int8_vector(normalized),
+                _pack_sign_bits(normalized),
+            )
+        # Persist an explicit little-endian float32 wire format. Native
+        # ``array('f')`` bytes would be mislabeled on a big-endian host. The
+        # sign-bit prescreen is written only when explicitly opted in.
+        sign_bits = _pack_sign_bits(normalized) if self._write_binary_prescreen else None
+        return normalized, struct.pack(f"<{len(normalized)}f", *normalized), sign_bits
+
     def _write_embedding_row(
         self,
         embedded_id: str,
@@ -865,10 +1014,7 @@ class VectorStore:
         if kind != "summary":
             raise ValueError("embedded kind must be 'summary'")
         identity_hash = identity.identity_hash
-        normalized = self._normalized(vec, expected_dim=int(profile["dim"]))
-        # Persist an explicit little-endian float32 wire format. Native
-        # ``array('f')`` bytes would be mislabeled on a big-endian host.
-        packed = struct.pack(f"<{len(normalized)}f", *normalized)
+        normalized, packed, sign_bits = self._encode_stored_vector(vec, profile)
         numeric_id = self._as_node_id(embedded_id)
         summary = (
             self._conn.execute(
@@ -896,10 +1042,21 @@ class VectorStore:
             (embedded_id, kind, identity_hash),
         )
         self._conn.execute(
+            "DELETE FROM lcm_embedding_binary WHERE embedded_id = ? "
+            "AND identity_hash = ?",
+            (embedded_id, identity_hash),
+        )
+        self._conn.execute(
             "INSERT INTO lcm_embedding_vectors(embedded_id, identity_hash, vec) "
             "VALUES(?, ?, ?)",
             (embedded_id, identity_hash, packed),
         )
+        if sign_bits is not None:
+            self._conn.execute(
+                "INSERT INTO lcm_embedding_binary(embedded_id, identity_hash, bits) "
+                "VALUES(?, ?, ?)",
+                (embedded_id, identity_hash, sign_bits),
+            )
         self._conn.execute(
             """
             INSERT INTO lcm_embedding_meta(
@@ -991,6 +1148,14 @@ class VectorStore:
                 )
                 if self._conn.execute(
                     "SELECT 1 FROM sqlite_master WHERE type='table' "
+                    "AND name='lcm_embedding_binary'"
+                ).fetchone() is not None:
+                    self._conn.execute(
+                        f"DELETE FROM lcm_embedding_binary "
+                        f"WHERE embedded_id IN (SELECT id FROM {table})"
+                    )
+                if self._conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' "
                     "AND name='lcm_embedding_backfill_inflight'"
                 ).fetchone() is not None:
                     self._conn.execute(
@@ -1018,7 +1183,7 @@ class VectorStore:
             str(row[0])
             for row in conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name IN ("
-                "'lcm_embedding_vectors','lcm_embedding_meta',"
+                "'lcm_embedding_vectors','lcm_embedding_meta','lcm_embedding_binary',"
                 "'lcm_embedding_profile','lcm_embedding_backfill_inflight')"
             ).fetchall()
         }
@@ -1039,6 +1204,12 @@ class VectorStore:
             f"WHERE embedded_id IN ({placeholders})",
             unique_ids,
         )
+        if "lcm_embedding_binary" in tables:
+            conn.execute(
+                f"DELETE FROM lcm_embedding_binary "
+                f"WHERE embedded_id IN ({placeholders})",
+                unique_ids,
+            )
         if "lcm_embedding_backfill_inflight" in tables:
             conn.execute(
                 f"DELETE FROM lcm_embedding_backfill_inflight "
@@ -1100,6 +1271,7 @@ class VectorStore:
         identity_hash: str,
         dim: int,
         embedded_ids: Sequence[str],
+        dtype: str = _VECTOR_DTYPE,
     ) -> tuple[list[int], list[str], list[str], Any]:
         """Load only the SQL-bounded candidate set into a NumPy matrix."""
         with self._cache_lock:
@@ -1110,7 +1282,7 @@ class VectorStore:
                 self._matrix_cache.move_to_end(key)  # mark most-recently used
                 return cached
             rowids, loaded_ids, kinds, raw_vectors = self._load_vectors_for_ids(
-                identity_hash, dim, embedded_ids
+                identity_hash, dim, embedded_ids, dtype
             )
             matrix = (
                 numpy.asarray(raw_vectors, dtype=numpy.float32)
@@ -1207,11 +1379,30 @@ class VectorStore:
             ]
         return bounded_ids
 
+    @staticmethod
+    def _decode_stored_vec(blob: bytes, dim: int, dtype: str) -> tuple[float, ...] | None:
+        """Decode a stored ``vec`` BLOB to floats per the profile dtype.
+
+        float32 blobs are ``dim*4`` bytes; int8 blobs are ``dim`` bytes + a
+        float32 scale (dequantized here). A blob whose length does not match the
+        expected dtype layout is rejected (returns None) rather than
+        misinterpreted — the same defensive guard the float path always had.
+        """
+        if dtype == _INT8_DTYPE:
+            return _decode_int8_vector(blob, dim)
+        if len(blob) != dim * 4:
+            return None
+        try:
+            return struct.unpack(f"<{dim}f", blob)
+        except struct.error:
+            return None
+
     def _load_vectors_for_ids(
         self,
         identity_hash: str,
         dim: int,
         embedded_ids: Sequence[str],
+        dtype: str = _VECTOR_DTYPE,
     ) -> tuple[list[int], list[str], list[str], list[list[float]]]:
         """Load vectors (pure-Python) for a bounded, already-filtered id set.
 
@@ -1240,11 +1431,10 @@ class VectorStore:
             ).fetchall()
         for row in rows:
             try:
-                blob = bytes(row["vec"])
-                if len(blob) != dim * 4:
-                    continue
-                vector = struct.unpack(f"<{dim}f", blob)
-            except (TypeError, ValueError, struct.error):
+                vector = self._decode_stored_vec(bytes(row["vec"]), dim, dtype)
+            except (TypeError, ValueError):
+                continue
+            if vector is None:
                 continue
             rowids.append(int(row["rowid"]))
             out_ids.append(str(row["embedded_id"]))
@@ -1397,6 +1587,261 @@ class VectorStore:
             if str(embedded_id) in allowed
         ]
 
+    # -- Two-stage KNN (binary Hamming prescreen -> int8/float rescore) -----
+    #
+    # SPEC C1: when the active identity has a sign-bit prescreen column, KNN runs
+    # over the WHOLE corpus (coverage='full') within the deadline: stage 1 ranks
+    # every live vector by Hamming distance to the query's sign bits (packed 1
+    # bit/dim, ~20MB for 260k x 1024bit) and keeps M = mult x k survivors; stage 2
+    # rescores only those M by exact int8 cosine and returns top-k. Stage 1 is an
+    # APPROXIMATE prescreen — recall@M is the guarantee, not exact top-k — so M is
+    # deliberately several times k.
+
+    def _has_binary(self, identity_hash: str, *, chunk: bool) -> bool:
+        """Does the active identity carry a sign-bit prescreen (int8 identities)?"""
+        table = "lcm_chunk_binary" if chunk else "lcm_embedding_binary"
+        try:
+            row = self._conn.execute(
+                f"SELECT 1 FROM {table} WHERE identity_hash = ? LIMIT 1",
+                (str(identity_hash),),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            return False
+        return row is not None
+
+    def _binary_fully_synced(self, identity_hash: str, *, chunk: bool) -> bool:
+        """True iff EVERY stored vector for the identity has a sign-bit row.
+
+        Defense-in-depth for FIX 1: the two-stage path INNER JOINs the binary
+        table, so it is only correct when the binary corpus is a COMPLETE mirror
+        of the vector corpus. A partial binary corpus — e.g.
+        ``LCM_EMBEDDING_BINARY_PRESCREEN`` flipped on mid-life so sign-bits exist
+        only for rows written after the flip — would silently exclude every
+        pre-flip vector while reporting coverage='full'. When the counts disagree
+        (or no binary rows exist) this returns False so ``knn`` stays on the exact
+        scan with honest coverage. Both tables are written/deleted in lockstep for
+        a genuine prescreen identity (int8 or float32-with-prescreen), so a
+        fully-synced corpus reports equal counts.
+        """
+        binary_table = "lcm_chunk_binary" if chunk else "lcm_embedding_binary"
+        vector_table = "lcm_chunk_vectors" if chunk else "lcm_embedding_vectors"
+        try:
+            binary_count = self._conn.execute(
+                f"SELECT COUNT(*) FROM {binary_table} WHERE identity_hash = ?",
+                (str(identity_hash),),
+            ).fetchone()
+            vector_count = self._conn.execute(
+                f"SELECT COUNT(*) FROM {vector_table} WHERE identity_hash = ?",
+                (str(identity_hash),),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            return False
+        binary = int(binary_count[0]) if binary_count else 0
+        vectors = int(vector_count[0]) if vector_count else 0
+        return binary > 0 and binary == vectors
+
+    def _load_chunk_binary_matrix(
+        self,
+        numpy: Any,
+        identity_hash: str,
+        *,
+        since: float | None,
+        until: float | None,
+        conversation_ids: Sequence[str] | None,
+        source: str | None,
+    ) -> tuple[list[str], Any]:
+        """Load the FULL live sign-bit corpus for a chunk identity as a uint8 matrix.
+
+        The same message-column filters the bounded chunk path applies
+        (recency/session/source) run in the WHERE clause, but WITHOUT a LIMIT —
+        the whole point of the two-stage path is full-corpus reach. Returns the
+        parallel chunk-id list and an ``(N, nbytes)`` uint8 matrix.
+        """
+        where = ["cm.identity_hash = ?", "cm.archived = 0"]
+        args: list[object] = [str(identity_hash)]
+        if since is not None:
+            where.append("m.timestamp >= ?")
+            args.append(float(since))
+        if until is not None:
+            where.append("m.timestamp <= ?")
+            args.append(float(until))
+        if source is not None:
+            where.append("m.source = ?")
+            args.append(str(source))
+        with self._optional_temp_id_table(conversation_ids) as conversation_table:
+            conversation_join = (
+                f"JOIN {conversation_table} c ON c.id = m.session_id"
+                if conversation_table is not None
+                else ""
+            )
+            rows = self._conn.execute(
+                f"""
+                SELECT b.chunk_id, b.bits
+                FROM lcm_chunk_binary b
+                JOIN lcm_chunk_meta cm
+                  ON cm.chunk_id = b.chunk_id AND cm.identity_hash = b.identity_hash
+                JOIN messages m ON m.store_id = cm.store_id
+                {conversation_join}
+                WHERE {' AND '.join(where)}
+                """,
+                args,
+            ).fetchall()
+        return self._binary_rows_to_matrix(numpy, rows)
+
+    def _load_embedding_binary_matrix(
+        self,
+        numpy: Any,
+        identity_hash: str,
+        *,
+        since: float | None,
+        until: float | None,
+        conversation_ids: Sequence[str] | None,
+    ) -> tuple[list[str], Any]:
+        """Load the FULL live sign-bit corpus for a summary identity (no source).
+
+        since/until/conversation filters (plain ``summary_nodes`` columns) run in
+        the WHERE clause with no LIMIT. The ``source`` lineage filter is NOT
+        handled here — its recursive descendant walk is budget-bounded, so a
+        source-filtered summary query stays on the exact bounded path (the caller
+        gates on ``source is None`` before calling this).
+        """
+        columns = self._table_columns("summary_nodes")
+        recency_expr = (
+            "COALESCE(sn.latest_at, sn.created_at)"
+            if "latest_at" in columns
+            else "sn.created_at"
+        )
+        where = ["m.identity_hash = ?", "m.archived = 0"]
+        args: list[object] = [str(identity_hash)]
+        if "suppressed_at" in columns:
+            where.append("sn.suppressed_at IS NULL")
+        if since is not None:
+            where.append(f"{recency_expr} >= ?")
+            args.append(float(since))
+        if until is not None:
+            where.append(f"{recency_expr} <= ?")
+            args.append(float(until))
+        with self._optional_temp_id_table(conversation_ids) as conversation_table:
+            conversation_join = (
+                f"JOIN {conversation_table} c ON c.id = sn.session_id"
+                if conversation_table is not None
+                else ""
+            )
+            rows = self._conn.execute(
+                f"""
+                SELECT b.embedded_id, b.bits
+                FROM lcm_embedding_binary b
+                JOIN lcm_embedding_meta m
+                  ON m.embedded_id = b.embedded_id AND m.identity_hash = b.identity_hash
+                JOIN summary_nodes sn ON sn.node_id = CAST(b.embedded_id AS INTEGER)
+                {conversation_join}
+                WHERE {' AND '.join(where)}
+                """,
+                args,
+            ).fetchall()
+        return self._binary_rows_to_matrix(numpy, rows)
+
+    def _cached_binary_matrix(
+        self, cache: "OrderedDict[tuple[str, int], tuple[list[str], Any]]",
+        identity_hash: str, loader, *, cacheable: bool,
+    ) -> tuple[list[str], Any]:
+        """Load a full-corpus binary matrix, caching only the UNFILTERED case.
+
+        A filtered load (recency/session/source) varies per call, so it bypasses
+        the cache; the common unfiltered full-corpus recall reuses the loaded
+        sign-bit matrix across calls (keyed on data_version for cross-process
+        invalidation), which is what makes back-to-back two-stage recalls cheap.
+        """
+        if not cacheable:
+            return loader()
+        with self._cache_lock:
+            key = (identity_hash, self._data_version(identity_hash))
+            cached = cache.get(key)
+            if cached is not None:
+                cache.move_to_end(key)
+                return cached
+            loaded = loader()
+            cache[key] = loaded
+            while len(cache) > self._MATRIX_CACHE_MAX_ENTRIES:
+                cache.popitem(last=False)
+            return loaded
+
+    @staticmethod
+    def _binary_rows_to_matrix(numpy: Any, rows: Sequence[sqlite3.Row]) -> tuple[list[str], Any]:
+        ids: list[str] = []
+        raw: list[bytes] = []
+        nbytes = 0
+        for row in rows:
+            blob = bytes(row[1])
+            if not blob:
+                continue
+            if nbytes == 0:
+                nbytes = len(blob)
+            elif len(blob) != nbytes:
+                # A mixed-width row means a corrupt/foreign identity leaked in;
+                # skip it rather than mis-shape the matrix.
+                continue
+            ids.append(str(row[0]))
+            raw.append(blob)
+        if not raw:
+            return ids, numpy.empty((0, 0), dtype=numpy.uint8)
+        matrix = numpy.frombuffer(b"".join(raw), dtype=numpy.uint8).reshape(
+            len(raw), nbytes
+        )
+        return ids, matrix
+
+    def _two_stage_rank(
+        self,
+        numpy: Any,
+        identity_hash: str,
+        dim: int,
+        dtype: str,
+        query: Sequence[float],
+        k: int,
+        binary_ids: Sequence[str],
+        binary_matrix: Any,
+        *,
+        chunk: bool,
+    ) -> list[tuple[str, float, str]]:
+        """Stage-1 Hamming prescreen over ``binary_matrix`` then stage-2 rescore.
+
+        Stage 1 packs the query sign bits, XORs against every corpus row, popcounts
+        (byte lookup table), and keeps the M = mult x k lowest-Hamming survivors.
+        Stage 2 loads the survivors' int8 vectors, dequantizes, and ranks by exact
+        cosine (the query is unit-normalized, so the dot product is cosine).
+        """
+        n = binary_matrix.shape[0]
+        if n == 0:
+            return []
+        query_bits = numpy.packbits(
+            (numpy.asarray(query, dtype=numpy.float32) >= 0.0).astype(numpy.uint8)
+        )
+        # Guard against a query/corpus width mismatch (defensive; identities pin
+        # the dim so this should not happen).
+        width = min(binary_matrix.shape[1], int(query_bits.shape[0]))
+        popcount = numpy.asarray(_POPCOUNT_TABLE, dtype=numpy.uint16)
+        xor = numpy.bitwise_xor(binary_matrix[:, :width], query_bits[:width])
+        hamming = popcount[xor].sum(axis=1)
+        m = min(n, max(k, self.knn_prescreen_multiplier * k))
+        if m < n:
+            survivors = numpy.argpartition(hamming, m - 1)[:m]
+        else:
+            survivors = numpy.arange(n)
+        survivor_ids = [str(binary_ids[int(index)]) for index in survivors]
+        loader = (
+            self._load_chunk_vectors_for_ids
+            if chunk
+            else self._load_vectors_for_ids
+        )
+        rowids, out_ids, kinds, vectors = loader(
+            identity_hash, dim, survivor_ids, dtype
+        )
+        if not vectors:
+            return []
+        matrix = numpy.asarray(vectors, dtype=numpy.float32)
+        scores = matrix @ numpy.asarray(query, dtype=numpy.float32)
+        return self._ranked(rowids, out_ids, kinds, scores, k)
+
     def knn(
         self,
         query_vec: Sequence[float],
@@ -1432,11 +1877,41 @@ class VectorStore:
             return KNNResult(coverage="none")
         identity = str(profile["identity_hash"])
         dim = int(profile["dim"])
+        dtype = str(profile["dtype"])
         query = self._normalized(query_vec, expected_dim=dim)
         try:
             numpy = _load_numpy()
         except ImportError:
             numpy = None
+
+        # Two-stage full-corpus path when this identity's sign-bit prescreen is a
+        # COMPLETE mirror of its vectors. A partial binary corpus (FIX 1) stays on
+        # the exact scan below so no vector is silently INNER-JOINed away. The
+        # source filter stays on the exact bounded path (its lineage walk is
+        # budget-bounded and does not scale to a full-corpus scan).
+        if numpy is not None and source is None and self._binary_fully_synced(
+            identity, chunk=False
+        ):
+            unfiltered = since is None and until is None and conversation_ids is None
+            binary_ids, binary_matrix = self._cached_binary_matrix(
+                self._binary_matrix_cache,
+                identity,
+                lambda: self._load_embedding_binary_matrix(
+                    numpy, identity, since=since, until=until,
+                    conversation_ids=conversation_ids,
+                ),
+                cacheable=unfiltered,
+            )
+            if binary_matrix.shape[0] == 0:
+                return KNNResult(coverage="none")
+            candidates = self._two_stage_rank(
+                numpy, identity, dim, dtype, query, k, binary_ids, binary_matrix,
+                chunk=False,
+            )
+            # coverage='full_approx' (FIX 2): the whole corpus is REACHED, but
+            # stage-1 Hamming keeps only M=mult*k survivors, so top-k is an
+            # approximate (recall@M) result, not exact like the exact-scan 'full'.
+            return KNNResult(candidates, coverage="full_approx")
 
         limit = max(0, self.bounded_scan_rows)
         # Probe at most bound+1 through the indexed candidate query. This
@@ -1468,6 +1943,7 @@ class VectorStore:
                 identity,
                 dim,
                 bounded_ids,
+                dtype,
             )
             query_array = numpy.asarray(query, dtype=numpy.float32)
             scores = matrix @ query_array
@@ -1483,6 +1959,7 @@ class VectorStore:
                 identity,
                 dim,
                 bounded_ids,
+                dtype,
             )
             scores = [
                 sum(value * query_value for value, query_value in zip(vector, query))
@@ -1553,8 +2030,7 @@ class VectorStore:
         profile: sqlite3.Row,
     ) -> None:
         identity_hash = identity.identity_hash
-        normalized = self._normalized(vec, expected_dim=int(profile["dim"]))
-        packed = struct.pack(f"<{len(normalized)}f", *normalized)
+        normalized, packed, sign_bits = self._encode_stored_vector(vec, profile)
         embedded_at = self._now()
         self._conn.execute(
             "DELETE FROM lcm_chunk_vectors WHERE chunk_id = ? AND identity_hash = ?",
@@ -1565,9 +2041,19 @@ class VectorStore:
             (chunk_id, identity_hash),
         )
         self._conn.execute(
+            "DELETE FROM lcm_chunk_binary WHERE chunk_id = ? AND identity_hash = ?",
+            (chunk_id, identity_hash),
+        )
+        self._conn.execute(
             "INSERT INTO lcm_chunk_vectors(chunk_id, identity_hash, vec) VALUES(?, ?, ?)",
             (chunk_id, identity_hash, packed),
         )
+        if sign_bits is not None:
+            self._conn.execute(
+                "INSERT INTO lcm_chunk_binary(chunk_id, identity_hash, bits) "
+                "VALUES(?, ?, ?)",
+                (chunk_id, identity_hash, sign_bits),
+            )
         self._conn.execute(
             """
             INSERT INTO lcm_chunk_meta(
@@ -1822,6 +2308,7 @@ class VectorStore:
         identity_hash: str,
         dim: int,
         chunk_ids: Sequence[str],
+        dtype: str = _VECTOR_DTYPE,
     ) -> tuple[list[int], list[str], list[str], list[list[float]]]:
         rowids: list[int] = []
         out_ids: list[str] = []
@@ -1844,11 +2331,10 @@ class VectorStore:
             ).fetchall()
         for row in rows:
             try:
-                blob = bytes(row["vec"])
-                if len(blob) != dim * 4:
-                    continue
-                vector = struct.unpack(f"<{dim}f", blob)
-            except (TypeError, ValueError, struct.error):
+                vector = self._decode_stored_vec(bytes(row["vec"]), dim, dtype)
+            except (TypeError, ValueError):
+                continue
+            if vector is None:
                 continue
             rowids.append(int(row["rowid"]))
             out_ids.append(str(row["chunk_id"]))
@@ -1862,6 +2348,7 @@ class VectorStore:
         identity_hash: str,
         dim: int,
         chunk_ids: Sequence[str],
+        dtype: str = _VECTOR_DTYPE,
     ) -> tuple[list[int], list[str], list[str], Any]:
         with self._cache_lock:
             data_version = self._data_version(identity_hash)
@@ -1871,7 +2358,7 @@ class VectorStore:
                 self._chunk_matrix_cache.move_to_end(key)  # mark most-recently used
                 return cached
             rowids, loaded_ids, kinds, raw_vectors = self._load_chunk_vectors_for_ids(
-                identity_hash, dim, chunk_ids
+                identity_hash, dim, chunk_ids, dtype
             )
             matrix = (
                 numpy.asarray(raw_vectors, dtype=numpy.float32)
@@ -1923,11 +2410,41 @@ class VectorStore:
             return KNNResult(coverage="none")
         identity = str(profile["identity_hash"])
         dim = int(profile["dim"])
+        dtype = str(profile["dtype"])
         query = self._normalized(query_vec, expected_dim=dim)
         try:
             numpy = _load_numpy()
         except ImportError:
             numpy = None
+
+        # Two-stage full-corpus path when this chunk identity's sign-bit prescreen
+        # is a COMPLETE mirror of its vectors (FIX 1 — a partial binary corpus
+        # would be silently truncated by the INNER JOIN). Chunk filters are plain
+        # indexed message columns (timestamp/session_id/source), so they all apply
+        # in the binary load over the whole (filtered) corpus.
+        if numpy is not None and self._binary_fully_synced(identity, chunk=True):
+            unfiltered = (
+                since is None and until is None
+                and conversation_ids is None and source is None
+            )
+            binary_ids, binary_matrix = self._cached_binary_matrix(
+                self._chunk_binary_matrix_cache,
+                identity,
+                lambda: self._load_chunk_binary_matrix(
+                    numpy, identity, since=since, until=until,
+                    conversation_ids=conversation_ids, source=source,
+                ),
+                cacheable=unfiltered,
+            )
+            if binary_matrix.shape[0] == 0:
+                return KNNResult(coverage="none")
+            candidates = self._two_stage_rank(
+                numpy, identity, dim, dtype, query, k, binary_ids, binary_matrix,
+                chunk=True,
+            )
+            # coverage='full_approx' (FIX 2): whole corpus reached, but stage-1
+            # keeps only M=mult*k survivors -> approximate top-k, not exact.
+            return KNNResult(candidates, coverage="full_approx")
 
         limit = max(0, self.bounded_scan_rows)
         probed_ids = self._bounded_chunk_candidate_ids(
@@ -1945,14 +2462,14 @@ class VectorStore:
 
         if numpy is not None:
             rowids, chunk_ids, kinds, matrix = self._numpy_chunk_rows(
-                numpy, identity, dim, bounded_ids
+                numpy, identity, dim, bounded_ids, dtype
             )
             query_array = numpy.asarray(query, dtype=numpy.float32)
             scores = matrix @ query_array
             coverage = candidate_coverage
         else:
             rowids, chunk_ids, kinds, vectors = self._load_chunk_vectors_for_ids(
-                identity, dim, bounded_ids
+                identity, dim, bounded_ids, dtype
             )
             scores = [
                 sum(value * query_value for value, query_value in zip(vector, query))
@@ -1993,6 +2510,8 @@ class VectorStore:
         with self._cache_lock:
             self._matrix_cache.clear()
             self._chunk_matrix_cache.clear()
+            self._binary_matrix_cache.clear()
+            self._chunk_binary_matrix_cache.clear()
 
     def __del__(self) -> None:  # pragma: no cover - defensive resource cleanup
         try:

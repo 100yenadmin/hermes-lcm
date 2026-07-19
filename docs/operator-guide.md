@@ -177,6 +177,10 @@ environment variables:
 | `LCM_EMBEDDINGS_ENABLED` | `false` | Opt in to embedding warmup, backfill, and semantic retrieval storage |
 | `LCM_EMBEDDING_PROVIDER` | empty | Embedding provider: `voyage`, `ollama`, or `fastembed` |
 | `LCM_EMBEDDING_MODEL` | empty | Provider model identifier registered by `/lcm embed warmup` |
+| `LCM_EMBEDDING_STORAGE_DTYPE` | `float32` | Vector storage dtype for newly-registered embedding profiles: `float32` (byte-identical legacy path) or `int8` (per-vector quantization plus a sign-bit prescreen, a distinct profile identity). See [Vector storage scale options (v3)](#vector-storage-scale-options-v3) |
+| `LCM_EMBEDDING_STORE_DIM` | `0` | Optional Matryoshka truncation dimension for newly-registered profiles (`0` = full profile dim); truncated vectors are renormalized and are also a distinct profile identity |
+| `LCM_EMBEDDING_BINARY_PRESCREEN` | `false` | Write the sign-bit prescreen for float32 identities too (int8 identities always write it), unlocking the full-corpus two-stage KNN; flipping it on an already-populated identity mints a new, distinct identity rather than mutating the existing one |
+| `LCM_KNN_PRESCREEN_MULTIPLIER` | `4` | Stage-1 prescreen breadth for two-stage KNN: `M = multiplier × k` lowest-Hamming-distance survivors are exact-rescored |
 | `LCM_DOCTOR_CLEAN_APPLY_ENABLED` | `false` | Permit destructive `/lcm doctor clean apply` in trusted operator contexts |
 | `LCM_EMPTY_LIFECYCLE_GC_ENABLED` | `true` | Master toggle for automatic pruning of lifecycle rows for sessions that never ingested any messages or summary nodes |
 | `LCM_EMPTY_LIFECYCLE_GC_THRESHOLD` | `200` | Number of lifecycle rows at which the GC pass fires (default 200 so fresh installs skip the work) |
@@ -740,6 +744,104 @@ off-box and are exempt. Note that `LCM_SENSITIVE_PATTERNS_ENABLED` redaction run
 at **ingest**, so it does not retro-redact history already stored — that older
 raw text is still sent during a chunk backfill. See
 [embeddings-setup.md](embeddings-setup.md) for the full discussion.
+
+### Contextualized chunk grouping
+
+Voyage's `voyage-context-*` chunk models (the chunk-corpus default for the
+`voyage` provider, see `default_chunk_model`) are contextualized-embedding
+models: one message's chunks are sent to the provider's
+`/v1/contextualizedembeddings` endpoint as a single grouped document — an inner
+list of that message's chunks — instead of as independent inputs, so the model
+actually conditions each chunk's embedding on its sibling chunks from the same
+message. Non-context providers and models (fastembed, ollama, plain Voyage
+embedding models) are unaffected and continue to embed chunks independently.
+Grouped requests are bounded by the provider's per-document and per-request
+caps (32K tokens per chunk, 120K tokens per document, 120K tokens and 16,000
+chunks per request); a document over the per-document budget is split into
+contiguous sub-documents so no single request is rejected. The retry path for
+uncertain chunks (`/lcm embed backfill`'s retry-uncertain pass) selects rows
+out of store_id order, so it stably re-sorts the selected documents by
+`(store_id, chunk_index)` before batching — otherwise interleaved retry rows
+would collapse into singleton groups and silently defeat contextualization for
+that pass.
+
+### Vector storage scale options (v3)
+
+The default embedding storage path is float32 at full provider dimension, with
+an exact scan bounded by `LCM_EMBEDDING_BOUNDED_SCAN_ROWS` once a corpus
+outgrows that bound (see the `coverage` contract in the
+[retrieval tools reference](retrieval-tools.md#full-text-semantic-and-hybrid-modes)).
+That path is unchanged from pre-v3 installs. At real-archive scale — tens of
+thousands of vectors and up — a full brute-force scan gets slow and
+memory-heavy, and the recency-bounded fallback stops reaching the whole corpus.
+Four v3 environment variables, all opt-in, additive, and default-off, trade
+some exactness for full-corpus reach at much lower query cost:
+
+- `LCM_EMBEDDING_STORAGE_DTYPE` (default `float32`) selects the vector storage
+  dtype for **newly-registered** embedding profiles. `int8` stores each vector
+  as a per-vector symmetrically-quantized signed-byte array plus a
+  little-endian float32 scale in the same blob, and always writes a
+  companion sign-bit prescreen. `dtype` is part of the profile identity hash,
+  so an int8 identity never mixes with an existing float32 one.
+- `LCM_EMBEDDING_STORE_DIM` (default `0`, meaning the full profile dimension)
+  applies an optional Matryoshka truncation to newly-registered profiles. When
+  set to a value less than the provider's native dimension, vectors are
+  truncated to that many leading dimensions and renormalized before
+  storage/quantization. The stored dimension is also part of the profile
+  identity hash, so truncated vectors never mix with full-dimension ones.
+- `LCM_EMBEDDING_BINARY_PRESCREEN` (default `false`) writes the sign-bit
+  Hamming prescreen for float32 identities too (int8 identities always write
+  it), unlocking the two-stage KNN described below.
+- `LCM_KNN_PRESCREEN_MULTIPLIER` (default `4`) sets the two-stage KNN's stage-1
+  prescreen breadth: `M = multiplier × k` lowest-Hamming-distance survivors are
+  loaded and exact-rescored in stage 2. Larger values widen the approximate
+  prescreen toward exact recall at more cost.
+
+**Two-stage KNN.** With a sign-bit prescreen present, `knn` packs the query's
+sign bits, Hamming-XORs against every corpus row's prescreen bits (the whole
+corpus, not a recency-bounded slice), keeps the `M = LCM_KNN_PRESCREEN_MULTIPLIER
+× k` lowest-Hamming survivors, then loads only those survivors' full vectors and
+ranks them by exact cosine. The response reports `coverage='full_approx'`: the
+whole corpus was reached, but stage-1 keeps only the closest `M` candidates
+before the exact rescore, so the result is an approximate top-k rather than the
+exhaustive top-k that exact-scan `coverage='full'` gives.
+
+**Safety design (flipping the prescreen flag never silently truncates a
+corpus).** `LCM_EMBEDDING_BINARY_PRESCREEN` growing a companion sign-bit table
+means a prescreen corpus must never be read as if it were a legacy
+binary-free float32 corpus. Flipping the flag on an already-populated float32
+identity therefore mints a **new, distinct profile identity** (folded into the
+identity hash) rather than adding sign-bits to the existing one in place. As a
+second, independent guard, the two-stage path only engages when the sign-bit
+table is a **complete** mirror of the vector table for that identity — every
+stored vector has a matching sign-bit row. If the two tables disagree (a
+partially-populated prescreen, or none at all), `knn` falls back to the
+existing exact bounded/full scan and reports honest `bounded`/`full` coverage
+instead of silently dropping rows the sign-bit table doesn't cover while still
+claiming `coverage='full'`.
+
+**Measured trade-offs (C1 bench, 92,997-vector real chunk archive, Voyage
+`voyage-context-3`, dim 1024):**
+
+| Path | Coverage | Query latency (warm) | Peak RSS | recall@10 vs. exact |
+|---|---|---|---|---|
+| float32 full-scan (default) | `full` | ~195ms | ~3.3GB | — (exact) |
+| float32 + binary prescreen, two-stage | `full_approx` | ~67ms | ~279MB | 0.96 |
+| int8, two-stage | `full_approx` | ~65ms | ~279MB | 0.84 |
+
+The int8 path trades additional recall for roughly a quarter of the disk
+footprint of stored vectors (quantized bytes vs. float32), making it the option
+for disk-constrained installs; the float32+binary path keeps full-precision
+vectors on disk and gives up less recall for the same query-time and RAM win.
+
+**Current limitation.** Enabling `LCM_EMBEDDING_BINARY_PRESCREEN` (or switching
+to `int8`) on an archive that is already fully embedded requires a full
+re-backfill under the newly-minted identity — there is no shipped operator path
+yet to derive the prescreen bits (or quantized vectors) locally from the
+existing float32 corpus without re-registering and re-running
+`/lcm embed backfill --apply` against the new identity. A local-derive
+migration path (computing sign-bits/quantization from already-stored float32
+vectors, no provider re-call) is planned but not yet built.
 
 ## Import and backfill
 

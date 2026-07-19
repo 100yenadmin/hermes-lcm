@@ -25,14 +25,19 @@ from benchmarking.longmemeval import (
     evaluate_question,
     evidence_sessions,
     evidence_turns,
+    fresh_recall_session_id,
     load_questions,
     ndcg_at_k,
     parse_question,
     percentiles,
+    production_recall_hits,
     recall_at_k,
+    recall_hit_sessions,
+    recall_hit_turn_keys,
     rerank_sessions_voyage,
     rrf_fuse,
     run_harness,
+    summary_turn_keys,
     turn_ndcg_at_k,
     turn_recall_at_k,
 )
@@ -191,6 +196,42 @@ def test_turn_recall_summary_marker_covers_session_at_granularity():
     assert turn_recall_at_k([("s9", None)], evidence, 1) == 0.0
     assert turn_recall_at_k([], evidence, 5) == 0.0
     assert turn_recall_at_k([("s1", 3)], set(), 5) == 0.0
+
+
+def test_hybrid_turn_keys_project_from_fused_ranking_not_raw_key_fusion():
+    """C6: a hybrid arm's turn keys are session-granularity markers derived from its
+    fused SESSION ranking, NOT an RRF over the raw per-arm turn-key lists.
+
+    Regression for the B5-measured turn-precision collapse: fusing precise (fts /
+    chunk) and coarse (summary) turn keys in one ranked list let a flood of precise
+    NON-evidence keys consume the fixed top-k coverage budget ahead of the summary
+    markers of the high-ranked evidence session, dragging turn recall below every
+    input arm. Projecting the (strong) fused session ranking to (session, None)
+    markers restores full session-granularity coverage.
+    """
+    # Evidence lives entirely in session "sE" (3 labeled turns).
+    evidence = {("sE", 0), ("sE", 1), ("sE", 2)}
+    # The fused SESSION ranking puts the evidence session first (its strong signal).
+    fused_ranking = ["sE", "sA", "sB", "sC", "sD", "sF"]
+    # The precise arms AGREE on five NON-evidence turns, so each of those keys earns
+    # two RRF terms and outscores the evidence session's single-arm summary marker.
+    noise = [("sA", 0), ("sB", 0), ("sC", 0), ("sD", 0), ("sF", 0)]
+    fts_turns = list(noise)
+    chunk_turns = list(noise)
+    # In the summary arm the evidence session ranks LAST, so its marker lands at
+    # rank 6 — pushed out of the top-5 budget by the agreed-upon noise.
+    summary_turns = summary_turn_keys(["sA", "sB", "sC", "sD", "sF", "sE"])
+
+    # Old behavior: raw-key RRF buries ("sE", None) below five non-evidence keys.
+    diluted = rrf_fuse(fts_turns, summary_turns, chunk_turns)
+    # New behavior: project the fused session ranking to session-granularity markers.
+    projected = summary_turn_keys(fused_ranking)
+
+    assert all(key[1] is None for key in projected)
+    # The evidence session's marker sits at rank 1 and covers all its turns.
+    assert turn_recall_at_k(projected, evidence, 5) == pytest.approx(1.0)
+    # The diluted fusion recovers nothing in the top-5 (the collapse being fixed).
+    assert turn_recall_at_k(diluted, evidence, 5) == pytest.approx(0.0)
 
 
 def test_turn_ndcg_rewards_ranking_and_credits_summary_markers():
@@ -558,6 +599,113 @@ def test_db_template_reuse_matches_from_scratch_bootstrap(tmp_path):
     assert from_scratch["ingest"]["reuse_db_template"] is False
 
 
+# --------------------------------------------------------------------------- #
+# Production lcm_recall arm (the tool users actually call).
+# --------------------------------------------------------------------------- #
+
+
+def test_lcm_recall_arm_is_registered_and_scored(tmp_path):
+    """The production arm is a first-class arm: registered and scored end-to-end."""
+    assert "lcm_recall" in ARMS
+    report = run_harness(
+        _synthetic_dataset(), provider_name="stub", model="", tmp_dir=tmp_path
+    )
+    assert "lcm_recall" in report["arms"]
+    recall = report["arms"]["lcm_recall"]
+    assert set(recall) >= {"recall@1", "recall@5", "recall@10", "ndcg@10", "turn"}
+    # Non-degenerate: the production path recovers the evidence session (its ZEBRA
+    # cue is lexically distinctive, so at minimum the FTS arm inside recall fires).
+    assert recall["recall@10"] > 0.0
+
+
+def test_fresh_recall_session_is_disjoint_from_haystack_and_neutralizes_scope(tmp_path):
+    """The probe's current-session id sits OUTSIDE the dataset, so the scope prior
+    never boosts a dataset session (recency still applies — honest production)."""
+    evidence_id = "s-evidence"
+    sessions = {
+        "s-noise": [{"role": "user", "content": "chatter about the weather"}],
+        evidence_id: [
+            {"role": "user", "content": "the locker passcode is ZEBRA0", "has_answer": True},
+        ],
+    }
+    question = parse_question(
+        _make_raw(
+            "q-scope", "single-session-user", sessions=sessions,
+            answer_session_ids=[evidence_id], question="what is my locker passcode ZEBRA0",
+        )
+    )
+    fresh = fresh_recall_session_id(question)
+    assert fresh not in question.haystack_session_ids
+    assert fresh == fresh_recall_session_id(question)  # deterministic
+
+    # Use the real harness StubEmbedder (it carries provider_id="stub", which the
+    # production KNN arms match against the recorded profile) so the vector arms
+    # return hits, exercising the true scope-prior path rather than a degraded one.
+    from benchmarking.longmemeval import StubEmbedder
+    from hermes_lcm.config import LCMConfig
+    from hermes_lcm.dag import SummaryDAG
+    from hermes_lcm.store import MessageStore
+
+    embedder = StubEmbedder()
+    config = LCMConfig(
+        database_path=str(tmp_path / f"{question.question_id}.db"), embeddings_enabled=True,
+        embedding_provider="stub", embedding_model=embedder.model_id,
+    )
+    # Reuse the harness ingest to seed the store, then invoke the production tool.
+    evaluate_question(
+        question, embedder, provider_name="stub",
+        tmp_dir=tmp_path, embeddings_enabled=True,
+    )
+    store = MessageStore(config.database_path, ingest_protection_config=config)
+    dag = SummaryDAG(config.database_path)
+    try:
+        hits = production_recall_hits(
+            question, config, store, dag, embedder,
+            provider_name="stub", tmp_dir=tmp_path, embeddings_enabled=True, limit=25,
+        )
+    finally:
+        dag.close()
+        store.close()
+    assert hits, "production recall returned no hits"
+    # No hit belongs to the (fresh) current conversation, so the scope boost is inert.
+    assert all(hit.get("from_current_session") is False for hit in hits)
+
+
+def test_fresh_recall_session_avoids_haystack_collision():
+    """If the sentinel id already exists in the haystack, a unique variant is used."""
+    from benchmarking.longmemeval import _LCM_RECALL_FRESH_SESSION
+
+    collide = f"{_LCM_RECALL_FRESH_SESSION}q-collide"
+    raw = _make_raw(
+        "q-collide", "single-session-user",
+        sessions={collide: [{"role": "user", "content": "x"}]},
+        answer_session_ids=[collide],
+    )
+    question = parse_question(raw)
+    fresh = fresh_recall_session_id(question)
+    assert fresh not in question.haystack_session_ids
+    assert fresh.startswith(collide)
+
+
+def test_recall_hit_projection_sessions_and_turns():
+    """store_id -> (session, turn) projection: verbatim hits localize precisely,
+    summary hits become (session, None) markers, unmapped/missing ids drop."""
+    store_id_to_turn = {10: ("s1", 0), 11: ("s2", 3)}
+    hits = [
+        {"kind": "message_excerpt", "store_id": 10, "session_id": "s1"},
+        {"kind": "summary", "node_id": 7, "session_id": "s2"},
+        {"kind": "message_excerpt", "store_id": 11, "session_id": "s2"},
+        {"kind": "message_excerpt", "store_id": 99, "session_id": "s9"},  # unmapped -> drop
+        {"kind": "summary", "session_id": None},  # no session -> drop
+    ]
+    # Session ranking dedups in hit order (s2 first seen via the summary hit).
+    assert recall_hit_sessions(hits) == ["s1", "s2", "s9"]
+    # Turn projection: precise keys for verbatim, (session, None) for summary.
+    assert recall_hit_turn_keys(hits, store_id_to_turn) == [
+        ("s1", 0), ("s2", None), ("s2", 3),
+    ]
+
+
 def test_rrf_fuse_turn_keys_with_none_turn_tie_is_total_ordered():
     """A summary turn key (session, None) tying a localized (session, int) key
     on score and best rank must not crash the sort (None < int TypeError)."""
@@ -568,3 +716,13 @@ def test_rrf_fuse_turn_keys_with_none_turn_tie_is_total_ordered():
     # And a same-session tie between None-turn and int-turn keys:
     fused2 = rrf_fuse([("s1", None)], [("s1", 4)])
     assert set(fused2) == {("s1", None), ("s1", 4)}
+
+
+def test_deterministic_summary_of_empty_session_is_non_empty():
+    """Empty haystack sessions must yield embeddable (non-empty) summary text —
+    cloud endpoints reject empty inputs with HTTP 400 (regression: voyage 500q
+    run died on LongMemEval_S's empty sessions)."""
+    from benchmarking.longmemeval import deterministic_session_summary
+
+    assert deterministic_session_summary([]) == "(empty session)"
+    assert deterministic_session_summary([{"role": "user", "content": "  "}]).strip()

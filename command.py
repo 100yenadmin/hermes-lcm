@@ -53,13 +53,25 @@ from . import rollup_builder
 from .rollup_store import RollupStore
 from .session_patterns import build_session_match_keys, matches_session_pattern
 from .store import build_message_fts_spec
-from .chunking import VALID_CONTENT_POLICIES, chunk_message, normalize_content_policy
+from .chunking import (
+    VALID_CONTENT_POLICIES,
+    chunk_message,
+    group_by_store_id,
+    normalize_content_policy,
+)
 from .embedding_provider import (
     EmbeddedDocumentBatch,
     EmbeddingProviderError,
     FastembedProvider,
     ProviderPreDispatchError,
     VoyageError,
+    _VOYAGE_CONTEXT_DOCUMENT_TOKEN_BUDGET,
+    _VOYAGE_CONTEXT_MAX_CHUNK_TOKENS,
+    _VOYAGE_CONTEXT_MAX_REQUEST_CHUNKS,
+    _VOYAGE_CONTEXT_REQUEST_TOKEN_BUDGET,
+    _VOYAGE_MAX_BATCH_ITEMS,
+    _is_voyage_context_model,
+    _plan_contextualized_requests,
     default_chunk_model,
     fastembed_download_size_note,
     resolve_provider,
@@ -2504,6 +2516,36 @@ def _rollups_text(tokens: list[str], engine) -> str:
     else:
         result = _help_text("`/lcm rollups` accepts only `rebuild <day|week|month|all> [date]`.")
     return _bounded_rollups_text(result)
+def _resolve_storage_dtype(config, override: str | None = None) -> str:
+    """Resolve the vector storage dtype: an explicit --dtype flag, else config.
+
+    SPEC C1: float32 (default) keeps vectors byte-identical; int8 stores
+    quantized vectors + a sign-bit prescreen and unlocks two-stage full-corpus
+    KNN. Any unrecognized value degrades to float32.
+    """
+    value = str(
+        override
+        if override is not None
+        else getattr(config, "embedding_storage_dtype", "float32")
+    ).strip().lower()
+    return "int8" if value == "int8" else "float32"
+
+
+def _resolve_store_dim(config, provider_dim: int, override: int | None = None) -> int:
+    """Resolve the Matryoshka store dim: --store-dim flag or config, capped to provider dim.
+
+    0 (default) or any value >= the provider dim means "store the full dim".
+    """
+    raw = override if override is not None else getattr(config, "embedding_store_dim", 0)
+    try:
+        store_dim = int(raw or 0)
+    except (TypeError, ValueError):
+        store_dim = 0
+    if store_dim <= 0 or store_dim >= int(provider_dim):
+        return int(provider_dim)
+    return store_dim
+
+
 def _embedding_warmup_text(engine) -> str:
     """Warm the configured provider and dimension-lock its vector profile."""
     try:
@@ -2540,9 +2582,16 @@ def _embedding_warmup_text(engine) -> str:
         dim = len(vector)
         if dim < 1:
             raise ValueError("provider returned an empty warmup embedding")
+        storage_dtype = _resolve_storage_dtype(engine._config)
+        store_dim = _resolve_store_dim(engine._config, dim)
         store = VectorStore(engine._store.db_path, config=engine._config)
         try:
-            store.register_profile(provider.model_id, provider.provider_id, dim)
+            store.register_profile(
+                provider.model_id,
+                provider.provider_id,
+                store_dim,
+                dtype=storage_dtype,
+            )
         finally:
             store.close()
         # Semantic search caches provider instances by configured provider and
@@ -2563,7 +2612,8 @@ def _embedding_warmup_text(engine) -> str:
             progress,
             f"provider: {provider.provider_id}",
             f"model: {provider.model_id}",
-            f"dim: {dim}",
+            f"dim: {store_dim}",
+            f"dtype: {storage_dtype}",
             f"cost_note: {cost_note}",
         ])
     except Exception as exc:
@@ -2586,7 +2636,7 @@ def _embedding_current_profile(conn: sqlite3.Connection) -> sqlite3.Row | None:
     try:
         return conn.execute(
             """
-            SELECT identity_hash, model_name, provider, dim, registered_at
+            SELECT identity_hash, model_name, provider, dim, dtype, registered_at
             FROM lcm_embedding_profile
             WHERE active = 1 AND archived_at IS NULL
             ORDER BY registered_at DESC, identity_hash DESC
@@ -2709,6 +2759,53 @@ def _embedding_batch_estimate(provider: str, token_counts: list[int]) -> int:
         if batch_tokens:
             estimated += 1
     return estimated
+
+
+def _chunk_context_estimates(
+    documents: list[tuple[str, str, int]]
+) -> tuple[int, int, int]:
+    """Estimate tokens/billable-tokens/requests for the contextualized chunk path.
+
+    The dry-run estimate must match what the grouped apply path actually sends
+    (FIX 4). Apply slices the selected documents into ``_EMBEDDING_BACKFILL_BATCH_SIZE``
+    batches, groups each batch's chunks per source message
+    (``group_by_store_id``), drops any single chunk over the per-chunk context cap
+    (``_VOYAGE_CONTEXT_MAX_CHUNK_TOKENS`` = 32K, NOT the flat 27K per-document cap),
+    and packs the surviving per-message documents into requests via
+    ``_plan_contextualized_requests``. Mirror that flow exactly so the request
+    count and billable tokens preview equal apply's, rather than the pre-C2 flat
+    per-document packing (``_embedding_batch_estimate``).
+    """
+    total_tokens = sum(int(document[2]) for document in documents)
+    billable_tokens = 0
+    total_requests = 0
+    for offset in range(0, len(documents), _EMBEDDING_BACKFILL_BATCH_SIZE):
+        batch = documents[offset:offset + _EMBEDDING_BACKFILL_BATCH_SIZE]
+        store_ids = [str(item[0]).split(":", 1)[0] for item in batch]
+        per_document_tokens: list[list[int]] = []
+        for group_indexes in group_by_store_id(store_ids):
+            kept: list[int] = []
+            for index in group_indexes:
+                tokens = int(batch[index][2])
+                # A single chunk above the per-chunk cap is non-embeddable and is
+                # skipped by the provider before grouping -> not sent, not billed.
+                if tokens > _VOYAGE_CONTEXT_MAX_CHUNK_TOKENS:
+                    continue
+                kept.append(tokens)
+                billable_tokens += tokens
+            if kept:
+                per_document_tokens.append(kept)
+        if per_document_tokens:
+            total_requests += len(
+                _plan_contextualized_requests(
+                    per_document_tokens,
+                    doc_token_budget=_VOYAGE_CONTEXT_DOCUMENT_TOKEN_BUDGET,
+                    request_token_budget=_VOYAGE_CONTEXT_REQUEST_TOKEN_BUDGET,
+                    request_chunk_budget=_VOYAGE_CONTEXT_MAX_REQUEST_CHUNKS,
+                    max_inputs=_VOYAGE_MAX_BATCH_ITEMS,
+                )
+            )
+    return total_tokens, billable_tokens, total_requests
 
 
 def _embedding_estimated_cost(provider: str, model: str, tokens: int) -> float:
@@ -3247,21 +3344,30 @@ def _owned_inflight_transition(
 
 def _embedding_backfill_options(
     tokens: list[str],
-) -> tuple[bool, int, bool, str, str, bool] | str:
+) -> tuple[bool, int, bool, str, str, bool, str | None] | str:
     apply = False
     limit = 200
     retry_uncertain = False
     corpus = "summary"
     policy = ""
     confirm_raw_text = False
+    expected_dtype: str | None = None
     seen_corpus = False
     seen_policy = False
+    seen_dtype = False
     index = 0
     while index < len(tokens):
         token = tokens[index].lower()
         if token == "--apply" and not apply:
             apply = True
             index += 1
+            continue
+        if token == "--dtype" and index + 1 < len(tokens) and not seen_dtype:
+            expected_dtype = tokens[index + 1].lower()
+            if expected_dtype not in {"float32", "int8"}:
+                return "`--dtype` must be one of `float32` or `int8`."
+            seen_dtype = True
+            index += 2
             continue
         if token == "--retry-uncertain" and not retry_uncertain:
             retry_uncertain = True
@@ -3297,7 +3403,7 @@ def _embedding_backfill_options(
         return (
             "`/lcm embed backfill` accepts only `--apply`, `--retry-uncertain`, "
             "`--confirm-raw-text`, `--limit N`, `--corpus summary|chunks|both`, "
-            "and `--policy conversational|heads|full`."
+            "`--policy conversational|heads|full`, and `--dtype float32|int8`."
         )
     if retry_uncertain and not apply:
         return "`--retry-uncertain` requires `--apply` because it may incur charges."
@@ -3308,7 +3414,7 @@ def _embedding_backfill_options(
             "`--confirm-raw-text` only applies to the chunk corpus; add "
             "`--corpus chunks` or `--corpus both`."
         )
-    return apply, limit, retry_uncertain, corpus, policy, confirm_raw_text
+    return apply, limit, retry_uncertain, corpus, policy, confirm_raw_text, expected_dtype
 
 
 def _embedding_backfill_report(
@@ -3415,27 +3521,53 @@ def _provider_document_batches(provider, texts: list[str], *, before_dispatch):
     )
 
 
+def _provider_chunk_document_batches(
+    provider, batch, chunk_meta, *, before_dispatch
+):
+    """Yield accepted provider requests for a chunk backfill batch.
+
+    A contextualized provider (voyage-context-*) groups each message's chunks
+    into one inputs inner-list so the context model embeds them together; every
+    accepted batch still carries per-chunk flat indexes + vectors, so the
+    downstream publish/lease/inflight path stays per-chunk and unchanged.
+    Non-context / local providers keep the flat per-chunk document path.
+    """
+    if getattr(provider, "supports_contextualized_grouping", False):
+        store_ids = [chunk_meta[item[0]][0] for item in batch]
+        groups = [
+            [(index, batch[index][1]) for index in group_indexes]
+            for group_indexes in group_by_store_id(store_ids)
+        ]
+        yield from provider.embed_chunk_group_batches(
+            groups, before_dispatch=before_dispatch
+        )
+        return
+    yield from _provider_document_batches(
+        provider, [item[1] for item in batch], before_dispatch=before_dispatch
+    )
+
+
 def _embedding_backfill_text(tokens: list[str], engine) -> str:
     parsed = _embedding_backfill_options(tokens)
     if isinstance(parsed, str):
         return _help_text(parsed)
-    apply, limit, retry_uncertain, corpus, policy, confirm_raw_text = parsed
+    apply, limit, retry_uncertain, corpus, policy, confirm_raw_text, expected_dtype = parsed
     if corpus == "chunks":
         return _chunk_backfill_text(
             engine, apply=apply, limit=limit,
             retry_uncertain=retry_uncertain, policy=policy,
-            confirm_raw_text=confirm_raw_text,
+            confirm_raw_text=confirm_raw_text, expected_dtype=expected_dtype,
         )
     if corpus == "both":
         summary_report = _embedding_backfill_summary_text(
             engine, apply=apply, limit=limit, retry_uncertain=retry_uncertain,
-            include_next_hint=False,
+            include_next_hint=False, expected_dtype=expected_dtype,
         )
         chunk_report = _chunk_backfill_text(
             engine, apply=apply, limit=limit,
             retry_uncertain=retry_uncertain, policy=policy,
             confirm_raw_text=confirm_raw_text,
-            include_next_hint=False,
+            include_next_hint=False, expected_dtype=expected_dtype,
         )
         combined = summary_report + "\n\n" + chunk_report
         if not apply:
@@ -3448,13 +3580,14 @@ def _embedding_backfill_text(tokens: list[str], engine) -> str:
             )
         return combined
     return _embedding_backfill_summary_text(
-        engine, apply=apply, limit=limit, retry_uncertain=retry_uncertain
+        engine, apply=apply, limit=limit, retry_uncertain=retry_uncertain,
+        expected_dtype=expected_dtype,
     )
 
 
 def _embedding_backfill_summary_text(
     engine, *, apply: bool, limit: int, retry_uncertain: bool,
-    include_next_hint: bool = True,
+    include_next_hint: bool = True, expected_dtype: str | None = None,
 ) -> str:
     mode = "apply" if apply else "dry-run"
     started = time.monotonic()
@@ -3491,6 +3624,16 @@ def _embedding_backfill_summary_text(
         identity = str(profile["identity_hash"])
         model = str(profile["model_name"])
         provider_name = str(profile["provider"])
+        profile_dtype = str(profile["dtype"] or "float32")
+        if expected_dtype is not None and expected_dtype != profile_dtype:
+            return "\n".join([
+                "LCM embedding backfill",
+                f"mode: {mode}",
+                "status: refused",
+                f"error: --dtype {expected_dtype} does not match the registered "
+                f"summary profile dtype ({profile_dtype}); re-run `/lcm embed warmup` "
+                f"with LCM_EMBEDDING_STORAGE_DTYPE={expected_dtype} to register that identity",
+            ])
         if not apply:
             pending, rows = _embedding_pending_rows(read_conn, identity, limit)
     except sqlite3.Error as exc:
@@ -3968,7 +4111,7 @@ def _chunk_current_profile(conn: sqlite3.Connection) -> sqlite3.Row | None:
     try:
         return conn.execute(
             """
-            SELECT identity_hash, model_name, provider, dim, registered_at
+            SELECT identity_hash, model_name, provider, dim, dtype, registered_at
             FROM lcm_embedding_profile
             WHERE active = 1 AND archived_at IS NULL AND task = 'chunk'
             ORDER BY registered_at DESC, identity_hash DESC
@@ -4125,6 +4268,15 @@ def _chunk_authorized_uncertain_rows(
         store_id_str, index_str = chunk_id.split(":", 1)
         documents.append((chunk_id, text, tokens))
         meta[chunk_id] = (int(store_id_str), int(index_str), char_start, char_end)
+    # Rows are SELECTed by (updated_at, embedded_id) to pick WHICH uncertain
+    # chunks fall inside the retry budget, but that interleaves store_ids.
+    # ``group_by_store_id`` only merges ADJACENT equal store_ids, so an
+    # interleaved order collapses every retry chunk into a singleton group,
+    # defeating C2 cross-chunk contextualization on the retry path. Stably
+    # re-sort the selected documents by (store_id, chunk_index) so a message's
+    # chunks are contiguous and group into one contextualization document —
+    # matching the discovery path's natural store_id-ordered emission (FIX 3).
+    documents.sort(key=lambda item: meta[item[0]][:2])
     return len(documents), documents, meta
 
 
@@ -4174,6 +4326,7 @@ def _is_local_embedding_provider(provider_name: str) -> bool:
 def _chunk_backfill_text(
     engine, *, apply: bool, limit: int, retry_uncertain: bool, policy: str,
     confirm_raw_text: bool = False, include_next_hint: bool = True,
+    expected_dtype: str | None = None,
 ) -> str:
     policy = normalize_content_policy(policy or getattr(
         engine._config, "embedding_content_policy", "conversational"
@@ -4214,6 +4367,7 @@ def _chunk_backfill_text(
             model = str(profile["model_name"])
             provider_name = str(profile["provider"])
             profile_dim = int(profile["dim"])
+            profile_dtype = str(profile["dtype"] or "float32")
         else:
             # No chunk profile yet: a dry-run can still estimate pending/tokens/
             # cost using the default chunk model for the configured provider.
@@ -4221,6 +4375,17 @@ def _chunk_backfill_text(
             provider_name = configured_provider
             model = default_chunk_model(configured_provider, configured_model)
             profile_dim = 0
+            profile_dtype = "float32"
+        if (
+            expected_dtype is not None
+            and profile is not None
+            and expected_dtype != profile_dtype
+        ):
+            return _refused(
+                f"--dtype {expected_dtype} does not match the registered chunk "
+                f"profile dtype ({profile_dtype}); re-run `/lcm embed warmup` with "
+                f"LCM_EMBEDDING_STORAGE_DTYPE={expected_dtype} to register that identity"
+            )
         if not apply:
             pending, rows, _ = _chunk_pending_rows(read_conn, identity, policy, limit)
     except sqlite3.Error as exc:
@@ -4229,6 +4394,16 @@ def _chunk_backfill_text(
         read_conn.close()
 
     def _estimates(documents: list[tuple[str, str, int]]) -> tuple[int, int, int]:
+        # The contextualized (voyage-context) chunk apply path groups a message's
+        # chunks into one document, skips a chunk only above the 32K per-chunk
+        # context cap, and plans requests by the context budgets. Model that
+        # exactly so the cost/consent preview matches apply (FIX 4). Plain-voyage
+        # and local providers keep the flat per-document estimate.
+        if (
+            provider_name.strip().lower() in {"voyage", "voyageai"}
+            and _is_voyage_context_model(model)
+        ):
+            return _chunk_context_estimates(documents)
         est_tokens = sum(document[2] for document in documents)
         est_cost_tokens = sum(
             document[2]
@@ -4322,7 +4497,7 @@ def _chunk_backfill_text(
             )
         _prepare_inflight_for_lease(conn, identity, lease)
         captured_identity = EmbeddingIdentity.canonical(
-            provider_name, model, "", profile_dim, "float32", "little", "chunk"
+            provider_name, model, "", profile_dim, profile_dtype, "little", "chunk"
         )
         if captured_identity.identity_hash != identity:
             raise ValueError(
@@ -4403,8 +4578,8 @@ def _chunk_backfill_text(
 
                 try:
                     accepted_indexes: set[int] = set()
-                    for accepted_batch in _provider_document_batches(
-                        provider, [item[1] for item in batch],
+                    for accepted_batch in _provider_chunk_document_batches(
+                        provider, batch, chunk_meta,
                         before_dispatch=before_dispatch,
                     ):
                         if len(accepted_batch.indexes) != len(accepted_batch.vectors):

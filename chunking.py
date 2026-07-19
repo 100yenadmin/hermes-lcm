@@ -243,6 +243,27 @@ def chunk_message(
     return _full_chunks(store_id, text)
 
 
+def group_by_store_id(store_ids: Iterable[Any]) -> list[list[int]]:
+    """Group positional indexes into per-message documents by ``store_id``.
+
+    Returns a list of index groups, one per contiguous run of the same source
+    ``store_id`` (a message = one contextualization document), preserving both
+    the store order and the within-message chunk order. Chunk discovery emits a
+    message's chunks contiguously, so consecutive-run grouping keeps every
+    message's chunks in one group; this is the per-document grouping consumed by
+    the contextualized (cross-chunk) embedding path.
+    """
+    groups: list[list[int]] = []
+    last: Any = object()
+    for position, store_id in enumerate(store_ids):
+        if groups and store_id == last:
+            groups[-1].append(position)
+        else:
+            groups.append([position])
+            last = store_id
+    return groups
+
+
 def iter_message_chunks(
     messages: Iterable[Any],
     *,

@@ -30,6 +30,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Iterable, Sequence
 
 from .standalone import ensure_agent_context_engine_importable
@@ -55,8 +56,10 @@ DATASET_FILENAME = "longmemeval_s"
 
 PROVIDERS = ("stub", "fastembed", "voyage", "ollama")
 # ``chunk_vectors`` scores the raw-chunk KNN corpus; ``hybrid_rrf3`` fuses it as a
-# third arm alongside FTS + summary vectors. Both are appended so the existing
-# arms keep byte-identical outputs and report ordering.
+# third arm alongside FTS + summary vectors. ``lcm_recall`` scores the ACTUAL
+# production tool (weighted RRF + scope/recency prior + chunk-vs-FTS dedup), not a
+# harness reimplementation. All are appended so the earlier arms keep byte-identical
+# outputs and report ordering.
 ARMS = (
     "fts",
     "summary_vectors",
@@ -64,6 +67,7 @@ ARMS = (
     "hybrid_rerank",
     "chunk_vectors",
     "hybrid_rrf3",
+    "lcm_recall",
 )
 
 # LongMemEval `question_type` -> reported category label. Abstention questions
@@ -276,6 +280,11 @@ def deterministic_session_summary(turns: Sequence[dict[str, Any]], *, max_chars:
         content = turn.get("content", "") if isinstance(turn, dict) else str(turn)
         parts.append(f"{role}: {content}")
     condensed = _WHITESPACE_RE.sub(" ", " ".join(parts)).strip()
+    if not condensed:
+        # LongMemEval_S contains empty haystack sessions; cloud embedding
+        # endpoints (voyage) reject empty inputs with HTTP 400, so an empty
+        # session gets a deterministic non-empty placeholder instead.
+        return "(empty session)"
     return condensed[:max_chars]
 
 
@@ -547,14 +556,110 @@ def summary_turn_keys(session_ranked: Sequence[str]) -> list[TurnKey]:
     return [(session, None) for session in session_ranked]
 
 
-def reorder_turn_keys_by_session(turn_keys: Sequence[TurnKey], session_order: Sequence[str]) -> list[TurnKey]:
-    """Stably reorder turn keys to follow a reranked session order.
+# --------------------------------------------------------------------------- #
+# Production ``lcm_recall`` arm — the tool users actually call.
+# --------------------------------------------------------------------------- #
 
-    Keeps turn-level output of the rerank arm consistent with its session ranking
-    (whether the session ranking came from the real reranker or the placeholder).
+# A synthetic current-session id for the probe engine. lcm_recall applies a scope
+# prior that BOOSTS hits belonging to the current conversation; benchmarking the
+# production path honestly means the probe conversation must sit OUTSIDE the
+# dataset's sessions so no evidence session is silently lifted by conversation
+# membership. (The recency prior still applies to every hit — that is the honest
+# production behavior, noted in benchmarks/README.md.)
+_LCM_RECALL_FRESH_SESSION = "__lcm_recall_fresh_probe__"
+
+
+def fresh_recall_session_id(question: "Question") -> str:
+    """A current-session id guaranteed absent from ``question``'s haystack.
+
+    Deterministic (sentinel + question id) so runs are reproducible, and disjoint
+    from the haystack so the scope prior never boosts a dataset session.
     """
-    rank = {session: index for index, session in enumerate(session_order)}
-    return sorted(turn_keys, key=lambda key: rank.get(key[0], len(rank)))
+    existing = set(question.haystack_session_ids)
+    candidate = f"{_LCM_RECALL_FRESH_SESSION}{question.question_id}"
+    suffix = 0
+    while candidate in existing:
+        suffix += 1
+        candidate = f"{_LCM_RECALL_FRESH_SESSION}{question.question_id}-{suffix}"
+    return candidate
+
+
+def recall_hit_sessions(hits: Sequence[dict[str, Any]]) -> list[str]:
+    """Dedup production recall hits to a session ranking (hit order preserved)."""
+    return _dedup_sessions(
+        str(hit.get("session_id")) for hit in hits if hit.get("session_id")
+    )
+
+
+def recall_hit_turn_keys(
+    hits: Sequence[dict[str, Any]], store_id_to_turn: dict[int, TurnKey]
+) -> list[TurnKey]:
+    """Project production recall hits to turn keys.
+
+    A verbatim hit (``kind`` != ``summary``) carries a ``store_id`` that localizes
+    it to one ``(session, turn_index)`` via the ingest map; a summary hit covers a
+    whole session, so it becomes a ``(session, None)`` marker — the
+    session-granularity credit the ``*`` asterisk warns about.
+    """
+    keys: list[TurnKey] = []
+    for hit in hits:
+        session_id = hit.get("session_id")
+        if hit.get("kind") == "summary":
+            if session_id:
+                keys.append((str(session_id), None))
+            continue
+        store_id = hit.get("store_id")
+        if store_id is None:
+            continue
+        key = store_id_to_turn.get(int(store_id))
+        if key is not None:
+            keys.append(key)
+    return keys
+
+
+def production_recall_hits(
+    question: "Question",
+    config,
+    store,
+    dag,
+    provider_embedder,
+    *,
+    provider_name: str,
+    tmp_dir: Path,
+    embeddings_enabled: bool,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Invoke the REAL ``tools.lcm_recall`` against this question's temp store.
+
+    This is the tool users call: weighted RRF over the FTS + summary + chunk arms
+    (``retrieval_core.rrf_fuse`` with ``LCM_RECALL_ARM_WEIGHTS``), the scope/recency
+    prior, and chunk-vs-FTS dedup by ``store_id`` — none of which the per-arm harness
+    measurements exercise. The engine is the proven smoke-test stand-in (a
+    ``SimpleNamespace`` exposing the already-open store/dag/config with a fresh
+    current-session id). The warmed harness embedder is injected through
+    ``lcm_recall``'s provider cache so no second model load or network call occurs;
+    ``lcm_recall`` clamps ``limit`` to its own production ceiling.
+    """
+    _ensure_hermes_lcm_package()
+    import hermes_lcm.tools as lcm_tools
+
+    engine = SimpleNamespace(
+        _config=config,
+        _store=store,
+        _dag=dag,
+        _hermes_home=str(tmp_dir),
+        current_session_id=fresh_recall_session_id(question),
+    )
+    if embeddings_enabled:
+        cache_key = (
+            str(provider_name).strip().lower(),
+            str(provider_embedder.model_id).strip(),
+        )
+        engine._lcm_embedding_provider_cache = (cache_key, provider_embedder)
+    payload = json.loads(
+        lcm_tools.lcm_recall({"query": question.question, "limit": limit}, engine=engine)
+    )
+    return list(payload.get("hits", []))
 
 
 def _fuse_tiebreak(item):
@@ -834,7 +939,16 @@ def evaluate_question(
         summary_turns = summary_turn_keys(vector_ranked)
 
         hybrid_ranked, hybrid_ms = _timed(lambda: rrf_fuse(fts_ranked, vector_ranked))
-        hybrid_turns = rrf_fuse(fts_turns, summary_turns)
+        # C6: a hybrid arm's turn keys are session-granularity markers projected from
+        # its fused SESSION ranking, NOT an RRF over the raw per-arm turn-key lists.
+        # Fusing precise (fts/chunk) and coarse (summary) keys in one ranked list let
+        # non-evidence precise keys consume the fixed top-k coverage budget ahead of
+        # the summary markers of high-ranked evidence sessions, cratering turn recall
+        # below every input arm (measured 25q: rrf3 tR@5 0.40 vs chunk 0.62 / summary
+        # 0.76; session-marker projection restores it to 0.88). The fused session
+        # ranking is the arm's trustworthy signal, so its turn localization is honestly
+        # session-granularity (carried by the ``*`` asterisk), same as summary_vectors.
+        hybrid_turns = summary_turn_keys(hybrid_ranked)
 
         rerank_mode = RERANK_MODE_PLACEHOLDER
         rerank_start = time.perf_counter()
@@ -858,7 +972,8 @@ def evaluate_question(
         else:
             rerank_ranked = list(hybrid_ranked)
         rerank_ms = (time.perf_counter() - rerank_start) * 1000.0
-        rerank_turns = reorder_turn_keys_by_session(hybrid_turns, rerank_ranked)
+        # C6: session-granularity markers follow the reranked session order.
+        rerank_turns = summary_turn_keys(rerank_ranked)
 
         if embeddings_enabled:
             chunk_raw, chunk_ms = _timed(
@@ -872,7 +987,22 @@ def evaluate_question(
         hybrid_rrf3_ranked, rrf3_ms = _timed(
             lambda: rrf_fuse(fts_ranked, vector_ranked, chunk_ranked)
         )
-        rrf3_turns = rrf_fuse(fts_turns, summary_turns, chunk_turns)
+        # C6: session-granularity markers projected from the fused 3-arm ranking.
+        rrf3_turns = summary_turn_keys(hybrid_rrf3_ranked)
+
+        # The production tool: fetch drives lcm_recall's own limit (clamped to its
+        # 25-hit ceiling). Its hits carry session_id directly (session ranking) and
+        # store_id/node_id for turn projection. Its turn keys mix precise verbatim
+        # keys with (session, None) summary markers, so it carries the asterisk.
+        recall_raw, recall_ms = _timed(
+            lambda: production_recall_hits(
+                question, config, store, dag, provider_embedder,
+                provider_name=provider_name, tmp_dir=tmp_dir,
+                embeddings_enabled=embeddings_enabled, limit=fetch,
+            )
+        )
+        recall_ranked = recall_hit_sessions(recall_raw)
+        recall_turns = recall_hit_turn_keys(recall_raw, store_id_to_turn)
 
         # arm -> (session ranking, latency, turn keys, session_granularity asterisk).
         ranked_by_arm: dict[str, tuple[list[str], float, list[TurnKey], bool]] = {
@@ -882,6 +1012,7 @@ def evaluate_question(
             "hybrid_rerank": (rerank_ranked, rerank_ms, rerank_turns, True),
             "chunk_vectors": (chunk_ranked, chunk_ms, chunk_turns, False),
             "hybrid_rrf3": (hybrid_rrf3_ranked, rrf3_ms, rrf3_turns, True),
+            "lcm_recall": (recall_ranked, recall_ms, recall_turns, True),
         }
         scored: dict[str, Any] = {"ingest_ms": ingest_ms}
         for arm, (ranked, elapsed_ms, turn_keys, session_granularity) in ranked_by_arm.items():

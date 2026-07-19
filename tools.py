@@ -2693,6 +2693,22 @@ def _lcm_recall_bounded_reason(
     )
 
 
+def _lcm_recall_approx_reason(arm: str) -> str:
+    """Disclosure text for a ``coverage='full_approx'`` arm (FIX 2).
+
+    The two-stage path reaches the WHOLE corpus but stage-1 Hamming keeps only
+    the M=mult*k lowest-distance survivors before the exact rescore, so its top-k
+    is an approximate (recall@M) result rather than the exact top-k the
+    exact-scan 'full' coverage gives. Surfaced like 'bounded' so a caller can see
+    the ranking is approximate rather than assuming exhaustive exactness.
+    """
+    return (
+        f"{arm} arm coverage full_approx: whole corpus reached via the binary "
+        "prescreen, but top-k is approximate (stage-1 keeps only the closest "
+        "survivors before exact rescore)"
+    )
+
+
 def _lcm_recall_fts_arm(
     engine: "LCMEngine", query: str, *, candidate_limit: int, deadline: float
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
@@ -3024,6 +3040,10 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
                             degraded_reasons.append(
                                 _lcm_recall_bounded_reason("summary", scanned, total)
                             )
+                        elif cov == "full_approx":
+                            degraded_reasons.append(
+                                _lcm_recall_approx_reason("summary")
+                            )
                     except TimeoutError:
                         timed_out = True
                         coverage["summary"] = "none"
@@ -3046,6 +3066,10 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
                         elif cov == "bounded":
                             degraded_reasons.append(
                                 _lcm_recall_bounded_reason("chunk", scanned, total)
+                            )
+                        elif cov == "full_approx":
+                            degraded_reasons.append(
+                                _lcm_recall_approx_reason("chunk")
                             )
                     except TimeoutError:
                         timed_out = True
