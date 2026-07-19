@@ -4,6 +4,7 @@ import sqlite3
 
 import pytest
 
+import hermes_lcm.vector_store as vector_store_module
 from hermes_lcm.vector_store import EmbeddingIdentity, VectorStore
 
 MODEL = "voyage-context-4"
@@ -127,6 +128,23 @@ class TestChunkWriteAndKnn:
             assert len(result) <= 2
         finally:
             vs.close()
+
+    def test_numpy_absent_reports_full_when_scan_covers_corpus(
+        self, store, monkeypatch
+    ):
+        _write(store, "10:0", 10, 0, [1.0, 0.0, 0.0, 0.0])
+        _write(store, "11:0", 11, 0, [0.0, 1.0, 0.0, 0.0])
+
+        def unavailable():
+            raise ImportError("numpy not installed")
+
+        monkeypatch.setattr(vector_store_module, "_load_numpy", unavailable)
+        result = store.knn_chunks(
+            [1.0, 0.0, 0.0, 0.0], k=5, model=MODEL, provider=PROVIDER
+        )
+
+        assert result.coverage == "full"
+        assert {row[0] for row in result} == {"10:0", "11:0"}
 
 
 class TestArchiveOnPurge:

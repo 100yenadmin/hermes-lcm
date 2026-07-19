@@ -611,11 +611,15 @@ def test_warmup_command_probes_and_registers_profile(monkeypatch, tmp_path):
     )
     store = VectorStore(engine._store.db_path)
     try:
-        row = store.connection.execute(
-            "SELECT provider, dim FROM lcm_embedding_profile WHERE model_name = ?",
+        rows = store.connection.execute(
+            "SELECT provider, dim, task FROM lcm_embedding_profile "
+            "WHERE model_name = ? ORDER BY task",
             ("model-a",),
-        ).fetchone()
-        assert tuple(row) == ("ollama", 3)
+        ).fetchall()
+        assert [tuple(row) for row in rows] == [
+            ("ollama", 3, "chunk"),
+            ("ollama", 3, "summary"),
+        ]
     finally:
         store.close()
 
@@ -643,9 +647,60 @@ def test_warmup_command_new_dim_is_a_distinct_identity_no_clobber(monkeypatch, t
     try:
         rows = store.connection.execute(
             "SELECT dim, active FROM lcm_embedding_profile "
-            "WHERE model_name = 'model-a' ORDER BY dim"
+            "WHERE model_name = 'model-a' AND task = 'summary' ORDER BY dim"
         ).fetchall()
         assert [tuple(r) for r in rows] == [(2, 0), (3, 1)]
+    finally:
+        store.close()
+
+
+def test_warmup_registers_voyage_context_chunk_profile(monkeypatch, tmp_path):
+    summary = FakeWarmupProvider([0.1, 0.2, 0.3])
+    summary.provider_id = "voyage"
+    summary.model_id = "voyage-3"
+    chunk = FakeWarmupProvider([0.1, 0.2, 0.3, 0.4])
+    chunk.provider_id = "voyage"
+    chunk.model_id = "voyage-context-4"
+
+    def resolve(config):
+        return chunk if config.embedding_model == "voyage-context-4" else summary
+
+    monkeypatch.setattr(command_mod, "resolve_provider", resolve)
+    engine = _command_engine(tmp_path)
+    engine._config.embedding_provider = "voyage"
+    engine._config.embedding_model = "voyage-3"
+
+    result = handle_lcm_command("embed warmup", engine)
+
+    assert "status: ready" in result
+    assert "chunk_model: voyage-context-4" in result
+    assert "chunk_dim: 4" in result
+    assert summary.calls == ["warmup"]
+    assert chunk.calls == ["warmup"]
+    store = VectorStore(engine._store.db_path)
+    try:
+        rows = store.connection.execute(
+            "SELECT model_name, dim, task FROM lcm_embedding_profile "
+            "WHERE active = 1 ORDER BY task"
+        ).fetchall()
+        assert [tuple(row) for row in rows] == [
+            ("voyage-context-4", 4, "chunk"),
+            ("voyage-3", 3, "summary"),
+        ]
+    finally:
+        store.close()
+
+
+def test_summary_profile_lookup_ignores_newer_chunk_profile(tmp_path):
+    engine = _command_engine(tmp_path)
+    store = VectorStore(engine._store.db_path)
+    try:
+        summary_identity = store.register_profile("summary-model", "voyage", 3)
+        store.register_profile("chunk-model", "voyage", 4, task="chunk")
+        row = command_mod._embedding_current_profile(store.connection)
+        assert row is not None
+        assert row["identity_hash"] == summary_identity
+        assert row["task"] == "summary"
     finally:
         store.close()
 

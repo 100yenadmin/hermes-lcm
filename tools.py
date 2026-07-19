@@ -23,7 +23,7 @@ from .externalize import (
     read_externalized_payload_metadata_prefix,
     read_externalized_payload_search_prefix,
 )
-from .embedding_provider import VoyageError, resolve_provider
+from .embedding_provider import VoyageError, default_chunk_model, resolve_provider
 from .diagnostics import (
     _has_lifecycle_fragmentation,
     _state_db_path_for_engine,
@@ -2322,6 +2322,31 @@ def _resolve_recall_provider(
     return provider
 
 
+def _resolve_recall_chunk_provider(
+    engine: "LCMEngine", summary_provider: Any, *, deadline: float | None = None
+) -> Any:
+    """Resolve the provider/model identity registered for the chunk corpus."""
+    chunk_model = default_chunk_model(
+        summary_provider.provider_id, summary_provider.model_id
+    )
+    if chunk_model == summary_provider.model_id:
+        return summary_provider
+    cache_key = (str(summary_provider.provider_id).lower(), chunk_model)
+    cached = getattr(engine, "_lcm_chunk_provider_cache", None)
+    if cached is not None and cached[0] == cache_key:
+        return cached[1]
+    if deadline is not None and time.monotonic() >= deadline:
+        raise TimeoutError("chunk provider resolution deadline exhausted")
+    chunk_config = copy.copy(engine._config)
+    chunk_config.embedding_provider = summary_provider.provider_id
+    chunk_config.embedding_model = chunk_model
+    provider = resolve_provider(chunk_config)
+    if deadline is not None and time.monotonic() >= deadline:
+        raise TimeoutError("chunk provider resolution deadline exhausted")
+    engine._lcm_chunk_provider_cache = (cache_key, provider)
+    return provider
+
+
 def _lcm_grep_semantic(
     args: Dict[str, Any],
     *,
@@ -3098,7 +3123,8 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
             arm_hits["fts"] = hits
             coverage["fts"] = "ok"
 
-    # -- Vector arms (summary + chunk) share one provider + query embedding --
+    # -- Vector arms. Local/same-model corpora share one query embedding;
+    # Voyage's context chunk corpus resolves and embeds with its own model. --
     if run_summary or run_chunk:
         if not embeddings_enabled:
             degraded_reasons.append("semantic retrieval is disabled")
@@ -3110,6 +3136,8 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
             timed_out = True
         else:
             query_vector: list[float] | None = None
+            chunk_provider: Any = None
+            chunk_query_vector: list[float] | None = None
             provider_override = kwargs.get("provider_override")
             try:
                 provider = _run_within_deadline(
@@ -3123,7 +3151,7 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
                 )
                 if provider is None:
                     degraded_reasons.append("embedding provider is not configured")
-                else:
+                elif run_summary:
                     query_vector = _lcm_grep_embed_query(
                         provider, query, remaining_s=deadline - time.monotonic()
                     )
@@ -3136,6 +3164,40 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
             except Exception as exc:  # noqa: BLE001 - degrade, never bare-error the whole tool
                 provider = None
                 degraded_reasons.append(f"embedding provider unavailable: {exc}")
+
+            if run_chunk and provider is not None:
+                try:
+                    chunk_provider = _run_within_deadline(
+                        lambda: _resolve_recall_chunk_provider(
+                            engine, provider, deadline=deadline
+                        ),
+                        remaining_s=deadline - time.monotonic(),
+                        name="lcm-chunk-provider-resolution",
+                    )
+                    if chunk_provider is None:
+                        degraded_reasons.append(
+                            "chunk embedding provider is not configured"
+                        )
+                    elif (
+                        query_vector is not None
+                        and chunk_provider.provider_id == provider.provider_id
+                        and chunk_provider.model_id == provider.model_id
+                    ):
+                        chunk_query_vector = query_vector
+                    else:
+                        chunk_query_vector = _lcm_grep_embed_query(
+                            chunk_provider,
+                            query,
+                            remaining_s=deadline - time.monotonic(),
+                        )
+                except VoyageError as exc:
+                    degraded_reasons.append(f"chunk query embedding failed: {exc}")
+                except TimeoutError:
+                    timed_out = True
+                except Exception as exc:  # noqa: BLE001
+                    degraded_reasons.append(
+                        f"chunk embedding provider unavailable: {exc}"
+                    )
 
             if query_vector is not None:
                 if run_summary:
@@ -3165,12 +3227,13 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
                     except Exception as exc:  # noqa: BLE001
                         coverage["summary"] = "none"
                         degraded_reasons.append(f"summary arm failed: {exc}")
+            if chunk_query_vector is not None:
                 if run_chunk:
                     try:
                         hits, cov, scanned, total = _lcm_recall_chunk_arm(
                             engine,
-                            query_vector=query_vector,
-                            provider=provider,
+                            query_vector=chunk_query_vector,
+                            provider=chunk_provider,
                             candidate_limit=candidate_limit,
                             deadline=deadline,
                         )

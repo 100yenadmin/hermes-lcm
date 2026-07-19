@@ -123,6 +123,45 @@ def _recall(engine, monkeypatch, provider=None, **args):
     return payload
 
 
+def test_voyage_chunk_recall_uses_context_model(recall_engine, monkeypatch):
+    summary = MockProvider()
+    summary.provider_id = "voyage"
+    summary.model_id = "voyage-3"
+    chunk = MockProvider(vector=(0.0, 1.0))
+    chunk.provider_id = "voyage"
+    chunk.model_id = "voyage-context-4"
+    recall_engine._config.embedding_provider = "voyage"
+    recall_engine._config.embedding_model = "voyage-3"
+
+    def resolve(config):
+        return chunk if config.embedding_model == "voyage-context-4" else summary
+
+    captured = {}
+
+    def chunk_arm(_engine, *, query_vector, provider, **_kwargs):
+        captured["model"] = provider.model_id
+        captured["query_vector"] = query_vector
+        return [], "none", None, None
+
+    monkeypatch.setattr(lcm_tools, "resolve_provider", resolve)
+    monkeypatch.setattr(lcm_tools, "_lcm_recall_fts_arm", lambda *_a, **_k: ([], None))
+    monkeypatch.setattr(lcm_tools, "_lcm_recall_chunk_arm", chunk_arm)
+
+    json.loads(
+        lcm_tools.lcm_recall(
+            {"query": "context query", "include": "verbatim"},
+            engine=recall_engine,
+        )
+    )
+
+    assert summary.queries == []
+    assert chunk.queries == ["context query"]
+    assert captured == {
+        "model": "voyage-context-4",
+        "query_vector": [0.0, 1.0],
+    }
+
+
 def test_recall_returns_cross_session_summaries_without_a_filter(recall_engine, monkeypatch):
     other_a = _add_summary(recall_engine, "kanban board dashboard sprint plan", session_id="session-a", created_at=10.0)
     other_b = _add_summary(recall_engine, "fleet archive sprint board", session_id="session-b", created_at=11.0)

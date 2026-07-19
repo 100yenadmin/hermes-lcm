@@ -483,6 +483,37 @@ class TestChunkApply:
         assert "embedded: 0" in second
         assert _chunk_meta_ids(engine) == ["1:0", "2:0", "3:0"]
 
+    def test_prescreen_revision_identity_applies(self, monkeypatch, tmp_path):
+        engine = _engine(tmp_path)
+        engine._config.embedding_binary_prescreen = True
+        _seed_messages(engine, _user_msgs(1))
+        provider = FakeProvider()
+        monkeypatch.setattr(command_mod, "resolve_provider", lambda _c, **_k: provider)
+
+        result = handle_lcm_command("embed backfill --corpus chunks --apply", engine)
+
+        assert "status: complete" in result
+        assert _chunk_meta_ids(engine) == ["1:0"]
+
+    def test_provider_skips_leave_run_partial(self, monkeypatch, tmp_path):
+        engine = _engine(tmp_path)
+        _seed_messages(engine, _user_msgs(3))
+        provider = FakeProvider()
+
+        def skip_middle(texts):
+            provider.calls.append(list(texts))
+            provider.last_skipped_documents = [1]
+            return [[1.0, 1.0], [2.0, 1.0]]
+
+        provider.embed_documents = skip_middle
+        monkeypatch.setattr(command_mod, "resolve_provider", lambda _c, **_k: provider)
+
+        result = handle_lcm_command("embed backfill --corpus chunks --apply", engine)
+
+        assert "status: partial" in result
+        assert "skipped_overcap: 1" in result
+        assert "remaining: 1" in result
+
     def test_lease_and_uncertain_retry(self, monkeypatch, tmp_path):
         engine = _engine(tmp_path)
         _seed_messages(engine, _user_msgs(2))
