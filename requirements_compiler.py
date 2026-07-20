@@ -1127,6 +1127,7 @@ def _base_result(
             "input_tokens": 0,
             "output_tokens": 0,
             "cost_usd": 0.0,
+            "query_tokens_complete": True,
         },
         "budgets": limits.as_dict(),
         "metrics": {
@@ -1285,6 +1286,18 @@ def _merge_usage(target: dict[str, Any], payload: Mapping[str, Any]) -> None:
         value = source.get("cost_usd")
         if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value)):
             target["cost_usd"] += max(0.0, float(value))
+    metrics = payload.get("metrics")
+    if not isinstance(metrics, Mapping):
+        target["query_tokens_complete"] = False
+        return
+    calls = metrics.get("embedding_query_calls")
+    if isinstance(calls, (int, float)) and not isinstance(calls, bool):
+        target["provider_calls"] += max(0, int(calls))
+    tokens = metrics.get("embedding_query_tokens")
+    if isinstance(tokens, (int, float)) and not isinstance(tokens, bool):
+        target["input_tokens"] += max(0, int(tokens))
+    if metrics.get("embedding_query_tokens_complete") is not True:
+        target["query_tokens_complete"] = False
 
 
 def _retrieve_sources(
@@ -1327,8 +1340,10 @@ def _retrieve_sources(
             raw = retrieve(args)
             payload = json.loads(raw) if isinstance(raw, str) else raw
         except Exception:
+            result["retrieval"]["query_tokens_complete"] = False
             continue
         if not isinstance(payload, Mapping):
+            result["retrieval"]["query_tokens_complete"] = False
             continue
         _merge_usage(result["retrieval"], payload)
         hits = payload.get("hits")

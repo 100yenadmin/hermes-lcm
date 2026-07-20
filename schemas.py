@@ -499,14 +499,6 @@ LCM_EVIDENCE_PACK = {
             },
         },
         "required": ["question", "baseline_refs"],
-        "allOf": [
-            {
-                "if": {
-                    "properties": {"mode": {"const": "proposal"}},
-                },
-                "then": {"required": ["proposal"]},
-            }
-        ],
     },
 }
 
@@ -708,6 +700,14 @@ LCM_COMPILE_EVIDENCE = {
             },
         },
         "required": ["question", "baseline_refs"],
+        "allOf": [
+            {
+                "if": {
+                    "properties": {"mode": {"const": "proposal"}},
+                },
+                "then": {"required": ["proposal"]},
+            }
+        ],
     },
 }
 

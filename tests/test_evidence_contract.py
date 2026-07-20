@@ -676,6 +676,59 @@ def test_second_targeted_query_may_close_a_named_slot_after_no_progress(tmp_path
     assert all(not ref.startswith("lcm:3:") for ref in result["novel_exact_refs"])
 
 
+def test_retrieval_usage_maps_product_embedding_metrics_without_query_payload(tmp_path):
+    engine = _engine(tmp_path)
+    baseline = _append(engine, "We discussed the commute yesterday.")
+    useful = _append(engine, "My commute is 35 minutes.", session_id="fact")
+
+    def retrieve(_args):
+        return {
+            "hits": [{"exact_ref": useful["exact_ref"]}],
+            "metrics": {
+                "embedding_query_calls": 1,
+                "embedding_query_tokens": 7,
+                "embedding_query_tokens_complete": True,
+            },
+        }
+
+    try:
+        result = _compile(
+            engine,
+            "How long is my commute?",
+            [baseline],
+            retrieve=retrieve,
+        )
+    finally:
+        engine._store.close()
+
+    assert result["retrieval"]["provider_calls"] == 1
+    assert result["retrieval"]["input_tokens"] == 7
+    assert result["retrieval"]["query_tokens_complete"] is True
+    assert "commute" not in json.dumps(result["retrieval"]["queries"])
+
+
+def test_failed_retrieval_marks_query_token_provenance_incomplete(tmp_path):
+    engine = _engine(tmp_path)
+    baseline = _append(engine, "We discussed the commute yesterday.")
+
+    def retrieve(_args):
+        raise RuntimeError("provider unavailable")
+
+    try:
+        result = _compile(
+            engine,
+            "How long is my commute?",
+            [baseline],
+            retrieve=retrieve,
+        )
+    finally:
+        engine._store.close()
+
+    assert result["retrieval"]["calls"] >= 1
+    assert result["retrieval"]["query_tokens_complete"] is False
+    assert result["context"] is None
+
+
 def test_non_conversational_baseline_does_not_trigger_neighbor_expansion(tmp_path):
     engine = _engine(tmp_path)
     statement = _append(engine, "The reward program is changing soon.")
