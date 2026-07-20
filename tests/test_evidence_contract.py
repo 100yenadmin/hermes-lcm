@@ -339,8 +339,9 @@ def test_temporal_event_selects_only_the_resolved_question_day(tmp_path):
         engine._store.close()
 
     assert result["state"] == "answer_sufficient"
-    assert "Plank Challenge" in result["context"]
-    assert "reading challenge" not in result["context"]
+    assert result["context"] is None
+    assert result["status"] == "no_augmentation"
+    assert result["direct_fact"]["value"] == "I completed the Plank Challenge."
     assert result["finite_coverage"] is False
     assert result["direct_fact"]["time_basis"] == "adapter_session_date"
 
@@ -601,6 +602,264 @@ def test_global_hydration_cap_and_full_input_digest_are_honest(tmp_path):
     assert result["metrics"]["hydrated_candidates"] == 12
     assert result["metrics"]["candidate_count"] <= 48
     assert calls == []
+
+
+def test_saturated_baseline_reserves_frontier_for_opposite_role_closure(tmp_path):
+    engine = _engine(tmp_path)
+    lead = _append(
+        engine,
+        "Could you remind me how long the ferry commute takes?",
+        role="user",
+    )
+    _append(
+        engine,
+        "Your ferry commute takes 42 minutes.",
+        role="assistant",
+    )
+    noise = [
+        _append(engine, f"Unrelated garden note {index}.", session_id=f"noise-{index}")
+        for index in range(11)
+    ]
+    try:
+        result = _compile(
+            engine,
+            "How long is my ferry commute?",
+            [*noise, lead, _append(engine, "Another unrelated note.", session_id="tail")],
+            budgets={"max_retrieval_calls": 0},
+        )
+    finally:
+        engine._store.close()
+
+    assert result["state"] == "answer_sufficient"
+    assert len(result["novel_exact_refs"]) == 1
+    assert result["novel_exact_refs"][0].startswith("lcm:2:")
+    assert result["metrics"]["hydrated_candidates"] <= 12
+    assert result["metrics"]["session_loads"] >= 1
+
+
+def test_saturated_baseline_can_retrieve_second_named_operand_within_cap(tmp_path):
+    engine = _engine(tmp_path)
+    walking = _append(engine, "The walking route takes 45 minutes.", session_id="walk")
+    cycling = _append(engine, "The cycling route takes 20 minutes.", session_id="cycle")
+    noise = [
+        _append(engine, f"Unrelated recipe note {index}.", session_id=f"noise-{index}")
+        for index in range(12)
+    ]
+    calls = []
+
+    def retrieve(_args):
+        calls.append(True)
+        return {"hits": [cycling]}
+
+    try:
+        result = _compile(
+            engine,
+            "How much time do I save by cycling instead of walking?",
+            [*noise, walking],
+            retrieve=retrieve,
+        )
+    finally:
+        engine._store.close()
+
+    assert calls
+    assert result["state"] == "computation_sufficient"
+    assert result["computation"]["result_value"] == 25
+    assert result["metrics"]["hydrated_candidates"] <= 12
+
+
+def test_input_ref_outside_active_frontier_is_never_counted_as_novel(tmp_path):
+    engine = _engine(tmp_path)
+    noise = [
+        _append(engine, f"Unrelated travel note {index}.", session_id=f"noise-{index}")
+        for index in range(12)
+    ]
+    cached = _append(
+        engine,
+        "The ferry commute takes 42 minutes.",
+        session_id="cached-rank-13",
+    )
+
+    def retrieve(_args):
+        return {"hits": [cached]}
+
+    try:
+        result = _compile(
+            engine,
+            "How long is my ferry commute?",
+            [*noise, cached],
+            retrieve=retrieve,
+        )
+    finally:
+        engine._store.close()
+
+    assert cached["exact_ref"] not in result["novel_exact_refs"]
+
+
+def test_noun_product_does_not_trigger_arithmetic_fallback(tmp_path):
+    engine = _engine(tmp_path)
+    source = _append(engine, "You need 80 credits to redeem the free product.")
+    try:
+        result = _compile(
+            engine,
+            "How many credits do I need to redeem the free product?",
+            [source],
+            budgets={"max_retrieval_calls": 0},
+        )
+    finally:
+        engine._store.close()
+
+    assert result["contract"]["operation"] == "scalar"
+    assert result["direct_fact"]["value"] == 80
+
+
+def test_relative_temporal_wh_clause_uses_explicit_as_of(tmp_path):
+    engine = _engine(tmp_path)
+    source = _append(
+        engine,
+        "I held the pottery exhibition at Harbor Hall.",
+        session_id="event",
+    )
+    engine._session_occurrence_dates["event"] = "2025-03-06"
+    try:
+        result = _compile(
+            engine,
+            "I mentioned an exhibition two weeks ago. Where was it held?",
+            [source],
+            question_as_of="2025-03-20",
+            budgets={"max_retrieval_calls": 0},
+        )
+    finally:
+        engine._store.close()
+
+    assert result["contract"]["operation"] == "date_filter"
+    assert result["contract"]["answer_kind"] == "place"
+    assert result["direct_fact"]["value"] == "Harbor Hall"
+
+
+def test_direct_stated_total_precedes_operand_arithmetic(tmp_path):
+    engine = _engine(tmp_path)
+    source = _append(
+        engine,
+        "The workshop fees were $40 and $65, for a total of $105.",
+    )
+    try:
+        result = _compile(
+            engine,
+            "How much total money did I spend on the workshop fees?",
+            [source],
+            budgets={"max_retrieval_calls": 0},
+        )
+    finally:
+        engine._store.close()
+
+    assert result["state"] == "answer_sufficient"
+    assert result["direct_fact"]["value"] == 105
+    assert result["direct_fact"]["unit"] == "usd"
+    assert result["context"] is None
+
+
+def test_three_quoted_operands_compile_three_exact_sum_slots(tmp_path):
+    engine = _engine(tmp_path)
+    alpha = _append(engine, "Reading 'Alpha' took 1 week.", session_id="alpha")
+    beta = _append(engine, "Reading 'Beta' took 2 weeks.", session_id="beta")
+    gamma = _append(engine, "Reading 'Gamma' took 3 weeks.", session_id="gamma")
+    try:
+        result = _compile(
+            engine,
+            "How many weeks total did I spend on 'Alpha', 'Beta', and 'Gamma'?",
+            [alpha, beta, gamma],
+            budgets={"max_retrieval_calls": 0},
+        )
+    finally:
+        engine._store.close()
+
+    assert len(result["contract"]["slots"]) == 3
+    assert result["state"] == "computation_sufficient"
+    assert result["computation"]["result_value"] == 6
+
+
+def test_unique_highest_anchor_scalar_beats_irrelevant_number_but_tie_fails(tmp_path):
+    engine = _engine(tmp_path)
+    weak = _append(engine, "The group reservation is for 8 people.", session_id="weak")
+    strong = _append(engine, "I directly lead 5 engineers on the platform team.", session_id="strong")
+    conflict = _append(engine, "I directly lead 6 engineers on the platform team.", session_id="conflict")
+    try:
+        selected = _compile(
+            engine,
+            "How many engineers do I directly lead on the platform team?",
+            [weak, strong],
+            budgets={"max_retrieval_calls": 0},
+        )
+        ambiguous = _compile(
+            engine,
+            "How many engineers do I directly lead on the platform team?",
+            [strong, conflict],
+            budgets={"max_retrieval_calls": 0},
+        )
+    finally:
+        engine._store.close()
+
+    assert selected["direct_fact"]["value"] == 5
+    assert ambiguous["reason_code"] == "ambiguous_scalar_candidates"
+    assert ambiguous["context"] is None
+
+
+def test_latest_ignores_irrelevant_older_conflict_but_frontier_conflict_fails(tmp_path):
+    engine = _engine(tmp_path)
+    old_time = datetime(2024, 1, 1, tzinfo=timezone.utc).timestamp()
+    new_time = datetime(2024, 2, 1, tzinfo=timezone.utc).timestamp()
+    old_a = _append(engine, "I live in Austin.", session_id="old-a", timestamp=old_time)
+    old_b = _append(engine, "I live in Boston.", session_id="old-b", timestamp=old_time)
+    current = _append(engine, "I live in Denver.", session_id="current", timestamp=new_time)
+    current_conflict = _append(engine, "I live in Seattle.", session_id="new-b", timestamp=new_time)
+    try:
+        safe = _compile(
+            engine,
+            "Where do I currently live?",
+            [old_a, old_b, current],
+            question_as_of="2024-03-01",
+            budgets={"max_retrieval_calls": 0},
+        )
+        conflicted = _compile(
+            engine,
+            "Where do I currently live?",
+            [current, current_conflict],
+            question_as_of="2024-03-01",
+            budgets={"max_retrieval_calls": 0},
+        )
+    finally:
+        engine._store.close()
+
+    assert safe["direct_fact"]["value"] == "Denver"
+    assert conflicted["reason_code"] == "state_conflicted"
+
+
+def test_finite_scan_ignores_generic_advice_but_rejects_unknown_source_event(tmp_path):
+    engine = _engine(tmp_path)
+    known = _append(engine, "I attended Jordan's wedding.", session_id="known")
+    _append(
+        engine,
+        "Wedding planning usually includes flowers and invitations.",
+        session_id="advice",
+        role="assistant",
+    )
+    unknown = _append(engine, "I attended Casey's wedding.", session_id="unknown")
+    engine._session_occurrence_dates["known"] = "2025-02-01"
+    try:
+        result = _compile(
+            engine,
+            "How many weddings did I attend this year?",
+            [known],
+            question_as_of="2025-12-31",
+            budgets={"max_retrieval_calls": 0},
+        )
+    finally:
+        engine._store.close()
+
+    assert result["finite_coverage"] is False
+    assert result["reason_code"] == "finite_unknown_time_population"
+    assert result["coverage_certificate"]["material_clauses"] == 2
+    assert unknown["exact_ref"].startswith("lcm:")
 
 
 def test_increase_from_uses_source_order_and_unique_operand_spans(tmp_path):

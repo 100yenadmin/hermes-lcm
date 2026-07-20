@@ -134,7 +134,8 @@ _TEMPORAL_RELATIVE_RE = re.compile(
     re.IGNORECASE,
 )
 _UNSUPPORTED_RE = re.compile(
-    r"\b(?:average|mean|median|percentage|percent|ratio|rate|multiply|product|divide)\b",
+    r"\b(?:average|mean|median|percentage|percent|ratio|rate|multiply|divide)\b|"
+    r"\bproduct\s+of\b",
     re.IGNORECASE,
 )
 _TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]*")
@@ -251,15 +252,47 @@ def _canonical_unit(raw: str | None) -> str | None:
 
 def _requested_unit(text: str) -> str | None:
     normalized = text.casefold()
+    has_time_dimension = bool(
+        re.search(r"\b(?:time|minutes?|hours?|days?|weeks?|months?|years?)\b", normalized)
+    )
+    if re.search(
+        r"(?:[$€£]|\b(?:usd|dollars?|money|cost|costs|fare|fares|fee|fees|"
+        r"price|prices|savings)\b)",
+        normalized,
+    ) or (
+        not has_time_dimension
+        and re.search(r"\bhow much\b.{0,80}\b(?:spend|spent|save|saved)\b", normalized)
+    ):
+        return "usd"
     match = re.search(
-        r"\bhow\s+many\s+(minutes?|hours?|days?|weeks?|months?|points?|pages?|"
-        r"items?|events?|people|persons?|[a-z][a-z-]{2,})\b",
+        r"\bhow\s+many\s+(minutes?|hours?|days?|weeks?|months?|years?|points?|pages?)\b",
         normalized,
     )
     if match:
         return _canonical_unit(match.group(1))
     match = re.search(
+        r"\bhow\s+many\s+(.{1,80}?)\s+"
+        r"(?:do|did|have|has|am|is|are|was|were|will|would|can|could|should|need)\b",
+        normalized,
+    )
+    if match:
+        phrase = re.sub(r"^(?:different|total|number\s+of)\s+", "", match.group(1))
+        if re.search(r"\bitems?\s+of\s+clothing\b", phrase):
+            return "clothing_item"
+        # Alternatives name a facet set, not a trustworthy scalar dimension.
+        if not re.search(r"\b(?:and|or)\b", phrase):
+            words = re.findall(r"[a-z][a-z-]*", phrase)
+            if words:
+                return _canonical_unit(words[-1])
+    match = re.search(
         r"\b(?:in|measured in)\s+(minutes?|hours?|days?|weeks?|months?)\b",
+        normalized,
+    )
+    if match:
+        return _canonical_unit(match.group(1))
+    match = re.search(
+        r"\b(?:the\s+)?(?:one|two|three|four|five|six|seven|eight|nine|ten|"
+        r"eleven|twelve|\d{1,2})\s+(?:named\s+)?([a-z][a-z-]*)s?\b",
         normalized,
     )
     return _canonical_unit(match.group(1)) if match else None
@@ -310,6 +343,13 @@ def _clean_operand(value: str) -> str | None:
 
 def _named_operands(text: str, operation: str) -> tuple[str, ...]:
     normalized = " ".join(text.split())
+    quoted = tuple(
+        value
+        for raw in re.findall(r"['\"]([^'\"]{1,120})['\"]", normalized)
+        if (value := _clean_operand(raw)) is not None
+    )
+    if 2 <= len(quoted) <= 8:
+        return quoted
     if operation == "difference":
         instead = re.search(
             r"\b(?:taking|using|choosing|with)?\s*(?:the\s+)?(.{1,80}?)\s+"
@@ -354,23 +394,28 @@ def _named_operands(text: str, operation: str) -> tuple[str, ...]:
         )
         if len(values) == 2:
             return values
-    quoted = tuple(
-        value
-        for raw in re.findall(r"['\"]([^'\"]{1,120})['\"]", normalized)
-        if (value := _clean_operand(raw)) is not None
-    )
-    return quoted if 2 <= len(quoted) <= 8 else ()
+    return ()
 
 
 def _answer_kind(text: str, operation: ContractOperation) -> AnswerKind:
     normalized = text.casefold()
     if operation in {"latest", "previous"}:
+        if re.search(r"\bhow\s+(?:many|much)\b", normalized):
+            return "quantity"
+        if re.search(r"\b(?:how long|duration|personal best time|record time)\b", normalized):
+            return "duration"
         if normalized.startswith("where"):
             return "place"
         if normalized.startswith("who"):
             return "person"
         return "state"
     if operation == "date_filter":
+        if re.search(r"\bwhere\b", normalized):
+            return "place"
+        if re.search(r"\b(?:who|whom|which artist|what artist)\b", normalized):
+            return "person"
+        if re.search(r"\bwhen\b", normalized):
+            return "time"
         return "event"
     if operation in {"sum", "difference", "count_distinct", "scalar"}:
         if re.search(r"\bhow long\b", normalized):
@@ -396,6 +441,47 @@ def _time_window(text: str, canonical_as_of: str | None) -> TemporalWindow | Non
             return relative
         anchor = date.fromisoformat(canonical_as_of)
         normalized = text.casefold()
+        rolling = re.search(
+            r"\blast\s+(\d+|one|two|three|four|five|six|seven|eight|nine|ten|"
+            r"eleven|twelve)\s+(day|week|month)s?\b",
+            normalized,
+        )
+        if rolling:
+            raw = rolling.group(1)
+            amount = int(raw) if raw.isdigit() else _WORD_NUMBERS[raw]
+            if rolling.group(2) == "day":
+                start = anchor - timedelta(days=amount)
+            elif rolling.group(2) == "week":
+                start = anchor - timedelta(days=amount * 7)
+            else:
+                month_index = anchor.year * 12 + anchor.month - 1 - amount
+                year, month_zero = divmod(month_index, 12)
+                start = date(year, month_zero + 1, 1)
+            return TemporalWindow(start, anchor + timedelta(days=1), rolling.group(0))
+        month_names = {
+            "january": 1,
+            "february": 2,
+            "march": 3,
+            "april": 4,
+            "may": 5,
+            "june": 6,
+            "july": 7,
+            "august": 8,
+            "september": 9,
+            "october": 10,
+            "november": 11,
+            "december": 12,
+        }
+        named_month = re.search(
+            r"\b(?:in|during)\s+(" + "|".join(month_names) + r")\b",
+            normalized,
+        )
+        if named_month:
+            month = month_names[named_month.group(1)]
+            year = anchor.year if month <= anchor.month else anchor.year - 1
+            start = date(year, month, 1)
+            end = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
+            return TemporalWindow(start, end, f"{named_month.group(1)} {year}")
         if re.search(r"\bthis year\b", normalized):
             return TemporalWindow(
                 date(anchor.year, 1, 1),
@@ -442,6 +528,7 @@ def compile_answer_contract(
     if relative and canonical_as_of is None:
         return ContractDecision("fallback", reason_code="question_as_of_required")
     window = _time_window(text, canonical_as_of)
+    unit_hint = _requested_unit(text)
 
     operation: ContractOperation
     coverage: CoveragePolicy
@@ -482,6 +569,14 @@ def compile_answer_contract(
         operation, coverage = "sum", "fixed_operands"
         named = _named_operands(text, operation)
         finite = len(named) or finite or 2
+    elif (
+        unit_hint in {"minute", "hour", "day", "week", "month", "year"}
+        and re.search(r"\bhow\s+many\b.{1,120}\b(?:and|plus)\b", normalized)
+        and len(_named_operands(text, "sum")) >= 2
+    ):
+        operation, coverage = "sum", "fixed_operands"
+        named = _named_operands(text, operation)
+        finite = len(named)
     elif re.search(r"\b(?:chronolog|in order|order of|earliest to latest|latest to earliest)\b", normalized):
         operation, coverage = "order", "fixed_operands"
         order_direction = (
@@ -493,17 +588,10 @@ def compile_answer_contract(
         r"\b(?:advice|tips?|recommend|suggest|what should|how can)\b", normalized
     ):
         operation, coverage, finite = "none", "source_asserted_fact", 1
-    elif re.search(r"\b(?:current|currently|now|latest|most recent|these days)\b", normalized):
-        operation, coverage, finite = "latest", "source_asserted_fact", 1
-    elif re.search(r"\b(?:previous|previously|formerly|former|prior|before that|used to)\b", normalized):
-        operation, coverage, finite = "previous", "source_asserted_fact", 1
-    elif window is not None and re.search(
-        r"\b(?:what|which|who|where).*(?:ago|yesterday|last\s+|this\s+)\b",
+    elif re.search(
+        r"\b(?:how many|how much|how long|what (?:was|is) the (?:number|count|duration))\b",
         normalized,
     ):
-        operation, coverage = "date_filter", "source_asserted_fact"
-        finite = None
-    elif re.search(r"\b(?:how many|how much|how long|what (?:was|is) the (?:number|count|duration))\b", normalized):
         if re.fullmatch(r"how much (?:was )?it\??", normalized):
             return ContractDecision("fallback", reason_code="insufficient_anchors")
         operation = "scalar"
@@ -521,6 +609,13 @@ def compile_answer_contract(
             else "source_asserted_fact"
         )
         finite = None
+    elif re.search(r"\b(?:current|currently|now|latest|most recent|these days)\b", normalized):
+        operation, coverage, finite = "latest", "source_asserted_fact", 1
+    elif re.search(r"\b(?:previous|previously|formerly|former|prior|before that|used to)\b", normalized):
+        operation, coverage, finite = "previous", "source_asserted_fact", 1
+    elif window is not None and re.search(r"\b(?:what|which|who|whom|where|when)\b", normalized):
+        operation, coverage = "date_filter", "source_asserted_fact"
+        finite = None
     elif re.match(r"^(?:who|where|when)\b", normalized):
         operation, coverage, finite = "none", "source_asserted_fact", 1
     elif re.match(r"^(?:what|which)\b", normalized):
@@ -536,7 +631,7 @@ def compile_answer_contract(
     else:
         return ContractDecision("not_applicable", reason_code="ordinary_or_low_confidence")
 
-    unit = _requested_unit(text)
+    unit = unit_hint
     anchors = _anchors(text, unit=unit)
     if not anchors and unit:
         anchors = (unit.replace("_", " "),)

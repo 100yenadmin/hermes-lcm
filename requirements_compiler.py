@@ -99,6 +99,17 @@ _TIME_FACTORS = {
     "day": 1_440.0,
     "week": 10_080.0,
 }
+_MEASUREMENT_UNITS = frozenset({
+    "minute",
+    "hour",
+    "day",
+    "week",
+    "month",
+    "year",
+    "usd",
+    "point",
+    "page",
+})
 
 
 @dataclass(frozen=True)
@@ -180,6 +191,50 @@ def _tokens(value: Any) -> set[str]:
 
 def _estimate_tokens(value: str) -> int:
     return max(1, math.ceil(len(value) / 4)) if value else 0
+
+
+def _raw_quote(raw: Any) -> str:
+    if not isinstance(raw, Mapping):
+        return ""
+    return str(raw.get("quote") or raw.get("content") or "")
+
+
+def _rank_baseline_inputs(
+    values: Sequence[Any], contract: AnswerContract | None
+) -> list[Any]:
+    """Prioritize already-retrieved exact evidence before bounded hydration.
+
+    This ranking can choose what to validate, but it cannot make an evidence
+    claim. Exact validation and ambiguity checks still happen after hydration.
+    Stable input order breaks equal scores.
+    """
+    if contract is None:
+        return list(values)
+
+    unit_forms = set(_unit_forms(contract.requested_unit))
+    ranked: list[tuple[int, int, Any]] = []
+    for index, raw in enumerate(values):
+        quote = _raw_quote(raw)
+        tokens = _tokens(quote)
+        anchor_overlap = len(tokens.intersection(contract.anchors))
+        score = anchor_overlap * 20
+        if unit_forms and any(form in quote.casefold() for form in unit_forms):
+            score += 12
+        if any(slot.anchor and _tokens(slot.anchor).issubset(tokens) for slot in contract.slots):
+            score += 30
+        if contract.operation in {"scalar", "sum", "difference"} and (
+            _DIGIT_NUMBER_RE.search(quote) or _WORD_NUMBER_RE.search(quote)
+        ):
+            score += 6
+        if contract.temporal_window is not None and (
+            _DATE_TEXT_RE.search(quote) or anchor_overlap
+        ):
+            score += 6
+        if quote.rstrip().endswith("?"):
+            score += 4
+        ranked.append((-score, index, raw))
+    ranked.sort(key=lambda item: (item[0], item[1]))
+    return [item[2] for item in ranked]
 
 
 def _canonical_unit(raw: Any) -> str | None:
@@ -449,8 +504,6 @@ def _numeric_candidates(
         unit = _unit_near_number(
             quote, start, end, requested=contract.requested_unit
         )
-        if not _compatible_unit(unit, contract.requested_unit):
-            continue
         clause_start, clause_end = _clause_bounds(quote, start, end)
         clause = quote[clause_start:clause_end]
         if not clause or clause.rstrip().endswith("?"):
@@ -473,16 +526,57 @@ def _numeric_candidates(
             "anchor_score": 0,
         }
         for slot in contract.slots:
-            if slot.value_type != "number" or not _compatible_unit(unit, slot.unit):
+            if slot.value_type != "number":
                 continue
             score = _anchor_score(contract, clause, slot)
+            compatible = _compatible_unit(unit, slot.unit)
+            if (
+                not compatible
+                and slot.anchor
+                and score >= 4
+                and slot.unit is None
+                and unit is None
+            ):
+                compatible = True
+            if (
+                not compatible
+                and slot.anchor
+                and score >= 6
+                and slot.unit not in _MEASUREMENT_UNITS
+                and unit not in _MEASUREMENT_UNITS
+            ):
+                # Entity-count wording varies (for example an adjective may
+                # precede the head noun). Strong named-facet grounding can
+                # bind the count, but measurement dimensions never relax.
+                compatible = True
+            if not compatible:
+                continue
             if slot.anchor and score < 4:
                 continue
             if not slot.anchor and contract.anchors and score < 1:
                 continue
             candidate["slot_names"].append(slot.name)
             candidate["anchor_score"] = max(candidate["anchor_score"], score)
+        if (
+            contract.operation in {"sum", "difference"}
+            and re.search(
+                r"\b(?:total|combined|altogether|in all|sum|difference|saved?|savings?)\b",
+                clause,
+                re.IGNORECASE,
+            )
+            and _compatible_unit(unit, contract.requested_unit)
+            and _anchor_score(contract, quote, None) >= 1
+        ):
+            candidate["slot_names"].append("answer")
+            candidate["anchor_score"] = max(
+                candidate["anchor_score"], _anchor_score(contract, quote, None) + 8
+            )
+        candidate["anchor_score"] = max(
+            int(candidate["anchor_score"]),
+            int(source.get("paired_anchor_score") or 0),
+        )
         if candidate["slot_names"]:
+            candidate["slot_names"] = list(dict.fromkeys(candidate["slot_names"]))
             output.append(candidate)
     return output
 
@@ -555,7 +649,10 @@ def _text_candidate(
         "value": value,
         "unit": None,
         "slot_names": [slot.name],
-        "anchor_score": _anchor_score(contract, str(source["quote"]), slot),
+        "anchor_score": max(
+            _anchor_score(contract, str(source["quote"]), slot),
+            int(source.get("paired_anchor_score") or 0),
+        ),
         "transition_explicit": transition_explicit,
     }
 
@@ -612,13 +709,32 @@ def _ordered_event_candidate(
         event_date = parsed.isoformat() if parsed else ""
     if not event_date:
         return None
+    key = _finite_event_key(quote, contract.requested_unit or "event")
+    if key is None:
+        return None
+    names = [
+        name
+        for name in re.findall(
+            r"\b[A-Z][A-Za-z'-]*(?:\s+[A-Z][A-Za-z'-]*){0,3}\b", quote
+        )
+        if name not in {"I", "The", "A", "An", "My", "We", "On", "In"}
+    ]
+    label = names[0] if names else quote[:300]
+    slot_names = []
+    for slot in contract.slots:
+        if slot.anchor and not _tokens(slot.anchor).issubset(_tokens(quote)):
+            continue
+        slot_names.append(slot.name)
+    if not slot_names:
+        return None
     return {
         **source,
-        "value": quote,
-        "label": quote[:300],
+        "value": label,
+        "label": label[:300],
+        "key": key,
         "date": event_date,
         "unit": None,
-        "slot_names": [slot.name for slot in contract.slots],
+        "slot_names": slot_names,
         "anchor_score": _anchor_score(contract, quote, None),
     }
 
@@ -644,6 +760,7 @@ def _extract_candidates(
                 candidate["exact_ref"],
                 candidate.get("value"),
                 candidate.get("unit"),
+                candidate.get("key"),
                 tuple(candidate.get("slot_names") or ()),
             )
             if key not in seen:
@@ -696,12 +813,18 @@ def _select_scalar(
     compatible = [
         candidate
         for candidate in candidates
-        if candidate.get("slot_names") == ["answer"]
+        if "answer" in candidate.get("slot_names", [])
         and isinstance(candidate.get("value"), (int, float))
         and not isinstance(candidate.get("value"), bool)
     ]
     if not compatible:
         return None, "scalar_not_found"
+    best_score = max(int(item.get("anchor_score") or 0) for item in compatible)
+    compatible = [
+        item
+        for item in compatible
+        if int(item.get("anchor_score") or 0) == best_score
+    ]
     grouped: dict[tuple[Any, ...], list[Mapping[str, Any]]] = {}
     for candidate in compatible:
         key = _normalized_numeric(
@@ -732,6 +855,12 @@ def _select_text(
     compatible = [candidate for candidate in candidates if "answer" in candidate.get("slot_names", [])]
     if not compatible:
         return None, "answer_fact_not_found"
+    best_score = max(int(item.get("anchor_score") or 0) for item in compatible)
+    compatible = [
+        item
+        for item in compatible
+        if int(item.get("anchor_score") or 0) == best_score
+    ]
     groups: dict[str, list[Mapping[str, Any]]] = {}
     for candidate in compatible:
         key = " ".join(str(candidate.get("value") or "").casefold().split())
@@ -884,13 +1013,6 @@ def _select_state(
     if not dated:
         return None, "state_time_unknown"
     dated.sort(key=lambda item: (item[0], int(item[2]["store_id"])))
-    grouped_by_time: dict[float, set[str]] = {}
-    for timestamp, _, candidate in dated:
-        grouped_by_time.setdefault(timestamp, set()).add(
-            " ".join(str(candidate.get("value") or "").casefold().split())
-        )
-    if any(len(values) > 1 for values in grouped_by_time.values()):
-        return None, "state_conflicted"
     if contract.operation == "previous":
         explicit_transitions = [
             item for item in dated if item[2].get("transition_explicit") is True
@@ -902,17 +1024,41 @@ def _select_state(
                 "selection_time": timestamp,
                 "selection_time_basis": basis,
             }, "previous_state_selected_from_explicit_transition"
-    distinct: list[tuple[float, str, Mapping[str, Any]]] = []
+
+    by_time: dict[float, list[tuple[float, str, Mapping[str, Any]]]] = {}
+    for item in dated:
+        by_time.setdefault(item[0], []).append(item)
+    frontier: list[tuple[float, str, Mapping[str, Any]]] = []
     seen_values: set[str] = set()
-    for item in reversed(dated):
-        key = " ".join(str(item[2].get("value") or "").casefold().split())
-        if key and key not in seen_values:
-            distinct.append(item)
-            seen_values.add(key)
+    for timestamp in sorted(by_time, reverse=True):
+        bucket = by_time[timestamp]
+        values: dict[str, list[tuple[float, str, Mapping[str, Any]]]] = {}
+        for item in bucket:
+            key = " ".join(str(item[2].get("value") or "").casefold().split())
+            if key:
+                values.setdefault(key, []).append(item)
+        novel_values = [key for key in values if key not in seen_values]
+        if len(novel_values) > 1:
+            return None, "state_conflicted"
+        if not novel_values:
+            continue
+        key = novel_values[0]
+        chosen_item = min(
+            values[key],
+            key=lambda item: (
+                item[2].get("origin") != "baseline",
+                int(item[2]["store_id"]),
+            ),
+        )
+        frontier.append(chosen_item)
+        seen_values.add(key)
+        if contract.operation == "latest" or len(frontier) == 2:
+            break
+
     index = 0 if contract.operation == "latest" else 1
-    if len(distinct) <= index:
+    if len(frontier) <= index:
         return None, "previous_state_not_proven" if index else "latest_state_not_proven"
-    timestamp, basis, chosen = distinct[index]
+    timestamp, basis, chosen = frontier[index]
     return {
         **chosen,
         "selection_time": timestamp,
@@ -933,7 +1079,8 @@ def _slot_operands(
             return _normalized_numeric(value, item.get("unit"), contract.requested_unit)
         if slot.value_type == "date":
             parsed = str(item.get("date") or "")
-            return (parsed,) if parsed else None
+            event_key = str(item.get("key") or "")
+            return (event_key, parsed) if parsed and event_key else ((parsed,) if parsed else None)
         text = " ".join(str(value or "").casefold().split())
         return (text,) if text else None
 
@@ -944,7 +1091,10 @@ def _slot_operands(
             semantic = semantic_value(item, slots[0])
             if semantic is None:
                 continue
-            key = (str(item.get("exact_ref") or ""), semantic)
+            key = semantic if contract.operation == "order" else (
+                str(item.get("exact_ref") or ""),
+                semantic,
+            )
             if key in seen_candidates:
                 continue
             seen_candidates.add(key)
@@ -1076,6 +1226,30 @@ def _input_exact_refs(values: Sequence[Any]) -> list[str]:
     return refs
 
 
+def _input_ref_ranges(values: Sequence[Any]) -> dict[int, list[tuple[int, int]]]:
+    ranges: dict[int, list[tuple[int, int]]] = {}
+    for exact_ref in _input_exact_refs(values):
+        match = _EXACT_REF_RE.fullmatch(exact_ref)
+        if match is None:
+            continue
+        ranges.setdefault(int(match.group("store_id")), []).append(
+            (int(match.group("start")), int(match.group("end")))
+        )
+    return ranges
+
+
+def _covered_by_input_ref(
+    candidate: Mapping[str, Any], ranges: Mapping[int, Sequence[tuple[int, int]]]
+) -> bool:
+    try:
+        store_id = int(candidate["store_id"])
+        start = int(candidate["span_start"])
+        end = int(candidate["span_end"])
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return False
+    return any(left <= start and end <= right for left, right in ranges.get(store_id, ()))
+
+
 def _baseline_identity(
     sources: Sequence[Mapping[str, Any]], incoming: Sequence[Any]
 ) -> dict[str, Any]:
@@ -1198,6 +1372,7 @@ def _finish(result: dict[str, Any], *, started: float) -> dict[str, Any]:
 def _adjacent_sources(
     baseline: Sequence[Mapping[str, Any]],
     *,
+    contract: AnswerContract,
     engine: Any,
     limits: RequirementsBudgets,
     capacity: int,
@@ -1207,21 +1382,34 @@ def _adjacent_sources(
     output: list[dict[str, Any]] = []
     seen: set[str] = {str(item["exact_ref"]) for item in baseline}
     loads = 0
-    for anchor in baseline:
+    ranked_anchors = sorted(
+        baseline,
+        key=lambda item: (
+            -_anchor_score(
+                contract,
+                str(item.get("content") or item.get("quote") or ""),
+                None,
+            ),
+            int(item["store_id"]),
+        ),
+    )
+    for anchor in ranked_anchors:
         if len(output) >= capacity:
             break
         session_id = str(anchor.get("session_id") or "")
         if not session_id:
             continue
         anchor_content = str(anchor.get("content") or anchor.get("quote") or "").strip()
-        if not (
+        anchor_score = _anchor_score(contract, anchor_content, None)
+        question_shaped = bool(
             anchor_content.endswith("?")
             or re.match(
                 r"^(?:who|what|when|where|which|how|why|do|did|does|is|are|was|were|can|could|would|should)\b",
                 anchor_content,
                 re.IGNORECASE,
             )
-        ):
+        )
+        if not question_shaped and anchor_score < 2:
             continue
         rows = engine._store.load_session_window(
             session_id,
@@ -1245,11 +1433,52 @@ def _adjacent_sources(
             }
             hydrated = _normalize_ref(raw, engine=engine, origin="adjacent_role_partner")
             if hydrated and hydrated["exact_ref"] not in seen:
+                hydrated["paired_anchor_score"] = anchor_score + 8
+                marginal = _candidate_inventory([hydrated], contract, limit=limits.max_candidates)
+                if not marginal:
+                    continue
                 seen.add(hydrated["exact_ref"])
                 output.append(hydrated)
                 if len(output) >= capacity:
                     break
     return output[:capacity], loads
+
+
+def _active_baseline_frontier(
+    baseline: Sequence[Mapping[str, Any]],
+    candidates: Sequence[Mapping[str, Any]],
+    *,
+    contract: AnswerContract,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Keep every material baseline source, then the best closure nuclei."""
+    material_store_ids = {int(item["store_id"]) for item in candidates}
+    retained = [dict(item) for item in baseline if int(item["store_id"]) in material_store_ids]
+    if len(retained) >= limit:
+        return retained[:limit]
+    seen = {str(item["exact_ref"]) for item in retained}
+    nuclei = sorted(
+        baseline,
+        key=lambda item: (
+            -_anchor_score(
+                contract,
+                str(item.get("content") or item.get("quote") or ""),
+                None,
+            ),
+            int(item["store_id"]),
+        ),
+    )
+    # Preserve at most half of the active set as non-candidate nuclei so that
+    # named closure always has room for an opposite-role or retrieval delta.
+    nucleus_limit = max(1, limit // 2)
+    for item in nuclei:
+        if len(retained) >= limit or len(retained) >= len(material_store_ids) + nucleus_limit:
+            break
+        ref = str(item["exact_ref"])
+        if ref not in seen:
+            retained.append(dict(item))
+            seen.add(ref)
+    return retained
 
 
 def _query_for(
@@ -1444,6 +1673,26 @@ def _finite_event_key(quote: str, unit: str | None) -> str | None:
     return None
 
 
+def _source_event_clause(quote: str, *, role: Any, unit: str | None) -> bool:
+    """Return true only for a first-person, source-stated event occurrence."""
+    if str(role or "").casefold() != "user" or not unit:
+        return False
+    if quote.rstrip().endswith("?"):
+        return False
+    normalized = " ".join(quote.casefold().split())
+    if re.search(r"\b(?:might|may|plan(?:ning)? to|want to|hope to|would|could|should|never|not)\b", normalized):
+        return False
+    forms = "|".join(re.escape(form) for form in _unit_forms(unit))
+    return bool(
+        re.search(
+            r"\b(?:i|we)\s+(?:attended|visited|went to|took|viewed|added|bought|"
+            r"returned from|participated in|completed|joined|traveled to)\b",
+            normalized,
+        )
+        and re.search(rf"\b(?:{forms})\b", normalized)
+    )
+
+
 def _finite_enumeration(
     contract: AnswerContract,
     *,
@@ -1479,6 +1728,12 @@ def _finite_enumeration(
     for row in scan.get("rows") or []:
         content = str(row.get("content") or "")
         for start, end, clause in _material_clauses(content, contract.requested_unit):
+            if not _source_event_clause(
+                clause,
+                role=row.get("role"),
+                unit=contract.requested_unit,
+            ):
+                continue
             certificate["material_clauses"] += 1
             hydrated = _normalize_ref(
                 {
@@ -1674,9 +1929,10 @@ def compile_preanswer_evidence(
     contract = decision.contract
 
     baseline_input = list(baseline_refs)
+    ranked_baseline_input = _rank_baseline_inputs(baseline_input, contract)
     baseline: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for raw in baseline_input[: limits.max_candidates]:
+    for raw in ranked_baseline_input[: limits.max_candidates]:
         hydrated = _normalize_ref(raw, engine=engine, origin="baseline")
         if hydrated is not None and hydrated["exact_ref"] not in seen:
             seen.add(hydrated["exact_ref"])
@@ -1720,10 +1976,23 @@ def compile_preanswer_evidence(
                 }
             )
             return _finish(result, started=started)
-        if reason == "ambiguous_scalar_candidates":
-            result["reason_code"] = reason
-            return _finish(result, started=started)
     elif contract.operation in {"sum", "difference", "date_interval", "order"}:
+        direct, _ = _select_scalar(baseline_candidates, contract)
+        if direct is not None:
+            result.update(
+                {
+                    "state": "answer_sufficient",
+                    "reason_code": "baseline_already_answer_sufficient",
+                    "direct_fact": {
+                        "value": direct["value"],
+                        "unit": direct.get("unit"),
+                        "exact_ref": direct["exact_ref"],
+                    },
+                    "closed_requirements": ["answer"],
+                    "open_requirements": [],
+                }
+            )
+            return _finish(result, started=started)
         computation, operands, reason = _compute(
             str(question), contract, baseline_candidates, engine=engine
         )
@@ -1759,19 +2028,19 @@ def compile_preanswer_evidence(
     elif contract.operation == "date_filter":
         chosen, reason = _select_temporal_event(baseline_candidates, contract)
         if chosen is not None:
-            result["direct_fact"] = {
-                "value": chosen["value"],
-                "unit": None,
-                "exact_ref": chosen["exact_ref"],
-                "time_basis": chosen.get("temporal_match_basis"),
-            }
-            _deliver(
-                result,
-                state="answer_sufficient",
-                reason_code=reason,
-                context=_render_fact(chosen, contract),
-                evidence=[chosen],
-                novel_refs=(),
+            result.update(
+                {
+                    "state": "answer_sufficient",
+                    "reason_code": "baseline_already_answer_sufficient",
+                    "direct_fact": {
+                        "value": chosen["value"],
+                        "unit": None,
+                        "exact_ref": chosen["exact_ref"],
+                        "time_basis": chosen.get("temporal_match_basis"),
+                    },
+                    "closed_requirements": ["answer"],
+                    "open_requirements": [],
+                }
             )
             return _finish(result, started=started)
     else:
@@ -1792,15 +2061,22 @@ def compile_preanswer_evidence(
             )
             return _finish(result, started=started)
 
+    active_baseline = _active_baseline_frontier(
+        baseline,
+        baseline_candidates,
+        contract=contract,
+        limit=limits.max_hydrated_candidates,
+    )
     adjacent, loads = _adjacent_sources(
         baseline,
+        contract=contract,
         engine=engine,
         limits=limits,
-        capacity=max(0, limits.max_hydrated_candidates - len(baseline)),
+        capacity=max(0, limits.max_hydrated_candidates - len(active_baseline)),
     )
     result["metrics"]["session_loads"] = loads
     novel_sources = list(adjacent)
-    all_sources = [*baseline, *novel_sources]
+    all_sources = [*active_baseline, *novel_sources]
     candidates = _candidate_inventory(
         all_sources, contract, limit=limits.max_candidates
     )
@@ -1810,6 +2086,9 @@ def compile_preanswer_evidence(
             fact, why = _select_scalar(candidates, contract)
             return fact, None, [fact] if fact else [], why
         if contract.operation in {"sum", "difference", "date_interval", "order"}:
+            fact, direct_why = _select_scalar(candidates, contract)
+            if fact is not None:
+                return fact, None, [fact], direct_why
             computation, operands, why = _compute(
                 str(question), contract, candidates, engine=engine
             )
@@ -1829,14 +2108,18 @@ def compile_preanswer_evidence(
         and computation is None
         and retrieve is not None
         and limits.max_retrieval_calls
-        and not reason.startswith("ambiguous")
     ):
         capacity = max(0, limits.max_hydrated_candidates - len(all_sources))
+        input_seen_refs = [
+            exact_ref
+            for exact_ref in _input_exact_refs(baseline_input)
+            if _EXACT_REF_RE.fullmatch(exact_ref)
+        ]
         retrieved = _retrieve_sources(
             contract,
             retrieve=retrieve,
             engine=engine,
-            seen_refs=[item["exact_ref"] for item in all_sources],
+            seen_refs=[*input_seen_refs, *[item["exact_ref"] for item in all_sources]],
             open_slots=_open_slots(candidates, contract),
             capacity=capacity,
             limits=limits,
@@ -1850,7 +2133,14 @@ def compile_preanswer_evidence(
         direct, computation, selected, reason = attempt()
 
     coverage_certificate = None
-    if direct is None and computation is None and contract.operation == "scalar":
+    if (
+        direct is None
+        and computation is None
+        and contract.operation == "scalar"
+        and contract.coverage_policy == "source_asserted_or_finite_enumeration"
+        and contract.temporal_window is not None
+        and contract.requested_unit is not None
+    ):
         computation, selected, coverage_certificate, reason = _finite_enumeration(
             contract,
             engine=engine,
@@ -1871,12 +2161,12 @@ def compile_preanswer_evidence(
         result["reason_code"] = reason
         return _finish(result, started=started)
 
-    baseline_refs_set = {item["exact_ref"] for item in baseline}
+    baseline_ranges = _input_ref_ranges(baseline_input)
     selected_items = [item for item in selected if isinstance(item, Mapping)]
     novel_selected_all = [
         str(item["exact_ref"])
         for item in selected_items
-        if str(item["exact_ref"]) not in baseline_refs_set
+        if not _covered_by_input_ref(item, baseline_ranges)
     ]
     novel_selected_all = list(dict.fromkeys(novel_selected_all))
     if len(novel_selected_all) > limits.max_novel_refs:
