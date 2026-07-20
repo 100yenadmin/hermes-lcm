@@ -27,6 +27,7 @@ OpenClaw. For an interactive visualization of the LCM idea, see
 - [LCM vs built-in compression](#lcm-vs-built-in-compression)
 - [Quick start](#quick-start)
 - [Commands and tools](#commands-and-tools)
+- [Recall skill and policy](#recall-skill-and-policy)
 - [Configuration](#configuration)
 - [Retrieval contract](#retrieval-contract)
 - [OpenClaw/lossless-claw import](#openclawlossless-claw-import)
@@ -157,6 +158,11 @@ From an existing checkout, install a symlink:
 HERMES_PROFILE=myprofile ./scripts/install.sh
 ```
 
+Run `scripts/install.sh` even when the checkout already lives at the canonical
+plugin path. It leaves that checkout in place and exposes the bundled
+`hermes-lcm` skill in the matching global/profile `skills/` directory. The
+installer preflights both paths and refuses conflicts before creating links.
+
 ### Activate it
 
 The plugin has two names:
@@ -192,6 +198,8 @@ Expected signals:
 - tool list includes `lcm_grep`, `lcm_load_session`, `lcm_describe`,
   `lcm_expand`, `lcm_expand_query`, `lcm_status`, `lcm_inspect`, and
   `lcm_doctor`
+- the normal available-skills index includes `hermes-lcm`; current hosts can
+  also resolve the explicit plugin-qualified skill `hermes-lcm:hermes-lcm`
 
 Typical output:
 
@@ -260,6 +268,31 @@ outside the LCM database.
 | `lcm_status` | Show runtime health, context pressure, config, source lineage, and lifecycle stats. |
 | `lcm_inspect` | Read-only operator inventory for current-session lineage, frontier/fresh-tail metadata, externalized refs/readability, compaction skip/no-op reasons, and matched ignore/stateless patterns. Returns metadata only; use retrieval tools for content. |
 | `lcm_doctor` | Run database, FTS, lifecycle, config, and context-pressure diagnostics. |
+
+## Recall skill and policy
+
+Hermes-LCM ships `skills/hermes-lcm/SKILL.md` plus progressive-disclosure
+references for configuration, architecture, diagnostics, recall routing, and
+session lifecycle. The installer links that directory into the active Hermes
+profile so it appears in ordinary skill discovery. On hosts with plugin skill
+registration, it is also available explicitly as `hermes-lcm:hermes-lcm`.
+
+When LCM is the active context engine for a bound session, the plugin registers
+one deterministic `pre_llm_call` hook. Hermes injects the canonical policy into
+the current user-message context, not the system prompt, preserving the stable
+system-prompt cache prefix. The policy:
+
+- treats summaries as recall cues rather than exact proof;
+- prefers newer source-backed evidence and verifies contradictions;
+- teaches narrow FTS query construction and bounded scope selection;
+- routes current compacted, cross-conversation, and recent/time-bounded recall
+  through the appropriate existing tools;
+- does not force a tool call when the current context is already sufficient.
+
+The canonical bytes live in
+`skills/hermes-lcm/references/recall-policy.md`. Merely loading the plugin does
+not inject them when another context engine is serving the session. Older hosts
+without skill or hook registration keep their existing schema-driven behavior.
 
 ### Slash commands
 

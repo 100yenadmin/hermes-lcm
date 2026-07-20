@@ -32,6 +32,11 @@ From an existing checkout, install a symlink:
 HERMES_PROFILE=myprofile ./scripts/install.sh
 ```
 
+The installer exposes both the plugin checkout and the bundled
+`skills/hermes-lcm` package in the matching global/profile skill tree. It is
+safe to run from a checkout already cloned into the canonical plugin path and
+refuses a conflicting plugin or skill path before creating either link.
+
 ## Activate
 
 The plugin has two names:
@@ -87,6 +92,8 @@ Expected signals:
 - plugin list includes `hermes-lcm`
 - selected context engine is `lcm`
 - tool list includes `lcm_grep`, `lcm_load_session`, `lcm_describe`, `lcm_expand`, `lcm_expand_query`, `lcm_status`, `lcm_inspect`, and `lcm_doctor`
+- ordinary skill discovery includes `hermes-lcm`; plugin-qualified explicit
+  loading is `hermes-lcm:hermes-lcm` on hosts that support plugin skills
 
 Typical output:
 
@@ -102,6 +109,12 @@ For source checkouts, `lcm_status`, `/lcm status`, `lcm_inspect`,
 `lcm_doctor`, and `/lcm doctor` also report the loaded plugin path and
 best-effort git identity:
 `plugin_git_commit`, `plugin_git_branch`, and `plugin_git_dirty`.
+
+The product-owned recall policy is injected through the host's ephemeral
+`pre_llm_call` user-context seam only after an LCM engine is bound to the
+session. It does not modify the system prompt or activate when another context
+engine is serving the turn. Its canonical file and digest source is
+`skills/hermes-lcm/references/recall-policy.md`.
 
 ## Troubleshooting
 

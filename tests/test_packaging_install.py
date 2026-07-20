@@ -202,12 +202,96 @@ def test_install_script_creates_profile_aware_symlink_and_prints_activation_step
     )
 
     target = hermes_home / "profiles" / "sandbox" / "plugins" / "hermes-lcm"
+    skill_target = hermes_home / "profiles" / "sandbox" / "skills" / "hermes-lcm"
     assert target.is_symlink()
     assert target.resolve() == repo_root.resolve()
+    assert skill_target.is_symlink()
+    assert skill_target.resolve() == (repo_root / "skills" / "hermes-lcm").resolve()
     assert "plugins:" in result.stdout
     assert "- hermes-lcm" in result.stdout
     assert "context:" in result.stdout
     assert "engine: lcm" in result.stdout
+    assert "Discoverable skill:" in result.stdout
+    assert str(skill_target) in result.stdout
+
+
+def test_install_script_is_idempotent_for_plugin_and_skill_links(tmp_path):
+    repo_root = Path(__file__).resolve().parent.parent
+    hermes_home = tmp_path / "hermes-home"
+    env = {
+        "HOME": str(tmp_path / "home"),
+        "HERMES_HOME": str(hermes_home),
+    }
+
+    for _ in range(2):
+        subprocess.run(
+            ["bash", str(repo_root / "scripts" / "install.sh")],
+            cwd=repo_root,
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    assert (hermes_home / "plugins" / "hermes-lcm").resolve() == repo_root.resolve()
+    assert (hermes_home / "skills" / "hermes-lcm").resolve() == (
+        repo_root / "skills" / "hermes-lcm"
+    ).resolve()
+
+
+def test_install_script_preflights_skill_conflict_before_creating_plugin_link(tmp_path):
+    repo_root = Path(__file__).resolve().parent.parent
+    hermes_home = tmp_path / "hermes-home"
+    skill_target = hermes_home / "skills" / "hermes-lcm"
+    skill_target.mkdir(parents=True)
+    (skill_target / "SKILL.md").write_text("existing skill\n", encoding="utf-8")
+
+    result = subprocess.run(
+        ["bash", str(repo_root / "scripts" / "install.sh")],
+        cwd=repo_root,
+        env={
+            "HOME": str(tmp_path / "home"),
+            "HERMES_HOME": str(hermes_home),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "Refusing to replace existing skill path" in result.stderr
+    assert not (hermes_home / "plugins" / "hermes-lcm").exists()
+
+
+def test_install_script_accepts_checkout_already_in_canonical_plugin_path(tmp_path):
+    repo_root = Path(__file__).resolve().parent.parent
+    hermes_home = tmp_path / "hermes-home"
+    checkout = hermes_home / "plugins" / "hermes-lcm"
+    (checkout / "scripts").mkdir(parents=True)
+    (checkout / "skills" / "hermes-lcm").mkdir(parents=True)
+    shutil.copy2(repo_root / "scripts" / "install.sh", checkout / "scripts" / "install.sh")
+    (checkout / "skills" / "hermes-lcm" / "SKILL.md").write_text(
+        "---\nname: hermes-lcm\ndescription: test\n---\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ["bash", str(checkout / "scripts" / "install.sh")],
+        cwd=checkout,
+        env={
+            "HOME": str(tmp_path / "home"),
+            "HERMES_HOME": str(hermes_home),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert checkout.is_dir()
+    skill_target = hermes_home / "skills" / "hermes-lcm"
+    assert skill_target.is_symlink()
+    assert skill_target.resolve() == (checkout / "skills" / "hermes-lcm").resolve()
 
 
 def test_install_script_refuses_to_replace_existing_non_symlink_path(tmp_path):
@@ -391,6 +475,71 @@ def test_register_gracefully_degrades_when_host_lacks_register_tool():
 
     assert ctx.engine is not None
     assert ctx.engine.name == "lcm"
+
+
+def test_plugin_entrypoint_registers_bundled_skill_and_active_lcm_recall_policy(tmp_path, monkeypatch):
+    module = _load_plugin_entrypoint_module("hermes_lcm_packaging_skill_and_policy")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    registered_skills = []
+    hooks = {}
+
+    class _Ctx:
+        def __init__(self):
+            self.engine = None
+
+        def register_context_engine(self, engine):
+            self.engine = engine
+
+        def register_skill(self, name, path, description=""):
+            registered_skills.append((name, Path(path), description))
+
+        def register_hook(self, name, callback):
+            hooks.setdefault(name, []).append(callback)
+
+    ctx = _Ctx()
+    module.register(ctx)
+
+    assert len(registered_skills) == 1
+    name, path, description = registered_skills[0]
+    assert name == "hermes-lcm"
+    assert path == Path(module.__file__).resolve().parent / "skills" / "hermes-lcm"
+    assert (path / "SKILL.md").is_file()
+    assert "recall" in description.lower()
+    assert len(hooks["pre_llm_call"]) == 1
+
+    policy_hook = hooks["pre_llm_call"][0]
+    assert policy_hook(session_id="not-bound") is None
+
+    ctx.engine.on_session_start("active-session", platform="cli")
+    first = policy_hook(session_id="active-session")
+    second = policy_hook(session_id="active-session")
+    assert first == second
+    assert first == {"context": module.get_recall_policy()}
+    assert "Hermes-LCM Recall Policy" in first["context"]
+    assert "lcm_recall" in first["context"]
+    assert "lcm_expand_query" in first["context"]
+    ctx.engine.shutdown()
+
+
+def test_plugin_entrypoint_gracefully_degrades_without_skill_or_hook_registration(
+    tmp_path, monkeypatch
+):
+    module = _load_plugin_entrypoint_module("hermes_lcm_packaging_legacy_guidance_host")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+
+    class _LegacyCtx:
+        def __init__(self):
+            self.engine = None
+
+        def register_context_engine(self, engine):
+            self.engine = engine
+
+    ctx = _LegacyCtx()
+    module.register(ctx)
+
+    assert ctx.engine is not None
+    assert ctx.engine.name == "lcm"
+    ctx.engine.shutdown()
 
 
 def test_register_gracefully_degrades_when_register_tool_hook_raises():

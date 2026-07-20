@@ -8,8 +8,16 @@ Based on the LCM paper by Ehrlich & Blackman (Voltropy PBC, Feb 2026).
 
 import logging
 import os
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+
+def get_recall_policy() -> str:
+    """Load the canonical product policy without making bare imports package-dependent."""
+    from .guidance import get_recall_policy as _get_recall_policy
+
+    return _get_recall_policy()
 
 
 def _env_flag_enabled(name: str, default: bool = False) -> bool:
@@ -115,6 +123,29 @@ def register(ctx):
     # Register as the context engine (replaces ContextCompressor)
     ctx.register_context_engine(engine)
 
+    # Ship the same recall contract through both Hermes plugin skill
+    # registration (explicit qualified loads) and the installer's ordinary
+    # profile skill link (normal discovery). Older hosts simply lack this
+    # capability and keep their existing schema-driven behavior.
+    skill_root = Path(__file__).resolve().parent / "skills" / "hermes-lcm"
+    register_skill = getattr(ctx, "register_skill", None)
+    if callable(register_skill):
+        try:
+            register_skill(
+                "hermes-lcm",
+                skill_root,
+                description=(
+                    "Use, configure, diagnose, and recall exact evidence "
+                    "with the Hermes-LCM lossless context plugin."
+                ),
+            )
+        except Exception as exc:
+            logger.warning(
+                "LCM bundled skill registration did not complete; normal "
+                "profile skill discovery may still be available: %s",
+                exc,
+            )
+
     # Subscribe to the host's explicit subagent lifecycle events when available.
     # These carry the child_session_id/parent_session_id linkage directly, so LCM
     # can identify a subagent session from the host's own signal instead of
@@ -130,6 +161,37 @@ def register(ctx):
             logger.info(
                 "LCM explicit subagent-lineage hooks unavailable on this Hermes "
                 "host; auxiliary detection uses the legacy frame-walk fallback: %s",
+                exc,
+            )
+
+        # Hermes invokes this hook after the context engine has received
+        # on_session_start(). Resolve through LCM's own registry so merely
+        # loading the plugin cannot inject guidance when another context
+        # engine is serving the turn. Capture one validated policy value for
+        # deterministic, byte-stable injection across eligible turns.
+        try:
+            recall_policy = get_recall_policy()
+
+            def _on_pre_llm_call(**payload):
+                session_id = str(payload.get("session_id") or "")
+                conversation_id = str(
+                    payload.get("conversation_id")
+                    or payload.get("gateway_session_key")
+                    or ""
+                )
+                active_engine = resolve_active_lcm_engine(
+                    session_id=session_id,
+                    conversation_id=conversation_id,
+                )
+                if active_engine is None or getattr(active_engine, "name", None) != "lcm":
+                    return None
+                return {"context": recall_policy}
+
+            register_hook("pre_llm_call", _on_pre_llm_call)
+        except Exception as exc:
+            logger.warning(
+                "LCM recall-policy hook registration did not complete; "
+                "tool schemas remain available: %s",
                 exc,
             )
 

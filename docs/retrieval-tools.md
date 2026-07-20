@@ -4,8 +4,24 @@ Use this page when you need the exact LCM tool contract or archive-migration not
 
 ## Agent Tools
 
-Use these tools for current-session recall after compaction. Use `session_search`
-for earlier separate sessions or broad cross-session history.
+Hermes-LCM's bundled skill and active recall policy route current-session,
+cross-conversation, and time-bounded questions through these tools. Use
+`session_search` for Hermes-tracked history that is not present in `lcm.db`.
+
+Recommended escalation:
+
+- current compacted conversation: `lcm_grep` -> `lcm_describe` ->
+  `lcm_expand_query`;
+- cross-conversation LCM memory: `lcm_recall` -> the returned
+  `lcm_load_session` or exact `lcm_expand` hint;
+- recent/time-bounded recall: `lcm_recent` or time-bounded `lcm_grep`;
+- exact supported operations: bounded exact evidence ->
+  `lcm_evidence_pack`/`lcm_compute`.
+
+`lcm_expand` is known-handle drill-down, not broad first-step discovery. The
+canonical runtime policy is
+`skills/hermes-lcm/references/recall-policy.md` and is injected only while LCM
+is the active context engine.
 
 | Tool | Use |
 |------|-----|
