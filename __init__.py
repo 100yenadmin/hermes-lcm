@@ -6,6 +6,7 @@ that persists every message and provides structured retrieval tools.
 Based on the LCM paper by Ehrlich & Blackman (Voltropy PBC, Feb 2026).
 """
 
+import json
 import logging
 import os
 from datetime import datetime, timezone
@@ -124,20 +125,71 @@ def _pre_llm_context(active_engine, recall_policy: str, payload: dict) -> dict:
     )
     config = getattr(active_engine, "_config", None)
     enabled = bool(getattr(config, "preanswer_evidence_enabled", False))
+    if not enabled or not context_engine_enabled:
+        return {"context": recall_policy}
     baseline_refs = payload.get("baseline_refs")
     if not isinstance(baseline_refs, (list, tuple)):
         baseline_refs = ()
     try:
-        from .preanswer_evidence import build_preanswer_evidence
+        from .host_evidence import (
+            build_host_supplied_evidence,
+            call_auxiliary_selector,
+        )
 
-        result = build_preanswer_evidence(
-            payload.get("user_message"),
+        question = str(payload.get("user_message") or "").strip()
+        if not question:
+            return {"context": recall_policy}
+
+        # Official Hermes hook payloads do not currently include answer-ready
+        # refs.  Create that bounded baseline in product code when absent; the
+        # benchmark bridge supplies its frozen cached baseline and skips this
+        # retrieval, preserving those search bytes exactly.
+        if not baseline_refs:
+            raw = active_engine.handle_tool_call(
+                "lcm_recall",
+                {
+                    "query": question,
+                    "include": "verbatim",
+                    "detail": "answer_ready",
+                    "limit": 25,
+                    "scope_bias": 0.0,
+                    "include_occurrence_time": True,
+                },
+            )
+            recalled = json.loads(raw) if isinstance(raw, str) else raw
+            hits = recalled.get("hits") if isinstance(recalled, dict) else None
+            candidates = []
+            for hit in hits if isinstance(hits, list) else []:
+                if not isinstance(hit, dict):
+                    continue
+                exact_ref = str(hit.get("exact_ref") or "").strip()
+                quote = str(hit.get("content") or hit.get("snippet") or "")
+                if exact_ref and quote:
+                    candidates.append({"exact_ref": exact_ref, "quote": quote})
+            baseline_refs = tuple(candidates)
+
+        selector_model = str(
+            getattr(config, "assertion_extraction_model", "")
+            or getattr(config, "extraction_model", "")
+            or getattr(config, "summary_model", "")
+            or ""
+        )
+        configured_timeout = float(
+            getattr(config, "assertion_extraction_timeout_seconds", 10.0) or 10.0
+        )
+        selector_timeout = min(10.0, max(1.0, configured_timeout))
+        result = build_host_supplied_evidence(
+            question,
             engine=active_engine,
             baseline_refs=baseline_refs,
             question_date=_hook_question_date(payload),
+            selector=lambda request: call_auxiliary_selector(
+                request,
+                model=selector_model,
+                timeout_seconds=selector_timeout,
+            ),
             retrieve=lambda args: active_engine.handle_tool_call("lcm_recall", args),
-            enabled=enabled,
-            context_engine_enabled=context_engine_enabled,
+            enabled=True,
         )
     except Exception as exc:  # pragma: no cover - outer host safety net
         logger.warning("LCM pre-answer evidence failed open: %s", exc)

@@ -60,14 +60,15 @@ def _claim(facet: str, source: dict, claim_id: str, **values):
     }
 
 
-def _selector(*selections, operation="none", missing_facets=(), **extra):
+def _selector(*selections, operation=None, missing_facets=(), **extra):
     calls = []
 
     def select(request):
         calls.append(request)
+        if operation is not None:
+            assert request["operation"] == operation
         return {
             "version": SELECTOR_SCHEMA_VERSION,
-            "operation": operation,
             "selections": list(selections),
             "missing_facets": list(missing_facets),
             **extra,

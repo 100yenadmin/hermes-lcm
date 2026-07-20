@@ -39,7 +39,6 @@ _ALLOWED_OPERATIONS = {
 }
 _PROPOSAL_KEYS = {
     "version",
-    "operation",
     "requested_facets",
     "selections",
     "missing_facets",
@@ -349,8 +348,8 @@ def _validate_proposal(
         return None, "selector_schema_invalid", proposal_digest
     if raw.get("version") != SELECTOR_SCHEMA_VERSION:
         return None, "selector_schema_invalid", proposal_digest
-    operation = str(raw.get("operation") or "")
-    if operation not in _ALLOWED_OPERATIONS or operation != request["operation"]:
+    operation = str(request.get("operation") or "")
+    if operation not in _ALLOWED_OPERATIONS:
         return None, "selector_schema_invalid", proposal_digest
     selections = raw.get("selections")
     missing = raw.get("missing_facets")

@@ -1,5 +1,7 @@
 from pathlib import Path
+import importlib
 import importlib.util
+import json
 import logging
 import os
 import shutil
@@ -543,14 +545,44 @@ def test_pre_llm_hook_default_off_is_byte_identical_and_opt_in_adds_verified_evi
 
     ctx = _Ctx()
     module.register(ctx)
+    host_evidence = importlib.import_module(f"{module.__name__}.host_evidence")
+
+    def select(request, **_kwargs):
+        source = request["baseline_evidence"][0]
+        return {
+            "version": "evidence-selector-v1",
+            "requested_facets": [],
+            "selections": [
+                {
+                    "claim_id": "current-location",
+                    "facet": "current_state",
+                    "exact_ref": source["exact_ref"],
+                    "quote": source["quote"],
+                    "value": "Denver",
+                }
+            ],
+            "missing_facets": [],
+            "usage": {
+                "provider": "fixture",
+                "model": "none",
+                "effort": "none",
+                "calls": 1,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "latency_ms": 0,
+            },
+        }
+
+    monkeypatch.setattr(host_evidence, "call_auxiliary_selector", select)
     policy = module.get_recall_policy()
     hook = hooks["pre_llm_call"][0]
     ctx.engine.on_session_start("active-session", platform="cli")
-    ctx.engine._store.append(
+    source_text = "I moved to Denver and live there now."
+    source_id = ctx.engine._store.append(
         "prior-session",
         {
             "role": "user",
-            "content": "I moved to Denver and live there now.",
+            "content": source_text,
             "timestamp": 1_712_275_200,
         },
     )
@@ -563,6 +595,12 @@ def test_pre_llm_hook_default_off_is_byte_identical_and_opt_in_adds_verified_evi
     active = hook(
         session_id="active-session",
         user_message="Where do I live now?",
+        baseline_refs=[
+            {
+                "exact_ref": f"lcm:{source_id}:0-{len(source_text)}",
+                "quote": source_text,
+            }
+        ],
         conversation_history=[
             {
                 "role": "user",
@@ -573,13 +611,102 @@ def test_pre_llm_hook_default_off_is_byte_identical_and_opt_in_adds_verified_evi
     )
 
     assert disabled == {"context": policy}
-    assert active["context"].startswith(policy + "\n\n<lcm-preanswer-evidence>")
+    assert active["context"].startswith(
+        policy + "\n\n<lcm-compiled-evidence"
+    ), ctx.engine._last_preanswer_evidence_trace
     assert "Denver" in active["context"]
     assert "lcm:" in active["context"]
     trace = ctx.engine._last_preanswer_evidence_trace
-    assert trace["status"] == "augmented"
-    assert trace["retrieval"]["calls"] == 1
-    assert trace["decision"]["missing_requirement"]["kind"] == "latest_state_update"
+    assert trace["status"] == "compiled"
+    assert trace["state"] == "answer_sufficient"
+    assert trace["selector"]["status"] == "valid"
+    assert trace["provenance"]["envelope_owner"] == "hermes_lcm_product_code"
+    ctx.engine.shutdown()
+
+
+def test_pre_llm_hook_product_creates_answer_ready_baseline_before_selection(
+    tmp_path, monkeypatch
+):
+    module = _load_plugin_entrypoint_module("hermes_lcm_packaging_host_envelope")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    monkeypatch.setenv("LCM_PREANSWER_EVIDENCE_ENABLED", "true")
+    monkeypatch.setenv("LCM_EMBEDDINGS_ENABLED", "false")
+    hooks = {}
+
+    class _Ctx:
+        def __init__(self):
+            self.engine = None
+
+        def register_context_engine(self, engine):
+            self.engine = engine
+
+        def register_hook(self, name, callback):
+            hooks.setdefault(name, []).append(callback)
+
+    ctx = _Ctx()
+    module.register(ctx)
+    host_evidence = importlib.import_module(f"{module.__name__}.host_evidence")
+    content = "Maya owns the Atlas rollout."
+    source_id = ctx.engine._store.append(
+        "prior-session", {"role": "user", "content": content}
+    )
+    source = {
+        "exact_ref": f"lcm:{source_id}:0-{len(content)}",
+        "content": content,
+    }
+    recall_calls = []
+
+    def handle(tool, args, **_kwargs):
+        recall_calls.append((tool, args))
+        assert tool == "lcm_recall"
+        return json.dumps({"hits": [source]})
+
+    def select(request, **_kwargs):
+        assert request["baseline_evidence"] == [
+            {"exact_ref": source["exact_ref"], "quote": content}
+        ]
+        return {
+            "version": "evidence-selector-v1",
+            "requested_facets": [],
+            "selections": [
+                {
+                    "claim_id": "atlas-owner",
+                    "facet": "owner",
+                    "exact_ref": source["exact_ref"],
+                    "quote": content,
+                    "entity": "Maya",
+                    "value": "Maya",
+                }
+            ],
+            "missing_facets": [],
+            "usage": {
+                "provider": "fixture",
+                "model": "none",
+                "effort": "none",
+                "calls": 1,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "latency_ms": 0,
+            },
+        }
+
+    monkeypatch.setattr(ctx.engine, "handle_tool_call", handle)
+    monkeypatch.setattr(host_evidence, "call_auxiliary_selector", select)
+    ctx.engine.on_session_start("active-session", platform="cli")
+    response = hooks["pre_llm_call"][0](
+        session_id="active-session",
+        user_message="Who owns the Atlas rollout?",
+        question_date="2026-07-20",
+        enabled_toolsets=["context_engine"],
+    )
+
+    assert len(recall_calls) == 1
+    assert recall_calls[0][1]["detail"] == "answer_ready"
+    assert response["context"].startswith(
+        module.get_recall_policy() + "\n\n<lcm-compiled-evidence"
+    )
+    assert ctx.engine._last_preanswer_evidence_trace["state"] == "answer_sufficient"
+    assert ctx.engine._last_preanswer_evidence_trace["baseline"]["exact_ref_count"] == 1
     ctx.engine.shutdown()
 
 
