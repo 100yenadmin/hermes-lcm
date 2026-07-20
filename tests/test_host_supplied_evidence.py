@@ -12,6 +12,7 @@ from hermes_lcm.evidence_compiler import SELECTOR_SCHEMA_VERSION
 from hermes_lcm.host_evidence import (
     build_host_supplied_evidence,
     call_auxiliary_selector,
+    prepare_host_evidence_selector,
 )
 from hermes_lcm.store import MessageStore
 
@@ -100,6 +101,16 @@ def test_code_owns_host_envelope_and_selector_proposes_semantics_only(tmp_path):
     assert envelope["operation"] == "none"
     assert envelope["baseline_evidence"] == [owner, deadline]
     assert envelope["budgets"] == {"max_selections": 8, "max_quote_chars": 2400}
+    prepared = prepare_host_evidence_selector(
+        "Who owns the Atlas rollout and when is it due?",
+        baseline_refs=[owner, deadline],
+        question_date="2026-07-20",
+        budgets={"max_input_refs": 8, "max_selections": 8},
+    )
+    assert prepared["baseline_exact_ref_count"] == 2
+    assert prepared["request"]["operation"] == "none"
+    assert "Do not return the question" in prepared["prompt"]
+    assert len(prepared["envelope_sha256"]) == 64
     assert result["state"] == "answer_sufficient", json.dumps(result, sort_keys=True)
     assert result["baseline_retained"] is True
     assert result["context"].startswith("<lcm-compiled-evidence")

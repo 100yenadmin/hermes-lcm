@@ -961,6 +961,43 @@ def _persist_compiled_view(result: dict[str, Any], *, engine: Any) -> None:
     result["provenance"]["persisted"] = bool(published)
 
 
+def prepare_evidence_selector(
+    question: Any,
+    *,
+    baseline_refs: Sequence[Any] = (),
+    question_date: Any = None,
+    budgets: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Create the deterministic, code-owned selector envelope."""
+    limits = _budgets(budgets)
+    normalized_refs, exact_refs = _normalize_baseline_refs(
+        baseline_refs, limit=limits.max_input_refs
+    )
+    request = derive_evidence_request(question, question_date)
+    selector_request = {
+        "version": SELECTOR_SCHEMA_VERSION,
+        "question": request["question"],
+        "as_of": request["as_of"],
+        "facets": request["facets"],
+        "operation": request["operation"],
+        "exhaustive": request["exhaustive"],
+        "expected_cardinality": request["expected_cardinality"],
+        "baseline_evidence": normalized_refs,
+        "budgets": {
+            "max_selections": limits.max_selections,
+            "max_quote_chars": limits.max_quote_chars,
+        },
+    }
+    return {
+        "version": SELECTOR_SCHEMA_VERSION,
+        "request": request,
+        "selector_request": selector_request,
+        "baseline_exact_refs": exact_refs,
+        "baseline_exact_refs_sha256": _digest(exact_refs),
+        "budgets": limits.as_dict(),
+    }
+
+
 def compile_evidence(
     question: Any,
     *,
@@ -991,25 +1028,18 @@ def compile_evidence(
         result["reason_code"] = "selector_unavailable"
         return _finish(result, started=started)
     try:
-        request = derive_evidence_request(question, question_date)
+        prepared = prepare_evidence_selector(
+            question,
+            baseline_refs=normalized_refs,
+            question_date=question_date,
+            budgets=budgets,
+        )
     except ValueError as exc:
         result["reason_code"] = str(exc)
         return _finish(result, started=started)
+    request = prepared["request"]
     result["request"] = request
-    selector_request = {
-        "version": SELECTOR_SCHEMA_VERSION,
-        "question": request["question"],
-        "as_of": request["as_of"],
-        "facets": request["facets"],
-        "operation": request["operation"],
-        "exhaustive": request["exhaustive"],
-        "expected_cardinality": request["expected_cardinality"],
-        "baseline_evidence": normalized_refs,
-        "budgets": {
-            "max_selections": limits.max_selections,
-            "max_quote_chars": limits.max_quote_chars,
-        },
-    }
+    selector_request = prepared["selector_request"]
     selector_started = time.perf_counter()
     try:
         raw_proposal = selector(selector_request)

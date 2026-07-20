@@ -9,12 +9,17 @@ ordinary baseline by returning ``context=None``.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import time
 from typing import Any, Callable, Mapping, Sequence
 
-from .evidence_compiler import SELECTOR_SCHEMA_VERSION, compile_evidence
+from .evidence_compiler import (
+    SELECTOR_SCHEMA_VERSION,
+    compile_evidence,
+    prepare_evidence_selector,
+)
 from .model_routing import apply_lcm_model_route
 
 
@@ -69,6 +74,44 @@ def build_selector_prompt(request: Mapping[str, Any]) -> str:
             json.dumps(dict(request), ensure_ascii=False, sort_keys=True),
         ]
     )
+
+
+def prepare_host_evidence_selector(
+    question: Any,
+    *,
+    baseline_refs: Sequence[Any] = (),
+    question_date: Any = None,
+    budgets: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return the product-owned selector prompt and a stable envelope digest."""
+    prepared = prepare_evidence_selector(
+        question,
+        baseline_refs=baseline_refs,
+        question_date=question_date,
+        budgets=budgets,
+    )
+    request = prepared["selector_request"]
+    encoded = json.dumps(
+        request,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return {
+        "version": HOST_EVIDENCE_VERSION,
+        "prompt": build_selector_prompt(request),
+        "envelope_sha256": hashlib.sha256(encoded).hexdigest(),
+        "baseline_exact_refs_sha256": prepared["baseline_exact_refs_sha256"],
+        "baseline_exact_ref_count": len(prepared["baseline_exact_refs"]),
+        "request": prepared["request"],
+        "budgets": prepared["budgets"],
+        "provenance": {
+            "envelope_owner": "hermes_lcm_product_code",
+            "selector_output_semantics_only": True,
+            "registered_tool_transport_used": False,
+        },
+    }
 
 
 def call_auxiliary_selector(
