@@ -25,11 +25,16 @@ from .model_routing import apply_lcm_model_route
 
 HOST_EVIDENCE_VERSION = "host-supplied-evidence-v1"
 _REASONING_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+_EXACT_REF_RE = re.compile(r"^lcm:[1-9]\d*:\d+-\d+$")
 
 
 def _usage_value(usage: Any, *names: str) -> int:
     for name in names:
-        value = usage.get(name) if isinstance(usage, Mapping) else getattr(usage, name, None)
+        value = (
+            usage.get(name)
+            if isinstance(usage, Mapping)
+            else getattr(usage, name, None)
+        )
         if value is not None:
             try:
                 return max(0, int(value))
@@ -76,17 +81,128 @@ def build_selector_prompt(request: Mapping[str, Any]) -> str:
     )
 
 
+def _prepare_selector_retrieval(
+    retrieve: Callable[[dict[str, Any]], Any] | None,
+    *,
+    question: str,
+    facets: Sequence[Mapping[str, Any]],
+    baseline_refs: Sequence[Mapping[str, Any]],
+    budgets: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Add one bounded, named-facet delta before the only selector call."""
+    result: dict[str, Any] = {
+        "calls": 0,
+        "status": "not_called",
+        "facet": None,
+        "novel_exact_refs": [],
+        "usage": {},
+    }
+    baseline = [dict(item) for item in baseline_refs]
+    if retrieve is None or int(budgets.get("max_retrieval_calls") or 0) <= 0:
+        return baseline, result
+    required = [
+        str(item.get("name") or "")
+        for item in facets
+        if item.get("required") is True and str(item.get("name") or "")
+    ]
+    if not required:
+        return baseline, result
+    facet = required[0]
+    result["facet"] = facet
+    started = time.perf_counter()
+    try:
+        raw = retrieve(
+            {
+                "query": f"{facet.replace('_', ' ')} {question}"[:1_000],
+                "facet": facet,
+                "include": "verbatim",
+                "detail": "answer_ready",
+                "limit": min(8, int(budgets.get("max_novel_refs") or 8)),
+                "seen_refs": [str(item.get("exact_ref") or "") for item in baseline],
+            }
+        )
+        payload = json.loads(raw) if isinstance(raw, str) else raw
+        if not isinstance(payload, Mapping) or payload.get("error"):
+            raise ValueError("retrieval_error")
+    except Exception:
+        result.update(
+            {
+                "calls": 1,
+                "status": "error",
+                "latency_ms": round((time.perf_counter() - started) * 1_000.0, 3),
+            }
+        )
+        return baseline, result
+
+    seen = {str(item.get("exact_ref") or "") for item in baseline}
+    novel: list[dict[str, Any]] = []
+    max_quote_chars = int(budgets.get("max_quote_chars") or 2_400)
+    max_novel_refs = min(8, int(budgets.get("max_novel_refs") or 8))
+    hits = payload.get("hits")
+    for hit in hits if isinstance(hits, list) else []:
+        if not isinstance(hit, Mapping):
+            continue
+        exact_ref = str(hit.get("exact_ref") or "").strip()
+        quote = str(hit.get("content") or hit.get("snippet") or "")
+        if (
+            not _EXACT_REF_RE.fullmatch(exact_ref)
+            or exact_ref in seen
+            or not quote
+            or len(quote) > max_quote_chars
+        ):
+            continue
+        seen.add(exact_ref)
+        novel.append({"exact_ref": exact_ref, "quote": quote})
+        if len(novel) >= max_novel_refs:
+            break
+    metrics = payload.get("metrics")
+    metric_map = metrics if isinstance(metrics, Mapping) else {}
+    result.update(
+        {
+            "calls": 1,
+            "status": "novel" if novel else "no_progress",
+            "novel_exact_refs": [item["exact_ref"] for item in novel],
+            "usage": {
+                key: metric_map[key]
+                for key in (
+                    "embedding_query_calls",
+                    "embedding_query_tokens",
+                    "embedding_query_tokens_complete",
+                    "embedding_queries",
+                )
+                if key in metric_map
+            },
+            "latency_ms": round((time.perf_counter() - started) * 1_000.0, 3),
+        }
+    )
+    return baseline + novel, result
+
+
 def prepare_host_evidence_selector(
     question: Any,
     *,
     baseline_refs: Sequence[Any] = (),
     question_date: Any = None,
     budgets: Mapping[str, Any] | None = None,
+    retrieve: Callable[[dict[str, Any]], Any] | None = None,
 ) -> dict[str, Any]:
     """Return the product-owned selector prompt and a stable envelope digest."""
-    prepared = prepare_evidence_selector(
+    initial = prepare_evidence_selector(
         question,
         baseline_refs=baseline_refs,
+        question_date=question_date,
+        budgets=budgets,
+    )
+    compiler_refs, retrieval = _prepare_selector_retrieval(
+        retrieve,
+        question=initial["request"]["question"],
+        facets=initial["request"]["facets"],
+        baseline_refs=initial["selector_request"]["baseline_evidence"],
+        budgets=initial["budgets"],
+    )
+    prepared = prepare_evidence_selector(
+        question,
+        baseline_refs=compiler_refs,
         question_date=question_date,
         budgets=budgets,
     )
@@ -102,8 +218,13 @@ def prepare_host_evidence_selector(
         "version": HOST_EVIDENCE_VERSION,
         "prompt": build_selector_prompt(request),
         "envelope_sha256": hashlib.sha256(encoded).hexdigest(),
-        "baseline_exact_refs_sha256": prepared["baseline_exact_refs_sha256"],
-        "baseline_exact_ref_count": len(prepared["baseline_exact_refs"]),
+        "baseline_exact_refs_sha256": initial["baseline_exact_refs_sha256"],
+        "baseline_exact_ref_count": len(initial["baseline_exact_refs"]),
+        "selector_exact_refs_sha256": prepared["baseline_exact_refs_sha256"],
+        "selector_exact_ref_count": len(prepared["baseline_exact_refs"]),
+        "selector_request": request,
+        "compiler_refs": compiler_refs,
+        "retrieval": retrieval,
         "request": prepared["request"],
         "budgets": prepared["budgets"],
         "provenance": {
@@ -145,7 +266,9 @@ def call_auxiliary_selector(
     if not isinstance(proposal, dict):
         raise ValueError("evidence selector returned a non-object payload")
     usage = getattr(response, "usage", None)
-    response_model = str(getattr(response, "model", "") or call_kwargs.get("model") or "task_default")
+    response_model = str(
+        getattr(response, "model", "") or call_kwargs.get("model") or "task_default"
+    )
     proposal["usage"] = {
         "provider": str(
             getattr(response, "provider", "")
@@ -204,7 +327,9 @@ def _render_context(result: Mapping[str, Any], *, max_chars: int) -> str | None:
     payload = _context_payload(result)
     if not payload["evidence"] and not payload["computation"]:
         return None
-    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
     context = f'<lcm-compiled-evidence version="{HOST_EVIDENCE_VERSION}">{encoded}</lcm-compiled-evidence>'
     return context if len(context) <= max_chars else None
 
@@ -220,6 +345,7 @@ def build_host_supplied_evidence(
     enabled: bool = False,
     persist_view: bool = False,
     budgets: Mapping[str, Any] | None = None,
+    prepared_retrieval: Mapping[str, Any] | None = None,
     max_context_chars: int = 6_000,
 ) -> dict[str, Any]:
     """Compile one code-owned envelope and render only validated evidence."""
@@ -234,6 +360,29 @@ def build_host_supplied_evidence(
         persist_view=persist_view,
         budgets=budgets,
     )
+    if isinstance(prepared_retrieval, Mapping):
+        result["retrieval"] = {
+            key: prepared_retrieval[key]
+            for key in (
+                "calls",
+                "status",
+                "facet",
+                "novel_exact_refs",
+                "usage",
+                "latency_ms",
+            )
+            if key in prepared_retrieval
+        }
+        result["trace"]["retrieval_status"] = result["retrieval"].get("status")
+        result["trace_sha256"] = hashlib.sha256(
+            json.dumps(
+                result["trace"],
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest()
     max_chars = min(16_000, max(256, int(max_context_chars)))
     context = _render_context(result, max_chars=max_chars)
     result["context"] = context
@@ -252,6 +401,9 @@ def build_host_supplied_evidence(
             "envelope_owner": "hermes_lcm_product_code",
             "registered_tool_transport_used": False,
             "selector_output_semantics_only": True,
+            "retrieval_stage": (
+                "preselector" if isinstance(prepared_retrieval, Mapping) else "compiler"
+            ),
             "context_char_cap": max_chars,
         }
     )

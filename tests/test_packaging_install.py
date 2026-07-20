@@ -700,8 +700,10 @@ def test_pre_llm_hook_product_creates_answer_ready_baseline_before_selection(
         enabled_toolsets=["context_engine"],
     )
 
-    assert len(recall_calls) == 1
+    assert len(recall_calls) == 2
     assert recall_calls[0][1]["detail"] == "answer_ready"
+    assert recall_calls[1][1]["facet"] == "owner"
+    assert recall_calls[1][1]["limit"] == 8
     assert response["context"].startswith(
         module.get_recall_policy() + "\n\n<lcm-compiled-evidence"
     )

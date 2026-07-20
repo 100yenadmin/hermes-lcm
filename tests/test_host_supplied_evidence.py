@@ -31,7 +31,9 @@ def test_code_owns_host_envelope_and_selector_proposes_semantics_only(tmp_path):
     engine = _engine(tmp_path)
     owner_text = "Maya owns the Atlas rollout."
     deadline_text = "The Atlas rollout was due on 2026-07-15."
-    owner_id = engine._store.append("session-a", {"role": "user", "content": owner_text})
+    owner_id = engine._store.append(
+        "session-a", {"role": "user", "content": owner_text}
+    )
     deadline_id = engine._store.append(
         "session-a", {"role": "user", "content": deadline_text}
     )
@@ -118,6 +120,92 @@ def test_code_owns_host_envelope_and_selector_proposes_semantics_only(tmp_path):
     assert deadline["exact_ref"] in result["context"]
     assert result["provenance"]["envelope_owner"] == "hermes_lcm_product_code"
     assert result["provenance"]["registered_tool_transport_used"] is False
+
+
+def test_named_facet_delta_is_selected_before_the_only_semantic_call(tmp_path):
+    engine = _engine(tmp_path)
+    baseline_text = "Atlas rollout notes are available."
+    owner_text = "Maya owns the Atlas rollout."
+    baseline_id = engine._store.append(
+        "session-a", {"role": "user", "content": baseline_text}
+    )
+    owner_id = engine._store.append(
+        "session-b", {"role": "user", "content": owner_text}
+    )
+    baseline = {
+        "exact_ref": f"lcm:{baseline_id}:0-{len(baseline_text)}",
+        "quote": baseline_text,
+    }
+    owner = {
+        "exact_ref": f"lcm:{owner_id}:0-{len(owner_text)}",
+        "quote": owner_text,
+    }
+    retrieval_calls = []
+
+    def retrieve(args):
+        retrieval_calls.append(args)
+        return json.dumps(
+            {
+                "hits": [{"exact_ref": owner["exact_ref"], "content": owner_text}],
+                "metrics": {
+                    "embedding_query_calls": 1,
+                    "embedding_query_tokens": 4,
+                    "embedding_query_tokens_complete": True,
+                },
+            }
+        )
+
+    prepared = prepare_host_evidence_selector(
+        "Who owns the Atlas rollout?",
+        baseline_refs=[baseline],
+        question_date="2026-07-20",
+        retrieve=retrieve,
+    )
+    selector_calls = []
+
+    def selector(request):
+        selector_calls.append(request)
+        assert owner in request["baseline_evidence"]
+        return {
+            "version": SELECTOR_SCHEMA_VERSION,
+            "requested_facets": [],
+            "selections": [
+                {
+                    "claim_id": "atlas-owner",
+                    "facet": "owner",
+                    "exact_ref": owner["exact_ref"],
+                    "quote": owner["quote"],
+                    "entity": "Maya",
+                    "value": "Maya",
+                }
+            ],
+            "missing_facets": [],
+        }
+
+    try:
+        result = build_host_supplied_evidence(
+            "Who owns the Atlas rollout?",
+            engine=engine,
+            baseline_refs=prepared["compiler_refs"],
+            question_date="2026-07-20",
+            selector=selector,
+            retrieve=None,
+            enabled=True,
+            budgets={"max_retrieval_calls": 0},
+            prepared_retrieval=prepared["retrieval"],
+        )
+    finally:
+        engine._store.close()
+
+    assert len(retrieval_calls) == 1
+    assert retrieval_calls[0]["facet"] == "owner"
+    assert len(selector_calls) == 1
+    assert prepared["baseline_exact_ref_count"] == 1
+    assert prepared["selector_exact_ref_count"] == 2
+    assert prepared["retrieval"]["novel_exact_refs"] == [owner["exact_ref"]]
+    assert result["state"] == "answer_sufficient"
+    assert result["retrieval"]["status"] == "novel"
+    assert result["provenance"]["retrieval_stage"] == "preselector"
 
 
 def test_selector_cannot_override_host_fields_and_failure_retains_baseline(tmp_path):

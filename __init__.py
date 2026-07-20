@@ -134,6 +134,7 @@ def _pre_llm_context(active_engine, recall_policy: str, payload: dict) -> dict:
         from .host_evidence import (
             build_host_supplied_evidence,
             call_auxiliary_selector,
+            prepare_host_evidence_selector,
         )
 
         question = str(payload.get("user_message") or "").strip()
@@ -178,18 +179,31 @@ def _pre_llm_context(active_engine, recall_policy: str, payload: dict) -> dict:
             getattr(config, "assertion_extraction_timeout_seconds", 10.0) or 10.0
         )
         selector_timeout = min(10.0, max(1.0, configured_timeout))
+
+        def retrieve(args):
+            return active_engine.handle_tool_call("lcm_recall", args)
+
+        prepared = prepare_host_evidence_selector(
+            question,
+            baseline_refs=baseline_refs,
+            question_date=_hook_question_date(payload),
+            retrieve=retrieve,
+        )
+        proposal = call_auxiliary_selector(
+            prepared["selector_request"],
+            model=selector_model,
+            timeout_seconds=selector_timeout,
+        )
         result = build_host_supplied_evidence(
             question,
             engine=active_engine,
-            baseline_refs=baseline_refs,
+            baseline_refs=prepared["compiler_refs"],
             question_date=_hook_question_date(payload),
-            selector=lambda request: call_auxiliary_selector(
-                request,
-                model=selector_model,
-                timeout_seconds=selector_timeout,
-            ),
-            retrieve=lambda args: active_engine.handle_tool_call("lcm_recall", args),
+            selector=lambda _request: proposal,
+            retrieve=None,
             enabled=True,
+            budgets={"max_retrieval_calls": 0},
+            prepared_retrieval=prepared["retrieval"],
         )
     except Exception as exc:  # pragma: no cover - outer host safety net
         logger.warning("LCM pre-answer evidence failed open: %s", exc)
