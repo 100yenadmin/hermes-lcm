@@ -55,7 +55,10 @@ def test_router_uses_only_generic_question_and_explicit_date_cues():
         "When did I submit my research paper?": "session_bundle",
         "What happened five days ago?": "session_bundle",
         "What is the order of the three trips from earliest to latest?": "session_bundle",
+        "What is the total number of days across both trips?": "session_bundle",
+        "How many weeks did the three projects take in total?": "session_bundle",
         "What was my previous personal best?": "session_bundle",
+        "Where am I planning to stay for my birthday trip?": "session_bundle",
         "Which hotel would fit my usual preferences?": "session_bundle",
     }
     for question, expected in examples.items():
@@ -195,6 +198,40 @@ def test_bundle_is_stable_deduplicated_and_bounded(tmp_path):
     assert len(result["novel_exact_refs"]) == len(set(result["novel_exact_refs"]))
     assert result["metrics"]["context_chars"] <= 1_800
     assert result["trace"]["truncated"] is True
+
+
+def test_default_bundle_budget_is_small_enough_for_baseline_first_answering(tmp_path):
+    engine = _engine(tmp_path)
+    lead = "I started comparing the two travel plans."
+    lead_id = _append(engine, "travel", lead, observed_at=1_710_000_000)
+    for index in range(8):
+        _append(
+            engine,
+            "travel",
+            f"Travel detail {index}: " + ("x" * 1_000),
+            observed_at=1_710_000_100 + index,
+        )
+    try:
+        result = build_selective_session_bundle(
+            "What is the total number of days across both trips?",
+            engine=engine,
+            baseline_refs=[_ref(lead_id, lead)],
+            question_date="2024-12-31",
+            enabled=True,
+        )
+    finally:
+        engine._store.close()
+
+    assert result["status"] == "augmented"
+    assert result["budgets"] == {
+        "max_sessions": 3,
+        "max_messages_per_session": 4,
+        "max_novel_refs": 4,
+        "max_context_chars": 3_000,
+        "max_quote_chars": 600,
+    }
+    assert result["metrics"]["context_chars"] <= 3_000
+    assert len(result["novel_exact_refs"]) <= 4
 
 
 def test_unknown_source_time_is_valid_and_never_relabels_ingest_as_event(tmp_path):

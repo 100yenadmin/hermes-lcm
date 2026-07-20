@@ -23,11 +23,11 @@ _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 @dataclass(frozen=True)
 class SessionBundleBudgets:
-    max_sessions: int = 4
-    max_messages_per_session: int = 8
-    max_novel_refs: int = 8
-    max_context_chars: int = 8_000
-    max_quote_chars: int = 1_200
+    max_sessions: int = 3
+    max_messages_per_session: int = 4
+    max_novel_refs: int = 4
+    max_context_chars: int = 3_000
+    max_quote_chars: int = 600
 
     def public_dict(self) -> dict[str, int]:
         return {
@@ -52,18 +52,18 @@ def _bounded_int(value: Any, *, default: int, minimum: int, maximum: int) -> int
 def _budgets(raw: Any) -> SessionBundleBudgets:
     value = raw if isinstance(raw, Mapping) else {}
     return SessionBundleBudgets(
-        max_sessions=_bounded_int(value.get("max_sessions"), default=4, minimum=1, maximum=5),
+        max_sessions=_bounded_int(value.get("max_sessions"), default=3, minimum=1, maximum=5),
         max_messages_per_session=_bounded_int(
-            value.get("max_messages_per_session"), default=8, minimum=1, maximum=12
+            value.get("max_messages_per_session"), default=4, minimum=1, maximum=12
         ),
         max_novel_refs=_bounded_int(
-            value.get("max_novel_refs"), default=8, minimum=1, maximum=12
+            value.get("max_novel_refs"), default=4, minimum=1, maximum=12
         ),
         max_context_chars=_bounded_int(
-            value.get("max_context_chars"), default=8_000, minimum=512, maximum=16_000
+            value.get("max_context_chars"), default=3_000, minimum=512, maximum=16_000
         ),
         max_quote_chars=_bounded_int(
-            value.get("max_quote_chars"), default=1_200, minimum=160, maximum=2_400
+            value.get("max_quote_chars"), default=600, minimum=160, maximum=2_400
         ),
     )
 
@@ -100,7 +100,9 @@ def route_selective_recall(
         r"\b(?:before|after|earlier|later|earliest|latest|previous|prior|first|last)\b",
         r"\b(?:order|sequence|timeline|chronological)\b",
         r"\b(?:all|both|each|combined|across|several|multiple)\b",
+        r"\b(?:how many|how much|total|sum|difference)\b",
         r"\b(?:usual|normally|typically|preferences?|preferred)\b",
+        r"\b(?:plan|planning|planned)\s+to\b",
         r"\b(?:used to|no longer|currently|now|moved|changed|updated)\b",
     )
     if text and any(re.search(pattern, text) for pattern in cues):
