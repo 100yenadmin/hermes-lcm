@@ -259,6 +259,13 @@ def test_sum_difference_count_and_mixed_unit_fallback(evidence_db):
     assert execute_plan(sum_plan, (operands[0], mixed)).status == "fallback"
     hidden_units = tuple(replace(operand, unit=None) for operand in operands)
     assert execute_plan(sum_plan, hidden_units).status == "fallback"
+    partial_time_units = (
+        replace(operands[0], unit="hour", value=1),
+        replace(operands[1], unit=None, value=30),
+    )
+    partial = execute_plan(sum_plan, partial_time_units)
+    assert partial.status == "fallback"
+    assert partial.reason == "every time operand must carry a compatible unit"
 
     counted = replace(operands[0], key="dune", unit="item")
     counted_again = replace(operands[1], key="dune", unit="item")

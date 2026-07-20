@@ -1274,3 +1274,14 @@ def compile_evidence(
     if persist_view:
         _persist_compiled_view(result, engine=engine)
     return _finish(result, started=started)
+
+
+def compile_preanswer_evidence(*args, **kwargs):
+    """Invoke the deterministic V4.6.3 requirements compiler.
+
+    The lazy import preserves plugin bootstrap order and keeps the legacy
+    proposal compiler byte-compatible.
+    """
+    from .requirements_compiler import compile_preanswer_evidence as _compile
+
+    return _compile(*args, **kwargs)

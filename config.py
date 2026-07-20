@@ -377,6 +377,7 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("proactive_recall_budget_tokens", "LCM_PROACTIVE_RECALL_BUDGET_TOKENS", int),
     _EnvFieldSpec("proactive_recall_provider", "LCM_PROACTIVE_RECALL_PROVIDER", str),
     _EnvFieldSpec("preanswer_evidence_enabled", "LCM_PREANSWER_EVIDENCE_ENABLED", bool),
+    _EnvFieldSpec("preanswer_evidence_mode", "LCM_PREANSWER_EVIDENCE_MODE", str),
     _EnvFieldSpec("selective_compiler_enabled", "LCM_SELECTIVE_COMPILER_ENABLED", bool),
     _EnvFieldSpec("selective_compiler_model", "LCM_SELECTIVE_COMPILER_MODEL", str),
     _EnvFieldSpec("embedding_bounded_scan_rows", "LCM_EMBEDDING_BOUNDED_SCAN_ROWS", int),
@@ -662,6 +663,11 @@ class LCMConfig:
     # ``pre_llm_call`` seam. Default-off preserves the exact ordinary hook
     # context and performs no retrieval or computation work.
     preanswer_evidence_enabled: bool = False
+    # Empty preserves the historical boolean-only behavior: when the master
+    # flag is true it resolves to ``legacy_selective``. Explicit values are
+    # off | legacy_selective | requirements_v1. The master flag remains the
+    # default-off activation boundary.
+    preanswer_evidence_mode: str = ""
     # Optional minimal semantic selector for code-derived closed operations.
     # It is independent and default-off; enabling pre-answer evidence alone
     # still performs only the provider-free session-bundle path.

@@ -116,6 +116,52 @@ def _hook_question_date(payload: dict) -> object:
     return None
 
 
+def _answer_ready_baseline(active_engine, question: str, payload: dict):
+    """Return caller-supplied exact refs or create one bounded product baseline."""
+    baseline_refs = payload.get("baseline_refs")
+    if isinstance(baseline_refs, (list, tuple)):
+        return tuple(baseline_refs)
+    raw = active_engine.handle_tool_call(
+        "lcm_recall",
+        {
+            "query": question,
+            "include": "verbatim",
+            "detail": "answer_ready",
+            "limit": 25,
+            "scope_bias": 0.0,
+            "include_occurrence_time": True,
+        },
+    )
+    recalled = json.loads(raw) if isinstance(raw, str) else raw
+    hits = recalled.get("hits") if isinstance(recalled, dict) else None
+    candidates = []
+    for hit in hits if isinstance(hits, list) else []:
+        if not isinstance(hit, dict):
+            continue
+        exact_ref = str(hit.get("exact_ref") or "").strip()
+        quote = str(hit.get("content") or hit.get("snippet") or "")
+        if exact_ref and quote:
+            candidates.append({"exact_ref": exact_ref, "quote": quote})
+        elif hit.get("store_id") is not None and quote:
+            candidates.append(
+                {
+                    "store_id": hit.get("store_id"),
+                    "content_offset": hit.get("content_offset", 0),
+                    "content": quote,
+                }
+            )
+    return tuple(candidates)
+
+
+def _effective_preanswer_mode(config) -> str:
+    if not bool(getattr(config, "preanswer_evidence_enabled", False)):
+        return "off"
+    raw = str(getattr(config, "preanswer_evidence_mode", "") or "").strip().casefold()
+    if not raw:
+        return "legacy_selective"
+    return raw if raw in {"off", "legacy_selective", "requirements_v1"} else "off"
+
+
 def _pre_llm_context(active_engine, recall_policy: str, payload: dict) -> dict:
     """Keep ordinary baseline bytes, or add one bounded product-owned delta."""
     enabled_toolsets = payload.get("enabled_toolsets")
@@ -124,69 +170,64 @@ def _pre_llm_context(active_engine, recall_policy: str, payload: dict) -> dict:
         and "context_engine" not in enabled_toolsets
     )
     config = getattr(active_engine, "_config", None)
-    enabled = bool(getattr(config, "preanswer_evidence_enabled", False))
-    if not enabled or not context_engine_enabled:
+    mode = _effective_preanswer_mode(config)
+    if mode == "off" or not context_engine_enabled:
         return {"context": recall_policy}
     try:
+        question = str(payload.get("user_message") or "").strip()
+        if not question:
+            return {"context": recall_policy}
+        question_date = _hook_question_date(payload)
+
+        if mode == "requirements_v1":
+            from .answer_contract import compile_answer_contract
+            from .evidence_compiler import compile_preanswer_evidence
+
+            contract = compile_answer_contract(question, question_date)
+            if contract.status != "planned":
+                return {"context": recall_policy}
+            baseline_refs = _answer_ready_baseline(active_engine, question, payload)
+            result = compile_preanswer_evidence(
+                question,
+                engine=active_engine,
+                baseline_refs=baseline_refs,
+                question_as_of=question_date,
+                retrieve=lambda recall_args: active_engine.handle_tool_call(
+                    "lcm_recall", recall_args
+                ),
+                enabled=True,
+            )
+            try:
+                active_engine._last_preanswer_evidence_trace = result
+            except Exception:
+                pass
+            context = result.get("context") if isinstance(result, dict) else None
+            if not isinstance(context, str) or not context:
+                return {"context": recall_policy}
+            return {"context": f"{recall_policy}\n\n{context}"}
+
         from .selective_recall import (
             build_selective_session_bundle,
             route_selective_recall,
         )
 
-        question = str(payload.get("user_message") or "").strip()
-        if not question:
-            return {"context": recall_policy}
-        route = route_selective_recall(question, _hook_question_date(payload))
+        route = route_selective_recall(question, question_date)
         if route["route"] == "ordinary":
             # This branch deliberately performs no recall, session load, or
             # auxiliary-model call.  The ordinary policy bytes stay identical.
             return {"context": recall_policy}
 
-        baseline_refs = payload.get("baseline_refs")
-        if not isinstance(baseline_refs, (list, tuple)):
-            baseline_refs = ()
-
         # Official Hermes hook payloads do not currently include answer-ready
         # refs.  Create that bounded baseline in product code when absent; the
         # benchmark bridge supplies its frozen cached baseline and skips this
         # retrieval, preserving those search bytes exactly.
-        if not baseline_refs:
-            raw = active_engine.handle_tool_call(
-                "lcm_recall",
-                {
-                    "query": question,
-                    "include": "verbatim",
-                    "detail": "answer_ready",
-                    "limit": 25,
-                    "scope_bias": 0.0,
-                    "include_occurrence_time": True,
-                },
-            )
-            recalled = json.loads(raw) if isinstance(raw, str) else raw
-            hits = recalled.get("hits") if isinstance(recalled, dict) else None
-            candidates = []
-            for hit in hits if isinstance(hits, list) else []:
-                if not isinstance(hit, dict):
-                    continue
-                exact_ref = str(hit.get("exact_ref") or "").strip()
-                quote = str(hit.get("content") or hit.get("snippet") or "")
-                if exact_ref and quote:
-                    candidates.append({"exact_ref": exact_ref, "quote": quote})
-                elif hit.get("store_id") is not None and quote:
-                    candidates.append(
-                        {
-                            "store_id": hit.get("store_id"),
-                            "content_offset": hit.get("content_offset", 0),
-                            "content": quote,
-                        }
-                    )
-            baseline_refs = tuple(candidates)
+        baseline_refs = _answer_ready_baseline(active_engine, question, payload)
 
         result = build_selective_session_bundle(
             question,
             engine=active_engine,
             baseline_refs=baseline_refs,
-            question_date=_hook_question_date(payload),
+            question_date=question_date,
             enabled=True,
         )
         compiler_result = None
@@ -216,7 +257,7 @@ def _pre_llm_context(active_engine, recall_policy: str, payload: dict) -> dict:
                 prepared = prepare_selective_compiler(
                     question,
                     baseline_refs=compiler_refs,
-                    question_date=_hook_question_date(payload),
+                    question_date=question_date,
                 )
                 if prepared["status"] == "selector_required":
                     proposal, selector_usage = call_selective_auxiliary_selector(
@@ -231,7 +272,7 @@ def _pre_llm_context(active_engine, recall_policy: str, payload: dict) -> dict:
                         engine=active_engine,
                         compiler_refs=prepared["compiler_refs"],
                         selector_proposal=proposal,
-                        question_date=_hook_question_date(payload),
+                        question_date=question_date,
                         enabled=True,
                     )
             except Exception as exc:

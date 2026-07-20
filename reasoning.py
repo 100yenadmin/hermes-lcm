@@ -48,6 +48,7 @@ _UNSUPPORTED_OPERATION_RE = re.compile(
     re.IGNORECASE,
 )
 _WORD_NUMBERS = {
+    "zero": 0,
     "one": 1,
     "two": 2,
     "three": 3,
@@ -58,6 +59,16 @@ _WORD_NUMBERS = {
     "eight": 8,
     "nine": 9,
     "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
+    "thirteen": 13,
+    "fourteen": 14,
+    "fifteen": 15,
+    "sixteen": 16,
+    "seventeen": 17,
+    "eighteen": 18,
+    "nineteen": 19,
+    "twenty": 20,
 }
 _MONTHS = {
     name.lower(): number
@@ -106,6 +117,7 @@ class EvidencePlan:
     ] | None = None
     order_direction: Literal["ascending", "descending"] | None = None
     requires_complete_evidence: bool = False
+    result_unit: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -123,6 +135,7 @@ class EvidencePlan:
             "difference_direction": self.difference_direction,
             "order_direction": self.order_direction,
             "requires_complete_evidence": self.requires_complete_evidence,
+            "result_unit": self.result_unit,
         }
 
 
@@ -501,11 +514,20 @@ def _explicit_units(text: str) -> set[str]:
 
 
 def _explicit_numbers(text: str) -> list[float]:
-    return [
+    values = [
         float(match.group(0).replace(",", ""))
         for match in _NUMBER_RE.finditer(text)
         if math.isfinite(float(match.group(0).replace(",", "")))
     ]
+    values.extend(
+        float(_WORD_NUMBERS[match.group(0).casefold()])
+        for match in re.finditer(
+            r"\b(?:" + "|".join(_WORD_NUMBERS) + r")\b",
+            text,
+            re.IGNORECASE,
+        )
+    )
+    return values
 
 
 def _numeric_value_has_unit(value: float, unit: str, quote: str) -> bool:
@@ -520,8 +542,19 @@ def _numeric_value_has_unit(value: float, unit: str, quote: str) -> bool:
         "item": r"items?",
         "event": r"events?",
     }
-    for match in _NUMBER_RE.finditer(quote):
-        parsed = float(match.group(0).replace(",", ""))
+    mentions = [
+        (match, float(match.group(0).replace(",", "")))
+        for match in _NUMBER_RE.finditer(quote)
+    ]
+    mentions.extend(
+        (match, float(_WORD_NUMBERS[match.group(0).casefold()]))
+        for match in re.finditer(
+            r"\b(?:" + "|".join(_WORD_NUMBERS) + r")\b",
+            quote,
+            re.IGNORECASE,
+        )
+    )
+    for match, parsed in mentions:
         if abs(parsed - value) > 1e-9:
             continue
         before = quote[max(0, match.start() - 24):match.start()]
@@ -531,7 +564,9 @@ def _numeric_value_has_unit(value: float, unit: str, quote: str) -> bool:
             or re.match(r"\s*(?:usd\b|dollars?\b)", after, re.IGNORECASE)
         ):
             return True
-        pattern = unit_patterns.get(unit)
+        pattern = unit_patterns.get(
+            unit, re.escape(unit).replace(r"\_", r"[ _]") + "s?"
+        )
         if pattern and (
             re.match(rf"\s*{pattern}\b", after, re.IGNORECASE)
             or re.search(rf"\b{pattern}\s*[:=~-]?\s*$", before, re.IGNORECASE)
@@ -1005,10 +1040,32 @@ def execute_plan(
         if any(not isinstance(operand.value, (int, float)) for operand in selected):
             return ComputationDecision("fallback", reason="numeric operand missing")
         units = {operand.unit for operand in selected if operand.unit}
-        if len(units) > 1:
+        requested_unit = normalize_unit(plan.result_unit)
+        time_factors = {
+            "minute": 1.0,
+            "hour": 60.0,
+            "day": 1_440.0,
+            "week": 10_080.0,
+        }
+        time_dimension = bool(units) and units.issubset(time_factors)
+        if time_dimension and any(operand.unit is None for operand in selected):
+            return ComputationDecision(
+                "fallback",
+                reason="every time operand must carry a compatible unit",
+            )
+        if len(units) > 1 and not time_dimension:
             return ComputationDecision("fallback", reason="mixed units are not supported")
-        unit = next(iter(units), None)
-        if unit and any(operand.unit != unit for operand in selected):
+        if requested_unit and requested_unit not in units:
+            if not (time_dimension and requested_unit in time_factors):
+                return ComputationDecision(
+                    "fallback", reason="requested result unit is incompatible with operands"
+                )
+        unit = requested_unit or (
+            min(units, key=lambda item: time_factors[item])
+            if time_dimension and len(units) > 1
+            else next(iter(units), None)
+        )
+        if unit and not time_dimension and any(operand.unit != unit for operand in selected):
             return ComputationDecision(
                 "fallback", reason="every numeric operand must carry the compatible unit"
             )
@@ -1022,6 +1079,11 @@ def execute_plan(
                     reason="numeric units present in evidence must be supplied explicitly",
                 )
         values = [float(operand.value) for operand in selected]  # type: ignore[arg-type]
+        if time_dimension and unit in time_factors:
+            values = [
+                value * time_factors[str(operand.unit)] / time_factors[unit]
+                for value, operand in zip(values, selected)
+            ]
         if plan.operation == "sum":
             result_value = sum(values)
         else:

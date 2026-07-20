@@ -44,6 +44,29 @@ def _load_plugin_entrypoint_module(module_name: str):
     return module
 
 
+def _ensure_agent_context_engine_importable(monkeypatch):
+    """Install the smallest host stub needed for isolated plugin tests."""
+    agent_module = sys.modules.get("agent")
+    if agent_module is None:
+        agent_module = types.ModuleType("agent")
+        agent_module.__path__ = []
+        monkeypatch.setitem(sys.modules, "agent", agent_module)
+    context_engine_module = types.ModuleType("agent.context_engine")
+
+    class ContextEngine:
+        def on_session_reset(self):
+            return None
+
+    context_engine_module.ContextEngine = ContextEngine
+    monkeypatch.setitem(sys.modules, "agent.context_engine", context_engine_module)
+    monkeypatch.setattr(
+        agent_module,
+        "context_engine",
+        context_engine_module,
+        raising=False,
+    )
+
+
 def _register_plugin_engine(module_name: str):
     module = _load_plugin_entrypoint_module(module_name)
 
@@ -794,6 +817,112 @@ def test_pre_llm_hook_selective_compiler_uses_existing_auxiliary_seam_and_fails_
     )
     assert "lcm-selective-evidence" not in fallback["context"]
     assert fallback["context"].startswith(module.get_recall_policy())
+    ctx.engine.shutdown()
+
+
+def test_pre_llm_hook_requirements_mode_uses_compiler_without_selector(
+    tmp_path, monkeypatch
+):
+    _ensure_agent_context_engine_importable(monkeypatch)
+    module = _load_plugin_entrypoint_module("hermes_lcm_packaging_requirements_v1")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    monkeypatch.setenv("LCM_PREANSWER_EVIDENCE_ENABLED", "true")
+    monkeypatch.setenv("LCM_PREANSWER_EVIDENCE_MODE", "requirements_v1")
+    monkeypatch.setenv("LCM_SELECTIVE_COMPILER_ENABLED", "true")
+    monkeypatch.setenv("LCM_EMBEDDINGS_ENABLED", "false")
+    hooks = {}
+
+    class _Ctx:
+        def __init__(self):
+            self.engine = None
+
+        def register_context_engine(self, engine):
+            self.engine = engine
+
+        def register_hook(self, name, callback):
+            hooks.setdefault(name, []).append(callback)
+
+    ctx = _Ctx()
+    module.register(ctx)
+    prompt = "How long is your commute?"
+    answer = "My commute is 35 minutes."
+    prompt_id = ctx.engine._store.append(
+        "prior-session", {"role": "user", "content": prompt}
+    )
+    answer_id = ctx.engine._store.append(
+        "prior-session", {"role": "assistant", "content": answer}
+    )
+    baseline = [{"exact_ref": f"lcm:{prompt_id}:0-{len(prompt)}", "quote": prompt}]
+    product_calls = []
+
+    def handle(tool, args, **_kwargs):
+        product_calls.append((tool, args))
+        raise AssertionError("adjacent exact closure must not call retrieval")
+
+    monkeypatch.setattr(ctx.engine, "handle_tool_call", handle)
+    ctx.engine.on_session_start("active-session", platform="cli")
+    response = hooks["pre_llm_call"][0](
+        session_id="active-session",
+        user_message="How long is my commute?",
+        question_date="2026-07-20",
+        enabled_toolsets=["context_engine"],
+        baseline_refs=baseline,
+    )
+
+    assert product_calls == []
+    assert "lcm-answer-brief" in response["context"]
+    assert "35 minutes" in response["context"]
+    assert f"lcm:{answer_id}:" in response["context"]
+    trace = ctx.engine._last_preanswer_evidence_trace
+    assert trace["state"] == "answer_sufficient"
+    assert trace["provenance"]["selector_calls"] == 0
+    ctx.engine.shutdown()
+
+
+def test_pre_llm_hook_requirements_ordinary_and_disabled_toolset_are_byte_identical(
+    tmp_path, monkeypatch
+):
+    _ensure_agent_context_engine_importable(monkeypatch)
+    module = _load_plugin_entrypoint_module("hermes_lcm_packaging_requirements_noop")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    monkeypatch.setenv("LCM_PREANSWER_EVIDENCE_ENABLED", "true")
+    monkeypatch.setenv("LCM_PREANSWER_EVIDENCE_MODE", "requirements_v1")
+    monkeypatch.setenv("LCM_EMBEDDINGS_ENABLED", "false")
+    hooks = {}
+
+    class _Ctx:
+        def __init__(self):
+            self.engine = None
+
+        def register_context_engine(self, engine):
+            self.engine = engine
+
+        def register_hook(self, name, callback):
+            hooks.setdefault(name, []).append(callback)
+
+    ctx = _Ctx()
+    module.register(ctx)
+
+    def fail(*_args, **_kwargs):
+        raise AssertionError("no product retrieval is allowed")
+
+    monkeypatch.setattr(ctx.engine, "handle_tool_call", fail)
+    ctx.engine.on_session_start("active-session", platform="cli")
+    hook = hooks["pre_llm_call"][0]
+    policy = module.get_recall_policy()
+    ordinary = hook(
+        session_id="active-session",
+        user_message="Tell me about the Atlas project",
+        enabled_toolsets=["context_engine"],
+    )
+    disabled = hook(
+        session_id="active-session",
+        user_message="How long is my commute?",
+        enabled_toolsets=[],
+    )
+
+    assert ordinary == {"context": policy}
+    assert disabled == {"context": policy}
     ctx.engine.shutdown()
 
 

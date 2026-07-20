@@ -853,12 +853,27 @@ def lcm_evidence_pack(args: Dict[str, Any], **kwargs) -> str:
 
 
 def lcm_compile_evidence(args: Dict[str, Any], **kwargs) -> str:
-    """Validate one semantic proposal into a bounded product evidence brief."""
+    """Compile evidence through legacy proposal or deterministic auto mode."""
     engine = _require_engine(kwargs)
     if engine is None:
         return json.dumps({"error": "LCM engine not initialized"})
     # Lazy import preserves the plugin's order-independent module bootstrap.
-    from .evidence_compiler import compile_evidence
+    from .evidence_compiler import compile_evidence, compile_preanswer_evidence
+
+    mode = str(args.get("mode") or "proposal").strip().casefold()
+    if mode not in {"proposal", "auto"}:
+        return json.dumps({"error": "mode must be one of: proposal, auto"})
+    if mode == "auto":
+        result = compile_preanswer_evidence(
+            args.get("question"),
+            engine=engine,
+            baseline_refs=args.get("baseline_refs") or (),
+            question_as_of=args.get("question_date"),
+            retrieve=lambda recall_args: lcm_recall(recall_args, engine=engine),
+            enabled=True,
+            budgets=args.get("budgets"),
+        )
+        return json.dumps(result, ensure_ascii=False)
 
     proposal = args.get("proposal")
     result = compile_evidence(

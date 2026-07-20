@@ -594,6 +594,55 @@ class MessageStore:
         ).fetchall()
         return {row[0]: self._row_to_dict(row) for row in rows}
 
+    def scan_evidence_rows(self, *, limit: int = 4096) -> Dict[str, Any]:
+        """Return one bounded, read-only whole-corpus evidence snapshot.
+
+        The window metadata and rows come from one SQLite statement, so a
+        caller cannot accidentally certify finite coverage from a count and a
+        row page taken at different corpus generations.  This API deliberately
+        has no query or session filter: a narrower scan is not whole-corpus
+        coverage.  Callers must treat ``truncated`` as an honest fallback.
+        """
+        bounded_limit = min(4096, max(1, int(limit)))
+        rows = self._conn.execute(
+            f"""
+            WITH snapshot AS (
+                SELECT {_MESSAGE_SELECT_COLUMNS},
+                       COUNT(*) OVER () AS snapshot_total_rows,
+                       MAX(store_id) OVER () AS snapshot_max_store_id,
+                       SUM(CASE WHEN observed_at IS NULL THEN 1 ELSE 0 END)
+                           OVER () AS snapshot_observed_at_missing_rows
+                FROM messages
+            )
+            SELECT * FROM snapshot
+            ORDER BY store_id
+            LIMIT ?
+            """,
+            (bounded_limit,),
+        ).fetchall()
+        if not rows:
+            return {
+                "rows": [],
+                "snapshot_max_store_id": 0,
+                "total_rows": 0,
+                "returned_rows": 0,
+                "truncated": False,
+                "observed_at_missing_rows": 0,
+            }
+        message_column_count = len(_MESSAGE_SELECT_COLUMNS.split(","))
+        total_rows = int(rows[0][message_column_count] or 0)
+        snapshot_max_store_id = int(rows[0][message_column_count + 1] or 0)
+        observed_at_missing_rows = int(rows[0][message_column_count + 2] or 0)
+        messages = [self._row_to_dict(row[:message_column_count]) for row in rows]
+        return {
+            "rows": messages,
+            "snapshot_max_store_id": snapshot_max_store_id,
+            "total_rows": total_rows,
+            "returned_rows": len(messages),
+            "truncated": total_rows > len(messages),
+            "observed_at_missing_rows": observed_at_missing_rows,
+        }
+
     def get_range(self, session_id: str, start_id: int = 0,
                   end_id: int | None = None,
                   limit: int = 1000,

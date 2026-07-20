@@ -499,6 +499,14 @@ LCM_EVIDENCE_PACK = {
             },
         },
         "required": ["question", "baseline_refs"],
+        "allOf": [
+            {
+                "if": {
+                    "properties": {"mode": {"const": "proposal"}},
+                },
+                "then": {"required": ["proposal"]},
+            }
+        ],
     },
 }
 
@@ -506,7 +514,9 @@ LCM_COMPILE_EVIDENCE = {
     "name": "lcm_compile_evidence",
     "description": (
         "Compile a bounded, source-grounded evidence brief from baseline exact LCM "
-        "refs and one provider-neutral semantic proposal. Product code validates "
+        "refs. Proposal mode validates one provider-neutral semantic proposal; "
+        "auto mode deterministically compiles answer requirements and may retrieve "
+        "only for named missing slots. Product code validates "
         "every quote, span, entity, date, value, unit, distinct key, role, and source "
         "against immutable stored evidence. The result distinguishes partial, "
         "answer-sufficient, finite-coverage, computation-sufficient, conflicted, and "
@@ -517,6 +527,15 @@ LCM_COMPILE_EVIDENCE = {
         "type": "object",
         "additionalProperties": False,
         "properties": {
+            "mode": {
+                "type": "string",
+                "enum": ["proposal", "auto"],
+                "default": "proposal",
+                "description": (
+                    "Default proposal mode preserves the legacy wire contract. "
+                    "Auto mode uses the provider-free requirements compiler."
+                ),
+            },
             "question": {"type": "string", "minLength": 1, "maxLength": 4000},
             "question_date": {
                 "type": "string",
@@ -657,9 +676,29 @@ LCM_COMPILE_EVIDENCE = {
                     "max_retrieval_calls": {
                         "type": "integer",
                         "minimum": 0,
-                        "maximum": 1,
+                        "maximum": 2,
                     },
                     "max_novel_refs": {"type": "integer", "minimum": 1, "maximum": 8},
+                    "max_candidates": {"type": "integer", "minimum": 1, "maximum": 48},
+                    "max_hydrated_candidates": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 12,
+                    },
+                    "max_added_context_tokens": {
+                        "type": "integer",
+                        "minimum": 64,
+                        "maximum": 850,
+                    },
+                    "max_scan_rows": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 4096,
+                        "description": (
+                            "Auto mode only. Whole-corpus finite-coverage scan bound; "
+                            "truncation always falls back."
+                        ),
+                    },
                     "response_char_cap": {
                         "type": "integer",
                         "minimum": 4096,
@@ -668,7 +707,7 @@ LCM_COMPILE_EVIDENCE = {
                 },
             },
         },
-        "required": ["question", "baseline_refs", "proposal"],
+        "required": ["question", "baseline_refs"],
     },
 }
 
