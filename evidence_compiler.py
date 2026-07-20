@@ -17,6 +17,7 @@ import time
 from typing import Any, Callable, Mapping, Sequence
 
 from .evidence_pack import build_evidence_pack, normalize_question_date
+from .query_view_store import QueryViewBuildInProgressError, QueryViewIdentity
 from .reasoning import compile_evidence_plan, normalize_unit
 
 
@@ -749,6 +750,12 @@ def _base(
             "final_prose_cached": False,
             "persisted": False,
         },
+        "persistence": {
+            "requested": False,
+            "status": "not_requested",
+            "view_id": None,
+            "reason_code": "",
+        },
     }
 
 
@@ -797,6 +804,123 @@ def _finish(result: dict[str, Any], *, started: float) -> dict[str, Any]:
     return result
 
 
+def _view_identity(
+    request: Mapping[str, Any], candidates: Sequence[Mapping[str, Any]]
+) -> QueryViewIdentity:
+    operation = str(request.get("operation") or "none")
+    if operation == "none":
+        operation = "evidence_only"
+    temporal = request.get("temporal_window")
+    as_of = str(request.get("as_of") or "")
+    question = str(request.get("question") or "")
+    values: dict[str, Any] = {
+        "intent_type": str(candidates[0].get("kind") or "evidence_compiler"),
+        "operation": operation,
+        "requirements_digest": _digest(request),
+        "policy_version": EVIDENCE_COMPILER_VERSION,
+    }
+    if isinstance(temporal, Mapping) and temporal.get("start") and temporal.get("end"):
+        relative = bool(
+            as_of
+            and re.search(
+                r"\b(?:ago|today|yesterday|last\s+(?:day|week|month|year))\b",
+                question.casefold(),
+            )
+        )
+        values.update(
+            {
+                "time_mode": "relative" if relative else "absolute",
+                "question_anchor": as_of if relative else "",
+                "window_start": str(temporal["start"]),
+                "window_end": str(temporal["end"]),
+            }
+        )
+    return QueryViewIdentity(**values).normalized()
+
+
+def _persist_compiled_view(result: dict[str, Any], *, engine: Any) -> None:
+    result["persistence"]["requested"] = True
+    candidates = result.get("operational_candidates")
+    evidence = result.get("evidence")
+    request = result.get("request")
+    if not candidates or not evidence or not isinstance(request, Mapping):
+        result["persistence"].update(
+            {"status": "not_eligible", "reason_code": "no_high_value_grounded_state"}
+        )
+        return
+    store = getattr(engine, "_query_views", None)
+    if store is None:
+        result["persistence"].update(
+            {"status": "unavailable", "reason_code": "query_view_store_unavailable"}
+        )
+        return
+    try:
+        identity = _view_identity(request, candidates)
+        dependencies = [
+            store.snapshot_dependency(
+                int(item["store_id"]),
+                int(item["span_start"]),
+                int(item["span_end"]),
+                str(item["quote"]),
+                assertion_id=str(item.get("assertion_id") or ""),
+            )
+            for item in evidence
+        ]
+        token = store.claim_build(identity)
+        closed = sorted(
+            {str(item.get("facet") or "") for item in evidence if item.get("facet")}
+        )
+        manifest = {
+            "closed_slots": closed,
+            "open_slots": list(result.get("missing_facets") or []),
+            "operands": [
+                {
+                    "exact_ref": str(item["exact_ref"]),
+                    "facet": str(item.get("facet") or ""),
+                    "facets": dict(item.get("facets") or {}),
+                }
+                for item in evidence
+            ],
+            "retrieval_calls": int(result.get("retrieval", {}).get("calls") or 0),
+            "evidence_refs": [dependency.citation for dependency in dependencies],
+            "coverage": {
+                "state": str(result.get("state") or "unknown"),
+                "finite": bool(result.get("finite_coverage")),
+            },
+        }
+        completeness = (
+            "complete"
+            if result.get("state")
+            in {"answer_sufficient", "finite_coverage", "computation_sufficient"}
+            else "partial"
+        )
+        published = store.publish_ready(
+            token,
+            dependencies=dependencies,
+            manifest=manifest,
+            completeness=completeness,
+            search_policy_version=EVIDENCE_COMPILER_VERSION,
+        )
+    except QueryViewBuildInProgressError:
+        result["persistence"].update(
+            {"status": "busy", "reason_code": "query_view_build_in_progress"}
+        )
+        return
+    except Exception:
+        result["persistence"].update(
+            {"status": "error", "reason_code": "query_view_publish_failed"}
+        )
+        return
+    result["persistence"].update(
+        {
+            "status": "published" if published else "stale",
+            "view_id": identity.view_id,
+            "reason_code": "" if published else "corpus_changed_during_publish",
+        }
+    )
+    result["provenance"]["persisted"] = bool(published)
+
+
 def compile_evidence(
     question: Any,
     *,
@@ -806,6 +930,7 @@ def compile_evidence(
     selector: Callable[[dict[str, Any]], Any] | None = None,
     retrieve: Callable[[dict[str, Any]], Any] | None = None,
     enabled: bool = False,
+    persist_view: bool = False,
     budgets: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Compile a bounded exact-evidence brief, or fail to the ordinary path."""
@@ -1008,4 +1133,6 @@ def compile_evidence(
             "operational_candidates": _operational_candidates(validated),
         }
     )
+    if persist_view:
+        _persist_compiled_view(result, engine=engine)
     return _finish(result, started=started)

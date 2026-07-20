@@ -52,6 +52,7 @@ def test_recall_policy_covers_evidence_safety_and_stable_tool_routing():
         "lcm_recall",
         "lcm_load_session",
         "lcm_recent",
+        "lcm_compile_evidence",
         "lcm_evidence_pack",
         "lcm_compute",
         "Open-cardinality evidence remains incomplete",
@@ -83,6 +84,7 @@ def test_bundled_skill_has_valid_minimal_frontmatter_and_matching_tool_reference
         "lcm_expand",
         "lcm_expand_query",
         "lcm_compute",
+        "lcm_compile_evidence",
         "lcm_evidence_pack",
     }
     for tool_name in documented:

@@ -334,7 +334,7 @@ LCM_COMPUTE = {
                                 {"type": "string"},
                                 {"type": "null"},
                             ],
-                            "description": "Explicit numeric or string operand value."
+                            "description": "Explicit numeric or string operand value.",
                         },
                         "unit": {"type": "string"},
                         "key": {
@@ -364,7 +364,9 @@ LCM_COMPUTE = {
                             "properties": {
                                 "observed_at": {"type": "number"},
                                 "stored_at": {"type": "number"},
-                                "event_at": {"anyOf": [{"type": "number"}, {"type": "null"}]},
+                                "event_at": {
+                                    "anyOf": [{"type": "number"}, {"type": "null"}]
+                                },
                                 "event_date": {"type": "string"},
                                 "event_time_source": {
                                     "type": "string",
@@ -497,6 +499,165 @@ LCM_EVIDENCE_PACK = {
             },
         },
         "required": ["question", "baseline_refs"],
+    },
+}
+
+LCM_COMPILE_EVIDENCE = {
+    "name": "lcm_compile_evidence",
+    "description": (
+        "Compile a bounded, source-grounded evidence brief from baseline exact LCM "
+        "refs and one provider-neutral semantic proposal. Product code validates "
+        "every quote, span, entity, date, value, unit, distinct key, role, and source "
+        "against immutable stored evidence. The result distinguishes partial, "
+        "answer-sufficient, finite-coverage, computation-sufficient, conflicted, and "
+        "unknown states and never returns final prose. Finite coverage cannot be "
+        "asserted by the proposal or inferred from linguistic singularity."
+    ),
+    "parameters": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "question": {"type": "string", "minLength": 1, "maxLength": 4000},
+            "question_date": {
+                "type": "string",
+                "description": "Optional explicit calendar-date/as-of anchor.",
+            },
+            "baseline_refs": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 50,
+                "items": {
+                    "anyOf": [
+                        {"type": "string"},
+                        {
+                            "type": "object",
+                            "additionalProperties": True,
+                            "required": ["exact_ref"],
+                            "properties": {
+                                "exact_ref": {"type": "string"},
+                                "quote": {"type": "string"},
+                            },
+                        },
+                    ]
+                },
+            },
+            "proposal": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": [
+                    "version",
+                    "operation",
+                    "selections",
+                    "missing_facets",
+                ],
+                "properties": {
+                    "version": {"type": "string", "enum": ["evidence-selector-v1"]},
+                    "operation": {
+                        "type": "string",
+                        "enum": [
+                            "none",
+                            "date_interval",
+                            "date_filter",
+                            "count_distinct",
+                            "sum",
+                            "difference",
+                            "order",
+                            "latest_fact",
+                        ],
+                    },
+                    "selections": {
+                        "type": "array",
+                        "maxItems": 50,
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": [
+                                "claim_id",
+                                "facet",
+                                "exact_ref",
+                                "quote",
+                            ],
+                            "properties": {
+                                "claim_id": {"type": "string"},
+                                "facet": {"type": "string"},
+                                "exact_ref": {"type": "string"},
+                                "quote": {"type": "string"},
+                                "entity": {"type": "string"},
+                                "date": {"type": "string"},
+                                "value": {
+                                    "anyOf": [
+                                        {"type": "number"},
+                                        {"type": "string"},
+                                        {"type": "null"},
+                                    ]
+                                },
+                                "unit": {"type": "string"},
+                                "distinct_key": {"type": "string"},
+                                "label": {"type": "string"},
+                                "role": {"type": "string"},
+                                "source": {"type": "string"},
+                            },
+                        },
+                    },
+                    "missing_facets": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "usage": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "provider": {"type": "string"},
+                            "model": {"type": "string"},
+                            "effort": {"type": "string"},
+                            "calls": {"type": "integer", "minimum": 0},
+                            "input_tokens": {"type": "integer", "minimum": 0},
+                            "output_tokens": {"type": "integer", "minimum": 0},
+                            "latency_ms": {"type": "number", "minimum": 0},
+                            "cost_usd": {"type": "number", "minimum": 0},
+                        },
+                    },
+                },
+            },
+            "persist_view": {
+                "type": "boolean",
+                "default": False,
+                "description": (
+                    "Default-off. Persist only validated high-value operational evidence "
+                    "as an exact-dependency query view in the same lcm.db."
+                ),
+            },
+            "budgets": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "max_input_refs": {"type": "integer", "minimum": 1, "maximum": 50},
+                    "max_selections": {"type": "integer", "minimum": 1, "maximum": 50},
+                    "max_selector_chars": {
+                        "type": "integer",
+                        "minimum": 1024,
+                        "maximum": 64000,
+                    },
+                    "max_quote_chars": {
+                        "type": "integer",
+                        "minimum": 64,
+                        "maximum": 2400,
+                    },
+                    "max_retrieval_calls": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 1,
+                    },
+                    "max_novel_refs": {"type": "integer", "minimum": 1, "maximum": 8},
+                    "response_char_cap": {
+                        "type": "integer",
+                        "minimum": 4096,
+                        "maximum": 64000,
+                    },
+                },
+            },
+        },
+        "required": ["question", "baseline_refs", "proposal"],
     },
 }
 

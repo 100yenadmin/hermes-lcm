@@ -47,7 +47,7 @@ Use as low-level drill-down after a known handle:
 Do not use it as broad first-step discovery.
 
 Set `include_exact_ref=true` with `store_id` when the recovered slice will be
-cited or passed to `lcm_evidence_pack`/`lcm_compute`. The default remains off
+cited or passed to `lcm_evidence_pack`/`lcm_compile_evidence`/`lcm_compute`. The default remains off
 for byte compatibility.
 
 ## Cross-conversation memory
@@ -83,13 +83,17 @@ For exact raw-message windows, use `lcm_grep` with explicit `time_from`/`time_to
 
 ## Exact evidence and computation
 
+### `lcm_compile_evidence`
+
+Use when a question needs multiple named facets, exact operands, conflict handling, or latest-state reasoning. Supply one bounded semantic proposal over already retrieved exact refs. The proposal is only a hint: product code revalidates every ref, unique quote span, entity, date, value, unit, distinct key, role, and source. Use `answer_sufficient` for a specifically answered open-ended question; require `finite_coverage` or `computation_sufficient` for exhaustive counts, lists, or arithmetic. On `partial`, `conflicted`, or `unknown`, preserve uncertainty and the ordinary answer path.
+
 ### `lcm_evidence_pack`
 
 Use after bounded baseline refs exist. It validates/hydrates exact refs, keeps occurrence and observation time distinct, deduplicates, and may return a canonical computation trace. It returns evidence, not final prose. Open-cardinality stays partial unless coverage is product-verifiable.
 
 ### `lcm_compute`
 
-Use only over exact cited evidence for supported date intervals/filters, distinct counts, compatible-unit sums, directed or absolute differences, ordering, and latest-state selection. Invalid spans, mixed units, ambiguity, or unsupported closure fail closed.
+Use only over exact cited evidence validated by the compiler for supported date intervals/filters, distinct counts, compatible-unit sums, directed or absolute differences, ordering, and latest-state selection. Invalid spans, mixed units, ambiguity, or unsupported closure fail closed.
 
 ## Default-off advanced paths
 

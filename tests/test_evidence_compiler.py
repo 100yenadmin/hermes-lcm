@@ -16,7 +16,9 @@ from hermes_lcm.evidence_compiler import (
     compile_evidence,
     derive_evidence_request,
 )
+from hermes_lcm.query_view_store import QueryViewStore
 from hermes_lcm.store import MessageStore
+from hermes_lcm.tools import lcm_compile_evidence
 
 
 def _engine(tmp_path):
@@ -586,3 +588,101 @@ def test_no_progress_retrieval_stops_and_trace_is_secret_safe(tmp_path):
         ).hexdigest()
     )
     assert result["version"] == EVIDENCE_COMPILER_VERSION
+
+
+def test_registered_tool_uses_the_product_compiler_path(tmp_path):
+    engine = _engine(tmp_path)
+    source = _append(engine, "Maya owns the Atlas rollout.")
+    proposal = _selector(
+        _claim("owner", source, "atlas-owner", entity="Maya", role="user")
+    )({})
+    try:
+        payload = json.loads(
+            lcm_compile_evidence(
+                {
+                    "question": "Who owns the Atlas rollout?",
+                    "question_date": "2026-07-20",
+                    "baseline_refs": [source],
+                    "proposal": proposal,
+                    "budgets": {"max_retrieval_calls": 0},
+                },
+                engine=engine,
+            )
+        )
+    finally:
+        engine._store.close()
+
+    assert payload["status"] == "compiled"
+    assert payload["state"] == "answer_sufficient"
+    assert payload["evidence"][0]["exact_ref"] == source["exact_ref"]
+    assert payload["provenance"]["storage"] == "same_lcm_db"
+    assert payload["provenance"]["final_prose_cached"] is False
+
+
+def test_selective_query_view_persistence_is_same_db_and_default_off(tmp_path):
+    engine = _engine(tmp_path)
+    query_views = QueryViewStore(engine._config.database_path)
+    engine._query_views = query_views
+    source = _append(engine, "Maya owns the Atlas rollout.")
+    selector = _selector(
+        _claim("owner", source, "atlas-owner", entity="Maya", role="user")
+    )
+    try:
+        default_result = _compile(
+            engine,
+            "Who owns the Atlas rollout?",
+            refs=[source],
+            selector=selector,
+        )
+        persisted_result = compile_evidence(
+            "Who owns the Atlas rollout?",
+            engine=engine,
+            baseline_refs=[source],
+            selector=selector,
+            enabled=True,
+            persist_view=True,
+        )
+        count = query_views._conn.execute(
+            "SELECT COUNT(*) FROM lcm_query_view_versions"
+        ).fetchone()[0]
+    finally:
+        query_views.close()
+        engine._store.close()
+
+    assert default_result["persistence"]["status"] == "not_requested"
+    assert default_result["provenance"]["persisted"] is False
+    assert persisted_result["persistence"]["status"] == "published"
+    assert persisted_result["provenance"]["persisted"] is True
+    assert persisted_result["persistence"]["view_id"]
+    assert count == 1
+
+
+def test_selective_persistence_rejects_generic_or_ungrounded_state(tmp_path):
+    engine = _engine(tmp_path)
+    query_views = QueryViewStore(engine._config.database_path)
+    engine._query_views = query_views
+    source = _append(engine, "The Atlas color is blue.")
+    try:
+        result = compile_evidence(
+            "What color is Atlas?",
+            engine=engine,
+            baseline_refs=[source],
+            selector=_selector(_claim("answer", source, "atlas-color", value="blue")),
+            enabled=True,
+            persist_view=True,
+        )
+        count = query_views._conn.execute(
+            "SELECT COUNT(*) FROM lcm_query_view_versions"
+        ).fetchone()[0]
+    finally:
+        query_views.close()
+        engine._store.close()
+
+    assert result["state"] == "answer_sufficient"
+    assert result["persistence"] == {
+        "requested": True,
+        "status": "not_eligible",
+        "view_id": None,
+        "reason_code": "no_high_value_grounded_state",
+    }
+    assert count == 0

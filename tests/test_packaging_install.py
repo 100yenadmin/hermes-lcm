@@ -13,6 +13,7 @@ EXPECTED_LCM_TOOLS = {
     "lcm_recall",
     "lcm_query_state",
     "lcm_compute",
+    "lcm_compile_evidence",
     "lcm_evidence_pack",
     "lcm_retrieve",
     "lcm_recent",

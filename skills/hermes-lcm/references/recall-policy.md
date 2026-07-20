@@ -10,7 +10,7 @@ Use the narrowest bounded route that fits the question:
 - Cross-conversation memory already stored in LCM: use `lcm_recall`, then follow its expansion hint with `lcm_load_session` or exact-handle `lcm_expand`.
 - Recent or time-bounded history: use `lcm_recent` for its supported natural periods or `lcm_grep` with explicit time bounds.
 - Hermes-tracked history outside `lcm.db`: use the host's `session_search` when available.
-- Exact date/count/sum/difference/order/latest-state questions: first recover source-backed exact refs, then use `lcm_evidence_pack` for bounded operands/completeness and `lcm_compute` only for a validated canonical operation. Open-cardinality evidence remains incomplete without product-verifiable coverage.
+- Multi-facet, conflict, latest-state, or exact-operand questions: first recover source-backed exact refs, then use `lcm_compile_evidence` to validate one bounded semantic proposal. Use `lcm_evidence_pack` for lower-level hydration and `lcm_compute` only for a compiler-validated canonical operation. Open-cardinality evidence remains incomplete without product-verifiable coverage.
 
 Full-text search uses FTS5 AND semantics, so extra words narrow the query. Do not pad a query with synonyms. Keep broad/global scope opt-in. Treat `lcm_expand` as known-handle drill-down, not broad discovery.
 

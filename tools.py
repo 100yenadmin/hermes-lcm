@@ -852,6 +852,29 @@ def lcm_evidence_pack(args: Dict[str, Any], **kwargs) -> str:
     )
 
 
+def lcm_compile_evidence(args: Dict[str, Any], **kwargs) -> str:
+    """Validate one semantic proposal into a bounded product evidence brief."""
+    engine = _require_engine(kwargs)
+    if engine is None:
+        return json.dumps({"error": "LCM engine not initialized"})
+    # Lazy import preserves the plugin's order-independent module bootstrap.
+    from .evidence_compiler import compile_evidence
+
+    proposal = args.get("proposal")
+    result = compile_evidence(
+        args.get("question"),
+        engine=engine,
+        baseline_refs=args.get("baseline_refs") or (),
+        question_date=args.get("question_date"),
+        selector=lambda _request: proposal,
+        retrieve=lambda recall_args: lcm_recall(recall_args, engine=engine),
+        enabled=True,
+        persist_view=args.get("persist_view") is True,
+        budgets=args.get("budgets"),
+    )
+    return json.dumps(result, ensure_ascii=False)
+
+
 _LCM_RETRIEVE_RESPONSE_CHAR_CAP = 64_000
 _LCM_RETRIEVE_ARGUMENTS = frozenset({
     "action",

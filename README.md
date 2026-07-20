@@ -78,7 +78,7 @@ Core capabilities:
 - **Summary DAG** - builds depth-aware summary nodes over compacted history
 - **Bounded recovery** - pages raw messages, child summaries, and externalized
   payloads instead of dumping everything into the prompt
-- **Agent tools** - `lcm_grep`, `lcm_recall`, `lcm_query_state`, `lcm_compute`, `lcm_evidence_pack`, `lcm_retrieve`, `lcm_recent`, `lcm_load_session`,
+- **Agent tools** - `lcm_grep`, `lcm_recall`, `lcm_query_state`, `lcm_compute`, `lcm_compile_evidence`, `lcm_evidence_pack`, `lcm_retrieve`, `lcm_recent`, `lcm_load_session`,
   `lcm_describe`, `lcm_expand`, `lcm_expand_query`, `lcm_status`, `lcm_inspect`,
   and `lcm_doctor`
 - **Source-aware retrieval** - filters raw rows and summaries by descendant
@@ -258,6 +258,7 @@ outside the LCM database.
 | `lcm_recall` | Search the entire memory across ALL conversations and all time by meaning. Fuses full-text, summary-vector, and chunk-vector arms with RRF, then applies a soft current-conversation (`scope_bias`) and recency prior. Returns bounded summary and verbatim-excerpt hits with `lcm_expand` handles; works FTS-only when embeddings are disabled. |
 | `lcm_query_state` | Query the opt-in V4 assertion sidecar for bounded current or historical facts, preferences, recommendations, commitments, actions, and status. Every result carries an exact message ref/span/quote; conflicts stay visible. |
 | `lcm_compute` | Execute supported dates, distinct counts, compatible-unit sums, directed/absolute differences, ordering, and latest-state operations over exact cited evidence. Planning, arithmetic, and trace verification are dependency-free and provider-neutral; ambiguous or incomplete inputs fail closed. |
+| `lcm_compile_evidence` | Validate one bounded provider-neutral semantic proposal against exact stored refs and return a compact evidence brief with explicit sufficiency state and an optional canonical computation. It never returns final prose or treats model claims as finite-coverage proof. |
 | `lcm_evidence_pack` | Hydrate and validate bounded baseline exact refs in the same `lcm.db`, repair only unique in-window quote spans, preserve occurrence/observation time separation, and optionally emit an immutable canonical computation trace without prose. |
 | `lcm_retrieve` | Opt-in bounded controller for one continuous answerer tool turn. It tracks typed evidence slots, permits at most three targeted calls to existing retrieval tools, accepts only exact observed refs, caps the evidence context, and can finish through `lcm_compute`. It persists evidence views and traces, never final prose. |
 | `lcm_recent` | Retrieve recent summaries by natural UTC period, preferring ready rollups and transparently falling back to time-bounded leaf summaries. |
