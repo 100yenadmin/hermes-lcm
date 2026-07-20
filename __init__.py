@@ -8,6 +8,7 @@ Based on the LCM paper by Ehrlich & Blackman (Voltropy PBC, Feb 2026).
 
 import logging
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -84,6 +85,71 @@ def _ensure_engine_bound_to_session(
             platform=platform,
             conversation_id=conversation_id or None,
         )
+
+
+def _hook_question_date(payload: dict) -> object:
+    """Return an explicit turn anchor without inventing event time."""
+    explicit = payload.get("question_date") or payload.get("question_as_of")
+    if explicit:
+        return explicit
+    history = payload.get("conversation_history")
+    if not isinstance(history, list):
+        return None
+    user_message = str(payload.get("user_message") or "")
+    for message in reversed(history):
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if user_message and isinstance(content, str) and content != user_message:
+            continue
+        timestamp = message.get("timestamp")
+        if isinstance(timestamp, (int, float)) and not isinstance(timestamp, bool):
+            try:
+                return datetime.fromtimestamp(
+                    float(timestamp), tz=timezone.utc
+                ).date().isoformat()
+            except (OverflowError, OSError, ValueError):
+                return None
+        if isinstance(timestamp, str) and timestamp.strip():
+            return timestamp.strip()
+    return None
+
+
+def _pre_llm_context(active_engine, recall_policy: str, payload: dict) -> dict:
+    """Build the exact ordinary hook result plus an optional verified delta."""
+    enabled_toolsets = payload.get("enabled_toolsets")
+    context_engine_enabled = not (
+        isinstance(enabled_toolsets, (list, tuple, set, frozenset))
+        and "context_engine" not in enabled_toolsets
+    )
+    config = getattr(active_engine, "_config", None)
+    enabled = bool(getattr(config, "preanswer_evidence_enabled", False))
+    baseline_refs = payload.get("baseline_refs")
+    if not isinstance(baseline_refs, (list, tuple)):
+        baseline_refs = ()
+    try:
+        from .preanswer_evidence import build_preanswer_evidence
+
+        result = build_preanswer_evidence(
+            payload.get("user_message"),
+            engine=active_engine,
+            baseline_refs=baseline_refs,
+            question_date=_hook_question_date(payload),
+            retrieve=lambda args: active_engine.handle_tool_call("lcm_recall", args),
+            enabled=enabled,
+            context_engine_enabled=context_engine_enabled,
+        )
+    except Exception as exc:  # pragma: no cover - outer host safety net
+        logger.warning("LCM pre-answer evidence failed open: %s", exc)
+        return {"context": recall_policy}
+    try:
+        active_engine._last_preanswer_evidence_trace = result
+    except Exception:
+        pass
+    augmentation = result.get("context") if isinstance(result, dict) else None
+    if not isinstance(augmentation, str) or not augmentation:
+        return {"context": recall_policy}
+    return {"context": f"{recall_policy}\n\n{augmentation}"}
 
 
 def register(ctx):
@@ -185,7 +251,7 @@ def register(ctx):
                 )
                 if active_engine is None or getattr(active_engine, "name", None) != "lcm":
                     return None
-                return {"context": recall_policy}
+                return _pre_llm_context(active_engine, recall_policy, payload)
 
             register_hook("pre_llm_call", _on_pre_llm_call)
         except Exception as exc:

@@ -521,6 +521,67 @@ def test_plugin_entrypoint_registers_bundled_skill_and_active_lcm_recall_policy(
     ctx.engine.shutdown()
 
 
+def test_pre_llm_hook_default_off_is_byte_identical_and_opt_in_adds_verified_evidence(
+    tmp_path, monkeypatch
+):
+    module = _load_plugin_entrypoint_module("hermes_lcm_packaging_preanswer_hook")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    monkeypatch.setenv("LCM_PREANSWER_EVIDENCE_ENABLED", "true")
+    monkeypatch.setenv("LCM_EMBEDDINGS_ENABLED", "false")
+    hooks = {}
+
+    class _Ctx:
+        def __init__(self):
+            self.engine = None
+
+        def register_context_engine(self, engine):
+            self.engine = engine
+
+        def register_hook(self, name, callback):
+            hooks.setdefault(name, []).append(callback)
+
+    ctx = _Ctx()
+    module.register(ctx)
+    policy = module.get_recall_policy()
+    hook = hooks["pre_llm_call"][0]
+    ctx.engine.on_session_start("active-session", platform="cli")
+    ctx.engine._store.append(
+        "prior-session",
+        {
+            "role": "user",
+            "content": "I moved to Denver and live there now.",
+            "timestamp": 1_712_275_200,
+        },
+    )
+
+    disabled = hook(
+        session_id="active-session",
+        user_message="Where do I live now?",
+        enabled_toolsets=[],
+    )
+    active = hook(
+        session_id="active-session",
+        user_message="Where do I live now?",
+        conversation_history=[
+            {
+                "role": "user",
+                "content": "Where do I live now?",
+                "timestamp": 1_712_361_600,
+            }
+        ],
+    )
+
+    assert disabled == {"context": policy}
+    assert active["context"].startswith(policy + "\n\n<lcm-preanswer-evidence>")
+    assert "Denver" in active["context"]
+    assert "lcm:" in active["context"]
+    trace = ctx.engine._last_preanswer_evidence_trace
+    assert trace["status"] == "augmented"
+    assert trace["retrieval"]["calls"] == 1
+    assert trace["decision"]["missing_requirement"]["kind"] == "latest_state_update"
+    ctx.engine.shutdown()
+
+
 def test_plugin_entrypoint_gracefully_degrades_without_skill_or_hook_registration(
     tmp_path, monkeypatch
 ):

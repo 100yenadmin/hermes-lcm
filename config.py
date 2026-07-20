@@ -376,6 +376,7 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("proactive_recall_min_score", "LCM_PROACTIVE_RECALL_MIN_SCORE", float),
     _EnvFieldSpec("proactive_recall_budget_tokens", "LCM_PROACTIVE_RECALL_BUDGET_TOKENS", int),
     _EnvFieldSpec("proactive_recall_provider", "LCM_PROACTIVE_RECALL_PROVIDER", str),
+    _EnvFieldSpec("preanswer_evidence_enabled", "LCM_PREANSWER_EVIDENCE_ENABLED", bool),
     _EnvFieldSpec("embedding_bounded_scan_rows", "LCM_EMBEDDING_BOUNDED_SCAN_ROWS", int),
     _EnvFieldSpec("embedding_storage_dtype", "LCM_EMBEDDING_STORAGE_DTYPE", str),
     _EnvFieldSpec("embedding_store_dim", "LCM_EMBEDDING_STORE_DIM", int),
@@ -655,6 +656,10 @@ class LCMConfig:
     # keep a local fastembed provider for the offline injection path even when
     # interactive search uses voyage). Empty => reuse the main provider/model.
     proactive_recall_provider: str = ""
+    # Product-owned automatic evidence validation at the official
+    # ``pre_llm_call`` seam. Default-off preserves the exact ordinary hook
+    # context and performs no retrieval or computation work.
+    preanswer_evidence_enabled: bool = False
     embedding_provider: str = ""
     embedding_model: str = ""
     # Content-aware chunk policy for the raw-history chunk corpus:
