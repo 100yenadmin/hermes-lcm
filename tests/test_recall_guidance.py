@@ -52,6 +52,9 @@ def test_recall_policy_covers_evidence_safety_and_stable_tool_routing():
         "lcm_recall",
         "lcm_load_session",
         "lcm_recent",
+        "lcm_evidence_pack",
+        "lcm_compute",
+        "Open-cardinality evidence remains incomplete",
     ):
         assert phrase in policy
 
