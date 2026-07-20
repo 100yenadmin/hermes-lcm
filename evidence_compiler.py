@@ -29,6 +29,7 @@ _CLAIM_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 _NUMBER_RE = re.compile(r"(?<![\w.])-?(?:\d+(?:,\d{3})*|\d*\.\d+)(?!\w)")
 _ALLOWED_OPERATIONS = {
     "none",
+    "scalar_fact",
     "date_interval",
     "date_filter",
     "count_distinct",
@@ -74,6 +75,53 @@ _SECRET_RE = re.compile(
     re.IGNORECASE,
 )
 _MAX_PROPOSED_FACETS = 12
+
+
+def _enumerated_operand_count(question: str) -> int | None:
+    """Return a code-proven small operand count from explicit named lists."""
+    normalized = " ".join(str(question or "").split())
+    quoted = re.findall(r"['\"]([^'\"]{1,200})['\"]", normalized)
+    if len(quoted) >= 2:
+        return min(8, len(quoted))
+    match = re.search(
+        r"\b(?:total|combined|altogether|sum)\b.*?\bof\b\s+(.+?)"
+        r"(?=\b(?:i|we)\s+(?:have|had|did|do|spent|used|earned|made)\b|\?)",
+        normalized,
+        re.IGNORECASE,
+    )
+    if not match:
+        match = re.search(
+            r"\bhow many\s+(?:hours?|minutes?|days?|weeks?|months?)\s+of\s+"
+            r"(.+?)(?=\b(?:did|do|was|were|have|has)\b|\?)",
+            normalized,
+            re.IGNORECASE,
+        )
+    if not match:
+        return None
+    phrase = match.group(1)
+    if not re.search(r"\b(?:and|plus)\b", phrase, re.IGNORECASE):
+        return None
+    parts = [
+        item.strip(" ,")
+        for item in re.split(r"\s*(?:,|\band\b|\bplus\b)\s*", phrase, flags=re.IGNORECASE)
+        if item.strip(" ,")
+    ]
+    return len(parts) if 2 <= len(parts) <= 8 else None
+
+
+def _is_scalar_fact_question(question: str) -> bool:
+    normalized = " ".join(str(question or "").casefold().split())
+    return bool(
+        re.search(
+            r"\bhow (?:many|much)\b.*\b(?:do|did|will|would|can)\s+i\s+"
+            r"(?:need|lead|view|earn|redeem|manage|owe|have left)\b",
+            normalized,
+        )
+        or re.search(
+            r"\bwhat (?:was|is)\b.*\b(?:increase|decrease|change|balance|count|number)\b",
+            normalized,
+        )
+    )
 
 
 @dataclass(frozen=True)
@@ -196,6 +244,16 @@ def derive_evidence_request(question: Any, question_date: Any = None) -> dict[st
     operation = plan.operation if plan is not None else "none"
     normalized = text.casefold()
 
+    enumerated = _enumerated_operand_count(text)
+    if (
+        operation == "count_distinct"
+        and enumerated is not None
+        and re.search(r"\bhow many\s+(?:hours?|minutes?|days?|weeks?|months?)\s+of\b", normalized)
+    ):
+        operation = "sum"
+    elif operation == "count_distinct" and _is_scalar_fact_question(text):
+        operation = "scalar_fact"
+
     facets: list[dict[str, Any]] = []
 
     def add(name: str) -> None:
@@ -226,7 +284,9 @@ def derive_evidence_request(question: Any, question_date: Any = None) -> dict[st
     ):
         add("premise")
 
-    if operation == "count_distinct":
+    if operation == "scalar_fact":
+        add("value")
+    elif operation == "count_distinct":
         add("events")
     elif operation in {"sum", "difference", "date_interval", "order"}:
         add("operands")
@@ -248,12 +308,16 @@ def derive_evidence_request(question: Any, question_date: Any = None) -> dict[st
         if plan is not None and plan.exact_operands is not None
         else _explicit_cardinality(text)
     )
+    if operation == "sum" and expected is None:
+        expected = enumerated
+    if operation == "scalar_fact":
+        expected = 1
     exhaustive = bool(
-        operation == "count_distinct"
+        operation in {"count_distinct", "scalar_fact"}
         or re.search(r"\b(all|every|complete list|exhaustive)\b", normalized)
         or expected is not None
         and operation
-        in {"count_distinct", "sum", "difference", "order", "date_interval"}
+        in {"count_distinct", "scalar_fact", "sum", "difference", "order", "date_interval"}
     )
     return {
         "version": EVIDENCE_COMPILER_VERSION,
@@ -1167,6 +1231,8 @@ def compile_evidence(
         and not rejections
     )
     if request["operation"] == "count_distinct" and expected is None:
+        computation = None
+    if request["operation"] == "scalar_fact":
         computation = None
     if request["exhaustive"] and not finite_coverage:
         computation = None

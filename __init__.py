@@ -189,17 +189,79 @@ def _pre_llm_context(active_engine, recall_policy: str, payload: dict) -> dict:
             question_date=_hook_question_date(payload),
             enabled=True,
         )
+        compiler_result = None
+        selector_usage = None
+        if bool(getattr(config, "selective_compiler_enabled", False)):
+            try:
+                from .selective_compiler import (
+                    call_selective_auxiliary_selector,
+                    compile_selective_evidence,
+                    prepare_selective_compiler,
+                )
+
+                compiler_refs = []
+                for raw in [*baseline_refs, *(result.get("evidence") or [])]:
+                    if not isinstance(raw, dict):
+                        continue
+                    exact_ref = str(raw.get("exact_ref") or "").strip()
+                    quote = str(raw.get("quote") or raw.get("content") or "")
+                    if exact_ref and quote:
+                        compiler_refs.append(
+                            {
+                                "exact_ref": exact_ref,
+                                "quote": quote,
+                                "date": raw.get("date"),
+                            }
+                        )
+                prepared = prepare_selective_compiler(
+                    question,
+                    baseline_refs=compiler_refs,
+                    question_date=_hook_question_date(payload),
+                )
+                if prepared["status"] == "selector_required":
+                    proposal, selector_usage = call_selective_auxiliary_selector(
+                        prepared,
+                        model=str(
+                            getattr(config, "selective_compiler_model", "") or ""
+                        ),
+                        timeout_seconds=8.0,
+                    )
+                    compiler_result = compile_selective_evidence(
+                        question,
+                        engine=active_engine,
+                        compiler_refs=prepared["compiler_refs"],
+                        selector_proposal=proposal,
+                        question_date=_hook_question_date(payload),
+                        enabled=True,
+                    )
+            except Exception as exc:
+                logger.warning("LCM selective compiler failed open: %s", exc)
     except Exception as exc:  # pragma: no cover - outer host safety net
         logger.warning("LCM pre-answer evidence failed open: %s", exc)
         return {"context": recall_policy}
     try:
-        active_engine._last_preanswer_evidence_trace = result
+        active_engine._last_preanswer_evidence_trace = (
+            {
+                **compiler_result,
+                "session_bundle": result,
+                "selector_usage": selector_usage,
+            }
+            if isinstance(compiler_result, dict)
+            else result
+        )
     except Exception:
         pass
-    augmentation = result.get("context") if isinstance(result, dict) else None
-    if not isinstance(augmentation, str) or not augmentation:
+    augmentations = []
+    session_context = result.get("context") if isinstance(result, dict) else None
+    compiler_context = (
+        compiler_result.get("context") if isinstance(compiler_result, dict) else None
+    )
+    for value in (session_context, compiler_context):
+        if isinstance(value, str) and value:
+            augmentations.append(value)
+    if not augmentations:
         return {"context": recall_policy}
-    return {"context": f"{recall_policy}\n\n{augmentation}"}
+    return {"context": f"{recall_policy}\n\n" + "\n\n".join(augmentations)}
 
 
 def register(ctx):

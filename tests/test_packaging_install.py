@@ -701,6 +701,102 @@ def test_pre_llm_hook_routed_path_creates_one_answer_ready_baseline(tmp_path, mo
     ctx.engine.shutdown()
 
 
+def test_pre_llm_hook_selective_compiler_uses_existing_auxiliary_seam_and_fails_open(
+    tmp_path, monkeypatch
+):
+    module = _load_plugin_entrypoint_module("hermes_lcm_packaging_selective_compiler")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    monkeypatch.setenv("LCM_PREANSWER_EVIDENCE_ENABLED", "true")
+    monkeypatch.setenv("LCM_SELECTIVE_COMPILER_ENABLED", "true")
+    monkeypatch.setenv("LCM_SELECTIVE_COMPILER_MODEL", "selector-test-model")
+    monkeypatch.setenv("LCM_EMBEDDINGS_ENABLED", "false")
+    hooks = {}
+
+    class _Ctx:
+        def __init__(self):
+            self.engine = None
+
+        def register_context_engine(self, engine):
+            self.engine = engine
+
+        def register_hook(self, name, callback):
+            hooks.setdefault(name, []).append(callback)
+
+    ctx = _Ctx()
+    module.register(ctx)
+    first = "The first of the two purchases cost $20."
+    second = "The second purchase cost $30."
+    first_id = ctx.engine._store.append("purchase-a", {"role": "user", "content": first})
+    second_id = ctx.engine._store.append("purchase-b", {"role": "user", "content": second})
+    refs = [
+        {"exact_ref": f"lcm:{first_id}:0-{len(first)}", "quote": first},
+        {"exact_ref": f"lcm:{second_id}:0-{len(second)}", "quote": second},
+    ]
+    selective = importlib.import_module(f"{module.__name__}.selective_compiler")
+    calls = []
+
+    def select(prepared, *, model, timeout_seconds):
+        calls.append((prepared["request"], model, timeout_seconds))
+        return (
+            {
+                "version": "selective-evidence-selector-v1",
+                "selections": [
+                    {
+                        "handle": "e01",
+                        "quote": "$20",
+                        "facet": "operand",
+                        "value": 20,
+                        "unit": "usd",
+                    },
+                    {
+                        "handle": "e02",
+                        "quote": "$30",
+                        "facet": "operand",
+                        "value": 30,
+                        "unit": "usd",
+                    },
+                ],
+            },
+            {"provider": "test", "model": model, "calls": 1},
+        )
+
+    monkeypatch.setattr(selective, "call_selective_auxiliary_selector", select)
+    hook = hooks["pre_llm_call"][0]
+    ctx.engine.on_session_start("active-session", platform="cli")
+    compiled = hook(
+        session_id="active-session",
+        user_message="What was the total cost of the two purchases?",
+        question_date="2026-07-20",
+        enabled_toolsets=["context_engine"],
+        baseline_refs=refs,
+    )
+
+    assert len(calls) == 1, (
+        ctx.engine._config.selective_compiler_enabled,
+        compiled,
+        getattr(ctx.engine, "_last_preanswer_evidence_trace", None),
+    )
+    assert calls[0][0]["operation"] == "sum"
+    assert calls[0][1:] == ("selector-test-model", 8.0)
+    assert "lcm-selective-evidence" in compiled["context"]
+    assert ctx.engine._last_preanswer_evidence_trace["computation"]["result_value"] == 50
+
+    def fail(*_args, **_kwargs):
+        raise TimeoutError("selector deadline")
+
+    monkeypatch.setattr(selective, "call_selective_auxiliary_selector", fail)
+    fallback = hook(
+        session_id="active-session",
+        user_message="What was the total cost of the two purchases?",
+        question_date="2026-07-20",
+        enabled_toolsets=["context_engine"],
+        baseline_refs=refs,
+    )
+    assert "lcm-selective-evidence" not in fallback["context"]
+    assert fallback["context"].startswith(module.get_recall_policy())
+    ctx.engine.shutdown()
+
+
 def test_plugin_entrypoint_gracefully_degrades_without_skill_or_hook_registration(
     tmp_path, monkeypatch
 ):
