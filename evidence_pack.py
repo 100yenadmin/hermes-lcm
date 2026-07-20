@@ -38,6 +38,27 @@ _EXACT_REF_RE = re.compile(r"^lcm:(?P<store_id>[1-9]\d*):(?P<start>\d+)-(?P<end>
 _DATE_PREFIX_RE = re.compile(
     r"^(?P<year>\d{4})[-/](?P<month>\d{2})[-/](?P<day>\d{2})(?=$|[Tt\s])"
 )
+_WEEKDAY_SUFFIX_RE = re.compile(
+    r"^\s*\((?P<weekday>mon(?:day)?|tue(?:sday)?|wed(?:nesday)?|"
+    r"thu(?:rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)\)\s*",
+    re.IGNORECASE,
+)
+_WEEKDAY_INDEX = {
+    "mon": 0,
+    "monday": 0,
+    "tue": 1,
+    "tuesday": 1,
+    "wed": 2,
+    "wednesday": 2,
+    "thu": 3,
+    "thursday": 3,
+    "fri": 4,
+    "friday": 4,
+    "sat": 5,
+    "saturday": 5,
+    "sun": 6,
+    "sunday": 6,
+}
 
 
 @dataclass(frozen=True)
@@ -149,13 +170,6 @@ def normalize_question_date(value: Any) -> tuple[QuestionDate | None, str | None
     match = _DATE_PREFIX_RE.match(raw)
     if match is None:
         return None, "question_date_invalid"
-    suffix = raw[match.end():]
-    if suffix and re.fullmatch(
-        r"(?:[Tt]|[ \t]+)(?:[01]\d|2[0-3]):[0-5]\d"
-        r"(?::[0-5]\d(?:\.\d{1,6})?)?(?:Z|[+-](?:[01]\d|2[0-3]):?[0-5]\d)?",
-        suffix,
-    ) is None:
-        return None, "question_date_invalid"
     try:
         day = date(
             int(match.group("year")),
@@ -164,11 +178,30 @@ def normalize_question_date(value: Any) -> tuple[QuestionDate | None, str | None
         )
     except ValueError:
         return None, "question_date_invalid"
+    suffix = raw[match.end() :]
+    weekday_match = _WEEKDAY_SUFFIX_RE.match(suffix)
+    if weekday_match is not None:
+        weekday = weekday_match.group("weekday").casefold()
+        if _WEEKDAY_INDEX[weekday] != day.weekday():
+            return None, "question_date_invalid"
+        suffix = suffix[weekday_match.end() :]
+    if (
+        suffix
+        and re.fullmatch(
+            r"(?:[Tt]|[ \t]+)?(?:[01]\d|2[0-3]):[0-5]\d"
+            r"(?::[0-5]\d(?:\.\d{1,6})?)?(?:Z|[+-](?:[01]\d|2[0-3]):?[0-5]\d)?",
+            suffix,
+        )
+        is None
+    ):
+        return None, "question_date_invalid"
     canonical = day.isoformat()
     if raw == canonical:
         normalization = "identity"
     elif raw.replace("/", "-") == canonical:
         normalization = "separator"
+    elif weekday_match is not None:
+        normalization = "weekday_date_component"
     else:
         normalization = "date_component"
     return QuestionDate(raw=raw, day=day, normalization=normalization), None
@@ -232,12 +265,18 @@ def _valid_epoch(value: Any) -> float | None:
     return timestamp if math.isfinite(timestamp) and timestamp > 0 else None
 
 
-def _observation_time(row: Mapping[str, Any], session_date: str | None) -> dict[str, Any]:
-    ingested_at = _valid_epoch(row.get("ingested_at")) or _valid_epoch(row.get("timestamp"))
+def _observation_time(
+    row: Mapping[str, Any], session_date: str | None
+) -> dict[str, Any]:
+    ingested_at = _valid_epoch(row.get("ingested_at")) or _valid_epoch(
+        row.get("timestamp")
+    )
     source_observed_at = _valid_epoch(row.get("observed_at"))
     observed_at: float | None = source_observed_at
     observed_day: str | None = None
-    source = "host_message_timestamp" if source_observed_at is not None else "unavailable"
+    source = (
+        "host_message_timestamp" if source_observed_at is not None else "unavailable"
+    )
     if session_date:
         match = _DATE_PREFIX_RE.match(str(session_date).strip())
         if match:
@@ -255,13 +294,15 @@ def _observation_time(row: Mapping[str, Any], session_date: str | None) -> dict[
             ).timestamp()
             source = "benchmark_session_date"
     if observed_day is None and source_observed_at is not None:
-        observed_day = datetime.fromtimestamp(
-            source_observed_at, tz=timezone.utc
-        ).date().isoformat()
+        observed_day = (
+            datetime.fromtimestamp(source_observed_at, tz=timezone.utc)
+            .date()
+            .isoformat()
+        )
     if observed_day is None and ingested_at is not None:
-        observed_day = datetime.fromtimestamp(
-            ingested_at, tz=timezone.utc
-        ).date().isoformat()
+        observed_day = (
+            datetime.fromtimestamp(ingested_at, tz=timezone.utc).date().isoformat()
+        )
         source = "ingest_fallback"
     return {
         "observed_at": observed_at,
@@ -321,10 +362,14 @@ def _resolve_candidate(
     session_date = sidecar_session_date
     source_observed_at = _valid_epoch(row.get("observed_at"))
     if session_date is None and source_observed_at is not None:
-        session_date = datetime.fromtimestamp(
-            source_observed_at, tz=timezone.utc
-        ).date().isoformat()
-    ingested_at = _valid_epoch(row.get("ingested_at")) or _valid_epoch(row.get("timestamp"))
+        session_date = (
+            datetime.fromtimestamp(source_observed_at, tz=timezone.utc)
+            .date()
+            .isoformat()
+        )
+    ingested_at = _valid_epoch(row.get("ingested_at")) or _valid_epoch(
+        row.get("timestamp")
+    )
     occurrence = resolve_occurrence_time(
         quote,
         observed_at=source_observed_at or 0.0,
@@ -390,7 +435,9 @@ def _resolve_candidate(
         "session_id": session_id,
         "observation_time": _observation_time(row, sidecar_session_date),
         "occurrence_time": {
-            "observed_at": _observation_time(row, sidecar_session_date).get("observed_at"),
+            "observed_at": _observation_time(row, sidecar_session_date).get(
+                "observed_at"
+            ),
             "stored_at": ingested_at,
             "occurred_at": occurrence.get("event_at"),
             "event_at": occurrence.get("event_at"),
@@ -497,15 +544,17 @@ def _run_retrieval_probe(
         }
     started = time.perf_counter()
     try:
-        raw = retrieve({
-            "query": question,
-            "include": "verbatim",
-            "detail": "answer_ready",
-            "limit": budgets.max_novel_refs,
-            "scope_bias": 0.0,
-            "seen_refs": list(seen_refs),
-            "include_occurrence_time": True,
-        })
+        raw = retrieve(
+            {
+                "query": question,
+                "include": "verbatim",
+                "detail": "answer_ready",
+                "limit": budgets.max_novel_refs,
+                "scope_bias": 0.0,
+                "seen_refs": list(seen_refs),
+                "include_occurrence_time": True,
+            }
+        )
         payload = json.loads(raw) if isinstance(raw, str) else raw
         if not isinstance(payload, Mapping):
             raise ValueError("retrieval result is not an object")
@@ -546,7 +595,11 @@ def _run_retrieval_probe(
         )
         return {
             "status": (
-                "novel_refs_available" if novel else "no_novel" if no_novel else "no_progress"
+                "novel_refs_available"
+                if novel
+                else "no_novel"
+                if no_novel
+                else "no_progress"
             ),
             "query_calls": 1,
             "novel_exact_refs": novel,
@@ -581,7 +634,9 @@ def _latest_selection(
         basis = "occurrence_time"
         dates = occurrence_dates
     else:
-        observations = [candidate.public.get("observation_time", {}) for candidate in candidates]
+        observations = [
+            candidate.public.get("observation_time", {}) for candidate in candidates
+        ]
         observation_dates = [
             str(item.get("date") or "") if isinstance(item, Mapping) else ""
             for item in observations
@@ -590,9 +645,9 @@ def _latest_selection(
             str(item.get("source") or "") if isinstance(item, Mapping) else ""
             for item in observations
         ]
-        if (
-            not all(observation_dates)
-            or any(source in {"", "unavailable", "ingest_fallback"} for source in observation_sources)
+        if not all(observation_dates) or any(
+            source in {"", "unavailable", "ingest_fallback"}
+            for source in observation_sources
         ):
             return {
                 "status": "fallback",
@@ -632,25 +687,29 @@ def build_evidence_pack(
         return json.dumps({"status": "fallback", "reason_code": "question_required"})
     question_date, date_error = normalize_question_date(args.get("question_date"))
     if date_error:
-        return json.dumps({
-            "status": "fallback",
-            "reason_code": date_error,
-            "question_date": None,
-        })
+        return json.dumps(
+            {
+                "status": "fallback",
+                "reason_code": date_error,
+                "question_date": None,
+            }
+        )
     normalized_question_date = question_date.day.isoformat() if question_date else None
     plan_decision = compile_evidence_plan(question, normalized_question_date)
     plan = plan_decision.plan if plan_decision.status == "planned" else None
     budgets = _parse_budgets(args.get("budgets"))
     raw_refs = args.get("baseline_refs")
     if not isinstance(raw_refs, list) or not raw_refs:
-        return json.dumps({
-            "status": "fallback",
-            "reason_code": "baseline_refs_required",
-            "question_date": question_date.public_dict() if question_date else None,
-            "budgets": budgets.public_dict(),
-        })
+        return json.dumps(
+            {
+                "status": "fallback",
+                "reason_code": "baseline_refs_required",
+                "question_date": question_date.public_dict() if question_date else None,
+                "budgets": budgets.public_dict(),
+            }
+        )
     input_count = len(raw_refs)
-    processed_refs = raw_refs[:budgets.max_refs]
+    processed_refs = raw_refs[: budgets.max_refs]
 
     resolved: list[ResolvedCandidate] = []
     rejections: list[dict[str, Any]] = []
@@ -690,26 +749,36 @@ def build_evidence_pack(
                 else None
             )
             if observed_at is not None and observed_at > as_of:
-                exclusions.append({
-                    "exact_ref": item.public["exact_ref"],
-                    "reason_code": "source_observed_after_question_as_of",
-                })
+                exclusions.append(
+                    {
+                        "exact_ref": item.public["exact_ref"],
+                        "reason_code": "source_observed_after_question_as_of",
+                    }
+                )
                 continue
             as_of_eligible.append(item)
         resolved = as_of_eligible
-    grounding = ground_evidence(
-        [item.operand for item in resolved],
-        messages=engine._store,
-        assertions=getattr(engine, "_assertions", None),
-        as_of=as_of,
-    ) if resolved else None
+    grounding = (
+        ground_evidence(
+            [item.operand for item in resolved],
+            messages=engine._store,
+            assertions=getattr(engine, "_assertions", None),
+            as_of=as_of,
+        )
+        if resolved
+        else None
+    )
     if grounding is None or grounding.status != "grounded":
         if resolved:
-            rejections.append({
-                "index": None,
-                "reason_code": "operand_grounding_failed",
-                "reason": grounding.reason if grounding is not None else "no evidence",
-            })
+            rejections.append(
+                {
+                    "index": None,
+                    "reason_code": "operand_grounding_failed",
+                    "reason": grounding.reason
+                    if grounding is not None
+                    else "no evidence",
+                }
+            )
         grounded_operands: Sequence[Any] = ()
     else:
         grounded_operands = grounding.operands
@@ -791,7 +860,12 @@ def build_evidence_pack(
             "response_truncated": False,
         },
         "provenance": {
-            "runtime_inputs": ["question", "question_date", "bounded_baseline_refs", "budgets"],
+            "runtime_inputs": [
+                "question",
+                "question_date",
+                "bounded_baseline_refs",
+                "budgets",
+            ],
             "storage": "same_lcm_db",
             "provider": "none",
             "model": "none",

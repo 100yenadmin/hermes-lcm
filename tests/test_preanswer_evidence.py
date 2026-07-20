@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from hermes_lcm.config import LCMConfig
+from hermes_lcm.evidence_pack import normalize_question_date
 from hermes_lcm.preanswer_evidence import build_preanswer_evidence
 from hermes_lcm.store import MessageStore
 
@@ -46,6 +47,40 @@ def test_preanswer_feature_flag_defaults_off_and_parses_env(monkeypatch):
     assert LCMConfig.from_env().preanswer_evidence_enabled is False
     monkeypatch.setenv("LCM_PREANSWER_EVIDENCE_ENABLED", "true")
     assert LCMConfig.from_env().preanswer_evidence_enabled is True
+
+
+def test_human_question_date_with_valid_weekday_reaches_product_planner(tmp_path):
+    engine = _engine(tmp_path)
+    taxi = _append(engine, "The taxi cost $60.", observed_at=1_680_000_000)
+    train = _append(engine, "The train cost $20.", observed_at=1_680_000_100)
+    try:
+        result = _result(
+            engine,
+            "What is the total of the two costs?",
+            refs=[taxi, train],
+            enabled=True,
+            question_date="2023/06/06 (Tue) 08:19",
+        )
+        invalid_weekday = _result(
+            engine,
+            "What is the total of the two costs?",
+            refs=[taxi, train],
+            enabled=True,
+            question_date="2023/06/06 (Wed) 08:19",
+        )
+    finally:
+        engine._store.close()
+
+    assert result["status"] == "computed"
+    normalized, error = normalize_question_date("2023/06/06 (Tue) 08:19")
+    assert error is None
+    assert normalized is not None
+    assert normalized.public_dict() == {
+        "input": "2023/06/06 (Tue) 08:19",
+        "date": "2023-06-06",
+        "normalization": "weekday_date_component",
+    }
+    assert invalid_weekday["reason_code"] == "question_date_invalid"
 
 
 @pytest.mark.parametrize(
