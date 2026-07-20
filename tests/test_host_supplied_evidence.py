@@ -160,6 +160,50 @@ def test_selector_cannot_override_host_fields_and_failure_retains_baseline(tmp_p
     assert result["computation"] is None
 
 
+def test_latest_state_text_value_uses_source_time_not_ingest_time(tmp_path):
+    engine = _engine(tmp_path)
+    engine._session_occurrence_dates["session-a"] = "2024-03-15"
+    content = "I moved from Austin to Denver in March 2024."
+    store_id = engine._store.append("session-a", {"role": "user", "content": content})
+    source = {
+        "exact_ref": f"lcm:{store_id}:0-{len(content)}",
+        "quote": content,
+    }
+
+    def selector(_request):
+        return {
+            "version": SELECTOR_SCHEMA_VERSION,
+            "requested_facets": [],
+            "selections": [
+                {
+                    "claim_id": "current-location",
+                    "facet": "current_state",
+                    "exact_ref": source["exact_ref"],
+                    "quote": content,
+                    "entity": "Denver",
+                    "value": "Denver",
+                }
+            ],
+            "missing_facets": [],
+        }
+
+    try:
+        result = build_host_supplied_evidence(
+            "Where do I live now?",
+            engine=engine,
+            baseline_refs=[source],
+            question_date="2024-04-06",
+            selector=selector,
+            enabled=True,
+        )
+    finally:
+        engine._store.close()
+
+    assert result["status"] == "compiled", json.dumps(result, sort_keys=True)
+    assert result["state"] == "answer_sufficient"
+    assert result["evidence"][0]["facets"]["value"] == "Denver"
+
+
 def test_compiled_brief_over_context_budget_is_not_injected(tmp_path):
     engine = _engine(tmp_path)
     content = "Maya owns the Atlas rollout."
