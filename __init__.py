@@ -117,7 +117,7 @@ def _hook_question_date(payload: dict) -> object:
 
 
 def _pre_llm_context(active_engine, recall_policy: str, payload: dict) -> dict:
-    """Build the exact ordinary hook result plus an optional verified delta."""
+    """Keep ordinary baseline bytes, or add one bounded product-owned delta."""
     enabled_toolsets = payload.get("enabled_toolsets")
     context_engine_enabled = not (
         isinstance(enabled_toolsets, (list, tuple, set, frozenset))
@@ -127,19 +127,24 @@ def _pre_llm_context(active_engine, recall_policy: str, payload: dict) -> dict:
     enabled = bool(getattr(config, "preanswer_evidence_enabled", False))
     if not enabled or not context_engine_enabled:
         return {"context": recall_policy}
-    baseline_refs = payload.get("baseline_refs")
-    if not isinstance(baseline_refs, (list, tuple)):
-        baseline_refs = ()
     try:
-        from .host_evidence import (
-            build_host_supplied_evidence,
-            call_auxiliary_selector,
-            prepare_host_evidence_selector,
+        from .selective_recall import (
+            build_selective_session_bundle,
+            route_selective_recall,
         )
 
         question = str(payload.get("user_message") or "").strip()
         if not question:
             return {"context": recall_policy}
+        route = route_selective_recall(question, _hook_question_date(payload))
+        if route["route"] == "ordinary":
+            # This branch deliberately performs no recall, session load, or
+            # auxiliary-model call.  The ordinary policy bytes stay identical.
+            return {"context": recall_policy}
+
+        baseline_refs = payload.get("baseline_refs")
+        if not isinstance(baseline_refs, (list, tuple)):
+            baseline_refs = ()
 
         # Official Hermes hook payloads do not currently include answer-ready
         # refs.  Create that bounded baseline in product code when absent; the
@@ -167,43 +172,22 @@ def _pre_llm_context(active_engine, recall_policy: str, payload: dict) -> dict:
                 quote = str(hit.get("content") or hit.get("snippet") or "")
                 if exact_ref and quote:
                     candidates.append({"exact_ref": exact_ref, "quote": quote})
+                elif hit.get("store_id") is not None and quote:
+                    candidates.append(
+                        {
+                            "store_id": hit.get("store_id"),
+                            "content_offset": hit.get("content_offset", 0),
+                            "content": quote,
+                        }
+                    )
             baseline_refs = tuple(candidates)
 
-        selector_model = str(
-            getattr(config, "assertion_extraction_model", "")
-            or getattr(config, "extraction_model", "")
-            or getattr(config, "summary_model", "")
-            or ""
-        )
-        configured_timeout = float(
-            getattr(config, "assertion_extraction_timeout_seconds", 10.0) or 10.0
-        )
-        selector_timeout = min(10.0, max(1.0, configured_timeout))
-
-        def retrieve(args):
-            return active_engine.handle_tool_call("lcm_recall", args)
-
-        prepared = prepare_host_evidence_selector(
-            question,
-            baseline_refs=baseline_refs,
-            question_date=_hook_question_date(payload),
-            retrieve=retrieve,
-        )
-        proposal = call_auxiliary_selector(
-            prepared["selector_request"],
-            model=selector_model,
-            timeout_seconds=selector_timeout,
-        )
-        result = build_host_supplied_evidence(
+        result = build_selective_session_bundle(
             question,
             engine=active_engine,
-            baseline_refs=prepared["compiler_refs"],
+            baseline_refs=baseline_refs,
             question_date=_hook_question_date(payload),
-            selector=lambda _request: proposal,
-            retrieve=None,
             enabled=True,
-            budgets={"max_retrieval_calls": 0},
-            prepared_retrieval=prepared["retrieval"],
         )
     except Exception as exc:  # pragma: no cover - outer host safety net
         logger.warning("LCM pre-answer evidence failed open: %s", exc)

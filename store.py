@@ -692,6 +692,34 @@ class MessageStore:
         ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
+    def load_session_window(
+        self,
+        session_id: str,
+        *,
+        anchor_store_id: int,
+        before: int = 2,
+        after: int = 3,
+    ) -> List[Dict[str, Any]]:
+        """Load one bounded ordered window around an exact message anchor."""
+        before = min(12, max(0, int(before)))
+        after = min(12, max(0, int(after)))
+        prior = self._conn.execute(
+            f"""SELECT {_MESSAGE_SELECT_COLUMNS}
+                FROM messages
+                WHERE session_id = ? AND store_id < ?
+                ORDER BY store_id DESC LIMIT ?""",
+            (session_id, anchor_store_id, before),
+        ).fetchall()
+        following = self._conn.execute(
+            f"""SELECT {_MESSAGE_SELECT_COLUMNS}
+                FROM messages
+                WHERE session_id = ? AND store_id >= ?
+                ORDER BY store_id LIMIT ?""",
+            (session_id, anchor_store_id, after + 1),
+        ).fetchall()
+        rows = list(reversed(prior)) + list(following)
+        return [self._row_to_dict(row) for row in rows]
+
     def get_session_messages(self, session_id: str,
                              limit: int = 10000) -> List[Dict[str, Any]]:
         """Get all messages for a session, ordered by store_id."""
