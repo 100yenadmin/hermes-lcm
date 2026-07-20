@@ -1572,6 +1572,8 @@ class TestEngineABC:
         assert "source_offset" in expand_props
         assert "source_limit" in expand_props
         assert "content_offset" in expand_props
+        assert "include_exact_ref" in expand_props
+        assert expand_props["include_exact_ref"]["default"] is False
         assert "store_id" in expand_props
         assert "across sessions" in expand_props["store_id"]["description"].lower() or "cross-session" in expand_props["store_id"]["description"].lower()
         assert "pagination" in expand_props["source_offset"]["description"].lower()
@@ -1584,6 +1586,8 @@ class TestEngineABC:
         assert "roles" in load_props
         assert "time_from" in load_props
         assert "time_to" in load_props
+        assert "include_exact_ref" in load_props
+        assert load_props["include_exact_ref"]["default"] is False
         assert "current session" in expand_query_schema["description"].lower()
         assert "session_search" in expand_query_schema["description"]
         expand_query_props = expand_query_schema["parameters"]["properties"]
@@ -26755,6 +26759,15 @@ class TestHandleExpandStoreId:
         assert result["role"] == "user"
         assert result["source"] == "cli"
         assert result["content"].startswith("cross session content")
+        assert "exact_ref" not in result
+
+        exact = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand",
+                {"store_id": store_id, "include_exact_ref": True},
+            )
+        )
+        assert exact["exact_ref"] == f"lcm:{store_id}:0-{len(exact['content'])}"
 
     def test_store_id_paging_via_content_offset(self, engine):
         big_content = "x" * 10000
@@ -26782,6 +26795,22 @@ class TestHandleExpandStoreId:
         assert second["content"]
         # Combined slices should not exceed total content length.
         assert first["content_chars"] == second["content_chars"]
+
+        exact_second = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand",
+                {
+                    "store_id": store_id,
+                    "max_tokens": 50,
+                    "content_offset": first["next_content_offset"],
+                    "include_exact_ref": True,
+                },
+            )
+        )
+        exact_end = exact_second["content_offset"] + exact_second["content_returned_chars"]
+        assert exact_second["exact_ref"] == (
+            f"lcm:{store_id}:{exact_second['content_offset']}-{exact_end}"
+        )
 
     def test_store_id_not_found_returns_error(self, engine):
         result = json.loads(
@@ -26932,6 +26961,21 @@ class TestHandleLoadSession:
         assert result["messages"][0]["content_truncated"] is False
         assert result["messages"][0]["from_current_session"] is False
         assert "snippet" not in result["messages"][0]
+        assert "exact_ref" not in result["messages"][0]
+
+        exact = json.loads(
+            engine.handle_tool_call(
+                "lcm_load_session",
+                {
+                    "session_id": "old-session",
+                    "limit": 2,
+                    "include_exact_ref": True,
+                },
+            )
+        )
+        assert exact["messages"][0]["exact_ref"] == (
+            f"lcm:{store_ids[0]}:0-{len('first old-session message')}"
+        )
 
     def test_load_session_pages_after_store_id(self, engine):
         store_ids = self._seed_old_session(engine)
@@ -27055,6 +27099,14 @@ class TestHandleLoadSession:
             )
         )
         assert "error" in bad_range and "time_to" in bad_range["error"]
+
+        bad_exact_ref = json.loads(
+            engine.handle_tool_call(
+                "lcm_load_session",
+                {"session_id": "old-session", "include_exact_ref": "yes"},
+            )
+        )
+        assert "error" in bad_exact_ref and "include_exact_ref" in bad_exact_ref["error"]
 
     def test_load_session_clamps_limit_and_never_falls_back_to_current(self, engine):
         self._seed_old_session(engine)

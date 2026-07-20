@@ -775,6 +775,14 @@ LCM_LOAD_SESSION = {
                 "type": "number",
                 "description": "Optional inclusive maximum message timestamp (Unix seconds).",
             },
+            "include_exact_ref": {
+                "type": "boolean",
+                "description": (
+                    "Opt in to an exact_ref for each returned content slice. "
+                    "Omitting it preserves the legacy response bytes."
+                ),
+                "default": False,
+            },
         },
         "required": ["session_id"],
     },
@@ -863,6 +871,14 @@ LCM_EXPAND = {
                 "type": "integer",
                 "description": "Character offset used to continue an oversized raw message, externalized payload, or store_id-mode message. Use next_content_offset from the previous response.",
                 "default": 0,
+            },
+            "include_exact_ref": {
+                "type": "boolean",
+                "description": (
+                    "In store_id mode, opt in to an exact_ref for the returned content slice. "
+                    "Omitting it preserves the legacy response bytes."
+                ),
+                "default": False,
             },
         },
         "required": [],

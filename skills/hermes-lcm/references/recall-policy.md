@@ -14,4 +14,7 @@ Use the narrowest bounded route that fits the question:
 
 Full-text search uses FTS5 AND semantics, so extra words narrow the query. Do not pad a query with synonyms. Keep broad/global scope opt-in. Treat `lcm_expand` as known-handle drill-down, not broad discovery.
 
+When a `store_id` drill-down or session page will feed citation or computation,
+request `include_exact_ref=true`; this leaves ordinary legacy responses unchanged.
+
 For exact commands, SHAs, paths, timestamps, configuration values, counts, operands, or causal chains, recover exact evidence before answering. State uncertainty when bounded evidence cannot prove completeness.

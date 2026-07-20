@@ -46,6 +46,10 @@ Use as low-level drill-down after a known handle:
 
 Do not use it as broad first-step discovery.
 
+Set `include_exact_ref=true` with `store_id` when the recovered slice will be
+cited or passed to `lcm_evidence_pack`/`lcm_compute`. The default remains off
+for byte compatibility.
+
 ## Cross-conversation memory
 
 ### `lcm_recall`
@@ -65,6 +69,7 @@ Use after a session ID is known. It enumerates raw rows in chronological `store_
 - Continue with `after_store_id` from `next_cursor`.
 - Increase `max_content_chars` only within its hard bound.
 - Recover a truncated individual row with `lcm_expand(store_id=..., content_offset=...)`.
+- Set `include_exact_ref=true` when transcript rows will feed exact evidence or computation.
 
 Use Hermes `session_search` for host-tracked sessions that are not present in `lcm.db`.
 

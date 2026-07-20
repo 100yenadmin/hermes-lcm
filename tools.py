@@ -1685,7 +1685,13 @@ def _slice_loaded_content(content: Any, max_content_chars: int) -> dict[str, Any
     }
 
 
-def _serialize_loaded_message(engine: "LCMEngine", row: dict[str, Any], max_content_chars: int) -> dict[str, Any]:
+def _serialize_loaded_message(
+    engine: "LCMEngine",
+    row: dict[str, Any],
+    max_content_chars: int,
+    *,
+    include_exact_ref: bool = False,
+) -> dict[str, Any]:
     stored_session_id = row.get("session_id", "")
     content_slice = _slice_loaded_content(row.get("content", "") or "", max_content_chars)
     item: dict[str, Any] = {
@@ -1707,6 +1713,9 @@ def _serialize_loaded_message(engine: "LCMEngine", row: dict[str, Any], max_cont
         item["tool_calls"] = row.get("tool_calls")
     if row.get("tool_name"):
         item["tool_name"] = row.get("tool_name")
+    store_id = row.get("store_id")
+    if include_exact_ref and isinstance(store_id, int) and content_slice["content_returned_chars"] > 0:
+        item["exact_ref"] = f"lcm:{store_id}:0-{content_slice['content_returned_chars']}"
     return item
 
 
@@ -1756,6 +1765,10 @@ def lcm_load_session(args: Dict[str, Any], **kwargs) -> str:
         return json.dumps({"error": time_to_error})
     if time_from is not None and time_to is not None and time_to < time_from:
         return json.dumps({"error": "time_to must be greater than or equal to time_from"})
+    raw_include_exact_ref = args.get("include_exact_ref", False)
+    if not isinstance(raw_include_exact_ref, bool):
+        return json.dumps({"error": "include_exact_ref must be a boolean"})
+    include_exact_ref = raw_include_exact_ref
 
     total_messages = engine._store.count_session_load_messages(
         session_id,
@@ -1782,7 +1795,15 @@ def lcm_load_session(args: Dict[str, Any], **kwargs) -> str:
         "after_store_id": after_store_id,
         "total_messages": total_messages,
         "returned_messages": len(page_rows),
-        "messages": [_serialize_loaded_message(engine, row, max_content_chars) for row in page_rows],
+        "messages": [
+            _serialize_loaded_message(
+                engine,
+                row,
+                max_content_chars,
+                include_exact_ref=include_exact_ref,
+            )
+            for row in page_rows
+        ],
         "next_cursor": next_cursor,
         "has_more": has_more,
     }
@@ -4408,6 +4429,12 @@ def lcm_expand(args: Dict[str, Any], **kwargs) -> str:
     source_limit_arg = args.get("source_limit")
     source_limit = _parse_positive_int(source_limit_arg, 0) if source_limit_arg is not None else None
     content_offset = _parse_non_negative_int(args.get("content_offset", 0), 0)
+    raw_include_exact_ref = args.get("include_exact_ref", False)
+    if not isinstance(raw_include_exact_ref, bool):
+        return json.dumps({"error": "include_exact_ref must be a boolean"})
+    include_exact_ref = raw_include_exact_ref
+    if include_exact_ref and raw_store_id_arg is None:
+        return json.dumps({"error": "include_exact_ref is supported only with store_id mode"})
 
     if externalized_ref:
         payload = _get_externalized_payload(engine, externalized_ref)
@@ -4465,6 +4492,10 @@ def lcm_expand(args: Dict[str, Any], **kwargs) -> str:
             "next_content_offset": sliced["next_content_offset"],
             "has_more": sliced["has_more"],
         }
+        if include_exact_ref and sliced["content_returned_chars"] > 0:
+            exact_start = sliced["content_offset"]
+            exact_end = exact_start + sliced["content_returned_chars"]
+            result["exact_ref"] = f"lcm:{store_id}:{exact_start}-{exact_end}"
         # Surface externalized-payload metadata when the row references one. Content
         # is not hydrated by default, mirroring the existing _expand_message_sources
         # default. Externalized lookup remains session-scoped (per the existing
