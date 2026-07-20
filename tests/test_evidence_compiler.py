@@ -253,6 +253,91 @@ def test_partial_and_answer_sufficient_are_distinct_for_operational_facets(tmp_p
     assert complete["provenance"]["persisted"] is False
 
 
+def test_semantic_proposal_can_replace_only_the_generic_answer_facet(tmp_path):
+    engine = _engine(tmp_path)
+    owner = _append(engine, "Maya owns the Atlas rollout.")
+    deadline = _append(engine, "The Atlas rollout is due on August 15.")
+    question = "Give me the key facts about the Atlas rollout."
+    assert [facet["name"] for facet in derive_evidence_request(question)["facets"]] == [
+        "answer"
+    ]
+
+    complete = _compile(
+        engine,
+        question,
+        refs=[owner, deadline],
+        selector=_selector(
+            _claim("owner", owner, "owner-1", entity="Maya"),
+            _claim("deadline", deadline, "deadline-1"),
+            requested_facets=["owner", "deadline"],
+        ),
+    )
+    partial = _compile(
+        engine,
+        question,
+        refs=[owner, deadline],
+        selector=_selector(
+            _claim("owner", owner, "owner-1", entity="Maya"),
+            requested_facets=["owner", "deadline"],
+            missing_facets=["deadline"],
+        ),
+    )
+
+    assert complete["state"] == "answer_sufficient"
+    assert complete["request"]["facet_source"] == "semantic_proposal"
+    assert [facet["name"] for facet in complete["request"]["facets"]] == [
+        "owner",
+        "deadline",
+    ]
+    assert partial["state"] == "partial"
+    assert partial["missing_facets"] == ["deadline"]
+
+
+def test_semantic_facets_cannot_erase_deterministic_facets_or_claim_coverage(tmp_path):
+    engine = _engine(tmp_path)
+    owner = _append(engine, "Maya owns the Atlas rollout.")
+    result = _compile(
+        engine,
+        "Who owns Atlas and what is the deadline?",
+        refs=[owner],
+        selector=_selector(
+            _claim("owner", owner, "owner-1", entity="Maya"),
+            requested_facets=["status"],
+            missing_facets=["deadline", "status"],
+        ),
+    )
+
+    assert result["state"] == "partial"
+    assert [facet["name"] for facet in result["request"]["facets"]] == [
+        "owner",
+        "deadline",
+        "status",
+    ]
+    assert result["finite_coverage"] is False
+
+
+@pytest.mark.parametrize(
+    "requested_facets",
+    [
+        ["unsafe facet"],
+        ["answer", "answer"],
+        [f"facet_{index}" for index in range(13)],
+    ],
+)
+def test_semantic_facet_schema_is_bounded_and_strict(tmp_path, requested_facets):
+    engine = _engine(tmp_path)
+    source = _append(engine, "Maya owns Atlas.")
+    result = _compile(
+        engine,
+        "Give me the key facts about Atlas.",
+        refs=[source],
+        selector=_selector(requested_facets=requested_facets),
+    )
+
+    assert result["state"] == "unknown"
+    assert result["reason_code"] == "selector_schema_invalid"
+
+
 def test_latest_state_selects_denver_and_retains_austin_as_history(tmp_path):
     engine = _engine(tmp_path)
     austin = _append(

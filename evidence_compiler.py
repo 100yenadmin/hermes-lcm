@@ -37,7 +37,14 @@ _ALLOWED_OPERATIONS = {
     "order",
     "latest_fact",
 }
-_PROPOSAL_KEYS = {"version", "operation", "selections", "missing_facets", "usage"}
+_PROPOSAL_KEYS = {
+    "version",
+    "operation",
+    "requested_facets",
+    "selections",
+    "missing_facets",
+    "usage",
+}
 _SELECTION_KEYS = {
     "claim_id",
     "facet",
@@ -67,6 +74,7 @@ _SECRET_RE = re.compile(
     r"(?:api[_-]?key|token|secret|password)\s*[:=]\s*[^\s,;]+)",
     re.IGNORECASE,
 )
+_MAX_PROPOSED_FACETS = 12
 
 
 @dataclass(frozen=True)
@@ -253,6 +261,8 @@ def derive_evidence_request(question: Any, question_date: Any = None) -> dict[st
         "question": text,
         "as_of": as_of,
         "facets": facets,
+        "facet_source": "deterministic",
+        "deterministic_facets": [item["name"] for item in facets],
         "operation": operation,
         "exhaustive": exhaustive,
         "expected_cardinality": expected,
@@ -344,11 +354,39 @@ def _validate_proposal(
         return None, "selector_schema_invalid", proposal_digest
     selections = raw.get("selections")
     missing = raw.get("missing_facets")
+    proposed_facets = raw.get("requested_facets", [])
     if not isinstance(selections, list) or len(selections) > limits.max_selections:
         return None, "selector_schema_invalid", proposal_digest
-    if not isinstance(missing, list) or len(missing) > len(request["facets"]):
+    if (
+        not isinstance(proposed_facets, list)
+        or len(proposed_facets) > _MAX_PROPOSED_FACETS
+    ):
         return None, "selector_schema_invalid", proposal_digest
-    requested = {item["name"] for item in request["facets"]}
+    normalized_proposed: list[str] = []
+    for item in proposed_facets:
+        name = str(item or "").strip().casefold()
+        if (
+            not _FACET_RE.fullmatch(name)
+            or name == "answer"
+            or name in normalized_proposed
+        ):
+            return None, "selector_schema_invalid", proposal_digest
+        normalized_proposed.append(name)
+    deterministic = [str(item["name"]) for item in request["facets"]]
+    if normalized_proposed and deterministic == ["answer"]:
+        effective = list(normalized_proposed)
+        facet_source = "semantic_proposal"
+    else:
+        effective = list(deterministic)
+        for name in normalized_proposed:
+            if name not in effective:
+                effective.append(name)
+        facet_source = (
+            "deterministic_plus_semantic" if normalized_proposed else "deterministic"
+        )
+    if not isinstance(missing, list) or len(missing) > len(effective):
+        return None, "selector_schema_invalid", proposal_digest
+    requested = set(effective)
     normalized_missing: list[str] = []
     for item in missing:
         name = str(item or "").strip().casefold()
@@ -393,6 +431,9 @@ def _validate_proposal(
         {
             "version": SELECTOR_SCHEMA_VERSION,
             "operation": operation,
+            "requested_facets": normalized_proposed,
+            "effective_facets": [_facet(name) for name in effective],
+            "facet_source": facet_source,
             "selections": normalized_selections,
             "missing_facets": normalized_missing,
             "usage": normalized_usage,
@@ -996,6 +1037,8 @@ def compile_evidence(
     if proposal_error or proposal is None:
         result["reason_code"] = proposal_error or "selector_schema_invalid"
         return _finish(result, started=started)
+    request["facets"] = proposal["effective_facets"]
+    request["facet_source"] = proposal["facet_source"]
 
     allowed_refs = set(exact_refs)
     validated: list[dict[str, Any]] = []

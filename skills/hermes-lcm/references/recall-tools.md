@@ -85,7 +85,7 @@ For exact raw-message windows, use `lcm_grep` with explicit `time_from`/`time_to
 
 ### `lcm_compile_evidence`
 
-Use when a question needs multiple named facets, exact operands, conflict handling, or latest-state reasoning. Supply one bounded semantic proposal over already retrieved exact refs. The proposal is only a hint: product code revalidates every ref, unique quote span, entity, date, value, unit, distinct key, role, and source. Use `answer_sufficient` for a specifically answered open-ended question; require `finite_coverage` or `computation_sufficient` for exhaustive counts, lists, or arithmetic. On `partial`, `conflicted`, or `unknown`, preserve uncertainty and the ordinary answer path.
+Use when a question needs multiple named facets, exact operands, conflict handling, or latest-state reasoning. Supply one bounded semantic proposal over already retrieved exact refs. When deterministic parsing yields only the catch-all `answer` facet, the proposal may provide up to 12 unique generic `requested_facets`; otherwise those facets can only extend, never erase, deterministic requirements. The proposal is only a hint: every requested facet must be closed by product-validated exact evidence, and product code revalidates every ref, unique quote span, entity, date, value, unit, distinct key, role, and source. Use `answer_sufficient` for a specifically answered open-ended question; require `finite_coverage` or `computation_sufficient` for exhaustive counts, lists, or arithmetic. On `partial`, `conflicted`, or `unknown`, preserve uncertainty and the ordinary answer path.
 
 ### `lcm_evidence_pack`
 

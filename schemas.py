@@ -565,6 +565,17 @@ LCM_COMPILE_EVIDENCE = {
                             "latest_fact",
                         ],
                     },
+                    "requested_facets": {
+                        "type": "array",
+                        "maxItems": 12,
+                        "description": (
+                            "Optional generic named facets required by the question. "
+                            "Product code keeps deterministic facets, replaces only the "
+                            "catch-all answer facet, and requires exact evidence for each "
+                            "facet before answer_sufficient."
+                        ),
+                        "items": {"type": "string"},
+                    },
                     "selections": {
                         "type": "array",
                         "maxItems": 50,
