@@ -265,6 +265,11 @@ _LCM_RECALL_DEFAULT_SCOPE_BIAS = 0.5
 _LCM_RECALL_SNIPPET_CHARS = 300
 _LCM_RECALL_RESPONSE_CHAR_CAP = 64_000
 _LCM_RECALL_VALID_INCLUDE = frozenset({"all", "summaries", "verbatim"})
+_LCM_RECALL_VALID_DETAIL = frozenset({"snippets", "answer_ready"})
+_LCM_RECALL_ANSWER_READY_PER_SESSION_LIMIT = 5
+_LCM_RECALL_ANSWER_READY_EXPANDED_HIT_LIMIT = 8
+_LCM_RECALL_ANSWER_READY_CONTENT_CHARS = 2_400
+_LCM_COMPUTE_RESPONSE_CHAR_CAP = 64_000
 # Recency boost half-life (30 days) and its floor: a memory's rank_score is
 # multiplied by 2**(-age/half_life), clamped so age never zeroes an otherwise
 # strong hit — it only nudges toward newer memories.
@@ -1103,7 +1108,13 @@ def _slice_loaded_content(content: Any, max_content_chars: int) -> dict[str, Any
     }
 
 
-def _serialize_loaded_message(engine: "LCMEngine", row: dict[str, Any], max_content_chars: int) -> dict[str, Any]:
+def _serialize_loaded_message(
+    engine: "LCMEngine",
+    row: dict[str, Any],
+    max_content_chars: int,
+    *,
+    include_exact_ref: bool = False,
+) -> dict[str, Any]:
     stored_session_id = row.get("session_id", "")
     content_slice = _slice_loaded_content(row.get("content", "") or "", max_content_chars)
     item: dict[str, Any] = {
@@ -1125,7 +1136,229 @@ def _serialize_loaded_message(engine: "LCMEngine", row: dict[str, Any], max_cont
         item["tool_calls"] = row.get("tool_calls")
     if row.get("tool_name"):
         item["tool_name"] = row.get("tool_name")
+    store_id = row.get("store_id")
+    returned_chars = content_slice["content_returned_chars"]
+    if include_exact_ref and isinstance(store_id, int) and returned_chars > 0:
+        item["exact_ref"] = f"lcm:{store_id}:0-{returned_chars}"
     return item
+
+
+def _compute_stage(
+    transport: str,
+    started_at: float,
+    *,
+    provider: str,
+    model: str,
+    **details: Any,
+) -> dict[str, Any]:
+    return {
+        "transport": transport,
+        "provider": provider,
+        "model": model,
+        "latency_ms": round((time.perf_counter() - started_at) * 1_000.0, 3),
+        **details,
+    }
+
+
+def lcm_compute(args: Dict[str, Any], **kwargs) -> str:
+    """Run a pure deterministic operation over exact source-message spans."""
+    from .reasoning import (
+        compile_evidence_plan,
+        execute_plan,
+        ground_evidence,
+        question_date_as_of_epoch,
+        validate_selector_alignment,
+        verify_final_answer,
+    )
+
+    total_started = time.perf_counter()
+    engine = _require_engine(kwargs)
+    if engine is None:
+        return json.dumps({"error": "LCM engine not initialized"})
+
+    question = str(args.get("question") or "").strip()
+    question_date = args.get("question_date")
+    stages: dict[str, Any] = {}
+    planner_started = time.perf_counter()
+    as_of: float | None = None
+    if question_date is not None:
+        as_of = question_date_as_of_epoch(question_date)
+        if as_of is None:
+            stages["planner"] = _compute_stage(
+                "deterministic_local",
+                planner_started,
+                provider="none",
+                model="none",
+                status="fallback",
+            )
+            return json.dumps({
+                "status": "fallback",
+                "reason": "question_date must be a valid timezone-unambiguous ISO date",
+                "next_path": "evidence_only",
+                "provenance": {"stages": stages},
+            })
+
+    plan_decision = compile_evidence_plan(question, question_date)
+    stages["planner"] = _compute_stage(
+        "deterministic_local",
+        planner_started,
+        provider="none",
+        model="none",
+        status=plan_decision.status,
+    )
+    if plan_decision.status != "planned" or plan_decision.plan is None:
+        return json.dumps({
+            "status": plan_decision.status,
+            "reason": plan_decision.reason,
+            "next_path": "evidence_only",
+            "provenance": {"stages": stages},
+        })
+    plan = plan_decision.plan
+
+    selector_started = time.perf_counter()
+    if plan.requires_complete_evidence and args.get("evidence_complete") is not True:
+        stages["selector"] = _compute_stage(
+            "host_tool_arguments",
+            selector_started,
+            provider="unknown_to_plugin",
+            model="unknown_to_plugin",
+            status="fallback",
+            evidence_complete=False,
+        )
+        return json.dumps({
+            "status": "fallback",
+            "reason": "operation requires explicit evidence_complete=true",
+            "plan": plan.as_dict(),
+            "next_path": "evidence_only",
+            "provenance": {"stages": stages},
+        })
+
+    raw_operands = args.get("operands")
+    try:
+        grounding = ground_evidence(raw_operands, messages=engine._store, as_of=as_of)
+    except (TypeError, ValueError, sqlite3.Error) as exc:
+        grounding = None
+        grounding_reason = f"selector validation failed: {exc}"
+    else:
+        grounding_reason = grounding.reason
+    if grounding is None or grounding.status != "grounded":
+        stages["selector"] = _compute_stage(
+            "host_tool_arguments",
+            selector_started,
+            provider="unknown_to_plugin",
+            model="unknown_to_plugin",
+            status="fallback",
+            evidence_complete=bool(args.get("evidence_complete") is True),
+            operand_count=(len(raw_operands) if isinstance(raw_operands, list) else 0),
+        )
+        return json.dumps({
+            "status": "fallback",
+            "reason": grounding_reason,
+            "plan": plan.as_dict(),
+            "next_path": "evidence_only",
+            "provenance": {"stages": stages},
+        })
+
+    alignment_error = validate_selector_alignment(question, plan, grounding.operands)
+    if alignment_error:
+        stages["selector"] = _compute_stage(
+            "host_tool_arguments",
+            selector_started,
+            provider="unknown_to_plugin",
+            model="unknown_to_plugin",
+            status="fallback",
+            evidence_complete=bool(args.get("evidence_complete") is True),
+            operand_count=len(grounding.operands),
+        )
+        return json.dumps({
+            "status": "fallback",
+            "reason": alignment_error,
+            "plan": plan.as_dict(),
+            "next_path": "evidence_only",
+            "provenance": {"stages": stages},
+        })
+    stages["selector"] = _compute_stage(
+        "host_tool_arguments",
+        selector_started,
+        provider="unknown_to_plugin",
+        model="unknown_to_plugin",
+        status="validated",
+        evidence_complete=bool(args.get("evidence_complete") is True),
+        operand_count=len(grounding.operands),
+    )
+
+    executor_started = time.perf_counter()
+    computed = execute_plan(plan, grounding.operands)
+    stages["executor"] = _compute_stage(
+        "deterministic_local",
+        executor_started,
+        provider="none",
+        model="none",
+        status=computed.status,
+        operation=plan.operation,
+    )
+    if computed.status != "computed" or computed.trace is None:
+        return json.dumps({
+            "status": "fallback",
+            "reason": computed.reason,
+            "plan": plan.as_dict(),
+            "next_path": "evidence_only",
+            "provenance": {"stages": stages},
+        })
+
+    trace = computed.trace
+    candidate_present = "candidate_answer" in args
+    candidate = str(args.get("candidate_answer") or "")
+    answer = trace.answer
+    candidate_used = False
+    if candidate_present:
+        verification = verify_final_answer(candidate, trace)
+        verification_payload = {
+            "status": verification.status,
+            "reason": verification.reason,
+        }
+        if verification.status == "verified":
+            answer = candidate.strip()
+            candidate_used = True
+    else:
+        verification_payload = {"status": "not_requested", "reason": ""}
+
+    stages["final_answerer"] = {
+        "transport": (
+            "host_supplied_candidate" if candidate_used else "deterministic_canonical"
+        ),
+        "provider": "unknown_to_plugin" if candidate_used else "none",
+        "model": "unknown_to_plugin" if candidate_used else "none",
+        "candidate_used": candidate_used,
+    }
+    response = {
+        "status": "computed",
+        "plan": plan.as_dict(),
+        "trace": trace.as_dict(),
+        "answer": answer,
+        "candidate_verification": verification_payload,
+        "provenance": {
+            "runtime_inputs": ["question", "question_date", "exact_retrieved_evidence"],
+            "stages": stages,
+        },
+        "metrics": {
+            "operand_count": len(grounding.operands),
+            "answer_chars": len(answer),
+            "total_latency_ms": round(
+                (time.perf_counter() - total_started) * 1_000.0, 3
+            ),
+        },
+        "response_char_cap": _LCM_COMPUTE_RESPONSE_CHAR_CAP,
+    }
+    encoded = json.dumps(response, ensure_ascii=False)
+    if len(encoded) > _LCM_COMPUTE_RESPONSE_CHAR_CAP:
+        return json.dumps({
+            "status": "fallback",
+            "reason": "deterministic response exceeded its bounded response cap",
+            "next_path": "evidence_only",
+            "provenance": {"stages": stages},
+        })
+    return encoded
 
 
 def lcm_load_session(args: Dict[str, Any], **kwargs) -> str:
@@ -1174,6 +1407,10 @@ def lcm_load_session(args: Dict[str, Any], **kwargs) -> str:
         return json.dumps({"error": time_to_error})
     if time_from is not None and time_to is not None and time_to < time_from:
         return json.dumps({"error": "time_to must be greater than or equal to time_from"})
+    raw_include_exact_ref = args.get("include_exact_ref", False)
+    if not isinstance(raw_include_exact_ref, bool):
+        return json.dumps({"error": "include_exact_ref must be a boolean"})
+    include_exact_ref = raw_include_exact_ref
 
     total_messages = engine._store.count_session_load_messages(
         session_id,
@@ -1200,7 +1437,15 @@ def lcm_load_session(args: Dict[str, Any], **kwargs) -> str:
         "after_store_id": after_store_id,
         "total_messages": total_messages,
         "returned_messages": len(page_rows),
-        "messages": [_serialize_loaded_message(engine, row, max_content_chars) for row in page_rows],
+        "messages": [
+            _serialize_loaded_message(
+                engine,
+                row,
+                max_content_chars,
+                include_exact_ref=include_exact_ref,
+            )
+            for row in page_rows
+        ],
         "next_cursor": next_cursor,
         "has_more": has_more,
     }
@@ -2807,6 +3052,173 @@ def _lcm_recall_excerpt_expand_hint(hit: dict[str, Any]) -> str:
     return f"lcm_expand(store_id={hit.get('store_id')}, content_offset={offset})"
 
 
+def _lcm_recall_diverse_entries(
+    ordered: list[dict[str, Any]],
+    *,
+    limit: int,
+    per_session_limit: int,
+) -> tuple[list[dict[str, Any]], int]:
+    """Select a stable rank-preserving result set with bounded session density."""
+    selected: list[dict[str, Any]] = []
+    session_counts: dict[str, int] = {}
+    dropped = 0
+    for entry in ordered:
+        hit = entry["hit"]
+        raw_session_id = hit.get("session_id")
+        session_key = (
+            str(raw_session_id)
+            if raw_session_id not in {None, ""}
+            else f"missing:{_hit_identity(hit)!r}"
+        )
+        if session_counts.get(session_key, 0) >= per_session_limit:
+            dropped += 1
+            continue
+        session_counts[session_key] = session_counts.get(session_key, 0) + 1
+        selected.append(entry)
+        if len(selected) >= limit:
+            break
+    return selected, dropped
+
+
+def _lcm_recall_content_window(
+    content: Any,
+    *,
+    match_start: int,
+    match_end: int,
+    char_cap: int,
+) -> dict[str, Any]:
+    """Return a bounded window centered on the selected evidence span."""
+    text = str(content or "")
+    content_chars = len(text)
+    start = min(max(0, int(match_start)), content_chars)
+    end = min(max(start, int(match_end)), content_chars)
+    if content_chars <= char_cap:
+        offset = 0
+    else:
+        midpoint = (start + end) // 2
+        offset = min(max(0, midpoint - char_cap // 2), content_chars - char_cap)
+    bounded = text[offset : offset + char_cap]
+    return {
+        "content": bounded,
+        "content_chars": content_chars,
+        "content_offset": offset,
+        "content_returned_chars": len(bounded),
+        "content_truncated": len(bounded) < content_chars,
+        "evidence_span": {"char_start": start, "char_end": end},
+    }
+
+
+def _lcm_recall_answer_ready_content(
+    engine: "LCMEngine",
+    entries: list[dict[str, Any]],
+    *,
+    query: str,
+    include_occurrence_time: bool,
+) -> dict[tuple, dict[str, Any]]:
+    """Hydrate selected refs with bounded exact reads and no new search."""
+    from .occurrence_time import resolve_occurrence_time
+
+    selected = entries[:_LCM_RECALL_ANSWER_READY_EXPANDED_HIT_LIMIT]
+    store_ids = [
+        int(entry["hit"]["store_id"])
+        for entry in selected
+        if entry["hit"].get("kind") == "message_excerpt"
+        and entry["hit"].get("store_id") is not None
+    ]
+    stored_by_id = engine._store.get_batch(store_ids)
+    hydrated: dict[tuple, dict[str, Any]] = {}
+
+    for entry in selected:
+        hit = entry["hit"]
+        identity = _hit_identity(hit)
+        if hit.get("kind") == "summary":
+            raw_node_id = hit.get("node_id")
+            if raw_node_id is None:
+                continue
+            node = engine._dag.get_node(int(raw_node_id))
+            if node is None:
+                continue
+            content = node.summary or ""
+            window = _lcm_recall_content_window(
+                content,
+                match_start=0,
+                match_end=min(len(content), _LCM_RECALL_SNIPPET_CHARS),
+                char_cap=_LCM_RECALL_ANSWER_READY_CONTENT_CHARS,
+            )
+            hydrated[identity] = {
+                **window,
+                "content_source": "summary",
+                "source_provenance": {
+                    "node_id": int(raw_node_id),
+                    "session_id": str(hit.get("session_id") or ""),
+                    "source": "summary",
+                    "role": "summary",
+                },
+            }
+            continue
+
+        raw_store_id = hit.get("store_id")
+        if raw_store_id is None:
+            continue
+        stored = stored_by_id.get(int(raw_store_id))
+        if stored is None:
+            continue
+        content = str(stored.get("content") or "")
+        span = hit.get("chunk_span") or {}
+        try:
+            match_start = int(span["char_start"])
+            match_end = int(span["char_end"])
+        except (KeyError, TypeError, ValueError):
+            match_start = _content_offset_for_query_match(content, query)
+            match_end = match_start + min(max(1, len(query)), _LCM_RECALL_SNIPPET_CHARS)
+        window = _lcm_recall_content_window(
+            content,
+            match_start=match_start,
+            match_end=match_end,
+            char_cap=_LCM_RECALL_ANSWER_READY_CONTENT_CHARS,
+        )
+        exact_start = int(window["content_offset"])
+        exact_end = exact_start + int(window["content_returned_chars"])
+        observed_at = stored.get("observed_at")
+        ingested_at = stored.get("ingested_at") or stored.get("timestamp")
+        item = {
+            **window,
+            "content_source": "message",
+            "role": stored.get("role"),
+            "source": stored.get("source") or "",
+            "exact_ref": f"lcm:{int(raw_store_id)}:{exact_start}-{exact_end}",
+            "source_provenance": {
+                "store_id": int(raw_store_id),
+                "session_id": str(stored.get("session_id") or ""),
+                "source": stored.get("source") or "",
+                "role": stored.get("role") or "unknown",
+            },
+            "observation_time": {
+                "observed_at": observed_at,
+                "ingested_at": ingested_at,
+                "source": stored.get("observed_at_source") or "unavailable",
+            },
+        }
+        if include_occurrence_time:
+            session_date = None
+            if observed_at is not None:
+                try:
+                    session_date = datetime.fromtimestamp(
+                        float(observed_at), tz=timezone.utc
+                    ).date().isoformat()
+                except (TypeError, ValueError, OverflowError, OSError):
+                    session_date = None
+            occurrence = resolve_occurrence_time(
+                window["content"],
+                observed_at=observed_at or 0,
+                session_date=session_date,
+            )
+            occurrence["stored_at"] = ingested_at
+            item["occurrence_time"] = occurrence
+        hydrated[identity] = item
+    return hydrated
+
+
 def _lcm_recall_bounded_reason(
     arm: str, scanned: int | None, total: int | None
 ) -> str:
@@ -3084,6 +3496,13 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
     if include not in _LCM_RECALL_VALID_INCLUDE:
         return json.dumps({"error": "include must be one of: all, summaries, verbatim"})
 
+    detail = str(args.get("detail") or "snippets").strip().lower()
+    if detail not in _LCM_RECALL_VALID_DETAIL:
+        return json.dumps({"error": "detail must be one of: snippets, answer_ready"})
+    include_occurrence_time = args.get("include_occurrence_time", False)
+    if not isinstance(include_occurrence_time, bool):
+        return json.dumps({"error": "include_occurrence_time must be a boolean"})
+
     # lcm_recall fans out three arms + fusion/hydration/rerank, so it uses its own
     # (larger) budget rather than lcm_grep's single-arm query deadline (sprint-opt-2).
     timeout_s = max(0.001, float(getattr(engine._config, "recall_query_timeout_s", 8.0)))
@@ -3333,10 +3752,27 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
         provider, query, ordered, window=rerank_window, deadline=deadline, config=engine._config
     )
 
-    # -- Response shaping (char-capped) --
+    # The default path retains the historical order and serialized bytes.
+    if detail == "answer_ready":
+        selected_entries, diversity_dropped = _lcm_recall_diverse_entries(
+            ordered,
+            limit=limit,
+            per_session_limit=_LCM_RECALL_ANSWER_READY_PER_SESSION_LIMIT,
+        )
+        answer_ready_content = _lcm_recall_answer_ready_content(
+            engine,
+            selected_entries,
+            query=query,
+            include_occurrence_time=include_occurrence_time,
+        )
+    else:
+        selected_entries = ordered
+        diversity_dropped = 0
+        answer_ready_content = {}
     hits_out: list[dict[str, Any]] = []
     response_chars = 0
-    for entry in ordered:
+    response_cap_truncated = False
+    for entry in selected_entries:
         hit = entry["hit"]
         arms = sorted({arm_order[index] for index in entry["ranks"].keys()})
         item: dict[str, Any] = {
@@ -3355,8 +3791,13 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
             item["store_id"] = hit.get("store_id")
             if hit.get("chunk_span"):
                 item["chunk_span"] = hit["chunk_span"]
+        if detail == "answer_ready":
+            hydrated = answer_ready_content.get(_hit_identity(hit))
+            if hydrated is not None:
+                item.update(hydrated)
         item_chars = len(json.dumps(item, ensure_ascii=False))
         if hits_out and response_chars + item_chars > _LCM_RECALL_RESPONSE_CHAR_CAP:
+            response_cap_truncated = True
             break
         response_chars += item_chars
         hits_out.append(item)
@@ -3391,6 +3832,34 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
         response["timeout"] = True
     if requested_limit > _LCM_RECALL_LIMIT_CAP:
         response["limit_clamped_from"] = requested_limit
+    if detail == "answer_ready":
+        answer_ready = {
+            "expanded_hit_count": sum("content" in hit for hit in hits_out),
+            "expanded_hit_limit": _LCM_RECALL_ANSWER_READY_EXPANDED_HIT_LIMIT,
+            "per_session_limit": _LCM_RECALL_ANSWER_READY_PER_SESSION_LIMIT,
+            "diversity_dropped_count": diversity_dropped,
+            "per_hit_char_cap": _LCM_RECALL_ANSWER_READY_CONTENT_CHARS,
+            "response_char_cap": _LCM_RECALL_RESPONSE_CHAR_CAP,
+            "hydration_policy": "bounded exact reads only; no additional retrieval search",
+            "response_truncated": response_cap_truncated,
+        }
+        response["detail"] = detail
+        response["provenance"]["answer_ready"] = answer_ready
+        encoded = json.dumps(response, ensure_ascii=False)
+        if len(encoded) > _LCM_RECALL_RESPONSE_CHAR_CAP:
+            original_query = response["query"]
+            response["query"] = original_query[:4_096]
+            answer_ready["query_truncated"] = len(response["query"]) < len(original_query)
+            encoded = json.dumps(response, ensure_ascii=False)
+        while len(encoded) > _LCM_RECALL_RESPONSE_CHAR_CAP and response["hits"]:
+            response["hits"].pop()
+            response["total_results"] = len(response["hits"])
+            answer_ready["response_truncated"] = True
+            answer_ready["expanded_hit_count"] = sum(
+                "content" in hit for hit in response["hits"]
+            )
+            encoded = json.dumps(response, ensure_ascii=False)
+        return encoded
     return json.dumps(response)
 
 
@@ -3506,6 +3975,12 @@ def lcm_expand(args: Dict[str, Any], **kwargs) -> str:
     source_limit_arg = args.get("source_limit")
     source_limit = _parse_positive_int(source_limit_arg, 0) if source_limit_arg is not None else None
     content_offset = _parse_non_negative_int(args.get("content_offset", 0), 0)
+    raw_include_exact_ref = args.get("include_exact_ref", False)
+    if not isinstance(raw_include_exact_ref, bool):
+        return json.dumps({"error": "include_exact_ref must be a boolean"})
+    include_exact_ref = raw_include_exact_ref
+    if include_exact_ref and raw_store_id_arg is None:
+        return json.dumps({"error": "include_exact_ref is supported only with store_id mode"})
 
     if externalized_ref:
         payload = _get_externalized_payload(engine, externalized_ref)
@@ -3563,6 +4038,10 @@ def lcm_expand(args: Dict[str, Any], **kwargs) -> str:
             "next_content_offset": sliced["next_content_offset"],
             "has_more": sliced["has_more"],
         }
+        if include_exact_ref and sliced["content_returned_chars"] > 0:
+            exact_start = sliced["content_offset"]
+            exact_end = exact_start + sliced["content_returned_chars"]
+            result["exact_ref"] = f"lcm:{store_id}:{exact_start}-{exact_end}"
         # Surface externalized-payload metadata when the row references one. Content
         # is not hydrated by default, mirroring the existing _expand_message_sources
         # default. Externalized lookup remains session-scoped (per the existing

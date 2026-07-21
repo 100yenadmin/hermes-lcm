@@ -237,6 +237,12 @@ _V5_CORE_TABLE_COLUMNS: dict[str, frozenset[str]] = {
     }),
 }
 
+# Backward-compatible source-time sidecars. A legacy v5 database gains these
+# columns when MessageStore opens it; no schema-version rewrite is required.
+_V5_CORE_OPTIONAL_COLUMNS: dict[str, frozenset[str]] = {
+    "messages": frozenset({"ingested_at", "observed_at", "observed_at_source"}),
+}
+
 # Core FTS5 virtual tables: presence is enough — their column layout is owned by
 # the FTS5 module, not by this schema contract.
 _V5_CORE_PRESENCE_ONLY = ("messages_fts", "nodes_fts")
@@ -343,8 +349,8 @@ def classify_version_mismatch(conn: sqlite3.Connection) -> str:
         if table not in tables:
             return VERSION_MISMATCH_GENUINELY_NEWER
 
-    # Core tables must match the v5 column contract exactly — a missing or an
-    # unexpected column both mean this is not a v5-shaped DB.
+    # Core tables must contain the v5 contract. Only declared compatible
+    # sidecars may additionally be present.
     for table, expected in _V5_CORE_TABLE_COLUMNS.items():
         try:
             actual = {
@@ -353,7 +359,10 @@ def classify_version_mismatch(conn: sqlite3.Connection) -> str:
             }
         except sqlite3.DatabaseError:
             return VERSION_MISMATCH_GENUINELY_NEWER
-        if actual != set(expected):
+        optional = set(_V5_CORE_OPTIONAL_COLUMNS.get(table, ()))
+        if not set(expected).issubset(actual) or not actual.issubset(
+            set(expected) | optional
+        ):
             return VERSION_MISMATCH_GENUINELY_NEWER
 
     # Any extra table must belong to a known feature family or be an FTS5 shadow.

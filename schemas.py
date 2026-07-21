@@ -140,7 +140,9 @@ LCM_RECALL = {
         "expand a cross-session summary). Not for retrieving exact/verbatim text within a known time range — "
         "use lcm_grep(mode='full_text') for that. Not for full transcripts — after locating the right "
         "conversation, use lcm_load_session(session_id). Recency and current-conversation preference are soft "
-        "ranking boosts, not filters; for hard time bounds use lcm_grep time_from/time_to."
+        "ranking boosts, not filters; for hard time bounds use lcm_grep time_from/time_to. "
+        "Set detail='answer_ready' to hydrate bounded exact evidence without "
+        "running another search."
     ),
     "parameters": {
         "type": "object",
@@ -176,8 +178,127 @@ LCM_RECALL = {
                 ),
                 "default": "all",
             },
+            "detail": {
+                "type": "string",
+                "enum": ["snippets", "answer_ready"],
+                "description": (
+                    "Response detail. 'snippets' (default) preserves the existing "
+                    "response bytes. 'answer_ready' applies bounded per-session "
+                    "diversity and hydrates up to eight exact evidence windows."
+                ),
+                "default": "snippets",
+            },
+            "include_occurrence_time": {
+                "type": "boolean",
+                "description": (
+                    "With answer_ready, opt in to source-grounded occurrence time. "
+                    "Unknown event time remains distinct from observation/write time."
+                ),
+                "default": False,
+            },
         },
         "required": ["query"],
+    },
+}
+
+LCM_COMPUTE = {
+    "name": "lcm_compute",
+    "description": (
+        "Run a dependency-free deterministic date, count, compatible-unit sum, "
+        "difference, or ordering operation over immutable exact message spans. "
+        "Every value and unit must be explicit in its cited source; unsupported, "
+        "incomplete, ambiguous, mixed-unit, or stale inputs fail closed to the "
+        "ordinary evidence-only answer path. This tool never calls a model."
+    ),
+    "parameters": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "question": {
+                "type": "string",
+                "description": "The user's question, unchanged.",
+            },
+            "question_date": {
+                "type": "string",
+                "description": (
+                    "Optional timezone-unambiguous ISO date anchoring relative-time "
+                    "and historical questions."
+                ),
+            },
+            "evidence_complete": {
+                "type": "boolean",
+                "description": (
+                    "Set true only after retrieval has closed every evidence slot "
+                    "for an open-cardinality operation."
+                ),
+                "default": False,
+            },
+            "operands": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 50,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "exact_ref": {
+                            "type": "string",
+                            "description": "Immutable lcm:<store_id>:<start>-<end> source span.",
+                        },
+                        "store_id": {"type": "integer"},
+                        "span_start": {"type": "integer"},
+                        "span_end": {"type": "integer"},
+                        "quote": {"type": "string"},
+                        "value": {
+                            "anyOf": [
+                                {"type": "number"},
+                                {"type": "string"},
+                                {"type": "null"},
+                            ],
+                            "description": "Explicit numeric or string operand value.",
+                        },
+                        "unit": {"type": "string"},
+                        "key": {
+                            "type": "string",
+                            "description": "Canonical key whose tokens occur in the exact quote.",
+                        },
+                        "label": {
+                            "type": "string",
+                            "description": "Label present verbatim in the exact quote.",
+                        },
+                        "date": {
+                            "type": "string",
+                            "description": "Date supported by the exact quote.",
+                        },
+                        "occurrence_time": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "event_date": {"type": "string"},
+                                "event_time_source": {
+                                    "type": "string",
+                                    "enum": [
+                                        "explicit",
+                                        "relative_to_session",
+                                        "unknown",
+                                    ],
+                                },
+                                "session_date": {"type": "string"},
+                            },
+                            "required": ["event_time_source"],
+                        },
+                    },
+                },
+            },
+            "candidate_answer": {
+                "type": "string",
+                "description": (
+                    "Optional narrative answer to verify against the immutable trace. "
+                    "A failed candidate is discarded in favor of canonical output."
+                ),
+            },
+        },
+        "required": ["question", "operands"],
     },
 }
 
@@ -271,6 +392,14 @@ LCM_LOAD_SESSION = {
                 "type": "number",
                 "description": "Optional inclusive maximum message timestamp (Unix seconds).",
             },
+            "include_exact_ref": {
+                "type": "boolean",
+                "description": (
+                    "Opt in to an exact_ref for each returned content slice. "
+                    "Omitting it preserves legacy response bytes."
+                ),
+                "default": False,
+            },
         },
         "required": ["session_id"],
     },
@@ -359,6 +488,14 @@ LCM_EXPAND = {
                 "type": "integer",
                 "description": "Character offset used to continue an oversized raw message, externalized payload, or store_id-mode message. Use next_content_offset from the previous response.",
                 "default": 0,
+            },
+            "include_exact_ref": {
+                "type": "boolean",
+                "description": (
+                    "In store_id mode, opt in to an exact_ref for the returned content slice. "
+                    "Omitting it preserves legacy response bytes."
+                ),
+                "default": False,
             },
         },
         "required": [],

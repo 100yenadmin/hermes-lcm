@@ -11,9 +11,11 @@ row identity (`store_id`) for DAG/source lookup.
 
 import json
 import logging
+import math
 import sqlite3
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -54,7 +56,8 @@ logger = logging.getLogger(__name__)
 _MESSAGE_ROLE_BIAS_SQL = "CASE m.role WHEN 'user' THEN 0 WHEN 'assistant' THEN 1 WHEN 'tool' THEN 2 ELSE 1 END"
 _MESSAGE_SELECT_COLUMNS = (
     "store_id, session_id, source, role, content, tool_call_id, "
-    "tool_calls, tool_name, timestamp, token_estimate, pinned, conversation_id"
+    "tool_calls, tool_name, timestamp, token_estimate, pinned, conversation_id, "
+    "ingested_at, observed_at, observed_at_source"
 )
 _UNKNOWN_SOURCE = "unknown"
 
@@ -74,6 +77,33 @@ def _normalize_source_value(source: str | None) -> str:
 
 def _normalize_conversation_id_value(conversation_id: str | None) -> str:
     return (conversation_id or "").strip()
+
+
+def _normalize_observed_at(value: Any) -> float | None:
+    """Accept a trustworthy source timestamp without relabeling write time."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        observed_at = float(value)
+    elif isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+        try:
+            observed_at = float(raw)
+        except ValueError:
+            try:
+                parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+            if parsed.tzinfo is None or parsed.utcoffset() is None:
+                return None
+            observed_at = parsed.timestamp()
+    else:
+        return None
+    if not math.isfinite(observed_at) or observed_at <= 0:
+        return None
+    return observed_at
 
 
 def _source_filter_clause(column: str, source: str | None) -> tuple[str | None, list[str]]:
@@ -261,7 +291,10 @@ class MessageStore:
                 tool_name TEXT,
                 timestamp REAL NOT NULL,
                 token_estimate INTEGER DEFAULT 0,
-                pinned INTEGER DEFAULT 0
+                pinned INTEGER DEFAULT 0,
+                ingested_at REAL,
+                observed_at REAL,
+                observed_at_source TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_msg_session
                 ON messages(session_id, store_id);
@@ -280,6 +313,7 @@ class MessageStore:
         run_versioned_migrations(self._conn)
         self._ensure_source_column()
         self._ensure_conversation_id_column()
+        self._ensure_time_contract_columns()
         self._conn.commit()
 
     def _ensure_source_column(self) -> None:
@@ -306,6 +340,33 @@ class MessageStore:
             "CREATE INDEX IF NOT EXISTS idx_msg_conversation_session ON messages(conversation_id, session_id, store_id)"
         )
 
+    def _ensure_time_contract_columns(self) -> None:
+        """Add source/write-time sidecars without inventing legacy observations."""
+        columns = {
+            row[1] for row in self._conn.execute("PRAGMA table_info(messages)").fetchall()
+        }
+        add_column_if_missing(
+            self._conn,
+            columns,
+            "ingested_at",
+            "ALTER TABLE messages ADD COLUMN ingested_at REAL",
+        )
+        add_column_if_missing(
+            self._conn,
+            columns,
+            "observed_at",
+            "ALTER TABLE messages ADD COLUMN observed_at REAL",
+        )
+        add_column_if_missing(
+            self._conn,
+            columns,
+            "observed_at_source",
+            "ALTER TABLE messages ADD COLUMN observed_at_source TEXT",
+        )
+        self._conn.execute(
+            "UPDATE messages SET ingested_at = timestamp WHERE ingested_at IS NULL"
+        )
+
     # -- Write operations ---------------------------------------------------
 
     def append(self, session_id: str, msg: Dict[str, Any],
@@ -320,13 +381,16 @@ class MessageStore:
         )
         tool_calls = msg.get("tool_calls")
         tc_json = json.dumps(tool_calls) if tool_calls else None
+        observed_at = _normalize_observed_at(msg.get("timestamp"))
+        ingested_at = time.time()
 
         with self._write_lock:
             cur = self._conn.execute(
                 """INSERT INTO messages
                    (session_id, source, conversation_id, role, content, tool_call_id, tool_calls,
-                    tool_name, timestamp, token_estimate, pinned)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    tool_name, timestamp, token_estimate, pinned, ingested_at,
+                    observed_at, observed_at_source)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     _normalize_source_value(source),
@@ -336,9 +400,12 @@ class MessageStore:
                     msg.get("tool_call_id"),
                     tc_json,
                     msg.get("tool_name"),
-                    time.time(),
+                    ingested_at,
                     token_estimate,
                     0,
+                    ingested_at,
+                    observed_at,
+                    "host_message_timestamp" if observed_at is not None else None,
                 ),
             )
             self._conn.commit()
@@ -385,11 +452,13 @@ class MessageStore:
                 tc = msg.get("tool_calls")
                 tc_json = json.dumps(tc) if tc else None
                 ts = time.time()
+                observed_at = _normalize_observed_at(msg.get("timestamp"))
                 cur = self._conn.execute(
                     """INSERT INTO messages
                        (session_id, source, conversation_id, role, content, tool_call_id, tool_calls,
-                        tool_name, timestamp, token_estimate, pinned)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        tool_name, timestamp, token_estimate, pinned, ingested_at,
+                        observed_at, observed_at_source)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         session_id,
                         _normalize_source_value(source),
@@ -402,6 +471,9 @@ class MessageStore:
                         ts,
                         est,
                         0,
+                        ts,
+                        observed_at,
+                        "host_message_timestamp" if observed_at is not None else None,
                     ),
                 )
                 ids.append(cur.lastrowid)
@@ -1307,6 +1379,7 @@ class MessageStore:
         cols = [
             "store_id", "session_id", "source", "role", "content", "tool_call_id",
             "tool_calls", "tool_name", "timestamp", "token_estimate", "pinned", "conversation_id",
+            "ingested_at", "observed_at", "observed_at_source",
         ]
         d = dict(zip(cols, row[:len(cols)]))
         d["source"] = _normalize_source_value(d.get("source"))

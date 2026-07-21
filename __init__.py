@@ -85,6 +85,7 @@ def register(ctx):
     from .schemas import (
         LCM_GREP,
         LCM_RECALL,
+        LCM_COMPUTE,
         LCM_RECENT,
         LCM_LOAD_SESSION,
         LCM_DESCRIBE,
@@ -139,6 +140,7 @@ def register(ctx):
     _TOOLS = [
         ("lcm_grep", LCM_GREP, "🔍"),
         ("lcm_recall", LCM_RECALL, "🧠"),
+        ("lcm_compute", LCM_COMPUTE, "🧮"),
         ("lcm_recent", LCM_RECENT, "🕒"),
         ("lcm_load_session", LCM_LOAD_SESSION, "📋"),
         ("lcm_describe", LCM_DESCRIBE, "📊"),

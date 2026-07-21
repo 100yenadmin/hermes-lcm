@@ -77,7 +77,7 @@ Core capabilities:
 - **Summary DAG** - builds depth-aware summary nodes over compacted history
 - **Bounded recovery** - pages raw messages, child summaries, and externalized
   payloads instead of dumping everything into the prompt
-- **Agent tools** - `lcm_grep`, `lcm_recall`, `lcm_recent`, `lcm_load_session`,
+- **Agent tools** - `lcm_grep`, `lcm_recall`, `lcm_compute`, `lcm_recent`, `lcm_load_session`,
   `lcm_describe`, `lcm_expand`, `lcm_expand_query`, `lcm_status`, `lcm_inspect`,
   and `lcm_doctor`
 - **Source-aware retrieval** - filters raw rows and summaries by descendant
@@ -247,11 +247,12 @@ outside the LCM database.
 | Tool | Use |
 |------|-----|
 | `lcm_grep` | Search current-session raw messages and summaries. Opt into `content_scope='externalized'|'both'` for bounded active-session payload search, or `session_scope='all'|'session'` for bounded raw-message archive recovery; broader scopes return raw-message hits only. |
-| `lcm_recall` | Search the entire memory across ALL conversations and all time by meaning. Fuses full-text, summary-vector, and chunk-vector arms with RRF, then applies a soft current-conversation (`scope_bias`) and recency prior. Returns bounded summary and verbatim-excerpt hits with `lcm_expand` handles; works FTS-only when embeddings are disabled. |
+| `lcm_recall` | Search the entire memory across ALL conversations and all time by meaning. Fuses full-text, summary-vector, and chunk-vector arms with RRF, then applies a soft current-conversation (`scope_bias`) and recency prior. The byte-compatible default returns bounded snippets; opt into `detail='answer_ready'` for bounded, diverse exact-source windows with provenance. |
+| `lcm_compute` | Run a dependency-free deterministic date, count, compatible-unit sum, difference, or ordering operation over immutable exact message spans. Ambiguous, incomplete, stale, or ungrounded inputs fail closed. |
 | `lcm_recent` | Retrieve recent summaries by natural UTC period, preferring ready rollups and transparently falling back to time-bounded leaf summaries. |
-| `lcm_load_session` | Load one ordered raw-message transcript page for an explicit `session_id`. Continues with `after_store_id` from `next_cursor`. |
+| `lcm_load_session` | Load one ordered raw-message transcript page for an explicit `session_id`. Continues with `after_store_id` from `next_cursor`; opt into `include_exact_ref` without changing default response bytes. |
 | `lcm_describe` | Inspect the current-session DAG or preview an `externalized_ref` without loading full content. |
-| `lcm_expand` | Recover source messages, child summaries, or externalized payloads with pagination. Use `store_id` to fetch a single raw message from a cross-session `lcm_grep` result. |
+| `lcm_expand` | Recover source messages, child summaries, or externalized payloads with pagination. In `store_id` mode, opt into an offset-aware `include_exact_ref` for the returned slice. |
 | `lcm_expand_query` | Answer a question using expanded current-session LCM context while returning a bounded answer. |
 | `lcm_status` | Show runtime health, context pressure, config, source lineage, and lifecycle stats. |
 | `lcm_inspect` | Read-only operator inventory for current-session lineage, frontier/fresh-tail metadata, externalized refs/readability, compaction skip/no-op reasons, and matched ignore/stateless patterns. Returns metadata only; use retrieval tools for content. |
@@ -775,7 +776,7 @@ store.py         SQLite message store and FTS
 dag.py           summary DAG and FTS
 config.py        env var defaults and overrides
 command.py       /lcm command handlers
-tools.py         lcm_grep, lcm_load_session, lcm_describe, lcm_expand, lcm_expand_query
+tools.py         lcm_grep, lcm_recall, lcm_compute, lcm_load_session, lcm_describe, lcm_expand
 schemas.py       tool schemas shown to the model
 tests/           standalone pytest coverage
 ```

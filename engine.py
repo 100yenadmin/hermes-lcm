@@ -90,6 +90,7 @@ from .schemas import (
     LCM_GREP,
     LCM_INSPECT,
     LCM_LOAD_SESSION,
+    LCM_COMPUTE,
     LCM_RECALL,
     LCM_RECENT,
     LCM_STATUS,
@@ -3281,6 +3282,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         return [
             LCM_GREP,
             LCM_RECALL,
+            LCM_COMPUTE,
             LCM_RECENT,
             LCM_LOAD_SESSION,
             LCM_DESCRIBE,
@@ -3311,6 +3313,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         handlers = {
             "lcm_grep": lcm_tools.lcm_grep,
             "lcm_recall": lcm_tools.lcm_recall,
+            "lcm_compute": lcm_tools.lcm_compute,
             "lcm_recent": lcm_tools.lcm_recent,
             "lcm_load_session": lcm_tools.lcm_load_session,
             "lcm_describe": lcm_tools.lcm_describe,
