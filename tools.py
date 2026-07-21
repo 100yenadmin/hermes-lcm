@@ -3210,7 +3210,7 @@ def _lcm_recall_answer_ready_content(
                     session_date = None
             occurrence = resolve_occurrence_time(
                 window["content"],
-                observed_at=observed_at or 0,
+                observed_at=observed_at,
                 session_date=session_date,
             )
             occurrence["stored_at"] = ingested_at

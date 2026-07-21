@@ -658,11 +658,28 @@ def _ground_one(
     if raw_occurrence is not None:
         if not isinstance(raw_occurrence, dict):
             return None, "occurrence_time must be an object"
+        trusted_session_date: str | None = None
+        if resolved.observed_at is not None:
+            try:
+                trusted_session_date = datetime.fromtimestamp(
+                    resolved.observed_at, tz=timezone.utc
+                ).date().isoformat()
+            except (ValueError, OverflowError, OSError):
+                trusted_session_date = None
         resolved_occurrence = resolve_occurrence_time(
             quote,
-            observed_at=resolved.observed_at or 0,
-            session_date=raw_occurrence.get("session_date"),
+            observed_at=resolved.observed_at,
+            session_date=trusted_session_date,
         )
+        supplied_session_date = raw_occurrence.get("session_date")
+        if supplied_session_date not in (None, ""):
+            supplied_session_day = _parse_day(supplied_session_date)
+            trusted_session_day = _parse_day(trusted_session_date)
+            if supplied_session_day is None or supplied_session_day != trusted_session_day:
+                return None, (
+                    "occurrence_time session date is not supported by persisted "
+                    "observation time"
+                )
         supplied_source = str(raw_occurrence.get("event_time_source") or "")
         if supplied_source != resolved_occurrence["event_time_source"]:
             return None, "occurrence_time source is not supported by the exact quote"
@@ -1057,31 +1074,8 @@ def verify_final_answer(candidate: Any, trace: ComputationTrace) -> Verification
         return VerificationDecision("fallback", "candidate answer is empty")
     if len(text) > 4_000:
         return VerificationDecision("fallback", "candidate answer exceeds verifier bound")
-    expected_citations = {f"[{citation}]" for citation in trace.citations}
-    actual_citations = set(re.findall(r"\[lcm:\d+:\d+-\d+\]", text))
-    if actual_citations != expected_citations:
-        return VerificationDecision("fallback", "candidate citations do not match exact operands")
-    if text == trace.answer:
-        return VerificationDecision("verified")
-    without_citations = re.sub(r"\s*\[lcm:\d+:\d+-\d+\]", "", text).strip()
-    if trace.result.casefold() not in without_citations.casefold():
-        return VerificationDecision("fallback", "candidate does not preserve the verified result")
-    expected_numbers = _explicit_numbers(trace.result)
-    actual_numbers = _explicit_numbers(without_citations)
-    if expected_numbers != actual_numbers:
-        return VerificationDecision("fallback", "candidate changes or adds numeric results")
-    expected_units = _explicit_units(trace.result)
-    actual_units = _explicit_units(without_citations)
-    if expected_units != actual_units:
-        return VerificationDecision("fallback", "candidate changes the verified unit")
-    normalized_candidate = without_citations.casefold()
-    missing_entities = [
-        entity
-        for entity in trace.entities
-        if entity.casefold() not in normalized_candidate
-    ]
-    if missing_entities:
+    if text != trace.answer:
         return VerificationDecision(
-            "fallback", "candidate omits or changes a grounded entity"
+            "fallback", "candidate must exactly match the canonical deterministic answer"
         )
     return VerificationDecision("verified")

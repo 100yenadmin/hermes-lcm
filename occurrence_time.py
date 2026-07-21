@@ -9,6 +9,7 @@ valid ``unknown`` results; observation time is never reused as event time.
 from __future__ import annotations
 
 import calendar
+import math
 import re
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
@@ -52,19 +53,25 @@ def _subtract_months(day: date, months: int) -> date:
     return date(year, month, min(day.day, calendar.monthrange(year, month)[1]))
 
 
+def _observed_epoch(value: Any) -> float | None:
+    try:
+        observed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(observed) or observed <= 0:
+        return None
+    return observed
+
+
 def _unknown(
     observed_at: Any,
     *,
     session_date: Any = None,
     reason: str = "no_supported_occurrence_time",
 ) -> dict[str, Any]:
-    try:
-        observed = float(observed_at)
-    except (TypeError, ValueError, OverflowError):
-        observed = 0.0
     anchor = _parse_anchor(session_date)
     return {
-        "observed_at": observed,
+        "observed_at": _observed_epoch(observed_at),
         "stored_at": None,
         "occurred_at": None,
         "event_at": None,
@@ -111,7 +118,7 @@ def resolve_occurrence_time(
         day, match = explicit[0]
         anchor = _parse_anchor(session_date)
         return {
-            "observed_at": float(observed_at or 0.0),
+            "observed_at": _observed_epoch(observed_at),
             "stored_at": None,
             "occurred_at": _epoch(day),
             "event_at": _epoch(day),
@@ -163,7 +170,7 @@ def resolve_occurrence_time(
             day = _subtract_months(anchor, count)
 
     return {
-        "observed_at": float(observed_at or 0.0),
+        "observed_at": _observed_epoch(observed_at),
         "stored_at": None,
         "occurred_at": _epoch(day),
         "event_at": _epoch(day),

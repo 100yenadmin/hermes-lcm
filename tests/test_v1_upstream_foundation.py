@@ -246,6 +246,27 @@ def test_pure_computation_uses_exact_refs_and_fails_closed(tmp_path):
             "exact_retrieved_evidence",
         ]
 
+        unsupported_candidate = json.loads(
+            lcm_tools.lcm_compute(
+                {
+                    **args,
+                    "candidate_answer": (
+                        "20 pages; the project is complete "
+                        + " ".join(
+                            f"[{citation}]" for citation in computed["trace"]["citations"]
+                        )
+                    ),
+                },
+                engine=engine,
+            )
+        )
+        assert unsupported_candidate["status"] == "computed"
+        assert unsupported_candidate["answer"] == computed["trace"]["answer"]
+        assert unsupported_candidate["candidate_verification"]["status"] == "fallback"
+        assert "canonical deterministic answer" in unsupported_candidate[
+            "candidate_verification"
+        ]["reason"]
+
         ambiguous = json.loads(
             lcm_tools.lcm_compute(
                 {
@@ -257,6 +278,81 @@ def test_pure_computation_uses_exact_refs_and_fails_closed(tmp_path):
         )
         assert ambiguous["status"] == "fallback"
         assert "not explicit" in ambiguous["reason"]
+    finally:
+        store.close()
+
+
+def test_relative_occurrence_time_uses_persisted_observation_anchor(tmp_path):
+    from hermes_lcm.reasoning import ground_evidence
+
+    store = MessageStore(tmp_path / "relative-time.db")
+    try:
+        content = "The launch was 5 days ago."
+        observed_at = datetime(2024, 3, 20, 10, 0, tzinfo=timezone.utc).timestamp()
+        store_id = store.append(
+            "session-a",
+            {
+                "role": "user",
+                "content": content,
+                "timestamp": "2024-03-20T10:00:00Z",
+            },
+        )
+        exact_ref = f"lcm:{store_id}:0-{len(content)}"
+        forged = ground_evidence(
+            [
+                {
+                    "exact_ref": exact_ref,
+                    "quote": content,
+                    "occurrence_time": {
+                        "session_date": "2099-01-01",
+                        "event_time_source": "relative_to_session",
+                        "event_date": "2098-12-27",
+                    },
+                }
+            ],
+            messages=store,
+        )
+        assert forged.status == "fallback"
+        assert "session date" in forged.reason
+
+        grounded = ground_evidence(
+            [
+                {
+                    "exact_ref": exact_ref,
+                    "quote": content,
+                    "occurrence_time": {
+                        "session_date": "2024-03-20",
+                        "event_time_source": "relative_to_session",
+                        "event_date": "2024-03-15",
+                    },
+                }
+            ],
+            messages=store,
+        )
+        assert grounded.status == "grounded"
+        assert grounded.operands[0].evidence_date.isoformat() == "2024-03-15"
+
+        legacy_id = store.append(
+            "legacy-session",
+            {"role": "user", "content": content},
+        )
+        legacy = ground_evidence(
+            [
+                {
+                    "exact_ref": f"lcm:{legacy_id}:0-{len(content)}",
+                    "quote": content,
+                    "occurrence_time": {
+                        "session_date": "2024-03-20",
+                        "event_time_source": "relative_to_session",
+                        "event_date": "2024-03-15",
+                    },
+                }
+            ],
+            messages=store,
+        )
+        assert legacy.status == "fallback"
+        assert "session date" in legacy.reason
+        assert store.get(store_id)["observed_at"] == observed_at
     finally:
         store.close()
 
@@ -362,3 +458,12 @@ def test_occurrence_time_ambiguity_never_relabels_observation_time():
     assert result["occurred_at"] is None
     assert result["event_time_source"] == "unknown"
     assert result["reason"] == "ambiguous_multiple_explicit_dates"
+
+    missing_observation = resolve_occurrence_time(
+        "That happened yesterday.",
+        observed_at=None,
+        session_date=None,
+    )
+    assert missing_observation["observed_at"] is None
+    assert missing_observation["occurred_at"] is None
+    assert missing_observation["reason"] == "relative_expression_without_session_date"

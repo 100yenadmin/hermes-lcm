@@ -293,8 +293,8 @@ LCM_COMPUTE = {
             "candidate_answer": {
                 "type": "string",
                 "description": (
-                    "Optional narrative answer to verify against the immutable trace. "
-                    "A failed candidate is discarded in favor of canonical output."
+                    "Optional candidate accepted only when it exactly matches the "
+                    "canonical deterministic answer. Any mismatch is discarded."
                 ),
             },
         },
