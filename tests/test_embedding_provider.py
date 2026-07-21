@@ -81,6 +81,29 @@ def test_voyage_batch_bin_packing_boundary(monkeypatch):
     assert all(call["payload"]["truncation"] is False for call in transport.calls)
 
 
+def test_voyage_flat_embeddings_record_provider_billed_tokens(monkeypatch):
+    monkeypatch.setattr(provider_mod, "count_tokens", lambda _text: 1)
+    monkeypatch.setenv("VOYAGE_API_KEY", "test-key")
+    document_response = _voyage_success(1)
+    document_payload = json.loads(document_response.body)
+    document_payload["usage"] = {"total_tokens": 17}
+    query_response = _voyage_success(1)
+    query_payload = json.loads(query_response.body)
+    query_payload["usage"] = {"total_tokens": 5}
+    provider = VoyageProvider(
+        "voyage-test",
+        transport=FakeTransport(
+            _response(200, document_payload),
+            _response(200, query_payload),
+        ),
+    )
+
+    provider.embed_documents(["document"])
+    assert provider.last_usage_tokens == 17
+    provider.embed_query("query")
+    assert provider.last_usage_tokens == 5
+
+
 def test_voyage_batch_splits_on_item_count_cap(monkeypatch):
     # Many tiny documents stay well under the token budget but exceed Voyage's
     # 1000-item per-request cap, so the batch must split.

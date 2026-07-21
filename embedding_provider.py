@@ -549,8 +549,8 @@ class VoyageProvider(_ResilientProvider):
         # Context models are dispatched through the contextualized endpoint; the
         # flat _request payload path is guarded against them (see _request).
         self._is_context = _is_voyage_context_model(self._model_id)
-        # Populated from the contextualized response's usage.total_tokens so a
-        # caller (e.g. a live micro-proof) can report provider-billed tokens.
+        # Populated from every successful response's usage.total_tokens so a
+        # caller can report provider-billed document and query tokens.
         self.last_usage_tokens = 0
         self._transport = transport or _default_http_transport
         self.timeout = float(timeout)
@@ -717,6 +717,12 @@ class VoyageProvider(_ResilientProvider):
                         raise EmbeddingProviderError(
                             "Voyage returned a different number of embeddings than requested"
                         )
+                    usage = data.get("usage")
+                    if isinstance(usage, dict):
+                        try:
+                            self.last_usage_tokens = int(usage.get("total_tokens", 0))
+                        except (TypeError, ValueError):
+                            pass
                     return parsed
 
                 runner = (
