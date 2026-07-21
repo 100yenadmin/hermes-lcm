@@ -15,9 +15,10 @@ import math
 from pathlib import Path
 import re
 import sqlite3
+import struct
 import threading
 import time
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Protocol, Sequence
 from urllib.parse import quote, unquote
 
 from .db_bootstrap import (
@@ -32,12 +33,16 @@ from .search_query import extract_search_terms
 
 TRAJECTORY_MIGRATION_STEP = "trajectory_store_v1"
 TRAJECTORY_SCHEMA_VERSION = 1
+TRAJECTORY_SEMANTIC_DOCUMENT_VERSION = "trajectory-semantic-document-v1"
 _MAX_CANDIDATES = 128
 _MAX_RESULTS = 24
 _MAX_IMAGES = 8
 _MAX_QUERY_TEXT_CHARS = 8_000
 _MAX_SOURCE_JSON_CHARS = 16_000_000
 _MAX_TEXT_CHARS = 2_000_000
+_MAX_SEMANTIC_DOCUMENT_CHARS = 48_000
+_MAX_SEMANTIC_STATE_CHARS = 900
+_MAX_SEMANTIC_STATES = 64
 _STOPWORDS = frozenset({
     "a", "an", "and", "are", "as", "at", "be", "before", "did", "do",
     "does", "for", "from", "happen", "happened", "how", "i", "in", "is",
@@ -68,6 +73,18 @@ class ExactTrajectoryRefError(TrajectoryStoreError):
 
 class TrajectorySchemaUnavailableError(TrajectoryStoreError):
     """Raised when a read-only database lacks the trajectory schema."""
+
+
+class TrajectoryEmbeddingProvider(Protocol):
+    """Provider-neutral surface needed by the trajectory semantic index."""
+
+    provider_id: str
+    model_id: str
+    dim: int
+
+    def embed_documents(self, texts: Sequence[str]) -> list[list[float]]: ...
+
+    def embed_query(self, text: str) -> list[float]: ...
 
 
 @dataclass(frozen=True)
@@ -224,6 +241,60 @@ def _canonical_json(value: Any) -> str:
     return encoded
 
 
+def _normalized_vector(values: Sequence[float], *, expected_dim: int | None = None) -> tuple[float, ...]:
+    try:
+        vector = tuple(float(value) for value in values)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("trajectory embedding vector must be numeric") from exc
+    if not vector or any(not math.isfinite(value) for value in vector):
+        raise ValueError("trajectory embedding vector must be finite and non-empty")
+    if expected_dim is not None and len(vector) != expected_dim:
+        raise ValueError("trajectory embedding vector dimension changed")
+    norm = math.sqrt(sum(value * value for value in vector))
+    if not math.isfinite(norm) or norm <= 0.0:
+        raise ValueError("trajectory embedding vector must have a finite nonzero norm")
+    return tuple(value / norm for value in vector)
+
+
+def _pack_vector(vector: Sequence[float]) -> bytes:
+    return struct.pack(f"<{len(vector)}f", *vector)
+
+
+def _unpack_vector(payload: bytes, dim: int) -> tuple[float, ...]:
+    expected_bytes = dim * 4
+    if len(payload) != expected_bytes:
+        raise TrajectoryStoreError("stored trajectory embedding dimension is invalid")
+    return tuple(struct.unpack(f"<{dim}f", payload))
+
+
+def create_trajectory_embedding_provider(
+    provider_name: str,
+    model_name: str,
+    *,
+    timeout_seconds: float,
+    for_backfill: bool = False,
+) -> TrajectoryEmbeddingProvider:
+    """Resolve an existing LCM provider without persisting its credential.
+
+    The provider reads credentials from its normal environment-backed secret
+    seam. Only the provider/model identifiers belong in saved memory config.
+    """
+    from .config import LCMConfig
+    from .embedding_provider import resolve_provider
+
+    timeout = max(0.1, float(timeout_seconds))
+    config = LCMConfig(
+        embedding_provider=str(provider_name).strip(),
+        embedding_model=str(model_name).strip(),
+        embedding_query_timeout_s=timeout,
+        embedding_backfill_timeout_s=timeout,
+    )
+    provider = resolve_provider(config, for_backfill=for_backfill)
+    if provider is None:
+        raise TrajectoryStoreError("trajectory embedding provider is not configured")
+    return provider
+
+
 def _finite_optional(value: float | None, field: str) -> float | None:
     if value is None:
         return None
@@ -271,6 +342,8 @@ class TrajectoryStore:
         asset_root: str | Path,
         read_only: bool = False,
         protect_sensitive: bool = True,
+        embedding_provider: TrajectoryEmbeddingProvider | None = None,
+        semantic_top_trajectories: int = 12,
     ) -> None:
         self.db_path = Path(db_path)
         self.identity = identity
@@ -279,6 +352,18 @@ class TrajectoryStore:
         self.asset_root = Path(asset_root).expanduser().resolve()
         self.read_only = bool(read_only)
         self.protect_sensitive = bool(protect_sensitive)
+        self.embedding_provider = embedding_provider
+        self.semantic_top_trajectories = min(
+            max(1, int(semantic_top_trajectories)),
+            32,
+        )
+        self._semantic_usage: dict[str, int] = {
+            "document_calls": 0,
+            "document_tokens": 0,
+            "query_calls": 0,
+            "query_tokens": 0,
+            "fallbacks": 0,
+        }
         self._lock = threading.RLock()
         self._conn = self._open_connection()
         try:
@@ -882,6 +967,313 @@ class TrajectoryStore:
                 self._conn.rollback()
                 raise
 
+    def set_embedding_provider(
+        self,
+        provider: TrajectoryEmbeddingProvider | None,
+    ) -> None:
+        """Replace the ephemeral provider without changing saved corpus state."""
+        self.embedding_provider = provider
+
+    def _ensure_semantic_schema(self) -> None:
+        self._require_writable()
+        self._conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS lcm_trajectory_embedding_profiles (
+                profile_digest TEXT PRIMARY KEY,
+                provider TEXT NOT NULL,
+                model_name TEXT NOT NULL,
+                dim INTEGER NOT NULL CHECK(dim > 0),
+                document_version TEXT NOT NULL,
+                source_manifest_digest TEXT NOT NULL,
+                document_count INTEGER NOT NULL CHECK(document_count >= 0),
+                index_digest TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 0 CHECK(active IN (0, 1)),
+                created_at REAL NOT NULL
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS lcm_trajectory_embedding_one_active
+            ON lcm_trajectory_embedding_profiles(active) WHERE active = 1;
+
+            CREATE TABLE IF NOT EXISTS lcm_trajectory_embeddings (
+                source_id INTEGER PRIMARY KEY
+                    REFERENCES lcm_trajectory_sources(source_id) ON DELETE CASCADE,
+                profile_digest TEXT NOT NULL
+                    REFERENCES lcm_trajectory_embedding_profiles(profile_digest)
+                    ON DELETE CASCADE,
+                document_sha256 TEXT NOT NULL,
+                vector BLOB NOT NULL,
+                embedded_at REAL NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS lcm_trajectory_embeddings_profile
+            ON lcm_trajectory_embeddings(profile_digest, source_id);
+            """
+        )
+        self._conn.commit()
+
+    def _semantic_profile(self) -> sqlite3.Row | None:
+        exists = self._conn.execute(
+            """
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'lcm_trajectory_embedding_profiles'
+            """
+        ).fetchone()
+        if exists is None:
+            return None
+        return self._conn.execute(
+            """
+            SELECT * FROM lcm_trajectory_embedding_profiles
+            WHERE active = 1
+            """
+        ).fetchone()
+
+    @staticmethod
+    def _sample_state_rows(rows: Sequence[sqlite3.Row]) -> list[sqlite3.Row]:
+        if len(rows) <= _MAX_SEMANTIC_STATES:
+            return list(rows)
+        last = len(rows) - 1
+        indexes = {
+            round(position * last / (_MAX_SEMANTIC_STATES - 1))
+            for position in range(_MAX_SEMANTIC_STATES)
+        }
+        return [rows[index] for index in sorted(indexes)]
+
+    def _semantic_documents(self) -> list[tuple[int, str, str]]:
+        sources = self._conn.execute(
+            """
+            SELECT source_id, trajectory_id, goal, start_url, outcome
+            FROM lcm_trajectory_sources
+            ORDER BY ordinal, trajectory_id
+            """
+        ).fetchall()
+        documents: list[tuple[int, str, str]] = []
+        for source in sources:
+            states = self._conn.execute(
+                """
+                SELECT state_index, sequence_ordinal, step, url,
+                       incoming_action, thoughts, text
+                FROM lcm_trajectory_states
+                WHERE source_id = ?
+                ORDER BY sequence_ordinal
+                """,
+                (int(source["source_id"]),),
+            ).fetchall()
+            lines = [
+                f"Trajectory: {source['trajectory_id']}",
+                f"Goal: {source['goal']}",
+                f"Start URL: {source['start_url']}",
+                f"Outcome: {source['outcome'] or '<unknown>'}",
+            ]
+            for state in self._sample_state_rows(states):
+                state_text = " | ".join(
+                    part
+                    for part in (
+                        f"State {state['state_index']} sequence {state['sequence_ordinal']} step {state['step']}",
+                        f"URL {state['url']}",
+                        (
+                            f"Action {state['incoming_action']}"
+                            if state["incoming_action"] is not None
+                            else ""
+                        ),
+                        (
+                            f"Thought {state['thoughts']}"
+                            if state["thoughts"] is not None
+                            else ""
+                        ),
+                        f"Visible {state['text']}",
+                    )
+                    if part
+                )
+                lines.append(state_text[:_MAX_SEMANTIC_STATE_CHARS])
+            document = "\n".join(lines)[:_MAX_SEMANTIC_DOCUMENT_CHARS]
+            documents.append(
+                (int(source["source_id"]), document, _sha256_text(document))
+            )
+        return documents
+
+    def build_semantic_index(
+        self,
+        provider: TrajectoryEmbeddingProvider | None = None,
+    ) -> dict[str, Any]:
+        """Build one deterministic source-derived vector per trajectory."""
+        if self.status != "complete":
+            raise CorpusIdentityError("trajectory corpus must be finalized before indexing")
+        active_provider = provider or self.embedding_provider
+        if active_provider is None:
+            raise TrajectoryStoreError("trajectory embedding provider is not configured")
+        self._ensure_semantic_schema()
+        corpus = self._conn.execute(
+            """
+            SELECT source_manifest_digest, trajectory_count
+            FROM lcm_trajectory_corpora WHERE singleton = 1
+            """
+        ).fetchone()
+        provider_name = str(getattr(active_provider, "provider_id", "unknown"))
+        model_name = str(getattr(active_provider, "model_id", "")).strip()
+        if not model_name:
+            raise ValueError("trajectory embedding model_id must not be empty")
+        current = self._semantic_profile()
+        expected_count = int(corpus["trajectory_count"])
+        if current is not None and (
+            str(current["provider"]) == provider_name
+            and str(current["model_name"]) == model_name
+            and str(current["document_version"]) == TRAJECTORY_SEMANTIC_DOCUMENT_VERSION
+            and str(current["source_manifest_digest"]) == str(corpus["source_manifest_digest"])
+            and int(current["document_count"]) == expected_count
+        ):
+            actual_count = int(self._conn.execute(
+                "SELECT COUNT(*) FROM lcm_trajectory_embeddings WHERE profile_digest = ?",
+                (str(current["profile_digest"]),),
+            ).fetchone()[0])
+            if actual_count == expected_count:
+                return {
+                    "status": "current",
+                    "profile_digest": str(current["profile_digest"]),
+                    "document_count": actual_count,
+                    "dim": int(current["dim"]),
+                    "index_digest": str(current["index_digest"]),
+                }
+
+        documents = self._semantic_documents()
+        texts = [document for _source_id, document, _digest in documents]
+        embed_batches = getattr(active_provider, "embed_document_batches", None)
+        vectors: list[list[float]] = []
+        if callable(embed_batches):
+            indexed_vectors: dict[int, list[float]] = {}
+            for batch in embed_batches(texts):
+                self._semantic_usage["document_calls"] += 1
+                self._semantic_usage["document_tokens"] += max(
+                    0,
+                    int(getattr(active_provider, "last_usage_tokens", 0) or 0),
+                )
+                for index, vector in zip(batch.indexes, batch.vectors):
+                    indexed_vectors[int(index)] = list(vector)
+            vectors = [indexed_vectors[index] for index in range(len(texts))]
+        else:
+            self._semantic_usage["document_calls"] += 1
+            vectors = active_provider.embed_documents(texts)
+            self._semantic_usage["document_tokens"] += max(
+                0,
+                int(getattr(active_provider, "last_usage_tokens", 0) or 0),
+            )
+        if len(vectors) != len(documents):
+            raise ValueError("trajectory embedding count does not match source count")
+        normalized: list[tuple[float, ...]] = []
+        dim: int | None = None
+        for vector in vectors:
+            normalized_vector = _normalized_vector(vector, expected_dim=dim)
+            if dim is None:
+                dim = len(normalized_vector)
+            normalized.append(normalized_vector)
+        if dim is None:
+            raise ValueError("trajectory semantic index cannot be empty")
+        profile_digest = _sha256_text(_canonical_json({
+            "provider": provider_name,
+            "model": model_name,
+            "dim": dim,
+            "document_version": TRAJECTORY_SEMANTIC_DOCUMENT_VERSION,
+            "source_manifest_digest": str(corpus["source_manifest_digest"]),
+        }))
+        packed = [_pack_vector(vector) for vector in normalized]
+        index_digest = _sha256_text(_canonical_json([
+            [source_id, document_sha, hashlib.sha256(vector).hexdigest()]
+            for (source_id, _document, document_sha), vector in zip(documents, packed)
+        ]))
+        now = time.time()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._conn.execute(
+                    "UPDATE lcm_trajectory_embedding_profiles SET active = 0 WHERE active = 1"
+                )
+                self._conn.execute("DELETE FROM lcm_trajectory_embeddings")
+                self._conn.execute(
+                    """
+                    INSERT INTO lcm_trajectory_embedding_profiles(
+                        profile_digest, provider, model_name, dim,
+                        document_version, source_manifest_digest,
+                        document_count, index_digest, active, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+                    ON CONFLICT(profile_digest) DO UPDATE SET
+                        document_count = excluded.document_count,
+                        index_digest = excluded.index_digest,
+                        active = 1,
+                        created_at = excluded.created_at
+                    """,
+                    (
+                        profile_digest,
+                        provider_name,
+                        model_name,
+                        dim,
+                        TRAJECTORY_SEMANTIC_DOCUMENT_VERSION,
+                        str(corpus["source_manifest_digest"]),
+                        len(documents),
+                        index_digest,
+                        now,
+                    ),
+                )
+                self._conn.executemany(
+                    """
+                    INSERT INTO lcm_trajectory_embeddings(
+                        source_id, profile_digest, document_sha256, vector, embedded_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (source_id, profile_digest, document_sha, vector, now)
+                        for (source_id, _document, document_sha), vector
+                        in zip(documents, packed)
+                    ],
+                )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+        return {
+            "status": "built",
+            "profile_digest": profile_digest,
+            "document_count": len(documents),
+            "dim": dim,
+            "index_digest": index_digest,
+        }
+
+    def semantic_metrics(self) -> dict[str, int]:
+        return dict(self._semantic_usage)
+
+    def _semantic_source_ranks(self, query: str) -> list[tuple[int, float]]:
+        provider = self.embedding_provider
+        profile = self._semantic_profile()
+        if provider is None or profile is None:
+            return []
+        if (
+            str(profile["provider"]) != str(getattr(provider, "provider_id", "unknown"))
+            or str(profile["model_name"]) != str(getattr(provider, "model_id", ""))
+        ):
+            return []
+        self._semantic_usage["query_calls"] += 1
+        query_vector = _normalized_vector(
+            provider.embed_query(query),
+            expected_dim=int(profile["dim"]),
+        )
+        self._semantic_usage["query_tokens"] += max(
+            0,
+            int(getattr(provider, "last_usage_tokens", 0) or 0),
+        )
+        rows = self._conn.execute(
+            """
+            SELECT source_id, vector
+            FROM lcm_trajectory_embeddings
+            WHERE profile_digest = ?
+            """,
+            (str(profile["profile_digest"]),),
+        ).fetchall()
+        ranked = []
+        for row in rows:
+            vector = _unpack_vector(bytes(row["vector"]), int(profile["dim"]))
+            similarity = sum(left * right for left, right in zip(query_vector, vector))
+            ranked.append((int(row["source_id"]), float(similarity)))
+        ranked.sort(key=lambda item: (-item[1], item[0]))
+        return ranked[: self.semantic_top_trajectories]
+
     @staticmethod
     def _fts_expression(query: str) -> str:
         terms: list[str] = []
@@ -1017,6 +1409,37 @@ class TrajectoryStore:
                 break
         return selected
 
+    def _fts_rows(
+        self,
+        expression: str,
+        candidate_limit: int,
+        *,
+        source_ids: Sequence[int] = (),
+    ) -> list[sqlite3.Row]:
+        source_clause = ""
+        params: list[Any] = [expression]
+        if source_ids:
+            placeholders = ",".join("?" for _ in source_ids)
+            source_clause = f" AND s.source_id IN ({placeholders})"
+            params.extend(int(source_id) for source_id in source_ids)
+        params.append(int(candidate_limit))
+        return self._conn.execute(
+            f"""
+            SELECT s.*, src.trajectory_id, src.goal, src.outcome, src.ordinal,
+                   a.relative_path, a.sha256 AS asset_sha256,
+                   bm25(lcm_trajectory_states_fts) AS rank
+            FROM lcm_trajectory_states_fts
+            JOIN lcm_trajectory_states s
+              ON s.state_id = lcm_trajectory_states_fts.rowid
+            JOIN lcm_trajectory_sources src ON src.source_id = s.source_id
+            LEFT JOIN lcm_trajectory_assets a ON a.state_id = s.state_id
+            WHERE lcm_trajectory_states_fts MATCH ?{source_clause}
+            ORDER BY rank ASC, src.ordinal ASC, s.sequence_ordinal ASC
+            LIMIT ?
+            """,
+            tuple(params),
+        ).fetchall()
+
     def query(
         self,
         query: str,
@@ -1039,32 +1462,84 @@ class TrajectoryStore:
         expression = self._fts_expression(query)
         if not expression:
             return ()
-        rows = self._conn.execute(
-            """
-            SELECT s.*, src.trajectory_id, src.goal, src.outcome, a.relative_path,
-                   a.sha256 AS asset_sha256, bm25(lcm_trajectory_states_fts) AS rank
-            FROM lcm_trajectory_states_fts
-            JOIN lcm_trajectory_states s ON s.state_id = lcm_trajectory_states_fts.rowid
-            JOIN lcm_trajectory_sources src ON src.source_id = s.source_id
-            LEFT JOIN lcm_trajectory_assets a ON a.state_id = s.state_id
-            WHERE lcm_trajectory_states_fts MATCH ?
-            ORDER BY rank ASC, src.ordinal ASC, s.sequence_ordinal ASC
-            LIMIT ?
-            """,
-            (expression, candidate_limit),
-        ).fetchall()
-        selected = self._select_diverse(rows, limit)
-        selected_ids = {int(row["state_id"]) for row in selected}
-        match_kind_by_id = {int(row["state_id"]): "fts" for row in selected}
-        score_by_id = {int(row["state_id"]): float(row["rank"]) for row in selected}
+        global_rows = self._fts_rows(expression, candidate_limit)
+        semantic_ranks: list[tuple[int, float]] = []
+        try:
+            semantic_ranks = self._semantic_source_ranks(query)
+        except Exception:
+            self._semantic_usage["fallbacks"] += 1
+        scoped_rows = self._fts_rows(
+            expression,
+            candidate_limit,
+            source_ids=[source_id for source_id, _score in semantic_ranks],
+        ) if semantic_ranks else []
 
-        if include_adjacent and len(selected) < limit:
+        if semantic_ranks and scoped_rows:
+            row_by_id: dict[int, sqlite3.Row] = {}
+            score_by_candidate: dict[int, float] = {}
+            semantic_position = {
+                source_id: position
+                for position, (source_id, _score) in enumerate(semantic_ranks, start=1)
+            }
+            for position, row in enumerate(global_rows, start=1):
+                state_id = int(row["state_id"])
+                row_by_id[state_id] = row
+                score_by_candidate[state_id] = score_by_candidate.get(state_id, 0.0) + (
+                    1.0 / (60.0 + position)
+                )
+            for position, row in enumerate(scoped_rows, start=1):
+                state_id = int(row["state_id"])
+                row_by_id[state_id] = row
+                score_by_candidate[state_id] = score_by_candidate.get(state_id, 0.0) + (
+                    1.0 / (60.0 + position)
+                )
+                trajectory_position = semantic_position.get(int(row["source_id"]), 32)
+                score_by_candidate[state_id] += 1.0 / (60.0 + trajectory_position)
+            rows = sorted(
+                row_by_id.values(),
+                key=lambda row: (
+                    -score_by_candidate[int(row["state_id"])],
+                    int(row["ordinal"]),
+                    int(row["sequence_ordinal"]),
+                ),
+            )
+            candidate_kind = {
+                int(row["state_id"]): "semantic_fts"
+                for row in scoped_rows
+            }
+            candidate_score = {
+                state_id: -score
+                for state_id, score in score_by_candidate.items()
+            }
+        else:
+            rows = global_rows
+            candidate_kind = {}
+            candidate_score = {
+                int(row["state_id"]): float(row["rank"])
+                for row in rows
+            }
+
+        adjacent_reserve = min(6, limit // 3) if include_adjacent else 0
+        nucleus_limit = max(1, limit - adjacent_reserve)
+        selected = self._select_diverse(rows, nucleus_limit)
+        selected_ids = {int(row["state_id"]) for row in selected}
+        match_kind_by_id = {
+            int(row["state_id"]): candidate_kind.get(int(row["state_id"]), "fts")
+            for row in selected
+        }
+        score_by_id = {
+            int(row["state_id"]): candidate_score[int(row["state_id"])]
+            for row in selected
+        }
+
+        if include_adjacent and selected and len(selected) < limit:
             nucleus_rows = list(selected)
+            adjacent_by_nucleus: list[list[sqlite3.Row]] = []
             for nucleus in nucleus_rows:
                 adjacent_rows = self._conn.execute(
                     """
-                    SELECT s.*, src.trajectory_id, src.goal, src.outcome, a.relative_path,
-                           a.sha256 AS asset_sha256, 0.0 AS rank
+                    SELECT s.*, src.trajectory_id, src.goal, src.outcome, src.ordinal,
+                           a.relative_path, a.sha256 AS asset_sha256, 0.0 AS rank
                     FROM lcm_trajectory_states s
                     JOIN lcm_trajectory_sources src ON src.source_id = s.source_id
                     LEFT JOIN lcm_trajectory_assets a ON a.state_id = s.state_id
@@ -1078,17 +1553,24 @@ class TrajectoryStore:
                         int(nucleus["sequence_ordinal"]),
                     ),
                 ).fetchall()
-                for row in adjacent_rows:
-                    state_id = int(row["state_id"])
-                    if state_id in selected_ids:
-                        continue
-                    selected.append(row)
-                    selected_ids.add(state_id)
-                    match_kind_by_id[state_id] = "adjacent"
-                    score_by_id[state_id] = float(nucleus["rank"]) + 0.000001
+                adjacent_by_nucleus.append(list(adjacent_rows))
+            while len(selected) < limit and any(adjacent_by_nucleus):
+                made_progress = False
+                for nucleus, adjacent_rows in zip(nucleus_rows, adjacent_by_nucleus):
+                    while adjacent_rows:
+                        row = adjacent_rows.pop(0)
+                        state_id = int(row["state_id"])
+                        if state_id in selected_ids:
+                            continue
+                        selected.append(row)
+                        selected_ids.add(state_id)
+                        match_kind_by_id[state_id] = "adjacent"
+                        score_by_id[state_id] = score_by_id[int(nucleus["state_id"])] + 0.000001
+                        made_progress = True
+                        break
                     if len(selected) >= limit:
                         break
-                if len(selected) >= limit:
+                if not made_progress:
                     break
 
         hits: list[TrajectoryHit] = []
@@ -1143,6 +1625,7 @@ class TrajectoryStore:
         row = self._conn.execute(
             "SELECT * FROM lcm_trajectory_corpora WHERE singleton = 1"
         ).fetchone()
+        semantic = self._semantic_profile()
         return {
             "identity": dict(self.identity_payload),
             "identity_digest": str(row["identity_digest"]),
@@ -1153,6 +1636,19 @@ class TrajectoryStore:
             "trajectory_count": row["trajectory_count"],
             "ingest_cursor": int(row["ingest_cursor"]),
             "status": str(row["status"]),
+            "semantic_index": (
+                {
+                    "profile_digest": str(semantic["profile_digest"]),
+                    "provider": str(semantic["provider"]),
+                    "model_name": str(semantic["model_name"]),
+                    "dim": int(semantic["dim"]),
+                    "document_version": str(semantic["document_version"]),
+                    "document_count": int(semantic["document_count"]),
+                    "index_digest": str(semantic["index_digest"]),
+                }
+                if semantic is not None
+                else None
+            ),
         }
 
     def backup_to(self, destination: str | Path) -> Path:
