@@ -247,12 +247,12 @@ outside the LCM database.
 | Tool | Use |
 |------|-----|
 | `lcm_grep` | Search current-session raw messages and summaries. Opt into `content_scope='externalized'|'both'` for bounded active-session payload search, or `session_scope='all'|'session'` for bounded raw-message archive recovery; broader scopes return raw-message hits only. |
-| `lcm_recall` | Search the entire memory across ALL conversations and all time by meaning. Fuses full-text, summary-vector, and chunk-vector arms with RRF, then applies a soft current-conversation (`scope_bias`) and recency prior. The byte-compatible default returns bounded snippets; opt into `detail='answer_ready'` for bounded, diverse exact-source windows with provenance. |
-| `lcm_compute` | Run a dependency-free deterministic date, count, compatible-unit sum, difference, or ordering operation over immutable exact message spans. Ambiguous, incomplete, stale, or ungrounded inputs fail closed. |
+| `lcm_recall` | Search the entire memory across ALL conversations and all time by meaning. Fuses full-text, summary-vector, and chunk-vector arms with RRF, then applies a soft current-conversation (`scope_bias`) and recency prior. The byte-compatible default returns bounded snippets; opt into `detail='answer_ready'` for bounded, diverse exact-source windows with provenance and immutable evidence identity. |
+| `lcm_compute` | Run a dependency-free deterministic date, count, compatible-unit sum, difference, or ordering operation over exact message spans carrying the emitted `evidence_identity`. Ambiguous, incomplete, overlapping, stale, or ungrounded inputs fail closed. |
 | `lcm_recent` | Retrieve recent summaries by natural UTC period, preferring ready rollups and transparently falling back to time-bounded leaf summaries. |
-| `lcm_load_session` | Load one ordered raw-message transcript page for an explicit `session_id`. Continues with `after_store_id` from `next_cursor`; opt into `include_exact_ref` without changing default response bytes. |
+| `lcm_load_session` | Load one ordered raw-message transcript page for an explicit `session_id`. Continues with `after_store_id` from `next_cursor`; opt into `include_exact_ref` plus `evidence_identity` without changing default response bytes. |
 | `lcm_describe` | Inspect the current-session DAG or preview an `externalized_ref` without loading full content. |
-| `lcm_expand` | Recover source messages, child summaries, or externalized payloads with pagination. In `store_id` mode, opt into an offset-aware `include_exact_ref` for the returned slice. |
+| `lcm_expand` | Recover source messages, child summaries, or externalized payloads with pagination. In `store_id` mode, opt into an offset-aware `include_exact_ref` plus `evidence_identity` for the returned slice. |
 | `lcm_expand_query` | Answer a question using expanded current-session LCM context while returning a bounded answer. |
 | `lcm_status` | Show runtime health, context pressure, config, source lineage, and lifecycle stats. |
 | `lcm_inspect` | Read-only operator inventory for current-session lineage, frontier/fresh-tail metadata, externalized refs/readability, compaction skip/no-op reasons, and matched ignore/stateless patterns. Returns metadata only; use retrieval tools for content. |

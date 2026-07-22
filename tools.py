@@ -1139,7 +1139,10 @@ def _serialize_loaded_message(
     store_id = row.get("store_id")
     returned_chars = content_slice["content_returned_chars"]
     if include_exact_ref and isinstance(store_id, int) and returned_chars > 0:
+        from .exact_refs import evidence_identity_for_row
+
         item["exact_ref"] = f"lcm:{store_id}:0-{returned_chars}"
+        item["evidence_identity"] = evidence_identity_for_row(row)
     return item
 
 
@@ -1165,6 +1168,7 @@ def lcm_compute(args: Dict[str, Any], **kwargs) -> str:
     from .reasoning import (
         compile_evidence_plan,
         execute_plan,
+        explicit_question_as_of_date,
         ground_evidence,
         question_date_as_of_epoch,
         validate_selector_alignment,
@@ -1181,8 +1185,46 @@ def lcm_compute(args: Dict[str, Any], **kwargs) -> str:
     stages: dict[str, Any] = {}
     planner_started = time.perf_counter()
     as_of: float | None = None
-    if question_date is not None:
-        as_of = question_date_as_of_epoch(question_date)
+    explicit_as_of, explicit_as_of_error = explicit_question_as_of_date(question)
+    if explicit_as_of_error:
+        stages["planner"] = _compute_stage(
+            "deterministic_local",
+            planner_started,
+            provider="none",
+            model="none",
+            status="fallback",
+        )
+        return json.dumps({
+            "status": "fallback",
+            "reason": explicit_as_of_error,
+            "next_path": "evidence_only",
+            "provenance": {"stages": stages},
+        })
+    effective_question_date = question_date
+    if explicit_as_of is not None:
+        explicit_boundary = question_date_as_of_epoch(explicit_as_of)
+        supplied_boundary = (
+            question_date_as_of_epoch(question_date)
+            if question_date is not None
+            else explicit_boundary
+        )
+        if supplied_boundary != explicit_boundary:
+            stages["planner"] = _compute_stage(
+                "deterministic_local",
+                planner_started,
+                provider="none",
+                model="none",
+                status="fallback",
+            )
+            return json.dumps({
+                "status": "fallback",
+                "reason": "question_date conflicts with the explicit as-of date",
+                "next_path": "evidence_only",
+                "provenance": {"stages": stages},
+            })
+        effective_question_date = explicit_as_of
+    if effective_question_date is not None:
+        as_of = question_date_as_of_epoch(effective_question_date)
         if as_of is None:
             stages["planner"] = _compute_stage(
                 "deterministic_local",
@@ -1198,7 +1240,7 @@ def lcm_compute(args: Dict[str, Any], **kwargs) -> str:
                 "provenance": {"stages": stages},
             })
 
-    plan_decision = compile_evidence_plan(question, question_date)
+    plan_decision = compile_evidence_plan(question, effective_question_date)
     stages["planner"] = _compute_stage(
         "deterministic_local",
         planner_started,
@@ -3116,6 +3158,7 @@ def _lcm_recall_answer_ready_content(
     include_occurrence_time: bool,
 ) -> dict[tuple, dict[str, Any]]:
     """Hydrate selected refs with bounded exact reads and no new search."""
+    from .exact_refs import evidence_identity_for_row
     from .occurrence_time import resolve_occurrence_time
 
     selected = entries[:_LCM_RECALL_ANSWER_READY_EXPANDED_HIT_LIMIT]
@@ -3187,6 +3230,7 @@ def _lcm_recall_answer_ready_content(
             "role": stored.get("role"),
             "source": stored.get("source") or "",
             "exact_ref": f"lcm:{int(raw_store_id)}:{exact_start}-{exact_end}",
+            "evidence_identity": evidence_identity_for_row(stored),
             "source_provenance": {
                 "store_id": int(raw_store_id),
                 "session_id": str(stored.get("session_id") or ""),
@@ -4039,9 +4083,12 @@ def lcm_expand(args: Dict[str, Any], **kwargs) -> str:
             "has_more": sliced["has_more"],
         }
         if include_exact_ref and sliced["content_returned_chars"] > 0:
+            from .exact_refs import evidence_identity_for_row
+
             exact_start = sliced["content_offset"]
             exact_end = exact_start + sliced["content_returned_chars"]
             result["exact_ref"] = f"lcm:{store_id}:{exact_start}-{exact_end}"
+            result["evidence_identity"] = evidence_identity_for_row(stored)
         # Surface externalized-payload metadata when the row references one. Content
         # is not hydrated by default, mirroring the existing _expand_message_sources
         # default. Externalized lookup remains session-scoped (per the existing

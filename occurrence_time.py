@@ -107,6 +107,13 @@ def resolve_occurrence_time(
             )
         except ValueError:
             continue
+    relative_matches = list(_RELATIVE.finditer(content))
+    if explicit and relative_matches:
+        return _unknown(
+            observed_at,
+            session_date=session_date,
+            reason="ambiguous_mixed_temporal_expressions",
+        )
     distinct_explicit = {item[0] for item in explicit}
     if len(distinct_explicit) > 1:
         return _unknown(
@@ -134,7 +141,7 @@ def resolve_occurrence_time(
             },
         }
 
-    matches = list(_RELATIVE.finditer(content))
+    matches = relative_matches
     if len(matches) != 1:
         return _unknown(
             observed_at,

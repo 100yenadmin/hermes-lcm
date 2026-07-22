@@ -1,14 +1,17 @@
 """Exact message-span references and immutable source provenance.
 
-An exact ref identifies one character span in one persisted message row.  The
-resolver always rereads the authoritative row and, when a quote is supplied,
-requires byte-for-byte text equality.  Missing, rewritten, or deleted sources
-therefore fail closed instead of silently drifting to nearby evidence.
+An exact ref identifies one character span in one persisted message row.  Every
+compute operand must also carry the content-and-provenance identity emitted with
+the ref.  The resolver rereads the authoritative row and rejects any identity or
+optional quote drift, so missing, rewritten, or deleted sources fail closed.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import hmac
+import json
 import math
 import re
 from typing import Any, Mapping
@@ -16,6 +19,21 @@ from typing import Any, Mapping
 
 _EXACT_REF_RE = re.compile(
     r"^lcm:(?P<store_id>[1-9]\d*):(?P<start>\d+)-(?P<end>\d+)$"
+)
+_EVIDENCE_IDENTITY_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_EVIDENCE_IDENTITY_FIELDS = (
+    "store_id",
+    "session_id",
+    "source",
+    "conversation_id",
+    "role",
+    "content",
+    "tool_call_id",
+    "tool_calls",
+    "tool_name",
+    "ingested_at",
+    "observed_at",
+    "observed_at_source",
 )
 
 
@@ -43,6 +61,7 @@ class ResolvedExactRef:
     observed_at: float | None
     ingested_at: float | None
     observed_at_source: str | None
+    evidence_identity: str
 
     @property
     def source_provenance(self) -> dict[str, Any]:
@@ -70,6 +89,19 @@ def _valid_epoch(value: Any) -> float | None:
     if not math.isfinite(parsed) or parsed <= 0:
         return None
     return parsed
+
+
+def evidence_identity_for_row(row: Mapping[str, Any]) -> str:
+    """Return a stable identity for the full content and source provenance."""
+    payload = {field: row.get(field) for field in _EVIDENCE_IDENTITY_FIELDS}
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
 def parse_exact_ref(value: Any) -> ExactRef | None:
@@ -125,6 +157,12 @@ def resolve_exact_ref(
     row = messages.get(parsed.store_id)
     if row is None:
         return None, "exact source row does not exist"
+    supplied_identity = str(candidate.get("evidence_identity") or "").strip()
+    if not _EVIDENCE_IDENTITY_RE.fullmatch(supplied_identity):
+        return None, "evidence_identity is required for every exact ref"
+    current_identity = evidence_identity_for_row(row)
+    if not hmac.compare_digest(supplied_identity, current_identity):
+        return None, "evidence_identity does not match current content and provenance"
     content = str(row.get("content") or "")
     if (
         parsed.span_start < 0
@@ -166,6 +204,7 @@ def resolve_exact_ref(
                 if row.get("observed_at_source")
                 else None
             ),
+            evidence_identity=current_identity,
         ),
         None,
     )

@@ -142,7 +142,7 @@ LCM_RECALL = {
         "conversation, use lcm_load_session(session_id). Recency and current-conversation preference are soft "
         "ranking boosts, not filters; for hard time bounds use lcm_grep time_from/time_to. "
         "Set detail='answer_ready' to hydrate bounded exact evidence without "
-        "running another search."
+        "running another search, including the evidence_identity required by lcm_compute."
     ),
     "parameters": {
         "type": "object",
@@ -205,9 +205,10 @@ LCM_COMPUTE = {
     "name": "lcm_compute",
     "description": (
         "Run a dependency-free deterministic date, count, compatible-unit sum, "
-        "difference, or ordering operation over immutable exact message spans. "
-        "Every value and unit must be explicit in its cited source; unsupported, "
-        "incomplete, ambiguous, mixed-unit, or stale inputs fail closed to the "
+        "difference, or ordering operation over exact message spans bound to the "
+        "required evidence_identity. Every value and unit must be explicit in its "
+        "cited source; unsupported, incomplete, overlapping, ambiguous, mixed-unit, "
+        "or stale inputs fail closed to the "
         "ordinary evidence-only answer path. This tool never calls a model."
     ),
     "parameters": {
@@ -243,7 +244,15 @@ LCM_COMPUTE = {
                     "properties": {
                         "exact_ref": {
                             "type": "string",
-                            "description": "Immutable lcm:<store_id>:<start>-<end> source span.",
+                            "description": "lcm:<store_id>:<start>-<end> source span.",
+                        },
+                        "evidence_identity": {
+                            "type": "string",
+                            "pattern": "^sha256:[0-9a-f]{64}$",
+                            "description": (
+                                "Required immutable content-and-provenance identity emitted "
+                                "with the exact ref."
+                            ),
                         },
                         "store_id": {"type": "integer"},
                         "span_start": {"type": "integer"},
@@ -288,6 +297,7 @@ LCM_COMPUTE = {
                             "required": ["event_time_source"],
                         },
                     },
+                    "required": ["evidence_identity"],
                 },
             },
             "candidate_answer": {
@@ -395,7 +405,7 @@ LCM_LOAD_SESSION = {
             "include_exact_ref": {
                 "type": "boolean",
                 "description": (
-                    "Opt in to an exact_ref for each returned content slice. "
+                    "Opt in to an exact_ref and evidence_identity for each returned content slice. "
                     "Omitting it preserves legacy response bytes."
                 ),
                 "default": False,
@@ -492,7 +502,7 @@ LCM_EXPAND = {
             "include_exact_ref": {
                 "type": "boolean",
                 "description": (
-                    "In store_id mode, opt in to an exact_ref for the returned content slice. "
+                    "In store_id mode, opt in to an exact_ref and evidence_identity for the returned content slice. "
                     "Omitting it preserves legacy response bytes."
                 ),
                 "default": False,

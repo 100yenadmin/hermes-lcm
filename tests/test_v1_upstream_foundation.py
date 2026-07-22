@@ -12,6 +12,7 @@ import pytest
 import hermes_lcm.tools as lcm_tools
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.dag import SummaryDAG
+from hermes_lcm.exact_refs import evidence_identity_for_row
 from hermes_lcm.store import MessageStore
 
 
@@ -35,6 +36,10 @@ def recall_engine(tmp_path):
     finally:
         dag.close()
         store.close()
+
+
+def _identity(store, store_id):
+    return evidence_identity_for_row(store.get(store_id))
 
 
 def test_answer_ready_is_opt_in_and_default_bytes_are_unchanged(recall_engine):
@@ -82,6 +87,7 @@ def test_answer_ready_returns_exact_grounding_and_separate_times(recall_engine):
     hit = payload["hits"][0]
     assert hit["store_id"] == store_id
     assert hit["exact_ref"].startswith(f"lcm:{store_id}:")
+    assert hit["evidence_identity"] == _identity(recall_engine._store, store_id)
     assert hit["content"] == content
     assert hit["source_provenance"] == {
         "store_id": store_id,
@@ -115,10 +121,15 @@ def test_exact_ref_resolution_is_content_bound_and_fails_after_source_deletion(t
         store_id = store.append("session-a", {"role": "user", "content": content})
         start = content.index("12 pages")
         exact_ref = f"lcm:{store_id}:{start}-{start + len('12 pages')}"
+        evidence_identity = _identity(store, store_id)
 
         resolved, error = resolve_exact_ref(
             store,
-            {"exact_ref": exact_ref, "quote": "12 pages"},
+            {
+                "exact_ref": exact_ref,
+                "evidence_identity": evidence_identity,
+                "quote": "12 pages",
+            },
         )
         assert error is None
         assert resolved is not None
@@ -127,7 +138,11 @@ def test_exact_ref_resolution_is_content_bound_and_fails_after_source_deletion(t
 
         stale, error = resolve_exact_ref(
             store,
-            {"exact_ref": exact_ref, "quote": "13 pages"},
+            {
+                "exact_ref": exact_ref,
+                "evidence_identity": evidence_identity,
+                "quote": "13 pages",
+            },
         )
         assert stale is None
         assert error == "quote does not match the exact source span"
@@ -136,7 +151,11 @@ def test_exact_ref_resolution_is_content_bound_and_fails_after_source_deletion(t
         store._conn.commit()
         missing, error = resolve_exact_ref(
             store,
-            {"exact_ref": exact_ref, "quote": "12 pages"},
+            {
+                "exact_ref": exact_ref,
+                "evidence_identity": evidence_identity,
+                "quote": "12 pages",
+            },
         )
         assert missing is None
         assert error == "exact source row does not exist"
@@ -163,6 +182,7 @@ def test_exact_ref_recovery_is_opt_in_and_tracks_page_offsets(recall_engine):
     )["messages"][0]
     assert loaded["content"] == content[:10]
     assert loaded["exact_ref"] == f"lcm:{store_id}:0-10"
+    assert loaded["evidence_identity"] == _identity(recall_engine._store, store_id)
 
     expand_args = {"store_id": store_id, "content_offset": 6, "max_tokens": 2}
     implicit_expand = lcm_tools.lcm_expand(expand_args, engine=recall_engine)
@@ -179,6 +199,7 @@ def test_exact_ref_recovery_is_opt_in_and_tracks_page_offsets(recall_engine):
     assert expanded["exact_ref"] == (
         f"lcm:{store_id}:6-{6 + expanded['content_returned_chars']}"
     )
+    assert expanded["evidence_identity"] == _identity(recall_engine._store, store_id)
 
 
 def test_exact_ref_paths_never_restore_secrets_redacted_before_storage(tmp_path):
@@ -204,6 +225,7 @@ def test_exact_ref_paths_never_restore_secrets_redacted_before_storage(tmp_path)
         assert secret not in loaded["content"]
         assert "[LCM sensitive redaction:" in loaded["content"]
         assert loaded["exact_ref"] == f"lcm:{store_id}:0-{len(loaded['content'])}"
+        assert loaded["evidence_identity"] == _identity(store, store_id)
     finally:
         store.close()
 
@@ -224,12 +246,14 @@ def test_pure_computation_uses_exact_refs_and_fails_closed(tmp_path):
             "operands": [
                 {
                     "exact_ref": f"lcm:{first_id}:{first_start}-{first_start + 8}",
+                    "evidence_identity": _identity(store, first_id),
                     "quote": "12 pages",
                     "value": 12,
                     "unit": "pages",
                 },
                 {
                     "exact_ref": f"lcm:{second_id}:{second_start}-{second_start + 7}",
+                    "evidence_identity": _identity(store, second_id),
                     "quote": "8 pages",
                     "value": 8,
                     "unit": "pages",
@@ -302,6 +326,7 @@ def test_relative_occurrence_time_uses_persisted_observation_anchor(tmp_path):
             [
                 {
                     "exact_ref": exact_ref,
+                    "evidence_identity": _identity(store, store_id),
                     "quote": content,
                     "occurrence_time": {
                         "session_date": "2099-01-01",
@@ -319,6 +344,7 @@ def test_relative_occurrence_time_uses_persisted_observation_anchor(tmp_path):
             [
                 {
                     "exact_ref": exact_ref,
+                    "evidence_identity": _identity(store, store_id),
                     "quote": content,
                     "occurrence_time": {
                         "session_date": "2024-03-20",
@@ -340,6 +366,7 @@ def test_relative_occurrence_time_uses_persisted_observation_anchor(tmp_path):
             [
                 {
                     "exact_ref": f"lcm:{legacy_id}:0-{len(content)}",
+                    "evidence_identity": _identity(store, legacy_id),
                     "quote": content,
                     "occurrence_time": {
                         "session_date": "2024-03-20",
@@ -380,6 +407,7 @@ def test_question_as_of_is_distinct_and_excludes_later_observations(tmp_path):
                     "operands": [
                         {
                             "exact_ref": f"lcm:{store_id}:{start}-{start + 7}",
+                            "evidence_identity": _identity(store, store_id),
                             "quote": "4 pages",
                             "value": 4,
                             "unit": "pages",

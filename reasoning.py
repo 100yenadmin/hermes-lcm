@@ -256,6 +256,24 @@ def question_date_as_of_epoch(value: Any) -> float | None:
     return next_day.timestamp() - 1e-6
 
 
+def explicit_question_as_of_date(question: Any) -> tuple[str | None, str | None]:
+    """Extract a required ISO boundary from an explicit ``as of`` question."""
+    text = str(question or "")
+    marker = re.search(r"\bas\s+of\b", text, re.IGNORECASE)
+    if marker is None:
+        return None, None
+    match = re.match(
+        r"\s+(?P<date>\d{4}[-/]\d{1,2}[-/]\d{1,2})(?!\d)",
+        text[marker.end() :],
+    )
+    if match is None:
+        return None, "explicit as-of question requires a valid ISO date"
+    parsed = _parse_day(match.group("date"))
+    if parsed is None:
+        return None, "explicit as-of question requires a valid ISO date"
+    return parsed.isoformat(), None
+
+
 def _subtract_months_clamped(anchor: date, months: int) -> date:
     zero_based = anchor.year * 12 + (anchor.month - 1) - months
     year, month_zero = divmod(zero_based, 12)
@@ -739,6 +757,21 @@ def ground_evidence(
         if error:
             return GroundingDecision("fallback", reason=f"operands[{index}]: {error}")
         grounded.append(operand)  # type: ignore[arg-type]
+    for index, operand in enumerate(grounded):
+        for previous_index, previous in enumerate(grounded[:index]):
+            if operand.store_id != previous.store_id:
+                continue
+            if (
+                operand.span_start < previous.span_end
+                and previous.span_start < operand.span_end
+            ):
+                return GroundingDecision(
+                    "fallback",
+                    reason=(
+                        f"operands[{previous_index}] and operands[{index}] overlap "
+                        "within the same exact source row"
+                    ),
+                )
     return GroundingDecision("grounded", operands=tuple(grounded))
 
 
@@ -802,25 +835,66 @@ def _label(operand: GroundedEvidence) -> str | None:
     return None
 
 
+def _finite_named_question_slots(question: str) -> tuple[str, ...]:
+    """Return an explicit comma/and list following a selector preposition."""
+    match = re.search(
+        r"\b(?:for|from|of)\s+(.+?)(?:[?.!]|$)",
+        question,
+        re.IGNORECASE,
+    )
+    if match is None:
+        return ()
+    raw = match.group(1).strip()
+    if "," not in raw and re.search(r"\b(?:and|&)\b", raw, re.IGNORECASE) is None:
+        return ()
+    slots = [
+        re.sub(r"^(?:and\s+|the\s+)", "", item.strip(), flags=re.IGNORECASE)
+        for item in re.split(r"\s*,\s*|\s+(?:and|&)\s+", raw, flags=re.IGNORECASE)
+    ]
+    bounded = tuple(item for item in slots if item and len(item) <= _MAX_LABEL_CHARS)
+    return bounded if len(bounded) >= 2 else ()
+
+
+def _slot_is_covered(slot: str, labels: Sequence[str]) -> bool:
+    slot_tokens = _normalized_tokens(slot)
+    if not slot_tokens:
+        return False
+    normalized_slot = " ".join(slot_tokens)
+    for label in labels:
+        normalized_label = " ".join(_normalized_tokens(label))
+        if normalized_label and (
+            normalized_label in normalized_slot or normalized_slot in normalized_label
+        ):
+            return True
+    return False
+
+
 def validate_selector_alignment(
     question: str,
     plan: EvidencePlan,
     operands: Sequence[GroundedEvidence],
 ) -> str | None:
-    """Validate the host selector's only semantic ordering obligation."""
-    if plan.operation != "difference" or plan.difference_direction == "absolute":
-        return None
-    if len(operands) != 2 or any(not operand.label for operand in operands):
-        return "directed difference requires two explicit operand labels"
-    normalized = question.casefold()
-    labels = [str(operand.label).casefold() for operand in operands]
-    if labels[0] == labels[1]:
-        return "directed difference labels must be distinct"
-    positions = [normalized.find(label) for label in labels]
-    if any(position < 0 for position in positions):
-        return "directed difference labels must appear literally in the question"
-    if positions != sorted(positions):
-        return "directed difference operands must follow question mention order"
+    """Validate finite-set coverage and directed selector ordering."""
+    if plan.requires_complete_evidence:
+        slots = _finite_named_question_slots(question)
+        if slots:
+            labels = [str(operand.label) for operand in operands if operand.label]
+            missing = [slot for slot in slots if not _slot_is_covered(slot, labels)]
+            if missing:
+                return "named evidence is incomplete; missing: " + ", ".join(missing)
+
+    if plan.operation == "difference" and plan.difference_direction != "absolute":
+        if len(operands) != 2 or any(not operand.label for operand in operands):
+            return "directed difference requires two explicit operand labels"
+        normalized = question.casefold()
+        labels = [str(operand.label).casefold() for operand in operands]
+        if labels[0] == labels[1]:
+            return "directed difference labels must be distinct"
+        positions = [normalized.find(label) for label in labels]
+        if any(position < 0 for position in positions):
+            return "directed difference labels must appear literally in the question"
+        if positions != sorted(positions):
+            return "directed difference operands must follow question mention order"
     return None
 
 
