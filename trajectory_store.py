@@ -1584,6 +1584,41 @@ class TrajectoryStore:
                 break
         return selected
 
+    @staticmethod
+    def _select_with_floor(
+        fused_rows: Sequence[sqlite3.Row],
+        global_rows: Sequence[sqlite3.Row],
+        limit: int,
+        floor_k: int,
+    ) -> list[sqlite3.Row]:
+        """Policy A -- reserve ``floor_k`` nucleus slots for the top pure-BM25
+        states, then fill the remainder from the fused order.
+
+        The lexical floor guarantees the strongest lexical winners a slot even
+        when the semantic boost would otherwise let a few semantic-top
+        trajectories monopolise the nucleus. Both the floor and the fill honour
+        the same 5-per-trajectory diversity cap as ``_select_diverse``.
+        """
+        selected = list(TrajectoryStore._select_diverse(global_rows, floor_k))
+        selected_ids = {int(row["state_id"]) for row in selected}
+        per_trajectory: dict[str, int] = {}
+        for row in selected:
+            trajectory_id = str(row["trajectory_id"])
+            per_trajectory[trajectory_id] = per_trajectory.get(trajectory_id, 0) + 1
+        for row in fused_rows:
+            if len(selected) >= limit:
+                break
+            state_id = int(row["state_id"])
+            if state_id in selected_ids:
+                continue
+            trajectory_id = str(row["trajectory_id"])
+            if per_trajectory.get(trajectory_id, 0) >= 5:
+                continue
+            selected.append(row)
+            selected_ids.add(state_id)
+            per_trajectory[trajectory_id] = per_trajectory.get(trajectory_id, 0) + 1
+        return selected[:limit]
+
     def _fts_rows(
         self,
         expression: str,
@@ -1624,12 +1659,14 @@ class TrajectoryStore:
         image_limit: int = 8,
         include_adjacent: bool = True,
         text_char_limit: int = 2_000,
+        lexical_floor: int = 0,
     ) -> tuple[TrajectoryHit, ...]:
         if self.status != "complete":
             raise CorpusIdentityError("trajectory corpus must be finalized before query")
         candidate_limit = min(max(1, int(candidate_limit)), _MAX_CANDIDATES)
         limit = min(max(1, int(limit)), _MAX_RESULTS)
         image_limit = min(max(0, int(image_limit)), _MAX_IMAGES)
+        lexical_floor = min(max(0, int(lexical_floor)), _MAX_RESULTS)
         text_char_limit = min(
             max(256, int(text_char_limit)),
             _MAX_QUERY_TEXT_CHARS,
@@ -1734,7 +1771,16 @@ class TrajectoryStore:
 
         adjacent_reserve = min(6, limit // 3) if include_adjacent else 0
         nucleus_limit = max(1, limit - adjacent_reserve)
-        selected = self._select_diverse(rows, nucleus_limit)
+        if lexical_floor > 0:
+            # Policy A (candidate-composition repair, issue #127): guarantee the
+            # top pure-BM25 states a nucleus slot before the fused order fills
+            # the rest. ``lexical_floor == 0`` (default) is byte-identical to the
+            # historical fused-only selection below.
+            selected = self._select_with_floor(
+                rows, global_rows, nucleus_limit, lexical_floor
+            )
+        else:
+            selected = self._select_diverse(rows, nucleus_limit)
         selected_ids = {int(row["state_id"]) for row in selected}
         match_kind_by_id = {
             int(row["state_id"]): candidate_kind.get(int(row["state_id"]), "fts")
