@@ -393,6 +393,9 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("recall_query_timeout_s", "LCM_RECALL_QUERY_TIMEOUT_S", float),
     _EnvFieldSpec("embedding_backfill_timeout_s", "LCM_EMBEDDING_BACKFILL_TIMEOUT_S", float),
     _EnvFieldSpec("embedding_max_batch_items", "LCM_EMBEDDING_MAX_BATCH_ITEMS", int),
+    _EnvFieldSpec("embedding_query_spend_max_calls", "LCM_EMBEDDING_QUERY_SPEND_MAX_CALLS", int),
+    _EnvFieldSpec("embedding_query_spend_window_seconds", "LCM_EMBEDDING_QUERY_SPEND_WINDOW_SECONDS", float),
+    _EnvFieldSpec("embedding_query_spend_backoff_seconds", "LCM_EMBEDDING_QUERY_SPEND_BACKOFF_SECONDS", float),
     _EnvFieldSpec("new_session_retain_depth", "LCM_NEW_SESSION_RETAIN_DEPTH", int),
     _EnvFieldSpec("doctor_clean_apply_enabled", "LCM_DOCTOR_CLEAN_APPLY_ENABLED", bool),
     _EnvFieldSpec("empty_lifecycle_gc_enabled", "LCM_EMPTY_LIFECYCLE_GC_ENABLED", bool),
@@ -694,6 +697,18 @@ class LCMConfig:
     # Voyage caps a single embeddings request at 1000 input items; document
     # batches split at this many items in addition to the token budget.
     embedding_max_batch_items: int = 1000
+    # Sliding-window spend guard for the latency-sensitive QUERY embedding path
+    # (resolve_provider(for_backfill=False)). The historical hardcoded default
+    # was 60 calls / 60s window / 60s backoff -- a backfill-economy control that
+    # silently gutted retrieval when a tight query loop (e.g. a benchmark firing
+    # hundreds of query embeds in a minute) crossed 60 calls and every further
+    # call was rejected pre-network with ProviderRateLimited (~9k tokens for 451
+    # query embeds is negligible spend, so the low ceiling bought nothing). The
+    # default is now generous; max_calls=0 disables the guard entirely. Backfill
+    # keeps its own bulk contract (max_calls=0) and is unaffected.
+    embedding_query_spend_max_calls: int = 600
+    embedding_query_spend_window_seconds: float = 60.0
+    embedding_query_spend_backoff_seconds: float = 60.0
 
     # -- Session carry-over ---
     # Depth retained after /new (-1 = all, 0 = nothing, 2 = keep d2+)
