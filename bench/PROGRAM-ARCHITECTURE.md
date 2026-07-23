@@ -145,6 +145,38 @@ non-official, always · routing ledger line per dispatch · pre-digest >200-line
 5. **Upstream PR stalls** (slow maintainer) → wave-1 is additive-only + fork-local value is already banked;
    stall costs nothing on the critical path; keep fork releases flowing.
 
+## 6a. DECISION RECORD — benchmark portfolio & the frontier-consumer position (owner dialogue, 07-24 ~05:3x)
+
+Owner input recorded: (i) authority now explicitly extends to release publishing, upstream PR waves, and
+leaderboard submissions — all release-PM calls are the orchestrator's; (ii) the critical rule is
+CHECK-THE-ANSWERS forensics — ">90% of the time it's bugs in the harness, not what the agent built"
+(this program's own history: SpendGuard, comparator LaTeX, fixture date-bomb, hub-crowding all found by
+reading answers); (iii) owner is nervous about LongMemEval-V2 (brand new, nobody has posted, hard to build
+for) and asks whether AgentArena / MemoryArena / BEAM / AMA-Bench / PersonaMem / LongMemEval-v1 fit the
+mission (agents as employees / chief-of-staff) better; (iv) the future-is-frontier thesis: tiny local readers
+are not the agentic future (GLM-5.2-local ≈ the floor going forward; multimodal + hybrid memory beyond that),
+while acknowledging the purist counter-theory (a memory system so good no-API-call retrieval alone scores).
+
+**Decisions (standing until revised by a documented addendum):**
+1. **LongMemEval-V2 stays the PRIMARY public target.** The empty leaderboard is a first-mover asset, our
+   instrumentation there is now cheap (~$1/full run) and battle-tested, and the harness-risk the owner fears
+   is exactly what our check-the-answers discipline converts into wins (M4). The three tiers map cleanly onto
+   the three theories: static lane = the purist no-API-calls theory test · agentic lane (H6) = the
+   frontier-consumer future · H7 = the product truth. The portfolio position is a HEDGE built into one bench.
+2. **Portfolio spike (new issue):** agent-run survey of AgentArena, MemoryArena, BEAM, AMA-Bench, PersonaMem,
+   LongMemEval-v1, and neighbors; scored on mission-fit (employee/chief-of-staff duties, agentic action
+   continuity), maturity (harness quality, baselines, active leaderboard), effort-to-run, full-system
+   comparability (does it exercise store+embeddings+tools end-to-end), and visibility. Output = a decision
+   record proposing primary + up-to-2 secondary benches; orchestrator decides. X1 BEAM / X2 MemoryArena
+   (#138) fold into this spike.
+3. **LongMemEval-v1: do NOT invest in crushing it** (saturated, >95% public repos = low marginal signal).
+   Instead MINE the winners: competitor-technique survey (new issue) extracting their retrieval/curation
+   mechanics for W3b/H6-P2. Revisit only if the portfolio spike ranks a v1 number as cheap credibility.
+4. **Frontier-local reader arm (deferred, noted):** GLM-5.2-local on GEX44 as an H6-class consumer arm once
+   P1-P3 land — tests the owner's "minimum future standard" directly. Not scheduled yet.
+5. **Submission authority:** now fully delegated; the #151 trigger rule stands as the orchestrator's own
+   standing decision (submit on static ≥193 or agentic ≥69.9 — the first public number frames the project).
+
 ## 6. Pointers
 GATE AUTHORITY NOTE: every gate summary in this document is an abbreviation — the GitHub ISSUE BODY carries the
 complete, binding gate text; score against the issue verbatim.
