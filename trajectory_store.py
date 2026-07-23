@@ -39,6 +39,7 @@ _MAX_CANDIDATES = 128
 _MAX_RESULTS = 24
 _MAX_IMAGES = 8
 _MAX_QUERY_TEXT_CHARS = 8_000
+_MAX_ADJACENCY_RADIUS = 8
 _MAX_SOURCE_JSON_CHARS = 16_000_000
 _MAX_TEXT_CHARS = 2_000_000
 _MAX_SEMANTIC_DOCUMENT_CHARS = 48_000
@@ -1705,6 +1706,87 @@ class TrajectoryStore:
             tuple(params),
         ).fetchall()
 
+    def _adjacency_expansion_arm(
+        self,
+        seed_rows: Sequence[sqlite3.Row],
+        radius: int,
+    ) -> list[tuple[sqlite3.Row, int, int]]:
+        """H5(b) pool-expansion arm (issue #135): sequence neighbors of the
+        lexical seed hits, as ``(row, seed_state_id, distance)`` triples.
+
+        Every pool row IS a lexical seed (it entered via ``global_rows`` /
+        ``scoped_rows`` FTS), so the seeds are exactly ``seed_rows`` in pool
+        (fused-rank) order. For each seed, the states at ``sequence_ordinal
+        +/- 1..radius`` WITHIN THE SAME SOURCE are candidates, giving a
+        non-lexical recall path: a target state with no query-term match of
+        its own is reachable when any state of its trajectory seeds.
+
+        Deterministic arm order is DISTANCE-major, then seed pool rank, then
+        ordinal ascending (``-d`` before ``+d``): a +/-1 neighbor of any seed
+        outranks a +/-2 neighbor of a stronger seed, mirroring the
+        ``ORDER BY ABS(...)`` discipline of the delivery-stage adjacency
+        backfill. States already in the pool are excluded; expanded neighbors
+        earn NO semantic boost and no BM25 rank of their own (anti-magnet
+        control -- they are admitted by the caller only through the
+        quota-capped ``_merge_arms`` tail).
+        """
+        pool_ids = {int(row["state_id"]) for row in seed_rows}
+        positions: list[tuple[int, int]] = []
+        wanted: set[tuple[int, int]] = set()
+        occupied = {
+            (int(row["source_id"]), int(row["sequence_ordinal"]))
+            for row in seed_rows
+        }
+        for row in seed_rows:
+            source_id = int(row["source_id"])
+            ordinal = int(row["sequence_ordinal"])
+            for distance in range(1, radius + 1):
+                for neighbor in (ordinal - distance, ordinal + distance):
+                    key = (source_id, neighbor)
+                    if neighbor < 0 or key in occupied or key in wanted:
+                        continue
+                    wanted.add(key)
+                    positions.append(key)
+        row_by_position: dict[tuple[int, int], sqlite3.Row] = {}
+        chunk = 400  # 2 bound params per pair; stay far below SQLite limits
+        for start in range(0, len(positions), chunk):
+            batch = positions[start : start + chunk]
+            values = ",".join("(?,?)" for _ in batch)
+            params: list[int] = []
+            for source_id, neighbor in batch:
+                params.extend((source_id, neighbor))
+            fetched = self._conn.execute(
+                f"""
+                SELECT s.*, src.trajectory_id, src.goal, src.outcome, src.ordinal,
+                       a.relative_path, a.sha256 AS asset_sha256, 0.0 AS rank
+                FROM lcm_trajectory_states s
+                JOIN lcm_trajectory_sources src ON src.source_id = s.source_id
+                LEFT JOIN lcm_trajectory_assets a ON a.state_id = s.state_id
+                WHERE (s.source_id, s.sequence_ordinal) IN (VALUES {values})
+                """,
+                params,
+            ).fetchall()
+            for fetched_row in fetched:
+                row_by_position[
+                    (int(fetched_row["source_id"]), int(fetched_row["sequence_ordinal"]))
+                ] = fetched_row
+        arm: list[tuple[sqlite3.Row, int, int]] = []
+        emitted: set[int] = set(pool_ids)
+        for distance in range(1, radius + 1):
+            for row in seed_rows:
+                source_id = int(row["source_id"])
+                ordinal = int(row["sequence_ordinal"])
+                for neighbor in (ordinal - distance, ordinal + distance):
+                    neighbor_row = row_by_position.get((source_id, neighbor))
+                    if neighbor_row is None:
+                        continue
+                    state_id = int(neighbor_row["state_id"])
+                    if state_id in emitted:
+                        continue
+                    emitted.add(state_id)
+                    arm.append((neighbor_row, int(row["state_id"]), distance))
+        return arm
+
     def query(
         self,
         query: str,
@@ -1716,6 +1798,8 @@ class TrajectoryStore:
         text_char_limit: int = 2_000,
         lexical_floor: int = 0,
         arm_quota: tuple[int, int] | None = None,
+        adjacency_radius: int = 0,
+        adjacency_quota: int = 0,
     ) -> tuple[TrajectoryHit, ...]:
         if self.status != "complete":
             raise CorpusIdentityError("trajectory corpus must be finalized before query")
@@ -1723,6 +1807,8 @@ class TrajectoryStore:
         limit = min(max(1, int(limit)), _MAX_RESULTS)
         image_limit = min(max(0, int(image_limit)), _MAX_IMAGES)
         lexical_floor = min(max(0, int(lexical_floor)), _MAX_RESULTS)
+        adjacency_radius = min(max(0, int(adjacency_radius)), _MAX_ADJACENCY_RADIUS)
+        adjacency_quota = min(max(0, int(adjacency_quota)), _MAX_CANDIDATES)
         text_char_limit = min(
             max(256, int(text_char_limit)),
             _MAX_QUERY_TEXT_CHARS,
@@ -1824,6 +1910,46 @@ class TrajectoryStore:
                 int(row["state_id"]): float(row["rank"])
                 for row in rows
             }
+
+        # H5(b) lexical-seed adjacency pool-expansion (issue #135): pull the
+        # sequence neighbors of the lexical seed hits INTO the state pool,
+        # pre-selection, as a QUOTA-CAPPED ADDITIVE arm through the existing
+        # ``_merge_arms`` machinery. The arm is appended strictly AFTER the
+        # ranked pool (no semantic boost, no BM25 rank of its own), so the
+        # nucleus selection -- and therefore delivery -- only changes when the
+        # ranked pool alone cannot fill the nucleus; the 5-per-trajectory
+        # diversity cap at selection is untouched. ``adjacency_radius == 0``
+        # or ``adjacency_quota == 0`` (defaults) skip this path entirely and
+        # reproduce current bytes.
+        adjacency_admitted: list[dict[str, int]] = []
+        if adjacency_radius > 0 and adjacency_quota > 0 and rows:
+            arm_triples = self._adjacency_expansion_arm(rows, adjacency_radius)
+            if arm_triples:
+                arm_adjacent = [triple[0] for triple in arm_triples]
+                seed_by_state = {
+                    int(triple[0]["state_id"]): (triple[1], triple[2])
+                    for triple in arm_triples
+                }
+                expanded = self._merge_arms(
+                    rows,
+                    arm_adjacent,
+                    len(rows) + adjacency_quota,
+                    len(rows),
+                    adjacency_quota,
+                )
+                for row in expanded[len(rows):]:
+                    state_id = int(row["state_id"])
+                    seed_state_id, distance = seed_by_state[state_id]
+                    candidate_kind[state_id] = "adjacent"
+                    candidate_score[state_id] = (
+                        candidate_score[seed_state_id] + 0.000001 * distance
+                    )
+                    adjacency_admitted.append({
+                        "state_id": state_id,
+                        "seed_state_id": seed_state_id,
+                        "distance": distance,
+                    })
+                rows = expanded
 
         adjacent_reserve = min(6, limit // 3) if include_adjacent else 0
         nucleus_limit = max(1, limit - adjacent_reserve)
@@ -1938,6 +2064,14 @@ class TrajectoryStore:
             ],
             "delivered_evidence_refs": [hit.exact_ref for hit in hits],
         }
+        if adjacency_radius > 0 and adjacency_quota > 0:
+            # Present only when the H5(b) knob is active so the default
+            # telemetry payload stays byte-identical (golden 451/451).
+            self._last_query_telemetry["adjacency_expansion"] = {
+                "radius": adjacency_radius,
+                "quota": adjacency_quota,
+                "admitted": adjacency_admitted,
+            }
         return tuple(hits)
 
     def resolve_exact_ref(self, exact_ref: str) -> TrajectoryHit:
