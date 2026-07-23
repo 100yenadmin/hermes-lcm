@@ -1,0 +1,134 @@
+# HERMES-LCM BENCHMARK PROGRAM — MASTER ARCHITECTURE v1 (frozen 2026-07-24 ~06:10 +07)
+
+_Authored by the program architect (Fable) under owner grant of full authority (07-24 ~05:55: "You have full
+capability and authority. You're the architect/designer/and release product manager"). This document + the
+ROADMAP issues + OPUS-DRIVE-LOOP.md are the complete operating state: a continuation agent (Opus 4.8) must be
+able to execute from these without access to this session's context. Strategy changes require either the owner
+or a documented DECISION-RECORD addendum here — never silent drift._
+
+## 0. Mission and the number ladder
+
+Make agent memory better for all agents, proven publicly on LongMemEval-V2 (primary) and memorybench-V1
+(secondary). The public ladder (leaderboard page, verified 07-24; leaderboard still EMPTY — first-mover slot open):
+
+| Tier | Published points (small track) | Our position |
+|---|---|---|
+| Reader-only floor | 1.3% | — |
+| Static (fixed reader) | RAG 42.8 @ ~0.2s · RAG+notes 51.0 @ 0.2s · AgentRunbook-R 58.6 @ 26.9s | **ours: 27.7 (125/451)** |
+| Agentic (own agent) | Codex 69.9 @ 177.2s · AgentRunbook-C 74.9 @ 108.3s | not yet entered |
+
+Leaderboard metric = **LAFS Gain: Pareto frontier over (accuracy, query-latency)**. Strategic consequence:
+there are TWO winnable slots — a fast-compact static point AND a high-accuracy agentic point. We pursue both.
+
+Targets (in order of expected attainment): static ≥42.8 → static ≥51.0 (beats every published static system)
+→ agentic ≥69.9 (beats vanilla Codex with the SAME agent + our memory) → agentic ≥74.9. V1: 444 → ≥450.
+
+## 1. The two load-bearing measurements (why this architecture)
+
+**M1 — The official static run (125/451, integrity-gated, OFFICIAL-RESULTS.md):** the dominant loss class is
+spurious-unknown — the official Qwen3.5-9B reader answers "unknown" on 95/323 (29%) of answerable questions
+while holding full ~22k-token untruncated contexts (medians identical for answered vs unknown; zero truncation).
+**The static score is bounded by context COMPACTNESS at the consumer, not recall volume.** Enterprise is worst
+(64/95 spurious-unknowns; 20.9% vs web 33.8%).
+
+**M2 — H5(b) adjacency no-go (H5B-SWEEP-REPORT.md):** pool-entry ceiling 4/30 vs gate ≥8/30, proven structural —
+25/30 recall-miss targets sit on zero-pooled-state trajectories that same-source adjacency can never seed.
+**The recall floor is reachability: states need direct semantic addressability (embedding backfill), not
+neighborhood expansion.**
+
+M1+M2 converge: **reach the right states, then deliver them small.** That is wave-3.
+
+## 2. DECISION RECORD — the official protocol becomes the primary static instrument (NEW, 07-24)
+
+The full 451-question official run cost **≈$1.1 and ~3.5h wall** (parallelizable to <1h in 4 batches). The Sol
+internal protocol costs more and measures a frontier reader that masks the exact failure mode (bulk-context
+tolerance) the official reader punishes. Therefore, effective immediately:
+- **Static candidates iterate against the OFFICIAL protocol directly** (60q stratified slices for dev loops at
+  ~$0.15, full 451 for gates), using the frozen batch machinery in `hermes-benchprog-h4/artifacts/phase3-openrouter/`.
+- Sol protocol is demoted to a dev-loop probe and for V1 (whose harness is Sol-native). Sol numbers remain
+  non-official-labeled always.
+- The 205/451 Sol baseline remains the tagged historical reference; the official 125/451 is the number of record.
+Predeclared instrument rules carry over: snapshot-first, per-category integrity check on every full run,
+both-sides rescoring if any scorer changes.
+
+## 3. Lane architecture
+
+### Lane S — static compactness (wave-3; epic issue W3)
+Goal: official static 125 → ≥193 (42.8-parity) → ≥230 (51.0-parity). Mechanisms, in dependency order:
+- **W3a — H5(a) state-level embedding backfill** (recall floor). Backfill Voyage embeddings for pool states so
+  zero-pooled-state trajectories are directly reachable. Gate (FROZEN, same bar H5(b) faced): pool-entry ≥8/30
+  on the frozen H5 target set; then Delivered-Recall@16 must move (>0); preservation 0-loss on the 154-set;
+  golden 451/451 byte-identical at defaults-off. Spend: Voyage embedding backfill over the state corpus —
+  size it first (W3a-0 sizing step, expect low single-digit $; hard cap $10 without owner ping).
+- **W3b — compact delivery** (the spurious-unknown killer). Replace 22k bulk contexts with budgeted sharp
+  contexts (target ≤4k tokens) via the selective/evidence-contract path (the R1 subsystem exists for exactly
+  this). Development gate: 60q official slice, primary metric = spurious-unknown rate on answerable questions
+  (currently 29%) + accuracy; promotion gate: paired full-451 official vs the 125 baseline, net ≥+15,
+  category-integrity pass. NOTE: compact delivery also collapses query latency → LAFS position improves on both
+  axes.
+- **W3c — enterprise diagnosis**: read 20 enterprise spurious-unknown cases (artifacts have full contexts),
+  classify (format? entity density? question style?), feed findings into W3b templates.
+Sequencing: W3a and W3c parallel; W3b consumes both; one promotion gate at the end (one-primary law).
+
+### Lane A — agentic (H6; spec SPEC-H6-AGENTIC-LANE.md; epic issue H6)
+The controlled experiment: SAME coding agent, vanilla file memory vs hermes-lcm store. Phases P0 (protocol
+read — dispatched 07-24 ~06:05) → P1 (vanilla-Codex 60q repro; validates env/cost/latency; measures per-q cost
+for the full-run spend ask) → P2 (`hermes_lcm_agentic` memory module: insert = existing ingest; query = agent
+workspace with store-backed search CLI) → P3 (paired 60q, gate: hermes ≥ vanilla +5pts) → P4 (full 451 +
+integrity + LAFS). Model/effort/binary pinned per run manifest; published-point parity checked in P0/P1.
+
+### Lane P — product-truth compaction-replay harness (H7; NEW — owner's concept, 07-24 ~05:55)
+The owner's design intuition, architected: benchmarks above measure ingest-then-query; the PRODUCT reality is
+a live agent whose context fills and must compact without losing operational memory. H7 harness:
+1. Replay a long conversation/work stream into a live agent session (LongMemEval-V2 histories are the replay
+   corpus; their questions are the probes).
+2. At a context threshold (parameter; owner suggested ~230k tokens), trigger hermes-lcm compaction (ingest the
+   evicted span into the store; keep the compact residue in-context).
+3. After each compaction cycle, run the probe subset answerable from evicted material; compare three arms:
+   (a) naive truncation, (b) summary-only compaction, (c) hermes-lcm compaction+store (agent may query the store).
+4. Metrics: retention curve vs compaction count; probe accuracy per arm; residue token cost.
+This measures "compactions provide memory relief AND keep data findable" — the product claim, directly. H7 is
+sequenced AFTER H6-P3 (it reuses H6's agent-with-store machinery; building it first would duplicate work).
+Design doc to be expanded in the H7 epic issue before any build.
+
+### Lane V — memorybench V1 (cycle-2; spec SPEC-W2A-CYCLE2.md; epic issue W2A-C2)
+Fixes 5 diagnosed classes; gate chain predeclared in the spec (paired ≥+8 AND ≥+3 vs cycle-1; redesigned
+achievability-verified blind, losses ≤2 & net ≥0; ONE full ≥450, MISS 445-449 ⇒ bank+close). Priority: below
+lanes S and A (V1 is secondary; 444 is already banked and respectable).
+
+### Lane C — community/release (release-PM authority granted)
+- R1 release (program-r1): PUBLISH (fork-local; owner asked for tagging/release push on 07-23).
+- Wave-1 upstream PR: POST from `upstream-wave-1@0cb7f37` with the completed body (official number filled,
+  CI story resolved). Shepherd per PR-shepherding standard; expect slow maintainer, Tosko4 reviews well.
+- Leaderboard submission: **HOLD** (release-PM decision, standing): 27.7 as the first public number frames the
+  project badly; submit when Lane S crosses ≥42.8 (RAG-parity) or Lane A produces a ≥69.9 entry. Revisit rule:
+  any lane crossing its threshold triggers the submission packet (validator + integrity gate + GEX divergence
+  rule; GEX cross-check continues meanwhile).
+- #423 / #434 / harness PR #2: continue shepherding (respond-to-review autonomy per established pattern).
+
+## 4. Standing discipline (unchanged, binding on all agents)
+Snapshot-first before ANY subsequent run · manifests frozen+sha256 BEFORE launch, with achievability verified
+at freeze (blind-R2 lesson: compute the control slice at freeze time) · predeclared gates, never relaxed
+at one-short, revisions only as documented addenda BEFORE numbers · one-primary law per candidate · no re-ingest
+of clonable state · file-keyed foreground polling, never process-exit or phantom background watches · durable
+scheduling for anything outliving a session, and execute-inline when a cron misses · assert outward-action
+success (ls-remote / re-read after push) · artifacts to LEXAR session-notes, never /tmp · Sol numbers labeled
+non-official, always · routing ledger line per dispatch · pre-digest >200-line outputs.
+
+## 5. Risk register (top 5, with mitigations)
+1. **W3b compact contexts lose recall** (sharp but wrong) → dev gate tracks accuracy AND spurious-unknown
+   jointly; paired full-451 promotion gate catches net harm.
+2. **H6 P1 baseline repro misses published 69.9 badly** → P0 pins model/effort; if repro diverges >8pts,
+   STOP the lane and file a protocol-parity issue rather than tuning toward a number (instrument-first rule).
+3. **Agentic full-run cost blows up** → P1 measures per-question cost; P4 is explicitly owner-gated on that number.
+4. **Continuation-agent drift** (Opus re-litigating settled decisions) → this doc's decision records are binding;
+   OPUS-DRIVE-LOOP.md defines what Opus may decide alone vs park.
+5. **Upstream PR stalls** (slow maintainer) → wave-1 is additive-only + fork-local value is already banked;
+   stall costs nothing on the critical path; keep fork releases flowing.
+
+## 6. Pointers
+Specs: SPEC-H6-AGENTIC-LANE.md · SPEC-W2A-CYCLE2.md · SPEC-H5b (superseded, archived) · H7 epic (to be filed).
+Evidence: hermes-benchprog-h4/artifacts/OFFICIAL-RESULTS.md (+OFFICIAL-FULL-RAW) · H5B-SWEEP-REPORT.md ·
+W2A-* artifacts · check-in #2 (#107 comment). Ops: bench/RUNBOOK.md (fork) · ~/.claude/runbooks/
+hermes-benchmark-ops.md · OPUS-DRIVE-LOOP.md (continuation operating system). Tracker: #107 map + the
+wave-3/H6/H7 milestones+issues posted 07-24.
