@@ -47,6 +47,11 @@ issues #152 → #107 → the milestone issues), (4) open issues in the wave-3/H6
 
 ## What you may decide alone vs must park
 
+**Owner reinforcements (07-24, going to sleep):** (i) TAG the repo at every major milestone — score-bearing
+results, doc/spec drafts, mechanism landings — so work survives token exhaustion (`bench-*` / `program-*`
+tag patterns); (ii) Codex tokens are plentiful — lean CODEX for implementation volume (codex-dispatch skill;
+this loop's routing table already defaults there for well-spec'd work); (iii) full autonomous continuation.
+
 **Alone:** dispatch routing; retry/rerun of INFRA failures (hung CI runner, transport errors); executing
 predeclared MISS branches; fork-local merges after your own review of green CI; shepherding replies on
 upstream PRs (repro-first, own real bugs plainly — see #423 history); fork releases for milestones the owner

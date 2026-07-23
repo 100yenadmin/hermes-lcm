@@ -165,12 +165,13 @@ while acknowledging the purist counter-theory (a memory system so good no-API-ca
    is exactly what our check-the-answers discipline converts into wins (M4). The three tiers map cleanly onto
    the three theories: static lane = the purist no-API-calls theory test · agentic lane (H6) = the
    frontier-consumer future · H7 = the product truth. The portfolio position is a HEDGE built into one bench.
-2. **Portfolio spike (new issue):** agent-run survey of AgentArena, MemoryArena, BEAM, AMA-Bench, PersonaMem,
-   LongMemEval-v1, and neighbors; scored on mission-fit (employee/chief-of-staff duties, agentic action
-   continuity), maturity (harness quality, baselines, active leaderboard), effort-to-run, full-system
-   comparability (does it exercise store+embeddings+tools end-to-end), and visibility. Output = a decision
-   record proposing primary + up-to-2 secondary benches; orchestrator decides. X1 BEAM / X2 MemoryArena
-   (#138) fold into this spike.
+2. **Portfolio — RESOLVED 07-24 (#153 decision comment = the record):** 15-candidate survey completed.
+   PRIMARY: LongMemEval-V2 (only bench whose haystack categorically exceeds frontier windows — immune to
+   context-stuffing false positives). SECONDARY 1: STATE-Bench (microsoft/STATE-Bench, stateful DB-mutating
+   agent loop, "bring your own memory") — readiness spike gated on H6-P3. SECONDARY 2: PersonaMem-v2
+   (implicit-preference inference, 37-48% frontier headroom) — adapter gated on W3b promotion attempt 1.
+   BEAM parked (scale-regime peer; revisit when a slot opens). Excluded: LongBench V2, CL-Bench, LoCoMo
+   (mission grounds). AgentLongBench unconfirmed (no primary source). #138 closed into this.
 3. **LongMemEval-v1: do NOT invest in crushing it** (saturated, >95% public repos = low marginal signal).
    Instead MINE the winners: competitor-technique survey (new issue) extracting their retrieval/curation
    mechanics for W3b/H6-P2. Revisit only if the portfolio spike ranks a v1 number as cheap credibility.
