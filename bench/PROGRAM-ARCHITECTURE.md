@@ -50,7 +50,9 @@ The full 451-question official run cost **≈$1.1 and ~3.5h wall** (parallelizab
 internal protocol costs more and measures a frontier reader that masks the exact failure mode (bulk-context
 tolerance) the official reader punishes. Therefore, effective immediately:
 - **Static candidates iterate against the OFFICIAL protocol directly** (60q stratified slices for dev loops at
-  ~$0.15, full 451 for gates), using the frozen batch machinery in `hermes-benchprog-h4/artifacts/phase3-openrouter/`.
+  ~$0.15, full 451 for gates), using the frozen batch machinery at
+  `/Volumes/LEXAR/Codex/session-notes/2026-07-23/hermes-benchprog-h4/artifacts/phase3-openrouter/` (harness
+  worktree: `/Volumes/LEXAR/hermes-work/wt-bench-h1-v2adapter`).
 - Sol protocol is demoted to a dev-loop probe and for V1 (whose harness is Sol-native). Sol numbers remain
   non-official-labeled always.
 - The 205/451 Sol baseline remains the tagged historical reference; the official 125/451 is the number of record.
@@ -62,10 +64,11 @@ both-sides rescoring if any scorer changes.
 ### Lane S — static compactness (wave-3; epic issue W3)
 Goal: official static 125 → ≥193 (42.8-parity) → ≥230 (51.0-parity). Mechanisms, in dependency order:
 - **W3a — H5(a) state-level embedding backfill** (recall floor). Backfill Voyage embeddings for pool states so
-  zero-pooled-state trajectories are directly reachable. Gate (FROZEN, same bar H5(b) faced): pool-entry ≥8/30
-  on the frozen H5 target set; then Delivered-Recall@16 must move (>0); preservation 0-loss on the 154-set;
-  golden 451/451 byte-identical at defaults-off. Spend: Voyage embedding backfill over the state corpus —
-  size it first (W3a-0 sizing step, expect low single-digit $; hard cap $10 without owner ping).
+  zero-pooled-state trajectories are directly reachable. Gate summary (the ISSUE #142 body is the sole complete
+  source of truth): pool-entry ≥8/30 on the frozen H5 target set
+  (`/Volumes/LEXAR/Codex/session-notes/2026-07-23/hermes-benchprog-h1/artifacts/h5-targets.json`); plus the
+  delivered-recall, preservation/golden, and latency conditions per #142. Spend: size first (W3a-0, expect low
+  single-digit $; hard cap $10 without owner ping; re-meter at 50% of the backfill before continuing).
 - **W3b — compact delivery** (the spurious-unknown killer). Replace 22k bulk contexts with budgeted sharp
   contexts (target ≤4k tokens) via the selective/evidence-contract path (the R1 subsystem exists for exactly
   this). Development gate: 60q official slice, primary metric = spurious-unknown rate on answerable questions
@@ -133,7 +136,9 @@ non-official, always · routing ledger line per dispatch · pre-digest >200-line
    stall costs nothing on the critical path; keep fork releases flowing.
 
 ## 6. Pointers
-Specs: SPEC-H6-AGENTIC-LANE.md · SPEC-W2A-CYCLE2.md · SPEC-H5b (superseded, archived) · H7 epic (to be filed).
+GATE AUTHORITY NOTE: every gate summary in this document is an abbreviation — the GitHub ISSUE BODY carries the
+complete, binding gate text; score against the issue verbatim.
+Specs: SPEC-H6-AGENTIC-LANE.md · SPEC-W2A-CYCLE2.md · SPEC-H5b (superseded, archived) · H7 epic (#149).
 Evidence: hermes-benchprog-h4/artifacts/OFFICIAL-RESULTS.md (+OFFICIAL-FULL-RAW) · H5B-SWEEP-REPORT.md ·
 W2A-* artifacts · check-in #2 (#107 comment). Ops: bench/RUNBOOK.md (fork) · ~/.claude/runbooks/
 hermes-benchmark-ops.md · OPUS-DRIVE-LOOP.md (continuation operating system). Tracker: #107 map + the
