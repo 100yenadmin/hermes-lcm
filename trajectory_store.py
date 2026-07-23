@@ -1619,6 +1619,49 @@ class TrajectoryStore:
             per_trajectory[trajectory_id] = per_trajectory.get(trajectory_id, 0) + 1
         return selected[:limit]
 
+    @staticmethod
+    def _merge_arms(
+        arm_lex: Sequence[sqlite3.Row],
+        arm_sem: Sequence[sqlite3.Row],
+        limit: int,
+        q_lex: int,
+        q_sem: int,
+    ) -> list[sqlite3.Row]:
+        """Policy D -- round-robin a pure-lexical arm and the semantic/fused arm
+        into the nucleus by a ``q_lex:q_sem`` quota.
+
+        Strictly generalises Policy A: the lexical arm is guaranteed its quota
+        (serving the SOURCE_MISS bucket) while the semantic arm keeps its own
+        quota (preserving the semantic gains). Deduped by ``state_id``; a short
+        arm is backfilled by the other (a skipped duplicate does not consume a
+        quota slot). Arm order is the deterministic tie-break.
+        """
+        selected: list[sqlite3.Row] = []
+        seen: set[int] = set()
+
+        def _pull(arm: Sequence[sqlite3.Row], start: int, quota: int) -> int:
+            added = 0
+            index = start
+            while index < len(arm) and added < quota and len(selected) < limit:
+                row = arm[index]
+                index += 1
+                state_id = int(row["state_id"])
+                if state_id in seen:
+                    continue
+                selected.append(row)
+                seen.add(state_id)
+                added += 1
+            return index
+
+        lex_i = sem_i = 0
+        while len(selected) < limit and (lex_i < len(arm_lex) or sem_i < len(arm_sem)):
+            next_lex = _pull(arm_lex, lex_i, q_lex)
+            next_sem = _pull(arm_sem, sem_i, q_sem)
+            if next_lex == lex_i and next_sem == sem_i:
+                break
+            lex_i, sem_i = next_lex, next_sem
+        return selected[:limit]
+
     def _fts_rows(
         self,
         expression: str,
@@ -1660,6 +1703,7 @@ class TrajectoryStore:
         include_adjacent: bool = True,
         text_char_limit: int = 2_000,
         lexical_floor: int = 0,
+        arm_quota: tuple[int, int] | None = None,
     ) -> tuple[TrajectoryHit, ...]:
         if self.status != "complete":
             raise CorpusIdentityError("trajectory corpus must be finalized before query")
@@ -1771,7 +1815,19 @@ class TrajectoryStore:
 
         adjacent_reserve = min(6, limit // 3) if include_adjacent else 0
         nucleus_limit = max(1, limit - adjacent_reserve)
-        if lexical_floor > 0:
+        if arm_quota is not None:
+            # Policy D (candidate-composition repair, issue #127): round-robin a
+            # pure-lexical arm and the semantic/fused arm into the nucleus by the
+            # requested quota. Superset of Policy A; ``arm_quota is None``
+            # (default) is byte-identical to the historical selection below.
+            q_lex = max(0, int(arm_quota[0]))
+            q_sem = max(0, int(arm_quota[1]))
+            arm_lex = self._select_diverse(global_rows, nucleus_limit)
+            arm_sem = self._select_diverse(rows, nucleus_limit)
+            selected = self._merge_arms(
+                arm_lex, arm_sem, nucleus_limit, q_lex, q_sem
+            )
+        elif lexical_floor > 0:
             # Policy A (candidate-composition repair, issue #127): guarantee the
             # top pure-BM25 states a nucleus slot before the fused order fills
             # the rest. ``lexical_floor == 0`` (default) is byte-identical to the
