@@ -8,6 +8,7 @@ degrade matrix (embeddings-off) still returns the FTS arm.
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
 import time
 from types import SimpleNamespace
@@ -31,6 +32,7 @@ class MockProvider:
     def __init__(self, vector=(1.0, 0.0)):
         self.vector = list(vector)
         self.queries: list[str] = []
+        self.last_usage_tokens = 7
 
     def embed_query(self, text: str) -> list[float]:
         self.queries.append(text)
@@ -121,6 +123,28 @@ def _recall(engine, monkeypatch, provider=None, **args):
     monkeypatch.setattr(lcm_tools, "resolve_provider", lambda _config: provider or MockProvider())
     payload = json.loads(lcm_tools.lcm_recall({"query": "kanban dashboard sprint", **args}, engine=engine))
     return payload
+
+
+def _summary_hit(engine, node_id):
+    node = engine._dag.get_node(node_id)
+    assert node is not None
+    return {
+        "kind": "summary",
+        "node_id": node.node_id,
+        "session_id": node.session_id,
+        "timestamp": node.latest_at or node.created_at or 0,
+        "snippet": node.summary[:300],
+        "from_current_session": node.session_id == engine.current_session_id,
+        "expand_hint": f"lcm_load_session(session_id='{node.session_id}')",
+    }
+
+
+def _patch_summary_arm(monkeypatch, hits):
+    monkeypatch.setattr(
+        lcm_tools,
+        "_lcm_recall_summary_arm",
+        lambda *_args, **_kwargs: (list(hits), "full", len(hits), len(hits)),
+    )
 
 
 def test_voyage_chunk_recall_uses_context_model(recall_engine, monkeypatch):
@@ -379,6 +403,477 @@ def test_limit_is_capped_and_reported(recall_engine, monkeypatch):
 def test_missing_query_is_rejected(recall_engine):
     payload = json.loads(lcm_tools.lcm_recall({"query": "   "}, engine=recall_engine))
     assert "error" in payload
+
+
+def test_answer_ready_is_opt_in_and_default_response_is_byte_compatible(
+    recall_engine, monkeypatch
+):
+    summary = "kanban dashboard sprint " + "compact-default " * 240
+    node = _add_summary(
+        recall_engine,
+        summary,
+        session_id="session-a",
+        created_at=10.0,
+    )
+    _seed_summary_vectors(recall_engine, [(node, [1.0, 0.0])])
+    monkeypatch.setattr(lcm_tools, "resolve_provider", lambda _config: MockProvider())
+    monkeypatch.setattr(lcm_tools.time, "time", lambda: 10.0)
+
+    base_args = {
+        "query": "kanban dashboard sprint",
+        "include": "summaries",
+        "limit": 1,
+    }
+    implicit_raw = lcm_tools.lcm_recall(base_args, engine=recall_engine)
+    explicit_raw = lcm_tools.lcm_recall(
+        {**base_args, "detail": "snippets"},
+        engine=recall_engine,
+    )
+    payload = json.loads(implicit_raw)
+
+    assert implicit_raw == explicit_raw
+    assert "detail" not in payload
+    assert len(payload["hits"][0]["snippet"]) == 300
+    assert "content" not in payload["hits"][0]
+    assert "answer_ready" not in payload["provenance"]
+
+
+def test_answer_ready_delta_is_opt_in_and_returns_only_novel_exact_refs(
+    recall_engine, monkeypatch
+):
+    first = recall_engine._store.append(
+        "session-a", {"role": "user", "content": "kanban dashboard sprint alpha"}
+    )
+    second = recall_engine._store.append(
+        "session-b", {"role": "user", "content": "kanban dashboard sprint beta"}
+    )
+    monkeypatch.setattr(lcm_tools, "resolve_provider", lambda _config: MockProvider())
+    monkeypatch.setattr(lcm_tools, "_lcm_recall_summary_arm", lambda *_a, **_k: ([], "none", 0, 0))
+    monkeypatch.setattr(lcm_tools, "_lcm_recall_chunk_arm", lambda *_a, **_k: ([], "none", 0, 0))
+
+    primary = _recall(
+        recall_engine,
+        monkeypatch,
+        include="verbatim",
+        detail="answer_ready",
+        limit=2,
+        seen_refs=[],
+    )
+    refs = [hit["exact_ref"] for hit in primary["hits"]]
+    assert {hit["store_id"] for hit in primary["hits"]} == {first, second}
+    assert len(refs) == len(set(refs)) == 2
+
+    delta = _recall(
+        recall_engine,
+        monkeypatch,
+        include="verbatim",
+        detail="answer_ready",
+        limit=2,
+        seen_refs=[refs[0]],
+    )
+    assert [hit["exact_ref"] for hit in delta["hits"]] == [refs[1]]
+    assert delta["delta"]["novel_refs"] == [refs[1]]
+    assert delta["delta"]["progress"] is True
+
+    exhausted = _recall(
+        recall_engine,
+        monkeypatch,
+        include="verbatim",
+        detail="answer_ready",
+        limit=2,
+        seen_refs=refs,
+    )
+    assert exhausted["hits"] == []
+    assert exhausted["delta"]["termination_reason"] == "no_novel_exact_ref"
+
+
+def test_answer_ready_baseline_bytes_ignore_disabled_occurrence_extension(
+    recall_engine, monkeypatch
+):
+    recall_engine._store.append(
+        "session-a", {"role": "user", "content": "kanban dashboard sprint alpha"}
+    )
+    monkeypatch.setattr(lcm_tools, "resolve_provider", lambda _config: MockProvider())
+    monkeypatch.setattr(lcm_tools.time, "time", lambda: 10.0)
+    args = {
+        "query": "kanban dashboard sprint",
+        "include": "verbatim",
+        "detail": "answer_ready",
+        "limit": 1,
+    }
+    baseline = lcm_tools.lcm_recall(args, engine=recall_engine)
+    explicitly_disabled = lcm_tools.lcm_recall(
+        {**args, "include_occurrence_time": False}, engine=recall_engine
+    )
+    assert baseline == explicitly_disabled
+    assert "occurrence_time" not in baseline
+    assert "exact-ref-delta-v1" not in baseline
+
+
+def test_occurrence_time_is_opt_in_and_uses_source_session_date(
+    recall_engine, monkeypatch
+):
+    recall_engine._store.append(
+        "session-a",
+        {
+            "role": "user",
+            "content": "I finished the kanban dashboard sprint 5 days ago.",
+        },
+    )
+    recall_engine._session_occurrence_dates = {"session-a": "2023-03-20"}
+    payload = _recall(
+        recall_engine,
+        monkeypatch,
+        include="verbatim",
+        detail="answer_ready",
+        limit=1,
+        seen_refs=[],
+        include_occurrence_time=True,
+    )
+    occurrence = payload["hits"][0]["occurrence_time"]
+    assert occurrence["event_date"] == "2023-03-15"
+    assert occurrence["event_time_source"] == "relative_to_session"
+    assert occurrence["observed_at"] != occurrence["event_at"]
+
+
+def test_occurrence_time_uses_host_observation_without_benchmark_sidecar(
+    recall_engine, monkeypatch
+):
+    observed_at = datetime(2024, 3, 20, tzinfo=timezone.utc).timestamp()
+    recall_engine._store.append(
+        "session-a",
+        {
+            "role": "user",
+            "content": "I finished the kanban dashboard sprint 5 days ago.",
+            "timestamp": observed_at,
+        },
+    )
+    payload = _recall(
+        recall_engine,
+        monkeypatch,
+        include="verbatim",
+        detail="answer_ready",
+        limit=1,
+        seen_refs=[],
+        include_occurrence_time=True,
+    )
+    hit = payload["hits"][0]
+    assert hit["occurrence_time"]["event_date"] == "2024-03-15"
+    assert hit["observation_time"]["observed_at"] == observed_at
+    assert hit["observation_time"]["source"] == "host_message_timestamp"
+
+
+def test_occurrence_time_legacy_row_uses_ingest_fallback_without_relative_event(
+    recall_engine, monkeypatch
+):
+    recall_engine._store.append(
+        "session-a",
+        {
+            "role": "user",
+            "content": "I finished the kanban dashboard sprint 5 days ago.",
+        },
+    )
+    payload = _recall(
+        recall_engine,
+        monkeypatch,
+        include="verbatim",
+        detail="answer_ready",
+        limit=1,
+        seen_refs=[],
+        include_occurrence_time=True,
+    )
+    hit = payload["hits"][0]
+    assert hit["occurrence_time"]["event_time_source"] == "unknown"
+    assert hit["occurrence_time"]["event_date"] is None
+    assert hit["observation_time"]["observed_at"] is None
+    assert hit["observation_time"]["source"] == "ingest_fallback"
+
+
+def test_invalid_recall_detail_is_rejected(recall_engine):
+    payload = json.loads(
+        lcm_tools.lcm_recall(
+            {"query": "kanban", "detail": "full-transcript"},
+            engine=recall_engine,
+        )
+    )
+    assert payload["error"] == "detail must be one of: snippets, answer_ready"
+
+
+def test_recall_schema_exposes_answer_ready_as_opt_in():
+    from hermes_lcm.schemas import LCM_RECALL
+
+    detail = LCM_RECALL["parameters"]["properties"]["detail"]
+    assert detail["enum"] == ["snippets", "answer_ready"]
+    assert detail["default"] == "snippets"
+
+
+def test_recall_reports_query_embedding_provider_and_usage(recall_engine, monkeypatch):
+    provider = MockProvider()
+    payload = _recall(
+        recall_engine,
+        monkeypatch,
+        provider=provider,
+        include="summaries",
+    )
+
+    assert payload["metrics"] == {
+        "embedding_query_calls": 1,
+        "embedding_query_tokens": 7,
+        "embedding_query_tokens_complete": True,
+        "embedding_queries": [
+            {"provider": "mock", "model": "mock-model", "usage_tokens": 7}
+        ],
+    }
+
+
+def test_answer_ready_applies_stable_post_rank_session_diversity(
+    recall_engine, monkeypatch
+):
+    node_ids = []
+    for index in range(7):
+        node_ids.append(
+            _add_summary(
+                recall_engine,
+                f"kanban same-session evidence {index}",
+                session_id="session-a",
+                created_at=10.0,
+            )
+        )
+    for index in range(3):
+        node_ids.append(
+            _add_summary(
+                recall_engine,
+                f"kanban diverse-session evidence {index}",
+                session_id=f"session-{index + 1}",
+                created_at=10.0,
+            )
+        )
+    _patch_summary_arm(
+        monkeypatch,
+        [_summary_hit(recall_engine, node_id) for node_id in node_ids],
+    )
+
+    payload = _recall(
+        recall_engine,
+        monkeypatch,
+        include="summaries",
+        detail="answer_ready",
+        scope_bias=0.0,
+        limit=8,
+    )
+
+    assert [hit["node_id"] for hit in payload["hits"]] == node_ids[:5] + node_ids[7:10]
+    assert [hit["session_id"] for hit in payload["hits"]].count("session-a") == 5
+    policy = payload["provenance"]["answer_ready"]
+    assert policy["per_session_limit"] == 5
+    assert policy["diversity_dropped_count"] == 2
+
+
+def test_answer_ready_keeps_missing_session_refs_independently_eligible():
+    entries = [
+        {
+            "hit": {"kind": "message_excerpt", "store_id": index, "session_id": None}
+        }
+        for index in range(7)
+    ]
+
+    selected, dropped = lcm_tools._lcm_recall_diverse_entries(
+        entries,
+        limit=7,
+        per_session_limit=5,
+    )
+
+    assert [entry["hit"]["store_id"] for entry in selected] == list(range(7))
+    assert dropped == 0
+
+
+def test_answer_ready_centers_message_content_on_exact_chunk_span(
+    recall_engine, monkeypatch
+):
+    match = "kanban dashboard sprint"
+    content = "a" * 2_500 + match + "z" * 2_500
+    store_id = recall_engine._store.append(
+        "session-a",
+        {"role": "user", "content": content},
+        source="chat",
+    )
+    match_start = content.index(match)
+    match_end = match_start + len(match)
+    _seed_chunk_vectors(
+        recall_engine,
+        [(store_id, 0, match_start, match_end, [1.0, 0.0])],
+    )
+
+    payload = _recall(
+        recall_engine,
+        monkeypatch,
+        include="verbatim",
+        detail="answer_ready",
+        scope_bias=0.0,
+        limit=1,
+    )
+
+    hit = payload["hits"][0]
+    expected_offset = (match_start + match_end) // 2 - 1_200
+    assert hit["store_id"] == store_id
+    assert hit["content_offset"] == expected_offset
+    assert len(hit["content"]) == 2_400
+    assert match in hit["content"]
+    assert hit["content_chars"] == len(content)
+    assert hit["content_truncated"] is True
+    assert hit["content_source"] == "message"
+    assert hit["role"] == "user"
+    assert hit["source"] == "chat"
+    assert hit["evidence_span"] == {
+        "char_start": match_start,
+        "char_end": match_end,
+    }
+
+
+def test_answer_ready_expands_summary_ref_with_2400_char_bound(
+    recall_engine, monkeypatch
+):
+    summary = "kanban dashboard sprint " + "summary-evidence " * 240
+    node = _add_summary(
+        recall_engine,
+        summary,
+        session_id="session-a",
+        created_at=10.0,
+    )
+    _seed_summary_vectors(recall_engine, [(node, [1.0, 0.0])])
+
+    payload = _recall(
+        recall_engine,
+        monkeypatch,
+        include="summaries",
+        detail="answer_ready",
+        limit=1,
+    )
+
+    hit = payload["hits"][0]
+    assert hit["node_id"] == node
+    assert hit["snippet"] == summary[:300]
+    assert hit["content"] == summary[:2_400]
+    assert hit["content_returned_chars"] == 2_400
+    assert hit["content_truncated"] is True
+    assert hit["content_source"] == "summary"
+    assert hit["source"] == "summary"
+
+
+def test_answer_ready_expands_only_first_eight_and_reports_policy(
+    recall_engine, monkeypatch
+):
+    node_ids = [
+        _add_summary(
+            recall_engine,
+            "kanban dashboard sprint " + (f"evidence-{index} " * 300),
+            session_id=f"session-{index}",
+            created_at=10.0,
+        )
+        for index in range(9)
+    ]
+    _patch_summary_arm(
+        monkeypatch,
+        [_summary_hit(recall_engine, node_id) for node_id in node_ids],
+    )
+    monkeypatch.setattr(lcm_tools, "resolve_provider", lambda _config: MockProvider())
+
+    raw = lcm_tools.lcm_recall(
+        {
+            "query": "kanban dashboard sprint",
+            "include": "summaries",
+            "detail": "answer_ready",
+            "scope_bias": 0.0,
+            "limit": 9,
+        },
+        engine=recall_engine,
+    )
+    payload = json.loads(raw)
+
+    assert len(raw) <= 64_000
+    assert len(payload["hits"]) == 9
+    assert all(len(hit["content"]) <= 2_400 for hit in payload["hits"][:8])
+    assert "content" not in payload["hits"][8]
+    policy = payload["provenance"]["answer_ready"]
+    assert policy["expanded_hit_count"] == 8
+    assert policy["expanded_hit_limit"] == 8
+    assert policy["per_hit_char_cap"] == 2_400
+    assert policy["snippet_char_cap"] == 300
+    assert policy["response_char_cap"] == 64_000
+    assert policy["response_truncated"] is False
+    assert "whole hits only" in policy["response_policy"]
+    assert "no additional retrieval search" in policy["hydration_policy"]
+
+
+def test_answer_ready_enforces_complete_response_cap_and_marks_query_truncation(
+    recall_engine, monkeypatch
+):
+    node = _add_summary(
+        recall_engine,
+        "bounded summary evidence",
+        session_id="session-a",
+        created_at=10.0,
+    )
+    _patch_summary_arm(monkeypatch, [_summary_hit(recall_engine, node)])
+    monkeypatch.setattr(lcm_tools, "resolve_provider", lambda _config: MockProvider())
+
+    raw = lcm_tools.lcm_recall(
+        {
+            "query": "q" * 70_000,
+            "include": "summaries",
+            "detail": "answer_ready",
+            "limit": 1,
+        },
+        engine=recall_engine,
+    )
+    payload = json.loads(raw)
+
+    assert len(raw) <= 64_000
+    assert len(payload["query"]) == 4_096
+    assert len(payload["hits"]) == 1
+    assert payload["provenance"]["answer_ready"]["query_truncated"] is True
+
+
+def test_answer_ready_hydration_uses_exact_reads_without_an_extra_search(
+    recall_engine, monkeypatch
+):
+    match = "kanban dashboard sprint"
+    content = "prefix " * 400 + match + " suffix" * 400
+    store_id = recall_engine._store.append(
+        "session-a",
+        {"role": "user", "content": content},
+    )
+    start = content.index(match)
+    _seed_chunk_vectors(
+        recall_engine,
+        [(store_id, 0, start, start + len(match), [1.0, 0.0])],
+    )
+    calls = {"search": 0, "get_batch": 0}
+    real_search = MessageStore.search
+    real_get_batch = MessageStore.get_batch
+
+    def counted_search(self, *args, **kwargs):
+        calls["search"] += 1
+        return real_search(self, *args, **kwargs)
+
+    def counted_get_batch(self, *args, **kwargs):
+        calls["get_batch"] += 1
+        return real_get_batch(self, *args, **kwargs)
+
+    monkeypatch.setattr(MessageStore, "search", counted_search)
+    monkeypatch.setattr(MessageStore, "get_batch", counted_get_batch)
+
+    payload = _recall(
+        recall_engine,
+        monkeypatch,
+        include="verbatim",
+        detail="answer_ready",
+        scope_bias=0.0,
+        limit=1,
+    )
+
+    assert payload["hits"][0]["store_id"] == store_id
+    assert calls == {"search": 1, "get_batch": 1}
 
 
 def test_recall_scans_full_corpus_not_grep_recency_window(recall_engine, monkeypatch):
