@@ -8,6 +8,7 @@ remain traceable to protected canonical source JSON.
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import asdict, dataclass
 import hashlib
 import json
@@ -388,7 +389,16 @@ class TrajectoryStore:
         }
         # Typed per-run instrument state (additive; the existing
         # ``_semantic_usage`` counters above are unchanged for back-compat).
-        self._semantic_attempts: list[TrajectorySemanticAttempt] = []
+        # The attempt log is BOUNDED (recent-window ring) so a long run cannot
+        # grow it without bound; the funnel counters are tracked SEPARATELY and
+        # stay cumulative regardless of the ring's cap.
+        self._semantic_attempts: deque[TrajectorySemanticAttempt] = deque(maxlen=1024)
+        self._semantic_attempt_totals: dict[str, Any] = {
+            "attempts": 0,
+            "successes": 0,
+            "fallbacks": 0,
+            "fallbacks_by_reason": {},
+        }
         self._last_semantic_attempt: TrajectorySemanticAttempt | None = None
         self._last_query_telemetry: dict[str, Any] | None = None
         self._lock = threading.RLock()
@@ -1267,6 +1277,21 @@ class TrajectoryStore:
         return dict(self._semantic_usage)
 
     @staticmethod
+    def _safe_getattr(obj: Any, name: str) -> Any:
+        """getattr that swallows EVERY exception, not just AttributeError.
+
+        A hostile/exotic exception can expose ``kind``/``status_code``/
+        ``retry_after`` as *properties that raise*; plain getattr(obj, name,
+        default) only absorbs AttributeError and would let that propagate out
+        of telemetry recording and crash the query path. Introspection must
+        never be able to turn a semantic fallback into a total failure.
+        """
+        try:
+            return getattr(obj, name, None)
+        except Exception:
+            return None
+
+    @staticmethod
     def _classify_semantic_reason(exception: BaseException) -> str:
         """Best-effort failure category for the fallbacks-by-reason counter.
 
@@ -1276,7 +1301,7 @@ class TrajectoryStore:
         surface distinctly instead of collapsing to one opaque bucket.
         """
         name = type(exception).__name__
-        kind = str(getattr(exception, "kind", "") or "")
+        kind = str(TrajectoryStore._safe_getattr(exception, "kind") or "")
         if name == "ProviderRateLimited":
             return "client_rate_guard"
         if name == "ProviderCircuitOpen":
@@ -1287,6 +1312,23 @@ class TrajectoryStore:
             return kind
         return "other"
 
+    def _bump_attempt_totals(self, attempt: TrajectorySemanticAttempt) -> None:
+        totals = self._semantic_attempt_totals
+        totals["attempts"] += 1
+        if attempt.outcome == "success":
+            totals["successes"] += 1
+        elif attempt.outcome == "fallback":
+            totals["fallbacks"] += 1
+            key = attempt.reason or "other"
+            by_reason = totals["fallbacks_by_reason"]
+            by_reason[key] = by_reason.get(key, 0) + 1
+
+    def _store_attempt(self, attempt: TrajectorySemanticAttempt) -> TrajectorySemanticAttempt:
+        self._semantic_attempts.append(attempt)
+        self._last_semantic_attempt = attempt
+        self._bump_attempt_totals(attempt)
+        return attempt
+
     def _record_semantic_attempt(
         self,
         *,
@@ -1295,17 +1337,21 @@ class TrajectoryStore:
         exception: BaseException | None,
     ) -> TrajectorySemanticAttempt:
         provider = self.embedding_provider
-        provider_id = str(getattr(provider, "provider_id", "unknown")) if provider else "none"
-        model_id = str(getattr(provider, "model_id", "")) if provider else ""
+        provider_id = str(self._safe_getattr(provider, "provider_id") or "unknown") if provider else "none"
+        model_id = str(self._safe_getattr(provider, "model_id") or "") if provider else ""
         exception_class: str | None = None
         http_status: int | None = None
         retry_after: float | None = None
         reason: str | None = None
         if exception is not None:
             exception_class = type(exception).__name__
-            raw_status = getattr(exception, "status_code", None)
-            http_status = int(raw_status) if isinstance(raw_status, int) else None
-            raw_retry = getattr(exception, "retry_after", None)
+            raw_status = self._safe_getattr(exception, "status_code")
+            http_status = (
+                int(raw_status)
+                if isinstance(raw_status, int) and not isinstance(raw_status, bool)
+                else None
+            )
+            raw_retry = self._safe_getattr(exception, "retry_after")
             retry_after = (
                 float(raw_retry)
                 if isinstance(raw_retry, (int, float)) and not isinstance(raw_retry, bool)
@@ -1322,9 +1368,23 @@ class TrajectoryStore:
             latency_ms=round(float(latency_ms), 3),
             reason=reason,
         )
-        self._semantic_attempts.append(attempt)
-        self._last_semantic_attempt = attempt
-        return attempt
+        return self._store_attempt(attempt)
+
+    def _record_minimal_fallback_attempt(
+        self, *, latency_ms: float
+    ) -> TrajectorySemanticAttempt:
+        """Last-resort record when even best-effort introspection failed. Keeps
+        the funnel honest (a fallback still counts) without touching the
+        offending exception again."""
+        provider = self.embedding_provider
+        attempt = TrajectorySemanticAttempt(
+            provider="unknown" if provider is not None else "none",
+            model="",
+            outcome="fallback",
+            reason="attempt_record_introspection_failed",
+            latency_ms=round(float(latency_ms), 3),
+        )
+        return self._store_attempt(attempt)
 
     def last_semantic_attempt(self) -> dict[str, Any] | None:
         """The typed attempt record from the most recent ``query()`` call."""
@@ -1333,23 +1393,15 @@ class TrajectoryStore:
         return asdict(self._last_semantic_attempt)
 
     def semantic_attempt_counters(self) -> dict[str, Any]:
-        """Per-run semantic funnel counters (attempts / successes / fallbacks
-        by reason) derived from the typed attempt log, for loud run summaries."""
-        successes = 0
-        fallbacks = 0
-        by_reason: dict[str, int] = {}
-        for attempt in self._semantic_attempts:
-            if attempt.outcome == "success":
-                successes += 1
-            elif attempt.outcome == "fallback":
-                fallbacks += 1
-                key = attempt.reason or "other"
-                by_reason[key] = by_reason.get(key, 0) + 1
+        """Per-run semantic funnel counters (attempts / successes / fallbacks by
+        reason). Tracked cumulatively and independently of the bounded attempt
+        ring, so counts stay exact across an arbitrarily long run."""
+        totals = self._semantic_attempt_totals
         return {
-            "attempts": successes + fallbacks,
-            "successes": successes,
-            "fallbacks": fallbacks,
-            "fallbacks_by_reason": by_reason,
+            "attempts": totals["attempts"],
+            "successes": totals["successes"],
+            "fallbacks": totals["fallbacks"],
+            "fallbacks_by_reason": dict(totals["fallbacks_by_reason"]),
         }
 
     def last_query_telemetry(self) -> dict[str, Any] | None:
@@ -1599,14 +1651,26 @@ class TrajectoryStore:
         try:
             semantic_ranks = self._semantic_source_ranks(query)
         except Exception as exc:
-            # Was a bare ``except Exception: fallbacks += 1`` that discarded the
-            # failure class/status. Now the typed reason survives.
-            semantic_attempt = self._record_semantic_attempt(
-                outcome="fallback",
-                latency_ms=(time.monotonic() - attempt_started) * 1000.0,
-                exception=exc,
-            )
+            # Restore historical semantics FIRST, unconditionally, before any
+            # introspection can fail: the fallback counter must bump even if the
+            # (hostile) exception explodes during telemetry recording.
             self._semantic_usage["fallbacks"] += 1
+            fallback_latency_ms = (time.monotonic() - attempt_started) * 1000.0
+            try:
+                # Was a bare ``except Exception: fallbacks += 1`` that discarded
+                # the failure class/status. Now the typed reason survives -- and
+                # the whole record step is itself fenced so an exotic exception
+                # (kind/status_code/retry_after as raising properties) degrades
+                # to a clean FTS fallback instead of failing the query.
+                semantic_attempt = self._record_semantic_attempt(
+                    outcome="fallback",
+                    latency_ms=fallback_latency_ms,
+                    exception=exc,
+                )
+            except Exception:
+                semantic_attempt = self._record_minimal_fallback_attempt(
+                    latency_ms=fallback_latency_ms,
+                )
         else:
             # Only record a success when an embed was actually dispatched; an
             # early return (no provider / profile mismatch) is a skip, not an

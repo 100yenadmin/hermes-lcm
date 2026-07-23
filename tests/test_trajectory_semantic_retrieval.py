@@ -356,6 +356,83 @@ def test_query_fallback_classifies_provider_and_guard_failures(tmp_path: Path):
         assert attempt["http_status"] == expected_status
 
 
+def test_query_survives_exceptions_with_raising_introspection_properties(tmp_path: Path):
+    # P1 regression: an exception whose kind/status_code/retry_after are
+    # PROPERTIES THAT RAISE must not crash query(); it must return FTS-only
+    # hits and bump the fallback counter for each.
+    class _EvilKind(RuntimeError):
+        @property
+        def kind(self):
+            raise ValueError("boom")
+
+    class _EvilStatus(RuntimeError):
+        @property
+        def status_code(self):
+            raise ZeroDivisionError("boom")
+
+    class _EvilRetry(RuntimeError):
+        @property
+        def retry_after(self):
+            raise KeyError("boom")
+
+    class _EvilProvider(FakeEmbeddingProvider):
+        def __init__(self, exc_cls) -> None:
+            super().__init__()
+            self._exc_cls = exc_cls
+
+        def embed_query(self, text):
+            self.query_calls += 1
+            raise self._exc_cls("exotic provider failure")
+
+    for label, exc_cls in (("kind", _EvilKind), ("status", _EvilStatus), ("retry", _EvilRetry)):
+        base = tmp_path / label
+        base.mkdir()
+        asset_root, store = _build_store(base, _EvilProvider(exc_cls))
+        store.insert(_source(
+            asset_root,
+            trajectory_id="target",
+            ordinal=0,
+            goal="Inspect profile toolbar settings",
+            texts=("The profile toolbar contains Edit.",),
+        ))
+        store.finalize(["target"])
+        store.build_semantic_index()
+
+        hits = store.query("profile toolbar", limit=2)  # must NOT raise
+        assert hits
+        assert hits[0].match_kind == "fts"
+        assert store.semantic_metrics()["fallbacks"] == 1
+        counters = store.semantic_attempt_counters()
+        assert counters["attempts"] == 1
+        assert counters["fallbacks"] == 1
+        assert store.last_semantic_attempt()["outcome"] == "fallback"
+
+
+def test_semantic_attempt_log_is_bounded_but_counters_stay_cumulative(tmp_path: Path):
+    # P2 regression: the attempt ring is capped (deque maxlen=1024) so a long
+    # run cannot grow it without bound, while the funnel counters remain exact.
+    provider = FakeEmbeddingProvider()
+    asset_root, store = _build_store(tmp_path, provider)
+    store.insert(_source(
+        asset_root,
+        trajectory_id="target",
+        ordinal=0,
+        goal="Inspect profile toolbar settings",
+        texts=("The profile toolbar has View, Edit, and Delete actions.",),
+    ))
+    store.finalize(["target"])
+    store.build_semantic_index()
+
+    for _ in range(1100):
+        store.query("profile toolbar actions", limit=2)
+
+    assert len(store._semantic_attempts) <= 1024
+    counters = store.semantic_attempt_counters()
+    assert counters["attempts"] == 1100
+    assert counters["successes"] == 1100
+    assert counters["fallbacks"] == 0
+
+
 def test_semantic_documents_use_protected_rows_not_raw_secrets(tmp_path: Path):
     provider = FakeEmbeddingProvider()
     asset_root, store = _build_store(tmp_path, provider)
