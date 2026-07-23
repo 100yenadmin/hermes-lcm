@@ -835,24 +835,77 @@ def _label(operand: GroundedEvidence) -> str | None:
     return None
 
 
-def _finite_named_question_slots(question: str) -> tuple[str, ...]:
-    """Return an explicit comma/and list following a selector preposition."""
-    match = re.search(
-        r"\b(?:for|from|of)\s+(.+?)(?:[?.!]|$)",
-        question,
-        re.IGNORECASE,
-    )
-    if match is None:
-        return ()
-    raw = match.group(1).strip()
+# A finite entity set can be attached to the operation by any of these
+# selectors, not only ``for``/``from``/``of``; a narrow allowlist let a caller
+# certify incomplete evidence just by rephrasing (``by``/``among``/``spent by``).
+_SELECTOR_PREPOSITIONS = (
+    "for",
+    "from",
+    "of",
+    "by",
+    "to",
+    "with",
+    "among",
+    "amongst",
+    "across",
+    "between",
+)
+_SELECTOR_PREPOSITION_RE = re.compile(
+    r"\b(?:" + "|".join(_SELECTOR_PREPOSITIONS) + r")\b", re.IGNORECASE
+)
+
+
+def _split_enumeration(raw: str) -> tuple[str, ...]:
+    """Split an explicit ``a, b, and c`` enumeration into bounded slots."""
     if "," not in raw and re.search(r"\b(?:and|&)\b", raw, re.IGNORECASE) is None:
         return ()
     slots = [
         re.sub(r"^(?:and\s+|the\s+)", "", item.strip(), flags=re.IGNORECASE)
         for item in re.split(r"\s*,\s*|\s+(?:and|&)\s+", raw, flags=re.IGNORECASE)
     ]
-    bounded = tuple(item for item in slots if item and len(item) <= _MAX_LABEL_CHARS)
+    bounded = tuple(
+        item
+        for item in slots
+        if item
+        and len(item) <= _MAX_LABEL_CHARS
+        and (tokens := _normalized_tokens(item))
+        # A finite entity set is named; bare numbers/dates are not entities.
+        and not all(token.isdigit() for token in tokens)
+    )
     return bounded if len(bounded) >= 2 else ()
+
+
+def _finite_named_question_slots(question: str) -> tuple[str, ...]:
+    """Return an explicit finite entity enumeration stated by the question.
+
+    Any selector preposition anchors the list; when the anchored slice still
+    contains a nested selector (``of pages for Alice and Bob``) the tighter,
+    preposition-free enumeration wins. A bare proper-noun enumeration is honored
+    when no preposition is present so the coverage check cannot be dodged by
+    rephrasing the selector.
+    """
+    fallback: tuple[str, ...] = ()
+    for match in _SELECTOR_PREPOSITION_RE.finditer(question):
+        tail = question[match.end() :]
+        end = re.search(r"[?.!]", tail)
+        slots = _split_enumeration(tail[: end.start()].strip() if end else tail.strip())
+        if not slots:
+            continue
+        if all(not _SELECTOR_PREPOSITION_RE.search(slot) for slot in slots):
+            return slots
+        if not fallback:
+            fallback = slots
+    if fallback:
+        return fallback
+    # Preposition-free proper-noun enumeration (e.g. "Alice, Bob, and Carol ...").
+    proper = re.search(
+        r"\b[A-Z][\w.'-]*(?:\s*,\s*(?:and\s+|&\s+)?[A-Z][\w.'-]*)*"
+        r"\s*,?\s+(?:and|&)\s+[A-Z][\w.'-]*",
+        question,
+    )
+    if proper is not None:
+        return _split_enumeration(proper.group(0).strip())
+    return ()
 
 
 def _slot_is_covered(slot: str, labels: Sequence[str]) -> bool:

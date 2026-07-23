@@ -158,6 +158,66 @@ def test_compute_rejects_incomplete_named_evidence(compute_store):
     assert "Carol" in payload["reason"]
 
 
+@pytest.mark.parametrize(
+    "selector",
+    ["for", "by", "among", "spent by", "paid to"],
+)
+def test_compute_rejects_incomplete_named_evidence_across_selectors(compute_store, selector):
+    """The finite-set coverage check must not be dodged by rephrasing the selector."""
+    store, engine = compute_store
+    rows = {}
+    for name, amount in (("Alice", 10), ("Bob", 20), ("Carol", 30)):
+        content = f"{name} amount ${amount}"
+        store_id = store.append("session-a", {"role": "user", "content": content})
+        rows[name] = (store_id, content, amount)
+
+    operands = [
+        _operand(store, rows[name][0], rows[name][1], value=rows[name][2], unit="usd", label=name)
+        for name in ("Alice", "Bob")
+    ]
+    payload = json.loads(
+        lcm_tools.lcm_compute(
+            {
+                "question": f"What is the total amount {selector} Alice, Bob, and Carol?",
+                "evidence_complete": True,
+                "operands": operands,
+            },
+            engine=engine,
+        )
+    )
+
+    assert payload["status"] == "fallback"
+    assert "Carol" in payload["reason"]
+
+
+def test_compute_accepts_complete_named_evidence_with_nonstandard_selector(compute_store):
+    """Broadened selector detection must still let a fully-covered set compute."""
+    store, engine = compute_store
+    rows = {}
+    for name, amount in (("Alice", 10), ("Bob", 20), ("Carol", 30)):
+        content = f"{name} amount ${amount}"
+        store_id = store.append("session-a", {"role": "user", "content": content})
+        rows[name] = (store_id, content, amount)
+
+    operands = [
+        _operand(store, rows[name][0], rows[name][1], value=rows[name][2], unit="usd", label=name)
+        for name in ("Alice", "Bob", "Carol")
+    ]
+    payload = json.loads(
+        lcm_tools.lcm_compute(
+            {
+                "question": "What is the total amount by Alice, Bob, and Carol?",
+                "evidence_complete": True,
+                "operands": operands,
+            },
+            engine=engine,
+        )
+    )
+
+    assert payload["status"] == "computed"
+    assert payload["trace"]["result"] == "$60"
+
+
 def test_compute_rejects_overlapping_spans_from_one_source(compute_store):
     store, engine = compute_store
     content = "Alice amount $12"
