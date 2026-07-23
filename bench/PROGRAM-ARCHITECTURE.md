@@ -51,8 +51,10 @@ the topic-specific trajectory in retrieval regardless of question topic (hub 961
 Same magnet-family pathology as H3.1. CONSEQUENCE (recorded before any W3b build): W3b must lead with a
 retrieval-diversity mechanism (hub-trajectory cap / per-source diversity quota) — repacking cannot surface
 what retrieval never returned — and W3a state-level embeddings attack the same root (topic-specific states
-become directly addressable instead of riding hub-trajectory coarse vectors). Compactness remains the live
-thesis for the web subset (sample pending) and for the static→agentic gap (M3).
+become directly addressable instead of riding hub-trajectory coarse vectors). WEB refinement (10-case sample,
+same method): 7/10 needle-absent (hub-crowding generalizes, weaker) + 3/10 needle-PRESENT but truncated by the
+fixed ~2.5-2.9K-char per-state AXTree excerpt window — a web-only delivery bug (W3b component 2: adaptive/
+needle-aware excerpt windows). Compactness remains the live thesis for the static→agentic gap (M3).
 
 ## 2. DECISION RECORD — the official protocol becomes the primary static instrument (NEW, 07-24)
 
