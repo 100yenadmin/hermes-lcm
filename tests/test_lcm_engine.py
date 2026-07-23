@@ -66,6 +66,33 @@ def test_shutdown_closes_lifecycle_store(tmp_path):
     assert engine._lifecycle._conn is None
 
 
+def test_assertion_store_is_default_off_and_closes_when_enabled(tmp_path):
+    disabled_db = tmp_path / "assertions-disabled.db"
+    disabled = LCMEngine(config=LCMConfig(database_path=str(disabled_db)))
+    try:
+        assert disabled._assertions is None
+        assert disabled._store._conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'lcm_assertion%'"
+        ).fetchone()[0] == 0
+    finally:
+        disabled.shutdown()
+
+    enabled_db = tmp_path / "assertions-enabled.db"
+    enabled = LCMEngine(
+        config=LCMConfig(
+            database_path=str(enabled_db),
+            assertions_enabled=True,
+        )
+    )
+    assertion_store = enabled._assertions
+    assert assertion_store is not None
+    assert assertion_store.db_path == enabled._store.db_path == enabled_db
+
+    enabled.shutdown()
+
+    assert assertion_store._conn is None
+
+
 def test_discord_short_turn_ingest_preserves_conversation_id(tmp_path):
     config = LCMConfig(database_path=str(tmp_path / "discord-lanes.db"))
     engine = LCMEngine(config=config)
@@ -184,6 +211,36 @@ def test_reused_engine_rebinds_storage_when_hermes_home_changes(tmp_path):
 
         assert rows_a == [("session-a", "message from profile a")]
         assert rows_b == [("session-b", "message from profile b")]
+    finally:
+        engine.shutdown()
+
+
+def test_assertion_store_rebinds_with_profile_home(tmp_path):
+    home_a = tmp_path / "assertion-profile-a"
+    home_b = tmp_path / "assertion-profile-b"
+    config = LCMConfig(database_path="", assertions_enabled=True)
+    engine = LCMEngine(config=config, hermes_home=str(home_a))
+    try:
+        first_store = engine._assertions
+        assert first_store is not None
+        assert first_store.db_path == engine._store.db_path == home_a / "lcm.db"
+
+        engine.on_session_start(
+            "session-b",
+            hermes_home=str(home_b),
+            platform="cli",
+            context_length=200_000,
+        )
+
+        assert first_store._conn is None
+        assert engine._assertions is not None
+        assert engine._assertions.db_path == engine._store.db_path == home_b / "lcm.db"
+        for db_path in (home_a / "lcm.db", home_b / "lcm.db"):
+            with sqlite3.connect(db_path) as conn:
+                assert conn.execute(
+                    "SELECT COUNT(*) FROM sqlite_master "
+                    "WHERE type='table' AND name='lcm_assertions'"
+                ).fetchone()[0] == 1
     finally:
         engine.shutdown()
 
@@ -1536,6 +1593,8 @@ class TestEngineABC:
         assert "source_offset" in expand_props
         assert "source_limit" in expand_props
         assert "content_offset" in expand_props
+        assert "include_exact_ref" in expand_props
+        assert expand_props["include_exact_ref"]["default"] is False
         assert "store_id" in expand_props
         assert "across sessions" in expand_props["store_id"]["description"].lower() or "cross-session" in expand_props["store_id"]["description"].lower()
         assert "pagination" in expand_props["source_offset"]["description"].lower()
@@ -1548,6 +1607,8 @@ class TestEngineABC:
         assert "roles" in load_props
         assert "time_from" in load_props
         assert "time_to" in load_props
+        assert "include_exact_ref" in load_props
+        assert load_props["include_exact_ref"]["default"] is False
         assert "current session" in expand_query_schema["description"].lower()
         assert "session_search" in expand_query_schema["description"]
         expand_query_props = expand_query_schema["parameters"]["properties"]
@@ -26719,6 +26780,15 @@ class TestHandleExpandStoreId:
         assert result["role"] == "user"
         assert result["source"] == "cli"
         assert result["content"].startswith("cross session content")
+        assert "exact_ref" not in result
+
+        exact = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand",
+                {"store_id": store_id, "include_exact_ref": True},
+            )
+        )
+        assert exact["exact_ref"] == f"lcm:{store_id}:0-{len(exact['content'])}"
 
     def test_store_id_paging_via_content_offset(self, engine):
         big_content = "x" * 10000
@@ -26746,6 +26816,22 @@ class TestHandleExpandStoreId:
         assert second["content"]
         # Combined slices should not exceed total content length.
         assert first["content_chars"] == second["content_chars"]
+
+        exact_second = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand",
+                {
+                    "store_id": store_id,
+                    "max_tokens": 50,
+                    "content_offset": first["next_content_offset"],
+                    "include_exact_ref": True,
+                },
+            )
+        )
+        exact_end = exact_second["content_offset"] + exact_second["content_returned_chars"]
+        assert exact_second["exact_ref"] == (
+            f"lcm:{store_id}:{exact_second['content_offset']}-{exact_end}"
+        )
 
     def test_store_id_not_found_returns_error(self, engine):
         result = json.loads(
@@ -26896,6 +26982,21 @@ class TestHandleLoadSession:
         assert result["messages"][0]["content_truncated"] is False
         assert result["messages"][0]["from_current_session"] is False
         assert "snippet" not in result["messages"][0]
+        assert "exact_ref" not in result["messages"][0]
+
+        exact = json.loads(
+            engine.handle_tool_call(
+                "lcm_load_session",
+                {
+                    "session_id": "old-session",
+                    "limit": 2,
+                    "include_exact_ref": True,
+                },
+            )
+        )
+        assert exact["messages"][0]["exact_ref"] == (
+            f"lcm:{store_ids[0]}:0-{len('first old-session message')}"
+        )
 
     def test_load_session_pages_after_store_id(self, engine):
         store_ids = self._seed_old_session(engine)
@@ -27019,6 +27120,14 @@ class TestHandleLoadSession:
             )
         )
         assert "error" in bad_range and "time_to" in bad_range["error"]
+
+        bad_exact_ref = json.loads(
+            engine.handle_tool_call(
+                "lcm_load_session",
+                {"session_id": "old-session", "include_exact_ref": "yes"},
+            )
+        )
+        assert "error" in bad_exact_ref and "include_exact_ref" in bad_exact_ref["error"]
 
     def test_load_session_clamps_limit_and_never_falls_back_to_current(self, engine):
         self._seed_old_session(engine)
