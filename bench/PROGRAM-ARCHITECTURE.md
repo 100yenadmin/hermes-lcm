@@ -44,6 +44,16 @@ quality into the same weak consumer.** The static/agentic ladder split is curati
 M1+M2+M3 converge: **reach the right states, then deliver them small — curation quality IS the benchmark.**
 That is wave-3 (pipeline curation) and H6 (agent curation over our store); they share the same thesis.
 
+**M4 — W3c enterprise classification (07-24, 20/20 sampled, #144):** REFINES M1 for the enterprise subset —
+the needle was ABSENT from the delivered context in 20/20 sampled enterprise spurious-unknowns (the reader
+abstained CORRECTLY). Mechanism: 3-4 generic hub trajectories (incident-list/search/creation flows) crowd out
+the topic-specific trajectory in retrieval regardless of question topic (hub 96131e7b in 19/20 contexts).
+Same magnet-family pathology as H3.1. CONSEQUENCE (recorded before any W3b build): W3b must lead with a
+retrieval-diversity mechanism (hub-trajectory cap / per-source diversity quota) — repacking cannot surface
+what retrieval never returned — and W3a state-level embeddings attack the same root (topic-specific states
+become directly addressable instead of riding hub-trajectory coarse vectors). Compactness remains the live
+thesis for the web subset (sample pending) and for the static→agentic gap (M3).
+
 ## 2. DECISION RECORD — the official protocol becomes the primary static instrument (NEW, 07-24)
 
 The full 451-question official run cost **≈$1.1 and ~3.5h wall** (parallelizable to <1h in 4 batches). The Sol
