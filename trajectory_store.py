@@ -8,7 +8,7 @@ remain traceable to protected canonical source JSON.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import hashlib
 import json
 import math
@@ -148,6 +148,28 @@ class TrajectoryInsertResult:
     source_sha256: str
     state_count: int
     already_current: bool
+
+
+@dataclass(frozen=True)
+class TrajectorySemanticAttempt:
+    """Typed record of one semantic-retrieval attempt on the query path.
+
+    Replaces the historical bare ``except Exception: fallbacks += 1`` that
+    discarded the failure class/status entirely (the defect that hid the
+    client-side spend-guard rate-limit behind an undifferentiated counter in
+    the frozen V2 run). ``outcome`` is ``"success"`` or ``"fallback"``; failure
+    fields are populated by best-effort duck-typing off the raised exception so
+    this record stays decoupled from the embedding_provider exception classes.
+    """
+
+    provider: str
+    model: str
+    outcome: str
+    exception_class: str | None = None
+    http_status: int | None = None
+    retry_after: float | None = None
+    latency_ms: float | None = None
+    reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -364,6 +386,11 @@ class TrajectoryStore:
             "query_tokens": 0,
             "fallbacks": 0,
         }
+        # Typed per-run instrument state (additive; the existing
+        # ``_semantic_usage`` counters above are unchanged for back-compat).
+        self._semantic_attempts: list[TrajectorySemanticAttempt] = []
+        self._last_semantic_attempt: TrajectorySemanticAttempt | None = None
+        self._last_query_telemetry: dict[str, Any] | None = None
         self._lock = threading.RLock()
         self._conn = self._open_connection()
         try:
@@ -1239,6 +1266,102 @@ class TrajectoryStore:
     def semantic_metrics(self) -> dict[str, int]:
         return dict(self._semantic_usage)
 
+    @staticmethod
+    def _classify_semantic_reason(exception: BaseException) -> str:
+        """Best-effort failure category for the fallbacks-by-reason counter.
+
+        Duck-typed so trajectory_store need not import the provider exception
+        classes: client-side spend guard, circuit breaker, and Voyage's
+        classified ``kind`` (auth/rate_limit/bad_request/server_error/...) all
+        surface distinctly instead of collapsing to one opaque bucket.
+        """
+        name = type(exception).__name__
+        kind = str(getattr(exception, "kind", "") or "")
+        if name == "ProviderRateLimited":
+            return "client_rate_guard"
+        if name == "ProviderCircuitOpen":
+            return "circuit_open"
+        if isinstance(exception, TimeoutError) or kind == "timeout":
+            return "timeout"
+        if kind:
+            return kind
+        return "other"
+
+    def _record_semantic_attempt(
+        self,
+        *,
+        outcome: str,
+        latency_ms: float,
+        exception: BaseException | None,
+    ) -> TrajectorySemanticAttempt:
+        provider = self.embedding_provider
+        provider_id = str(getattr(provider, "provider_id", "unknown")) if provider else "none"
+        model_id = str(getattr(provider, "model_id", "")) if provider else ""
+        exception_class: str | None = None
+        http_status: int | None = None
+        retry_after: float | None = None
+        reason: str | None = None
+        if exception is not None:
+            exception_class = type(exception).__name__
+            raw_status = getattr(exception, "status_code", None)
+            http_status = int(raw_status) if isinstance(raw_status, int) else None
+            raw_retry = getattr(exception, "retry_after", None)
+            retry_after = (
+                float(raw_retry)
+                if isinstance(raw_retry, (int, float)) and not isinstance(raw_retry, bool)
+                else None
+            )
+            reason = self._classify_semantic_reason(exception)
+        attempt = TrajectorySemanticAttempt(
+            provider=provider_id,
+            model=model_id,
+            outcome=str(outcome),
+            exception_class=exception_class,
+            http_status=http_status,
+            retry_after=retry_after,
+            latency_ms=round(float(latency_ms), 3),
+            reason=reason,
+        )
+        self._semantic_attempts.append(attempt)
+        self._last_semantic_attempt = attempt
+        return attempt
+
+    def last_semantic_attempt(self) -> dict[str, Any] | None:
+        """The typed attempt record from the most recent ``query()`` call."""
+        if self._last_semantic_attempt is None:
+            return None
+        return asdict(self._last_semantic_attempt)
+
+    def semantic_attempt_counters(self) -> dict[str, Any]:
+        """Per-run semantic funnel counters (attempts / successes / fallbacks
+        by reason) derived from the typed attempt log, for loud run summaries."""
+        successes = 0
+        fallbacks = 0
+        by_reason: dict[str, int] = {}
+        for attempt in self._semantic_attempts:
+            if attempt.outcome == "success":
+                successes += 1
+            elif attempt.outcome == "fallback":
+                fallbacks += 1
+                key = attempt.reason or "other"
+                by_reason[key] = by_reason.get(key, 0) + 1
+        return {
+            "attempts": successes + fallbacks,
+            "successes": successes,
+            "fallbacks": fallbacks,
+            "fallbacks_by_reason": by_reason,
+        }
+
+    def last_query_telemetry(self) -> dict[str, Any] | None:
+        """Side-channel telemetry for the most recent ``query()``: the semantic
+        attempt record, the ranked source-candidate list, the pre-selection
+        state-candidate pool, and the delivered-evidence refs. Written after the
+        call returns and never affects the returned hits (byte-identical
+        evidence)."""
+        if self._last_query_telemetry is None:
+            return None
+        return dict(self._last_query_telemetry)
+
     def _semantic_source_ranks(self, query: str) -> list[tuple[int, float]]:
         provider = self.embedding_provider
         profile = self._semantic_profile()
@@ -1461,13 +1584,39 @@ class TrajectoryStore:
         )
         expression = self._fts_expression(query)
         if not expression:
+            self._last_query_telemetry = {
+                "semantic_attempt": None,
+                "source_candidate_ranks": [],
+                "state_candidate_pool": [],
+                "delivered_evidence_refs": [],
+            }
             return ()
         global_rows = self._fts_rows(expression, candidate_limit)
         semantic_ranks: list[tuple[int, float]] = []
+        semantic_attempt: TrajectorySemanticAttempt | None = None
+        attempt_started = time.monotonic()
+        calls_before = self._semantic_usage["query_calls"]
         try:
             semantic_ranks = self._semantic_source_ranks(query)
-        except Exception:
+        except Exception as exc:
+            # Was a bare ``except Exception: fallbacks += 1`` that discarded the
+            # failure class/status. Now the typed reason survives.
+            semantic_attempt = self._record_semantic_attempt(
+                outcome="fallback",
+                latency_ms=(time.monotonic() - attempt_started) * 1000.0,
+                exception=exc,
+            )
             self._semantic_usage["fallbacks"] += 1
+        else:
+            # Only record a success when an embed was actually dispatched; an
+            # early return (no provider / profile mismatch) is a skip, not an
+            # attempt, and must not inflate the success count.
+            if self._semantic_usage["query_calls"] > calls_before:
+                semantic_attempt = self._record_semantic_attempt(
+                    outcome="success",
+                    latency_ms=(time.monotonic() - attempt_started) * 1000.0,
+                    exception=None,
+                )
         scoped_rows = self._fts_rows(
             expression,
             candidate_limit,
@@ -1584,6 +1733,28 @@ class TrajectoryStore:
                 query=query,
                 text_char_limit=text_char_limit,
             ))
+
+        # Side-channel per-query telemetry (does not affect the returned hits).
+        self._last_query_telemetry = {
+            "semantic_attempt": (
+                asdict(semantic_attempt) if semantic_attempt is not None else None
+            ),
+            "source_candidate_ranks": [
+                {"source_id": int(source_id), "rank": position, "score": float(score)}
+                for position, (source_id, score) in enumerate(
+                    semantic_ranks[:64], start=1
+                )
+            ],
+            "state_candidate_pool": [
+                {
+                    "state_id": int(row["state_id"]),
+                    "rank": position,
+                    "score": float(candidate_score.get(int(row["state_id"]), 0.0)),
+                }
+                for position, row in enumerate(rows[:64], start=1)
+            ],
+            "delivered_evidence_refs": [hit.exact_ref for hit in hits],
+        }
         return tuple(hits)
 
     def resolve_exact_ref(self, exact_ref: str) -> TrajectoryHit:

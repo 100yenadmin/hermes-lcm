@@ -239,6 +239,123 @@ def test_semantic_failure_falls_back_to_original_exact_fts(tmp_path: Path):
     assert store.semantic_metrics()["fallbacks"] == 1
 
 
+def test_query_records_typed_success_attempt_and_telemetry(tmp_path: Path):
+    provider = FakeEmbeddingProvider()
+    asset_root, store = _build_store(tmp_path, provider)
+    store.insert(_source(
+        asset_root,
+        trajectory_id="target",
+        ordinal=0,
+        goal="Inspect profile toolbar settings",
+        texts=("The profile toolbar has View, Edit, and Delete actions.",),
+    ))
+    store.finalize(["target"])
+    store.build_semantic_index()
+
+    hits = store.query("profile toolbar actions", limit=2)
+
+    attempt = store.last_semantic_attempt()
+    assert attempt is not None
+    assert attempt["outcome"] == "success"
+    assert attempt["provider"] == "fake"
+    assert attempt["model"] == "fake-trajectory-v1"
+    assert attempt["exception_class"] is None
+    assert attempt["reason"] is None
+    assert attempt["latency_ms"] is not None and attempt["latency_ms"] >= 0.0
+
+    counters = store.semantic_attempt_counters()
+    assert counters == {
+        "attempts": 1,
+        "successes": 1,
+        "fallbacks": 0,
+        "fallbacks_by_reason": {},
+    }
+
+    telemetry = store.last_query_telemetry()
+    assert telemetry is not None
+    assert telemetry["semantic_attempt"] == attempt
+    assert telemetry["source_candidate_ranks"]
+    assert telemetry["source_candidate_ranks"][0]["rank"] == 1
+    assert {"source_id", "rank", "score"} <= telemetry["source_candidate_ranks"][0].keys()
+    assert telemetry["state_candidate_pool"]
+    assert {"state_id", "rank", "score"} <= telemetry["state_candidate_pool"][0].keys()
+    # Delivered refs mirror the returned hits exactly (byte-identical evidence).
+    assert telemetry["delivered_evidence_refs"] == [hit.exact_ref for hit in hits]
+
+
+def test_query_fallback_records_typed_reason_not_bare_counter(tmp_path: Path):
+    # The historical bare ``except Exception: fallbacks += 1`` discarded the
+    # failure class. The typed record must now survive alongside the counter.
+    provider = FakeEmbeddingProvider(fail_query=True)  # raises RuntimeError
+    asset_root, store = _build_store(tmp_path, provider)
+    store.insert(_source(
+        asset_root,
+        trajectory_id="target",
+        ordinal=0,
+        goal="Inspect profile toolbar settings",
+        texts=("The profile toolbar contains Edit.",),
+    ))
+    store.finalize(["target"])
+    store.build_semantic_index()
+
+    store.query("profile toolbar", limit=2)
+
+    assert store.semantic_metrics()["fallbacks"] == 1  # legacy counter unchanged
+    attempt = store.last_semantic_attempt()
+    assert attempt is not None
+    assert attempt["outcome"] == "fallback"
+    assert attempt["exception_class"] == "RuntimeError"
+    assert attempt["reason"] == "other"
+    assert store.semantic_attempt_counters() == {
+        "attempts": 1,
+        "successes": 0,
+        "fallbacks": 1,
+        "fallbacks_by_reason": {"other": 1},
+    }
+
+
+def test_query_fallback_classifies_provider_and_guard_failures(tmp_path: Path):
+    class _VoyageLikeRateLimit(RuntimeError):
+        kind = "rate_limit"
+        status_code = 429
+
+    class ProviderRateLimited(RuntimeError):
+        """Name-matched to the product's client-side spend-guard exception."""
+
+    class _ClassifyingProvider(FakeEmbeddingProvider):
+        def __init__(self, exc: Exception) -> None:
+            super().__init__()
+            self._exc = exc
+
+        def embed_query(self, text):
+            self.query_calls += 1
+            raise self._exc
+
+    for exc, expected_reason, expected_status in (
+        (_VoyageLikeRateLimit("429"), "rate_limit", 429),
+        (ProviderRateLimited("guard cooling down"), "client_rate_guard", None),
+    ):
+        provider = _ClassifyingProvider(exc)
+        base = tmp_path / expected_reason
+        base.mkdir()
+        asset_root, store = _build_store(base, provider)
+        store.insert(_source(
+            asset_root,
+            trajectory_id="target",
+            ordinal=0,
+            goal="Inspect profile toolbar settings",
+            texts=("The profile toolbar contains Edit.",),
+        ))
+        store.finalize(["target"])
+        store.build_semantic_index()
+        store.query("profile toolbar", limit=2)
+        attempt = store.last_semantic_attempt()
+        assert attempt is not None
+        assert attempt["outcome"] == "fallback"
+        assert attempt["reason"] == expected_reason
+        assert attempt["http_status"] == expected_status
+
+
 def test_semantic_documents_use_protected_rows_not_raw_secrets(tmp_path: Path):
     provider = FakeEmbeddingProvider()
     asset_root, store = _build_store(tmp_path, provider)
