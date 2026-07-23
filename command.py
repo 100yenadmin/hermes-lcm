@@ -2547,7 +2547,7 @@ def _resolve_store_dim(config, provider_dim: int, override: int | None = None) -
 
 
 def _embedding_warmup_text(engine) -> str:
-    """Warm the configured provider and dimension-lock its vector profile."""
+    """Warm and dimension-lock both summary and chunk vector profiles."""
     try:
         if not bool(getattr(engine._config, "embeddings_enabled", False)):
             return (
@@ -2584,6 +2584,25 @@ def _embedding_warmup_text(engine) -> str:
             raise ValueError("provider returned an empty warmup embedding")
         storage_dtype = _resolve_storage_dtype(engine._config)
         store_dim = _resolve_store_dim(engine._config, dim)
+        chunk_model = default_chunk_model(provider.provider_id, provider.model_id)
+        chunk_provider = provider
+        chunk_dim = dim
+        chunk_progress = "shared summary probe"
+        if chunk_model != provider.model_id:
+            chunk_config = dataclasses.replace(
+                engine._config,
+                embedding_provider=provider.provider_id,
+                embedding_model=chunk_model,
+            )
+            chunk_provider = resolve_provider(chunk_config)
+            if chunk_provider is None:
+                raise ValueError("chunk embedding provider is not configured")
+            chunk_vector = chunk_provider.embed_query("warmup")
+            chunk_dim = len(chunk_vector)
+            if chunk_dim < 1:
+                raise ValueError("chunk provider returned an empty warmup embedding")
+            chunk_progress = "probe: complete"
+        chunk_store_dim = _resolve_store_dim(engine._config, chunk_dim)
         store = VectorStore(engine._store.db_path, config=engine._config)
         try:
             store.register_profile(
@@ -2591,6 +2610,13 @@ def _embedding_warmup_text(engine) -> str:
                 provider.provider_id,
                 store_dim,
                 dtype=storage_dtype,
+            )
+            store.register_profile(
+                chunk_provider.model_id,
+                chunk_provider.provider_id,
+                chunk_store_dim,
+                dtype=storage_dtype,
+                task="chunk",
             )
         finally:
             store.close()
@@ -2613,6 +2639,9 @@ def _embedding_warmup_text(engine) -> str:
             f"provider: {provider.provider_id}",
             f"model: {provider.model_id}",
             f"dim: {store_dim}",
+            f"chunk_model: {chunk_provider.model_id}",
+            f"chunk_dim: {chunk_store_dim}",
+            f"chunk_probe: {chunk_progress}",
             f"dtype: {storage_dtype}",
             f"cost_note: {cost_note}",
         ])
@@ -2636,9 +2665,10 @@ def _embedding_current_profile(conn: sqlite3.Connection) -> sqlite3.Row | None:
     try:
         return conn.execute(
             """
-            SELECT identity_hash, model_name, provider, dim, dtype, registered_at
+            SELECT identity_hash, model_name, provider, revision, dim, dtype,
+                   byteorder, task, registered_at
             FROM lcm_embedding_profile
-            WHERE active = 1 AND archived_at IS NULL
+            WHERE active = 1 AND archived_at IS NULL AND task = 'summary'
             ORDER BY registered_at DESC, identity_hash DESC
             LIMIT 1
             """
@@ -4040,6 +4070,7 @@ def _embedding_backfill_summary_text(
         selected_embeddable=selected_embeddable,
         failed=failed,
         uncertain=uncertain_count,
+        skipped=len(skipped),
     )
     estimated_tokens, estimated_cost_tokens, estimated_batches = _estimates(documents)
     return _embedding_backfill_report(
@@ -4111,7 +4142,8 @@ def _chunk_current_profile(conn: sqlite3.Connection) -> sqlite3.Row | None:
     try:
         return conn.execute(
             """
-            SELECT identity_hash, model_name, provider, dim, dtype, registered_at
+            SELECT identity_hash, model_name, provider, revision, dim, dtype,
+                   byteorder, task, registered_at
             FROM lcm_embedding_profile
             WHERE active = 1 AND archived_at IS NULL AND task = 'chunk'
             ORDER BY registered_at DESC, identity_hash DESC
@@ -4497,7 +4529,13 @@ def _chunk_backfill_text(
             )
         _prepare_inflight_for_lease(conn, identity, lease)
         captured_identity = EmbeddingIdentity.canonical(
-            provider_name, model, "", profile_dim, profile_dtype, "little", "chunk"
+            provider_name,
+            model,
+            str(profile["revision"] or ""),
+            profile_dim,
+            profile_dtype,
+            str(profile["byteorder"] or "little"),
+            "chunk",
         )
         if captured_identity.identity_hash != identity:
             raise ValueError(
@@ -4764,7 +4802,7 @@ def _chunk_backfill_text(
     status = _embedding_backfill_status(
         error=error, lease_lost=lease_lost, budget_exhausted=budget_exhausted,
         embedded=embedded, selected_embeddable=selected_embeddable,
-        failed=failed, uncertain=uncertain_count,
+        failed=failed, uncertain=uncertain_count, skipped=len(skipped),
     )
     estimated_tokens, estimated_cost_tokens, estimated_batches = _estimates(documents)
     return _embedding_backfill_report(
@@ -4788,13 +4826,14 @@ def _embedding_backfill_status(
     selected_embeddable: int,
     failed: list[tuple[str, str]],
     uncertain: int = 0,
+    skipped: int = 0,
 ) -> str:
     """Report the truthful terminal status — never a premature ``complete``."""
     if error:
         return "error"
     if lease_lost or budget_exhausted:
         return "partial"
-    if uncertain:
+    if uncertain or skipped:
         return "partial"
     if failed:
         return "failed" if embedded == 0 else "partial"

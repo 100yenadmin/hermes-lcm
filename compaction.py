@@ -351,6 +351,23 @@ class CompactionMixin:
                  current_tokens: int = None,
                  focus_topic: Optional[str] = None,
                  force: bool = False) -> List[Dict[str, Any]]:
+        """Run compaction and leave a terminal public status on every failure."""
+        try:
+            return self._compress_impl(
+                messages,
+                current_tokens=current_tokens,
+                focus_topic=focus_topic,
+                force=force,
+            )
+        except BaseException:
+            self._last_compression_status = "error"
+            self._last_compression_noop_reason = ""
+            raise
+
+    def _compress_impl(self, messages: List[Dict[str, Any]],
+                       current_tokens: int = None,
+                       focus_topic: Optional[str] = None,
+                       force: bool = False) -> List[Dict[str, Any]]:
         """Main compaction entry point.
 
         1. Ingest any new messages into the store

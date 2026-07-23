@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import threading
 from datetime import date, datetime, timedelta, timezone
 
@@ -1269,3 +1270,122 @@ def test_committed_mutation_event_survives_hook_gap_and_reconciles(rollup_parts)
         assert reopened.get_rollup("day", day.isoformat(), scope)["status"] == "stale"
     finally:
         reopened.close()
+
+
+@pytest.mark.parametrize("staging_helper", ["scope", "aggregate", "lineage"])
+def test_dag_temp_staging_releases_snapshot_before_later_write(
+    rollup_parts,
+    staging_helper,
+):
+    _store, dag, _config = rollup_parts
+    scope = f"transaction-hygiene-{staging_helper}"
+    day = date(2026, 7, 15)
+    node_id = _add_node(dag, scope, day, "staged source")
+    connection = dag.connection
+    assert connection is not None
+    assert connection.in_transaction is False
+
+    if staging_helper == "scope":
+        builder_module._scope_frontier(dag, scope)
+    elif staging_helper == "aggregate":
+        builder_module._canonical_aggregate_sources(dag, [node_id])
+    else:
+        periods_module.load_source_lineage(connection, [node_id], limit=10)
+
+    assert connection.in_transaction is False
+    with sqlite3.connect(dag.db_path) as independent:
+        independent.execute(
+            "INSERT OR REPLACE INTO metadata(key, value) VALUES(?, ?)",
+            (f"independent-{staging_helper}", "committed"),
+        )
+
+    # A leaked read snapshot makes this fail immediately with
+    # SQLITE_BUSY_SNAPSHOT after the independent commit above.
+    assert _add_node(dag, scope, day, "write after staging") > node_id
+
+
+@pytest.mark.parametrize("staging_helper", ["scope", "aggregate", "lineage"])
+def test_dag_temp_staging_preserves_caller_owned_transaction(
+    rollup_parts,
+    staging_helper,
+):
+    _store, dag, _config = rollup_parts
+    scope = f"outer-transaction-{staging_helper}"
+    day = date(2026, 7, 15)
+    node_id = _add_node(dag, scope, day, "outer transaction source")
+    connection = dag.connection
+    assert connection is not None
+
+    connection.execute("BEGIN")
+    connection.execute(
+        "INSERT INTO metadata(key, value) VALUES(?, ?)",
+        (f"caller-write-{staging_helper}", "still active"),
+    )
+    if staging_helper == "scope":
+        builder_module._scope_frontier(dag, scope)
+    elif staging_helper == "aggregate":
+        builder_module._canonical_aggregate_sources(dag, [node_id])
+    else:
+        periods_module.load_source_lineage(connection, [node_id], limit=10)
+
+    assert connection.in_transaction is True
+    assert connection.execute(
+        "SELECT value FROM metadata WHERE key = ?",
+        (f"caller-write-{staging_helper}",),
+    ).fetchone()[0] == "still active"
+    connection.rollback()
+    assert connection.execute(
+        "SELECT value FROM metadata WHERE key = ?",
+        (f"caller-write-{staging_helper}",),
+    ).fetchone() is None
+
+
+def test_scope_and_aggregate_staging_release_transaction_on_exception(
+    rollup_parts,
+    monkeypatch,
+):
+    _store, dag, _config = rollup_parts
+    scope = "staging-exception"
+    day = date(2026, 7, 15)
+    node_id = _add_node(dag, scope, day, "exception source")
+    connection = dag.connection
+    assert connection is not None
+
+    def fail_lineage(*_args, **_kwargs):
+        raise RuntimeError("forced lineage failure")
+
+    monkeypatch.setattr(builder_module, "load_source_lineage", fail_lineage)
+    with pytest.raises(builder_module.RollupWorkLimitExceeded):
+        builder_module._scope_frontier(dag, scope)
+    assert connection.in_transaction is False
+
+    with pytest.raises(builder_module.RollupWorkLimitExceeded):
+        builder_module._canonical_aggregate_sources(dag, [node_id])
+    assert connection.in_transaction is False
+
+
+def test_source_lineage_releases_transaction_on_exception(rollup_parts):
+    _store, dag, _config = rollup_parts
+    day = date(2026, 7, 15)
+    child_id = _add_node(dag, "lineage-exception", day, "child")
+    parent_id = dag.add_node(
+        SummaryNode(
+            session_id="lineage-exception",
+            depth=1,
+            summary="parent",
+            token_count=1,
+            source_token_count=2,
+            source_ids=[child_id],
+            source_type="nodes",
+            created_at=_timestamp(day),
+            earliest_at=_timestamp(day),
+            latest_at=_timestamp(day),
+        )
+    )
+    connection = dag.connection
+    assert connection is not None
+
+    with pytest.raises(RuntimeError, match="bounded work limit"):
+        periods_module.load_source_lineage(connection, [parent_id], limit=1)
+
+    assert connection.in_transaction is False

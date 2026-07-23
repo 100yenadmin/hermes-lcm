@@ -327,7 +327,7 @@ def test_vector_wire_format_is_explicit_little_endian_float32(stores):
     assert store.knn([3.0, 4.0], model="wire")[0][0] == str(node_id)
 
 
-def test_numpy_absent_uses_bounded_scan_with_same_top_k(stores, monkeypatch):
+def test_numpy_absent_reports_full_when_scan_covers_corpus(stores, monkeypatch):
     dag, store = stores
     first = _add_summary(dag, created_at=1.0)
     second = _add_summary(dag, created_at=2.0)
@@ -343,7 +343,7 @@ def test_numpy_absent_uses_bounded_scan_with_same_top_k(stores, monkeypatch):
     monkeypatch.setattr(vector_store_module, "_load_numpy", unavailable)
     result = store.knn([1.0, 0.0, 0.0], k=3, model="fallback")
 
-    assert result.coverage == "bounded"
+    assert result.coverage == "full"
     assert [row[0] for row in result] == [str(first), str(second), str(third)]
     assert [row[1] for row in result] == pytest.approx(
         [1.0, 1.0 / math.sqrt(2.0), 0.0],
@@ -812,7 +812,7 @@ def test_bounded_path_filters_before_applying_recency_bound(tmp_path, monkeypatc
         result = store.knn(
             [1.0, 0.0, 0.0], k=5, model="m", conversation_ids=["conversation-a"]
         )
-        assert result.coverage == "bounded"
+        assert result.coverage == "full"
         assert [row[0] for row in result] == [str(keep)]
     finally:
         store.close()

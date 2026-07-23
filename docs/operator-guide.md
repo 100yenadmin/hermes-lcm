@@ -181,6 +181,10 @@ environment variables:
 | `LCM_EMBEDDING_STORE_DIM` | `0` | Optional Matryoshka truncation dimension for newly-registered profiles (`0` = full profile dim); truncated vectors are renormalized and are also a distinct profile identity |
 | `LCM_EMBEDDING_BINARY_PRESCREEN` | `false` | Write the sign-bit prescreen for float32 identities too (int8 identities always write it), unlocking the full-corpus two-stage KNN; flipping it on an already-populated identity mints a new, distinct identity rather than mutating the existing one |
 | `LCM_KNN_PRESCREEN_MULTIPLIER` | `4` | Stage-1 prescreen breadth for two-stage KNN: `M = multiplier × k` lowest-Hamming-distance survivors are exact-rescored |
+| `LCM_PROACTIVE_RECALL_ENABLED` | `false` | Opt in to proactive memory injection: at assembly, embed the newest user message and inject one budget-capped "relevant memories" block (needs `LCM_EMBEDDINGS_ENABLED`). Default-off keeps assembly byte-identical |
+| `LCM_PROACTIVE_RECALL_MIN_SCORE` | `0.01` | Relevance floor for an injected memory. RRF-scale by default (a top-of-arm hit is ~0.016); with `LCM_RERANK_ENABLED` the score is a `[0,1]` cross-encoder relevance, so raise this (e.g. `0.3`) for a strict semantic gate |
+| `LCM_PROACTIVE_RECALL_BUDGET_TOKENS` | `500` | Hard token budget for the single injected block (1-3 items) |
+| `LCM_PROACTIVE_RECALL_PROVIDER` | empty | Embedding-provider override for the injection query only (e.g. keep a local `fastembed` provider offline even when search uses `voyage`). Empty reuses the main provider. The override provider must have embedded the corpus for its arms to return hits |
 | `LCM_DOCTOR_CLEAN_APPLY_ENABLED` | `false` | Permit destructive `/lcm doctor clean apply` in trusted operator contexts |
 | `LCM_EMPTY_LIFECYCLE_GC_ENABLED` | `true` | Master toggle for automatic pruning of lifecycle rows for sessions that never ingested any messages or summary nodes |
 | `LCM_EMPTY_LIFECYCLE_GC_THRESHOLD` | `200` | Number of lifecycle rows at which the GC pass fires (default 200 so fresh installs skip the work) |
@@ -871,6 +875,43 @@ not raw payload content, session ids, or tool-call ids. Repeated apply runs are
 idempotent. Rollback is also dry-run by default and accepts only an applied
 manifest; `--apply` deletes a manifest-owned sidecar only when its content still
 matches the recorded digest and neither a message nor a summary references it:
+Sidecar retention and redaction: before a historical tool result is written to
+the externalized-payload directory the command applies the currently enabled
+`LCM_SENSITIVE_PATTERNS` policy to its content, exactly as live ingest does, so no
+un-redacted secret is copied onto the new retention surface. Every manifest digest,
+ref, and provenance proof is derived from the redacted content that is actually
+stored. Each sidecar mirrors the live externalized-payload shape (kind, role,
+session id, tool-call id, and the redacted content) so recovery through
+`lcm_expand(externalized_ref=...)` keeps working. The manifest records the active
+redaction policy and refuses to resume a journal written under a different policy.
+
+The manifest is a durable ownership journal containing references, digests,
+provenance proofs, target-identity hashes, the redaction policy, counts, sizes, and
+token estimates, not raw payload content, session ids, or tool-call ids; the refs
+carry a `historical-backfill` marker rather than a tool-call stub. Reusing the same
+manifest path preserves every sidecar created by earlier apply runs. An interrupted apply
+can be rerun with the same path to recover its pending journal entries. The
+journal is bound to one database file and one externalized-payload storage root;
+the command refuses reuse or rollback against another target. Manifest files and
+sidecars are opened without following their final symlink and rollback rechecks
+file identity before deletion. A new manifest is published with a no-clobber
+link; an existing journal is updated with an atomic name exchange and restored
+if the displaced inode is not the validated manifest. A regular file or symlink
+that races into the manifest leaf is therefore preserved and the command fails
+closed. Existing-journal updates require atomic name-exchange support from the
+host OS and filesystem. Apply and rollback require the storage directory to be
+owned by the current user and not writable by group or other users. They also
+hold an advisory lock on the opened directory so concurrent invocations of this
+script cannot mutate it together.
+
+The command also refuses database schemas newer than this build before scanning
+rows or writing sidecars. Apply failures are recorded in `counts.failed` and
+`failed_paths` and cause a nonzero exit status. Rollback is dry-run by default
+and accepts only a complete, applied ownership journal for the historical-
+externalization operation; `--apply` deletes a sidecar only when its backfill
+provenance binds it to that journal, its content still matches the recorded
+digest, and no message content, nested `messages.tool_calls` value, or summary
+references it:
 
 ```bash
 python scripts/backfill_externalized_tool_outputs.py \
@@ -882,6 +923,15 @@ python scripts/backfill_externalized_tool_outputs.py \
 Stop the profile that owns the target database before an operator apply or
 rollback. Sidecar creation is additive, but a quiescent profile makes the
 reviewed manifest and reference checks a stable operator boundary.
+Stop the profile that owns the target database and every other process running
+as that account that can write the externalized-payload directory before an
+operator apply or rollback. The directory lock coordinates this script only;
+writers that ignore it are outside the supported integrity boundary. POSIX has
+no unlink-by-open-file-descriptor primitive, so rollback moves an owned sidecar
+to a random quarantine name, checks that inode again immediately before the
+name-based unlink, and fails closed with the quarantine entry retained if a
+replacement is detected. This quiescent, owner-controlled directory is the
+precondition that makes the final unlink safe.
 
 ### OpenClaw/lossless-claw history
 

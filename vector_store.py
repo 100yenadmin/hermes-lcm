@@ -1965,7 +1965,7 @@ class VectorStore:
                 sum(value * query_value for value, query_value in zip(vector, query))
                 for vector in vectors
             ]
-            coverage = "bounded"
+            coverage = candidate_coverage
 
         candidates = self._ranked(
             rowids,
@@ -2475,7 +2475,7 @@ class VectorStore:
                 sum(value * query_value for value, query_value in zip(vector, query))
                 for vector in vectors
             ]
-            coverage = "bounded"
+            coverage = candidate_coverage
 
         candidates = self._ranked(rowids, chunk_ids, kinds, scores, k)
         scanned = total = None

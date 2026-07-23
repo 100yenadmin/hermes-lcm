@@ -353,6 +353,10 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("embeddings_enabled", "LCM_EMBEDDINGS_ENABLED", bool),
     _EnvFieldSpec("rerank_enabled", "LCM_RERANK_ENABLED", bool),
     _EnvFieldSpec("recall_scan_rows", "LCM_RECALL_SCAN_ROWS", int),
+    _EnvFieldSpec("proactive_recall_enabled", "LCM_PROACTIVE_RECALL_ENABLED", bool),
+    _EnvFieldSpec("proactive_recall_min_score", "LCM_PROACTIVE_RECALL_MIN_SCORE", float),
+    _EnvFieldSpec("proactive_recall_budget_tokens", "LCM_PROACTIVE_RECALL_BUDGET_TOKENS", int),
+    _EnvFieldSpec("proactive_recall_provider", "LCM_PROACTIVE_RECALL_PROVIDER", str),
     _EnvFieldSpec("embedding_bounded_scan_rows", "LCM_EMBEDDING_BOUNDED_SCAN_ROWS", int),
     _EnvFieldSpec("embedding_storage_dtype", "LCM_EMBEDDING_STORAGE_DTYPE", str),
     _EnvFieldSpec("embedding_store_dim", "LCM_EMBEDDING_STORE_DIM", int),
@@ -592,6 +596,25 @@ class LCMConfig:
     recall_arm_weights: dict[str, float] = field(
         default_factory=lambda: dict(_DEFAULT_RECALL_ARM_WEIGHTS)
     )
+    # -- Proactive memory injection (SPEC F, default-OFF) ---
+    # At active-context assembly, embed the newest user message and run the
+    # lcm_recall pipeline to surface cross-session memories the model would
+    # otherwise have to lcm_recall by hand. Default-off => byte-identical
+    # assembly; when disabled the whole path is skipped before any work.
+    proactive_recall_enabled: bool = False
+    # Relevance floor on the lcm_recall composite score. Two regimes:
+    #  - rerank OFF (default): the score is RRF-scale (~0.014-0.05); a single
+    #    top-ranked arm hit is ~0.016, so this floor mainly drops ancient or
+    #    low-ranked hits. The default keeps fresh top-of-arm hits.
+    #  - rerank ON: a cross-encoder relevance in [0,1] dominates the score;
+    #    raise this floor (e.g. ~0.3) for a true semantic gate.
+    proactive_recall_min_score: float = 0.01
+    # Hard token budget for the single injected "relevant memories" block.
+    proactive_recall_budget_tokens: int = 500
+    # Optional embedding-provider override for the injection query only (e.g.
+    # keep a local fastembed provider for the offline injection path even when
+    # interactive search uses voyage). Empty => reuse the main provider/model.
+    proactive_recall_provider: str = ""
     embedding_provider: str = ""
     embedding_model: str = ""
     # Content-aware chunk policy for the raw-history chunk corpus:
