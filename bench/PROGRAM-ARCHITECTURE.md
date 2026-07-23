@@ -36,7 +36,13 @@ while holding full ~22k-token untruncated contexts (medians identical for answer
 **The recall floor is reachability: states need direct semantic addressability (embedding backfill), not
 neighborhood expansion.**
 
-M1+M2 converge: **reach the right states, then deliver them small.** That is wave-3.
+**M3 — H6-P0 protocol pin (07-24, file:line-verified):** the agentic tier ALSO answers through the same fixed
+Qwen3.5-9B reader — the coding agent only CURATES evidence (memory_markdown + ≤20 trajectory spans) which the
+reader consumes; scoring path identical to static. **Codex-69.9 vs our 27.7 is therefore entirely context-curation
+quality into the same weak consumer.** The static/agentic ladder split is curation-by-pipeline vs curation-by-agent.
+
+M1+M2+M3 converge: **reach the right states, then deliver them small — curation quality IS the benchmark.**
+That is wave-3 (pipeline curation) and H6 (agent curation over our store); they share the same thesis.
 
 ## 2. DECISION RECORD — the official protocol becomes the primary static instrument (NEW, 07-24)
 
