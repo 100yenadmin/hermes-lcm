@@ -324,3 +324,228 @@ def test_compute_enforces_explicit_as_of_date_without_optional_argument(compute_
 
     assert payload["status"] == "fallback"
     assert "after the question-date boundary" in payload["reason"]
+
+
+# --- Round-2 review contract seams (Tosko4, 2026-07-23T06:51Z) ------------------
+
+
+def test_compute_rejects_top_level_date_from_mixed_temporal_quote(compute_store):
+    """A top-level ``date`` must not certify an incidental date from a quote that
+    also carries a relative temporal expression. This operand deliberately omits
+    ``occurrence_time`` so it exercises the top-level ``date`` path, which
+    previously bypassed the mixed-temporal fail-closed check.
+    """
+    store, engine = compute_store
+    observed = datetime(2024, 3, 20, tzinfo=timezone.utc).timestamp()
+    dashboard = "I finished the dashboard 5 days ago. The contract was signed on 2024-03-01."
+    kickoff = "The kickoff was on 2024-03-10."
+    dashboard_id = store.append(
+        "session-a", {"role": "user", "content": dashboard, "timestamp": observed}
+    )
+    kickoff_id = store.append(
+        "session-a", {"role": "user", "content": kickoff, "timestamp": observed}
+    )
+
+    payload = json.loads(
+        lcm_tools.lcm_compute(
+            {
+                "question": "Put the dashboard and kickoff in chronological order.",
+                "evidence_complete": True,
+                "operands": [
+                    {
+                        **_operand(store, dashboard_id, dashboard, label="dashboard"),
+                        "date": "2024-03-01",
+                    },
+                    {
+                        **_operand(store, kickoff_id, kickoff, label="kickoff"),
+                        "date": "2024-03-10",
+                    },
+                ],
+            },
+            engine=engine,
+        )
+    )
+
+    assert payload["status"] == "fallback"
+    assert "2024-03-01" in payload["reason"]
+
+
+def test_compute_accepts_top_level_date_from_single_date_quote(compute_store):
+    """Guard against over-narrowing fix 1: a clean single-date quote still
+    certifies its top-level ``date``.
+    """
+    store, engine = compute_store
+    observed = datetime(2024, 3, 20, tzinfo=timezone.utc).timestamp()
+    dashboard = "The dashboard shipped on 2024-03-15."
+    kickoff = "The kickoff was on 2024-03-10."
+    dashboard_id = store.append(
+        "session-a", {"role": "user", "content": dashboard, "timestamp": observed}
+    )
+    kickoff_id = store.append(
+        "session-a", {"role": "user", "content": kickoff, "timestamp": observed}
+    )
+
+    payload = json.loads(
+        lcm_tools.lcm_compute(
+            {
+                "question": "Put the dashboard and kickoff in chronological order.",
+                "evidence_complete": True,
+                "operands": [
+                    {
+                        **_operand(store, dashboard_id, dashboard, label="dashboard"),
+                        "date": "2024-03-15",
+                    },
+                    {
+                        **_operand(store, kickoff_id, kickoff, label="kickoff"),
+                        "date": "2024-03-10",
+                    },
+                ],
+            },
+            engine=engine,
+        )
+    )
+
+    assert payload["status"] == "computed"
+    assert payload["trace"]["result"] == "kickoff -> dashboard"
+
+
+def test_compute_rejects_wrong_name_same_cardinality(compute_store):
+    """Known-cardinality plans (explicit count) must still enforce that the named
+    operands match the named set, not merely the operand count.
+    """
+    store, engine = compute_store
+    rows = {}
+    for name, amount in (("Alice", 10), ("Bob", 20), ("Dave", 40)):
+        content = f"{name} amount ${amount}"
+        store_id = store.append("session-a", {"role": "user", "content": content})
+        rows[name] = (store_id, content, amount)
+
+    operands = [
+        _operand(store, rows[name][0], rows[name][1], value=rows[name][2], unit="usd", label=name)
+        for name in ("Alice", "Bob", "Dave")
+    ]
+    payload = json.loads(
+        lcm_tools.lcm_compute(
+            {
+                "question": "What is the total of the three amounts for Alice, Bob, and Carol?",
+                "evidence_complete": True,
+                "operands": operands,
+            },
+            engine=engine,
+        )
+    )
+
+    assert payload["status"] == "fallback"
+    assert "Carol" in payload["reason"]
+
+
+def test_compute_rejects_substring_named_coverage(compute_store):
+    """Coverage is exact and injective: an ``Anna`` operand cannot cover ``Ann``."""
+    store, engine = compute_store
+    rows = {}
+    for name, amount in (("Ann", 5), ("Anna", 7), ("Bob", 9)):
+        content = f"{name} amount ${amount}"
+        store_id = store.append("session-a", {"role": "user", "content": content})
+        rows[name] = (store_id, content, amount)
+
+    operands = [
+        _operand(store, rows[name][0], rows[name][1], value=rows[name][2], unit="usd", label=name)
+        for name in ("Anna", "Bob")
+    ]
+    payload = json.loads(
+        lcm_tools.lcm_compute(
+            {
+                "question": "What is the total amount for Ann, Anna, and Bob?",
+                "evidence_complete": True,
+                "operands": operands,
+            },
+            engine=engine,
+        )
+    )
+
+    assert payload["status"] == "fallback"
+    assert payload["reason"].endswith("missing: Ann")
+
+
+def test_compute_accepts_value_derived_labels_for_named_order(compute_store):
+    """Round-1 regression guard: the coverage validator must derive names from a
+    string ``value`` (as the executor does), not only the optional ``label``.
+    """
+    store, engine = compute_store
+    observed = datetime(2024, 3, 20, tzinfo=timezone.utc).timestamp()
+    alice = "Alice shipped on 2024-03-05."
+    bob = "Bob shipped on 2024-03-08."
+    alice_id = store.append(
+        "session-a", {"role": "user", "content": alice, "timestamp": observed}
+    )
+    bob_id = store.append(
+        "session-a", {"role": "user", "content": bob, "timestamp": observed}
+    )
+
+    payload = json.loads(
+        lcm_tools.lcm_compute(
+            {
+                "question": "Put Alice and Bob in chronological order.",
+                "evidence_complete": True,
+                "operands": [
+                    {**_operand(store, alice_id, alice, value="Alice"), "date": "2024-03-05"},
+                    {**_operand(store, bob_id, bob, value="Bob"), "date": "2024-03-08"},
+                ],
+            },
+            engine=engine,
+        )
+    )
+
+    assert payload["status"] == "computed"
+    assert payload["trace"]["result"] == "Alice -> Bob"
+
+
+def test_selector_alignment_accepts_value_and_key_derived_labels():
+    """Fix 3, unit level: both the string-value and canonical-key derivation
+    routes satisfy finite-set coverage when the optional ``label`` is absent.
+    """
+    from hermes_lcm.reasoning import (
+        EvidencePlan,
+        GroundedEvidence,
+        validate_selector_alignment,
+    )
+
+    plan = EvidencePlan(
+        operation="order",
+        minimum_operands=2,
+        maximum_operands=50,
+        requires_complete_evidence=True,
+    )
+    operands = [
+        GroundedEvidence(
+            citation="lcm:1:0-5",
+            store_id=1,
+            span_start=0,
+            span_end=5,
+            quote="Alice",
+            value="Alice",
+            unit=None,
+            key=None,
+            label=None,
+            evidence_date=None,
+        ),
+        GroundedEvidence(
+            citation="lcm:2:0-3",
+            store_id=2,
+            span_start=0,
+            span_end=3,
+            quote="Bob",
+            value=None,
+            unit=None,
+            key="bob",
+            label=None,
+            evidence_date=None,
+        ),
+    ]
+
+    assert (
+        validate_selector_alignment(
+            "Put Alice and Bob in chronological order.", plan, operands
+        )
+        is None
+    )

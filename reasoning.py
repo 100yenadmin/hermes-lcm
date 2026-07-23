@@ -596,6 +596,31 @@ def _quote_supports_day(quote: str, expected: date, raw_date: str) -> bool:
     return False
 
 
+def _quote_temporal_day(quote: str, observed_at: float | None) -> tuple[date | None, bool]:
+    """Resolve the quote's single occurrence day and flag temporal ambiguity.
+
+    Returns ``(day, ambiguous)``. ``ambiguous`` is True when the quote mixes
+    competing temporal expressions (relative phrasing plus an explicit date, or
+    multiple distinct explicit dates), which is exactly when a supplied
+    top-level ``date`` would otherwise certify an incidental date drawn from the
+    same quote. ``day`` is the resolver's unambiguous event date when one
+    exists, otherwise ``None``.
+    """
+    session_date: str | None = None
+    if observed_at is not None:
+        try:
+            session_date = datetime.fromtimestamp(
+                observed_at, tz=timezone.utc
+            ).date().isoformat()
+        except (ValueError, OverflowError, OSError):
+            session_date = None
+    resolved = resolve_occurrence_time(
+        quote, observed_at=observed_at, session_date=session_date
+    )
+    ambiguous = str(resolved.get("reason") or "").startswith("ambiguous")
+    return _parse_day(str(resolved.get("event_date") or "")), ambiguous
+
+
 def _bounded_optional_text(value: Any, field: str) -> tuple[str | None, str | None]:
     if value is None:
         return None, None
@@ -712,10 +737,25 @@ def _ground_one(
         claimed_day = _parse_day(raw_date)
         if claimed_day is None:
             return None, f"date {raw_date!r} is invalid or timezone-ambiguous"
-        if claimed_day != occurrence_day and not _quote_supports_day(
-            quote, claimed_day, raw_date
-        ):
-            return None, f"date {raw_date!r} is not supported by the exact quote"
+        if claimed_day != occurrence_day:
+            # Without a resolved occurrence_time, a bare top-level date must be
+            # the quote's single, unambiguous day. A quote that mixes this date
+            # with other temporal expressions (relative phrasing or a second
+            # explicit date) makes the certified date incidental, so fail closed
+            # rather than pin an unrelated clause's date onto this operand.
+            if occurrence_day is None:
+                resolved_day, temporally_ambiguous = _quote_temporal_day(
+                    quote, resolved.observed_at
+                )
+                if temporally_ambiguous or (
+                    resolved_day is not None and resolved_day != claimed_day
+                ):
+                    return None, (
+                        f"date {raw_date!r} is not unambiguously supported by the "
+                        "exact quote"
+                    )
+            if not _quote_supports_day(quote, claimed_day, raw_date):
+                return None, f"date {raw_date!r} is not supported by the exact quote"
         evidence_day = claimed_day
 
     if as_of is not None and evidence_day is not None:
@@ -908,18 +948,30 @@ def _finite_named_question_slots(question: str) -> tuple[str, ...]:
     return ()
 
 
-def _slot_is_covered(slot: str, labels: Sequence[str]) -> bool:
-    slot_tokens = _normalized_tokens(slot)
-    if not slot_tokens:
-        return False
-    normalized_slot = " ".join(slot_tokens)
-    for label in labels:
-        normalized_label = " ".join(_normalized_tokens(label))
-        if normalized_label and (
-            normalized_label in normalized_slot or normalized_slot in normalized_label
-        ):
-            return True
-    return False
+def _selector_coverage_gap(slots: Sequence[str], labels: Sequence[str]) -> list[str]:
+    """Return the named slots that no distinct operand label covers.
+
+    Matching is exact (normalized-token equality, not substring) and injective:
+    each operand label satisfies at most one slot. Exactness stops ``Anna`` from
+    covering ``Ann``; injectivity stops a single operand from covering two slots
+    and stops a wrong-name operand (``Dave``) from filling a same-cardinality
+    set that names someone else (``Carol``).
+    """
+    remaining = [
+        normalized
+        for label in labels
+        if (normalized := " ".join(_normalized_tokens(label)))
+    ]
+    missing: list[str] = []
+    for slot in slots:
+        normalized_slot = " ".join(_normalized_tokens(slot))
+        if not normalized_slot:
+            continue
+        if normalized_slot in remaining:
+            remaining.remove(normalized_slot)
+        else:
+            missing.append(slot)
+    return missing
 
 
 def validate_selector_alignment(
@@ -928,11 +980,22 @@ def validate_selector_alignment(
     operands: Sequence[GroundedEvidence],
 ) -> str | None:
     """Validate finite-set coverage and directed selector ordering."""
-    if plan.requires_complete_evidence:
+    # A question that names a finite entity set must be answered from exactly
+    # that set -- even for known-cardinality plans (``sum``/``count``/``order``
+    # with an explicit count) where open-ended completeness is otherwise
+    # assumed satisfied by the count. Labels are derived the same way the
+    # executor derives them (explicit label, then a string value, then the
+    # canonical key), so a fully grounded operand that omits the optional label
+    # is not treated as missing.
+    if plan.requires_complete_evidence or plan.operation in {
+        "sum",
+        "count_distinct",
+        "order",
+    }:
         slots = _finite_named_question_slots(question)
         if slots:
-            labels = [str(operand.label) for operand in operands if operand.label]
-            missing = [slot for slot in slots if not _slot_is_covered(slot, labels)]
+            labels = [label for operand in operands if (label := _label(operand))]
+            missing = _selector_coverage_gap(slots, labels)
             if missing:
                 return "named evidence is incomplete; missing: " + ", ".join(missing)
 
