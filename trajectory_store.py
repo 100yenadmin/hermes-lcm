@@ -1626,6 +1626,7 @@ class TrajectoryStore:
         limit: int,
         q_lex: int,
         q_sem: int,
+        floor_k: int = 0,
     ) -> list[sqlite3.Row]:
         """Policy D -- round-robin a pure-lexical arm and the semantic/fused arm
         into the nucleus by a ``q_lex:q_sem`` quota.
@@ -1635,6 +1636,14 @@ class TrajectoryStore:
         quota (preserving the semantic gains). Deduped by ``state_id``; a short
         arm is backfilled by the other (a skipped duplicate does not consume a
         quota slot). Arm order is the deterministic tie-break.
+
+        ``floor_k`` composes Policy A on top (the A+D hybrid, issue #127): the
+        top ``floor_k`` pure-lexical (BM25) states are reserved a nucleus slot
+        FIRST -- protecting the strongest lexical incumbents as Policy A does --
+        and the quota round-robin then fills the remaining slots. ``floor_k == 0``
+        (default) is byte-identical to the pure Policy D round-robin. The floor
+        is drawn from the head of ``arm_lex`` (already 5-per-trajectory
+        diversity-capped), matching ``_select_with_floor``'s guaranteed slots.
         """
         selected: list[sqlite3.Row] = []
         seen: set[int] = set()
@@ -1654,6 +1663,9 @@ class TrajectoryStore:
             return index
 
         lex_i = sem_i = 0
+        floor_k = min(max(0, int(floor_k)), limit)
+        if floor_k:
+            lex_i = _pull(arm_lex, lex_i, floor_k)
         while len(selected) < limit and (lex_i < len(arm_lex) or sem_i < len(arm_sem)):
             next_lex = _pull(arm_lex, lex_i, q_lex)
             next_sem = _pull(arm_sem, sem_i, q_sem)
@@ -1820,12 +1832,17 @@ class TrajectoryStore:
             # pure-lexical arm and the semantic/fused arm into the nucleus by the
             # requested quota. Superset of Policy A; ``arm_quota is None``
             # (default) is byte-identical to the historical selection below.
+            # When ``lexical_floor > 0`` is ALSO supplied this becomes the A+D
+            # hybrid: the top ``lexical_floor`` pure-BM25 incumbents are reserved
+            # a slot first, then the quota round-robin fills the rest
+            # (``lexical_floor == 0`` reproduces the pure Policy D bytes).
             q_lex = max(0, int(arm_quota[0]))
             q_sem = max(0, int(arm_quota[1]))
             arm_lex = self._select_diverse(global_rows, nucleus_limit)
             arm_sem = self._select_diverse(rows, nucleus_limit)
             selected = self._merge_arms(
-                arm_lex, arm_sem, nucleus_limit, q_lex, q_sem
+                arm_lex, arm_sem, nucleus_limit, q_lex, q_sem,
+                floor_k=lexical_floor,
             )
         elif lexical_floor > 0:
             # Policy A (candidate-composition repair, issue #127): guarantee the

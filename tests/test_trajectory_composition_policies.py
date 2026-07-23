@@ -173,6 +173,50 @@ def test_merge_arms_dedups_and_backfills_without_wasting_quota():
     assert len(ids) == len(set(ids))
 
 
+def test_merge_arms_hybrid_floor_reserves_lexical_incumbents_first():
+    # A+D hybrid (issue #127): floor_k reserves the top pure-lexical rows a slot
+    # BEFORE the quota round-robin, then the round-robin fills the rest.
+    # floor_k=0 (the default) is byte-identical to the pure Policy D merge.
+    def _rows(ids):
+        return [{"state_id": i, "trajectory_id": f"t{i}"} for i in ids]
+
+    arm_lex = _rows([1, 2, 3, 4])
+    arm_sem = _rows([2, 3, 5, 6])  # 2,3 overlap with lex
+    hybrid = TrajectoryStore._merge_arms(
+        arm_lex, arm_sem, limit=6, q_lex=2, q_sem=2, floor_k=1
+    )
+    ids = [row["state_id"] for row in hybrid]
+    assert ids[0] == 1  # top pure-lexical incumbent reserved by the floor first
+    assert ids == [1, 2, 3, 5, 6, 4]
+    assert len(ids) == len(set(ids))
+    # floor_k=0 (and the omitted default) reproduce the pure Policy D bytes.
+    pure_d = [1, 2, 3, 5, 4, 6]
+    assert [r["state_id"] for r in TrajectoryStore._merge_arms(
+        arm_lex, arm_sem, limit=6, q_lex=2, q_sem=2)] == pure_d
+    assert [r["state_id"] for r in TrajectoryStore._merge_arms(
+        arm_lex, arm_sem, limit=6, q_lex=2, q_sem=2, floor_k=0)] == pure_d
+
+
+def test_hybrid_floor_plus_quota_readmits_winner_and_composes(tmp_path: Path):
+    # The A+D hybrid composes: the lexical floor protects the displaced winner
+    # while the arm quota keeps the semantic arm represented; arm_quota with
+    # lexical_floor=0 is byte-identical to the pure Policy D delivery.
+    store = _build_magnet_store(tmp_path)
+    assert "target" not in _delivered_trajectories(store.query(_QUERY, limit=16, image_limit=0))
+
+    hybrid = store.query(_QUERY, limit=16, image_limit=0, lexical_floor=1, arm_quota=(6, 5))
+    trajectories = _delivered_trajectories(hybrid)
+    assert "target" in trajectories  # lexical incumbent protected by the floor
+    assert any(t.startswith("distractor-") for t in trajectories)  # semantic arm kept
+    assert len({hit.exact_ref for hit in hybrid}) == len(hybrid)
+
+    pure_d_refs = [h.exact_ref for h in store.query(_QUERY, limit=16, image_limit=0, arm_quota=(6, 5))]
+    assert [
+        h.exact_ref
+        for h in store.query(_QUERY, limit=16, image_limit=0, lexical_floor=0, arm_quota=(6, 5))
+    ] == pure_d_refs
+
+
 def test_policies_are_noops_without_semantic_ranks(tmp_path: Path):
     # No embedding provider -> no semantic boost -> the fused order IS the lexical
     # order, so both policies degenerate to the historical selection.
