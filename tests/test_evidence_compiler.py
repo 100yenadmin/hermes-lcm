@@ -678,7 +678,14 @@ def test_no_progress_retrieval_stops_and_trace_is_secret_safe(tmp_path):
 
 def test_registered_tool_uses_the_product_compiler_path(tmp_path):
     engine = _engine(tmp_path)
-    source = _append(engine, "Maya owns the Atlas rollout.")
+    # Pin the observation time before the pinned question_date: an unpinned
+    # append is observed "now", which crosses the 2026-07-20 as_of boundary
+    # once the wall clock passes it and collapses the compile into fallback.
+    source = _append(
+        engine,
+        "Maya owns the Atlas rollout.",
+        observed_at=datetime(2026, 7, 19, 9, tzinfo=timezone.utc).timestamp(),
+    )
     proposal = _selector(
         _claim("owner", source, "atlas-owner", entity="Maya", role="user")
     )({})
