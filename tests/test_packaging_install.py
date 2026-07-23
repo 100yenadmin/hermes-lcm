@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from pathlib import Path
 import importlib
 import importlib.util
@@ -749,8 +750,17 @@ def test_pre_llm_hook_selective_compiler_uses_existing_auxiliary_seam_and_fails_
     module.register(ctx)
     first = "The first of the two purchases cost $20."
     second = "The second purchase cost $30."
-    first_id = ctx.engine._store.append("purchase-a", {"role": "user", "content": first})
-    second_id = ctx.engine._store.append("purchase-b", {"role": "user", "content": second})
+    # Pin the observation time before the pinned question_date ("2026-07-20"):
+    # an unpinned append is observed "now", which crosses the as_of boundary
+    # once the wall clock passes the pinned date, so grounding rejects the
+    # operands and the hook fails open without the selective-evidence block.
+    observed_at = datetime(2026, 7, 19, 9, tzinfo=timezone.utc).timestamp()
+    first_id = ctx.engine._store.append(
+        "purchase-a", {"role": "user", "content": first, "timestamp": observed_at}
+    )
+    second_id = ctx.engine._store.append(
+        "purchase-b", {"role": "user", "content": second, "timestamp": observed_at}
+    )
     refs = [
         {"exact_ref": f"lcm:{first_id}:0-{len(first)}", "quote": first},
         {"exact_ref": f"lcm:{second_id}:0-{len(second)}", "quote": second},

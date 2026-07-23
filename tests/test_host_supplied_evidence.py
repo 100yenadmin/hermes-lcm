@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
 import sys
 import types
@@ -15,6 +16,14 @@ from hermes_lcm.host_evidence import (
     prepare_host_evidence_selector,
 )
 from hermes_lcm.store import MessageStore
+
+# Fixtures that pin question_date="2026-07-20" must also pin the observation
+# time of their appended sources: an unpinned append is observed "now", which
+# crosses the as_of boundary once the wall clock passes the pinned date and
+# collapses grounding into compiler_fallback.
+_OBSERVED_BEFORE_QUESTION_DATE = datetime(
+    2026, 7, 19, 9, tzinfo=timezone.utc
+).timestamp()
 
 
 def _engine(tmp_path):
@@ -32,10 +41,20 @@ def test_code_owns_host_envelope_and_selector_proposes_semantics_only(tmp_path):
     owner_text = "Maya owns the Atlas rollout."
     deadline_text = "The Atlas rollout was due on 2026-07-15."
     owner_id = engine._store.append(
-        "session-a", {"role": "user", "content": owner_text}
+        "session-a",
+        {
+            "role": "user",
+            "content": owner_text,
+            "timestamp": _OBSERVED_BEFORE_QUESTION_DATE,
+        },
     )
     deadline_id = engine._store.append(
-        "session-a", {"role": "user", "content": deadline_text}
+        "session-a",
+        {
+            "role": "user",
+            "content": deadline_text,
+            "timestamp": _OBSERVED_BEFORE_QUESTION_DATE,
+        },
     )
     owner = {
         "exact_ref": f"lcm:{owner_id}:0-{len(owner_text)}",
@@ -127,10 +146,20 @@ def test_named_facet_delta_is_selected_before_the_only_semantic_call(tmp_path):
     baseline_text = "Atlas rollout notes are available."
     owner_text = "Maya owns the Atlas rollout."
     baseline_id = engine._store.append(
-        "session-a", {"role": "user", "content": baseline_text}
+        "session-a",
+        {
+            "role": "user",
+            "content": baseline_text,
+            "timestamp": _OBSERVED_BEFORE_QUESTION_DATE,
+        },
     )
     owner_id = engine._store.append(
-        "session-b", {"role": "user", "content": owner_text}
+        "session-b",
+        {
+            "role": "user",
+            "content": owner_text,
+            "timestamp": _OBSERVED_BEFORE_QUESTION_DATE,
+        },
     )
     baseline = {
         "exact_ref": f"lcm:{baseline_id}:0-{len(baseline_text)}",
