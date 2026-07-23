@@ -1710,9 +1710,9 @@ class TrajectoryStore:
         self,
         seed_rows: Sequence[sqlite3.Row],
         radius: int,
-    ) -> list[tuple[sqlite3.Row, int, int]]:
+    ) -> list[tuple[int, int, int]]:
         """H5(b) pool-expansion arm (issue #135): sequence neighbors of the
-        lexical seed hits, as ``(row, seed_state_id, distance)`` triples.
+        lexical seed hits, as ``(state_id, seed_state_id, distance)`` triples.
 
         Every pool row IS a lexical seed (it entered via ``global_rows`` /
         ``scoped_rows`` FTS), so the seeds are exactly ``seed_rows`` in pool
@@ -1729,6 +1729,11 @@ class TrajectoryStore:
         earn NO semantic boost and no BM25 rank of their own (anti-magnet
         control -- they are admitted by the caller only through the
         quota-capped ``_merge_arms`` tail).
+
+        Returns LIGHTWEIGHT id triples (a batched index-only probe): the full
+        rows -- state text is large -- are fetched by the caller for the
+        ADMITTED quota subset only, keeping the expansion inside the latency
+        budget (gate iv).
         """
         pool_ids = {int(row["state_id"]) for row in seed_rows}
         positions: list[tuple[int, int]] = []
@@ -1747,7 +1752,7 @@ class TrajectoryStore:
                         continue
                     wanted.add(key)
                     positions.append(key)
-        row_by_position: dict[tuple[int, int], sqlite3.Row] = {}
+        id_by_position: dict[tuple[int, int], int] = {}
         chunk = 400  # 2 bound params per pair; stay far below SQLite limits
         for start in range(0, len(positions), chunk):
             batch = positions[start : start + chunk]
@@ -1757,35 +1762,50 @@ class TrajectoryStore:
                 params.extend((source_id, neighbor))
             fetched = self._conn.execute(
                 f"""
-                SELECT s.*, src.trajectory_id, src.goal, src.outcome, src.ordinal,
-                       a.relative_path, a.sha256 AS asset_sha256, 0.0 AS rank
+                SELECT s.state_id, s.source_id, s.sequence_ordinal
                 FROM lcm_trajectory_states s
-                JOIN lcm_trajectory_sources src ON src.source_id = s.source_id
-                LEFT JOIN lcm_trajectory_assets a ON a.state_id = s.state_id
                 WHERE (s.source_id, s.sequence_ordinal) IN (VALUES {values})
                 """,
                 params,
             ).fetchall()
             for fetched_row in fetched:
-                row_by_position[
+                id_by_position[
                     (int(fetched_row["source_id"]), int(fetched_row["sequence_ordinal"]))
-                ] = fetched_row
-        arm: list[tuple[sqlite3.Row, int, int]] = []
+                ] = int(fetched_row["state_id"])
+        arm: list[tuple[int, int, int]] = []
         emitted: set[int] = set(pool_ids)
         for distance in range(1, radius + 1):
             for row in seed_rows:
                 source_id = int(row["source_id"])
                 ordinal = int(row["sequence_ordinal"])
                 for neighbor in (ordinal - distance, ordinal + distance):
-                    neighbor_row = row_by_position.get((source_id, neighbor))
-                    if neighbor_row is None:
-                        continue
-                    state_id = int(neighbor_row["state_id"])
-                    if state_id in emitted:
+                    state_id = id_by_position.get((source_id, neighbor))
+                    if state_id is None or state_id in emitted:
                         continue
                     emitted.add(state_id)
-                    arm.append((neighbor_row, int(row["state_id"]), distance))
+                    arm.append((state_id, int(row["state_id"]), distance))
         return arm
+
+    def _state_rows_by_ids(self, state_ids: Sequence[int]) -> dict[int, sqlite3.Row]:
+        """Full candidate-shaped rows (text, source join, asset join) for the
+        given state ids -- the same column shape as ``_fts_rows`` with a
+        placeholder rank, fetched only for the quota-admitted expansion
+        states."""
+        if not state_ids:
+            return {}
+        placeholders = ",".join("?" for _ in state_ids)
+        rows = self._conn.execute(
+            f"""
+            SELECT s.*, src.trajectory_id, src.goal, src.outcome, src.ordinal,
+                   a.relative_path, a.sha256 AS asset_sha256, 0.0 AS rank
+            FROM lcm_trajectory_states s
+            JOIN lcm_trajectory_sources src ON src.source_id = s.source_id
+            LEFT JOIN lcm_trajectory_assets a ON a.state_id = s.state_id
+            WHERE s.state_id IN ({placeholders})
+            """,
+            [int(state_id) for state_id in state_ids],
+        ).fetchall()
+        return {int(row["state_id"]): row for row in rows}
 
     def query(
         self,
@@ -1925,21 +1945,26 @@ class TrajectoryStore:
         if adjacency_radius > 0 and adjacency_quota > 0 and rows:
             arm_triples = self._adjacency_expansion_arm(rows, adjacency_radius)
             if arm_triples:
-                arm_adjacent = [triple[0] for triple in arm_triples]
                 seed_by_state = {
-                    int(triple[0]["state_id"]): (triple[1], triple[2])
-                    for triple in arm_triples
+                    state_id: (seed_state_id, distance)
+                    for state_id, seed_state_id, distance in arm_triples
                 }
-                expanded = self._merge_arms(
+                arm_adjacent = [
+                    {"state_id": state_id} for state_id, _seed, _dist in arm_triples
+                ]
+                merged = self._merge_arms(
                     rows,
-                    arm_adjacent,
+                    arm_adjacent,  # type: ignore[arg-type]  # only "state_id" is read
                     len(rows) + adjacency_quota,
                     len(rows),
                     adjacency_quota,
                 )
-                for row in expanded[len(rows):]:
-                    state_id = int(row["state_id"])
+                admitted_ids = [int(row["state_id"]) for row in merged[len(rows):]]
+                full_by_id = self._state_rows_by_ids(admitted_ids)
+                expanded = list(rows)
+                for state_id in admitted_ids:
                     seed_state_id, distance = seed_by_state[state_id]
+                    expanded.append(full_by_id[state_id])
                     candidate_kind[state_id] = "adjacent"
                     candidate_score[state_id] = (
                         candidate_score[seed_state_id] + 0.000001 * distance
