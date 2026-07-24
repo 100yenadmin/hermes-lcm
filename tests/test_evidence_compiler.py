@@ -17,6 +17,7 @@ from hermes_lcm.evidence_compiler import (
     derive_evidence_request,
 )
 from hermes_lcm.query_view_store import QueryViewStore
+from hermes_lcm.schemas import LCM_COMPILE_EVIDENCE
 from hermes_lcm.store import MessageStore
 from hermes_lcm.tools import lcm_compile_evidence
 
@@ -710,6 +711,52 @@ def test_registered_tool_uses_the_product_compiler_path(tmp_path):
     assert payload["evidence"][0]["exact_ref"] == source["exact_ref"]
     assert payload["provenance"]["storage"] == "same_lcm_db"
     assert payload["provenance"]["final_prose_cached"] is False
+
+
+def test_public_proposal_schema_does_not_require_code_derived_operation(tmp_path):
+    """The proposal schema's required/allowed keys must match what
+    _validate_proposal actually accepts. operation is a deterministic,
+    code-derived field surfaced to the selector as input (via
+    selector_request["operation"]) -- it is never a selector output, so the
+    public schema must not require (or allow) callers to echo it back
+    (F-PR436-4: the schema required it while the runtime rejected it)."""
+    proposal_schema = LCM_COMPILE_EVIDENCE["parameters"]["properties"]["proposal"]
+    assert "operation" not in proposal_schema["required"]
+    assert "operation" not in proposal_schema["properties"]
+
+    engine = _engine(tmp_path)
+    source = _append(
+        engine,
+        "Maya owns the Atlas rollout.",
+        observed_at=datetime(2026, 7, 19, 9, tzinfo=timezone.utc).timestamp(),
+    )
+    # A caller who builds a proposal containing ONLY the schema's required
+    # keys (the honest, schema-compliant path) must succeed end to end.
+    schema_compliant_proposal = {
+        key: value
+        for key, value in _selector(
+            _claim("owner", source, "atlas-owner", entity="Maya", role="user")
+        )({}).items()
+        if key in proposal_schema["required"]
+    }
+    assert set(schema_compliant_proposal) == set(proposal_schema["required"])
+    try:
+        payload = json.loads(
+            lcm_compile_evidence(
+                {
+                    "question": "Who owns the Atlas rollout?",
+                    "question_date": "2026-07-20",
+                    "baseline_refs": [source],
+                    "proposal": schema_compliant_proposal,
+                },
+                engine=engine,
+            )
+        )
+    finally:
+        engine._store.close()
+
+    assert payload["status"] == "compiled"
+    assert payload["reason_code"] != "selector_schema_invalid"
 
 
 def test_selective_query_view_persistence_is_same_db_and_default_off(tmp_path):
