@@ -113,6 +113,13 @@ be substituted for the primary if the primary disappoints.
 abstention subset is non-empty and that its accuracy is below ceiling, so "strictly up" is attainable.
 Record the L3 subset counts in the pilot report **before** the arm runs.
 
+**GATE STRENGTHENING (recorded 2026-07-25, BEFORE the pilot returned any numbers — this is a
+tightening, not a relaxation, and is logged as such per the never-relax-at-one-short rule):** the M11
+power check shows a 60q slice cannot distinguish a 2-question move from noise (abstention subset n=17,
+Fisher p=0.688 for a +2 swing). **The 60q pilot is therefore a SCREEN, not a promotion.** A pass
+authorises a full-451 confirmation run; it does NOT itself bank the mechanism, and no result from it may
+be published, submitted, or used to justify a mechanism story. A fail on the primary is still a fail.
+
 Outcome rule: PASS both → promote to a full 451 run. Primary up, floor breached → **NO-GO**, and the
 finding is that the mechanism trades answerable for abstention (still publishable, and it would be a
 genuine result about read-time absence signalling). Primary flat → the channel is not the binding

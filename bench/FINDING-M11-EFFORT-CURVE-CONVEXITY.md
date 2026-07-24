@@ -1,4 +1,8 @@
-# M11 — The effort/latency curve is convex, and that decides where every future point gets spent
+# M11 — Effort buys latency and (measurably) not much accuracy; low effort is the operating point
+
+_Original title claimed a convex curve. Retained in §2 as the point-estimate shape, but see the §2b
+power check: the accuracy deltas are within noise, so the load-bearing claim is the simpler and
+stronger one — **accuracy flat, latency halved**._
 
 **Date:** 2026-07-25 · **Issue:** #158 (P1 agentic latency sweep) · **Status:** measured, decision-bearing
 **Depends on:** M8 (LAFS = accuracy × latency) · M10 (search-flailing unifies accuracy and latency)
@@ -40,6 +44,41 @@ The last leg is the cheapest by a factor of ~3.5 against the leg above it. An ea
 L1→L2 segment alone characterised the trade as "roughly 1:1"; that describes the top of the curve and
 **does not generalise downward**. Notably, web accuracy is *identical* at medium and low (65.6% both)
 while web latency nearly halves (89.6s → 47.0s) — on web, the last effort step is free.
+
+## 2b. ★ POWER CHECK — the accuracy differences are NOT significant; the latency differences are
+
+Run after the fact, before any of this was allowed to drive the roadmap (Fisher exact, two-sided):
+
+| comparison | difference | p |
+|---|---|---|
+| overall, high vs low | 37/60 vs 34/60 (-3 q) | **0.711** |
+| answerable subset, high vs low | 34/43 vs 29/43 (-5 q) | **0.330** |
+| abstention subset, high vs low | 3/17 vs 5/17 (+2 q) | **0.688** |
+
+**None of the accuracy differences across the effort dial are distinguishable from noise on a 60q
+slice.** The per-step "costs" in the table above are point estimates, not established costs; "medium->low
+costs 1.66 points" must be read as "costs an amount indistinguishable from zero at this sample size."
+
+The LATENCY differences are a different matter: 126.3 / 99.0 / 51.6s are means over 60 observations with
+a large effect and are reliable.
+
+**This strengthens the operating-point decision rather than weakening it.** If accuracy is statistically
+indistinguishable across the effort dial while latency more than halves, low effort is the clear choice —
+the argument no longer even needs the convexity claim, it only needs "accuracy flat, latency halved."
+
+**It also retires a claim made in this session and briefly recorded here:** that effort moves the two
+subsets in *opposite* directions (low better at abstention, worse at answerable), with a mechanism story
+(more reasoning -> tidier pack -> over-persuasion) and a derived ~0.93 LAFS prize from combining
+high-effort answerable with low-effort abstention. At p=0.688 and p=0.330 that pattern is a 2-question
+and 5-question wobble. **Withdrawn.** It is a hypothesis for a powered sample, not a finding, and it must
+not be used to justify a mechanism or a spend. (This is the `feedback_instruments_adjudicate_eyeballs`
+discipline applied to my own narrative.)
+
+**Consequence for the distance-to-window number:** "1.94 points, ~1.2 questions" in §4 is a point
+estimate against a hard threshold. The confidence interval on a 60q proportion is wide (roughly +/-12
+points at 95%); we may already be above 58.6% on the full 451, or well below. The 60q slice is a
+SCREEN, not a promotion instrument. Any arm that passes on 60q requires a full-451 confirmation before
+it is banked or submitted.
 
 ## 3. Why this decides the operating point
 
@@ -84,14 +123,17 @@ points. **Rule reaffirmed: count provider-error rows before comparing any two ar
 
 ## 6. What this does and does not establish
 
-**Establishes:** the shape of the effort/latency trade across the full dial; that low effort costs
-almost nothing on web; that the operating point is low; that accuracy work is ~8× more valuable there;
-that the remaining distance to a non-zero score is ~1.2 questions on the dev slice.
+**Establishes:** the LATENCY of each effort setting (large, reliable effects over 60 observations);
+that accuracy across the dial is statistically indistinguishable on a 60q slice; that the operating
+point is therefore low; and — as arithmetic from the scorer, not an empirical claim — that accuracy is
+~8x more valuable at 51.6s than at 99.0s.
 
-**Does not establish:** the honest uncontended latency (L1–L3 were measured with concurrent workers —
-the L4 concurrency-1 probe is outstanding and can only move these numbers *down*, i.e. further in our
-favour); that M7's projected +6 will materialise; that 60q dev-slice accuracy transfers to the full
-451 (it has run ±3 points historically).
+**Does not establish:** any real accuracy DIFFERENCE between effort levels (all p>0.33 — the per-step
+costs in §2 are point estimates only); that effort moves answerable and abstention in opposite
+directions (retired, §2b); the honest uncontended latency (L1-L3 ran with concurrent workers — the L4
+concurrency-1 probe is outstanding and can only move these numbers *down*, i.e. further in our favour);
+that M7's projected +6 will materialise; that 60q dev-slice accuracy transfers to the full 451 (it has
+run +/-3 points historically, and the 95% CI on a 60q proportion is ~+/-12 points).
 
 **Next:** M7 pilot (#157), executed at **low** effort, with `searches_per_question` instrumented as
 the leading indicator per M10.

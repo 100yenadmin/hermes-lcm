@@ -172,6 +172,20 @@ at 58.6% accuracy at 51.6s, so the remaining distance is **1.94 points ~= 1.2 qu
 is worth ~0.55 landed at low effort vs ~0.07 at medium — the SAME mechanism, an 8x difference from the
 operating point alone. Full detail: `bench/FINDING-M11-EFFORT-CURVE-CONVEXITY.md`.
 
+**POWER CORRECTION (same day, before this drove any spend):** Fisher exact on the sweep shows **none of
+the accuracy differences across the effort dial are significant** — overall high-vs-low p=0.711,
+answerable p=0.330, abstention p=0.688. The per-step "costs" are point estimates only. The LATENCY
+differences (126.3/99.0/51.6s, means over 60 obs) ARE reliable. This STRENGTHENS the decision: the
+argument needs only "accuracy flat, latency halved", not the convexity claim. It also RETIRES a claim
+made and briefly recorded in-session — that effort moves answerable and abstention in opposite
+directions, with a mechanism story and a derived ~0.93 LAFS prize; at p=0.688/p=0.330 that is a
+2-question and 5-question wobble. **Withdrawn as a finding; a hypothesis for a powered sample only.**
+
+**STANDING RULE (new, from this correction): the 60q dev slice is a SCREEN, not a promotion
+instrument.** The 95% CI on a 60q proportion is roughly +/-12 points. Any arm that passes a 60q gate
+requires a full-451 confirmation before it is banked, published, or submitted; and no mechanism story
+may be built on a sub-significant subset difference. Applies to the M7 pilot gate (#157) as declared.
+
 Instrument note under 2g: L3/web took one reader-side HTTP 504 scored as a wrong answer (qid edb69441);
 as-measured 56.67%, excluding the artifact 57.63%. L1/L2 took zero. Changes no decision here, recorded because
 a single question is material at a 1.94-point margin. **Count provider-error rows before comparing two arms.**
