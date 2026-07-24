@@ -119,3 +119,19 @@ question-specific and can't be cached, but the underlying SEARCH hits can). Late
 - FIRE-SEQUENCE (when P4 done): (1) score P4 #148; (2) fresh 2q knob-probe on the post-port launcher (confirm cap+adaptive+quota telemetry engaged, no crash-path regression); (3) if clean → `launch-armE-full451.sh web` + `... enterprise`. Gate: net ≥+15 vs 125 AND category-integrity AND spurious strictly-improved (§6c recalibration). ~$2-5, ~5-6h. Expect ~165/451 (real promotion, below 193 submission trigger → submission stays parked).
 - Wave-3.5 (SPEC-W35-FAMILY / #155) is the successor family AFTER this promotion banks — C4 delivery-seat-selection flagship. Do NOT start it before the promotion.
 - Tracked non-blocker: test_w3b_env_passthroughs fails as a test-import artifact (loads adapter store not the wt-h5-recall@8c0c45f product store the launcher uses); probe proved runtime knobs engage. Worth a proper test-fix in wave-3.5 but not blocking the promotion.
+
+## 10. UPDATE 07-25 (Opus 5) — arm-E run LOCATIONS (a monitoring gap that cost 30 min)
+The in-flight arm-E promotion writes to TWO places; monitoring only the prep dir looks like a dead run:
+- **--output-dir** (traces, run_args, later per_question): `artifacts/W3B-PROMOTION-PREP/FULL-RUN-{web,enterprise}/`
+- **LOGS + monitor** (the authoritative progress signal): `/Volumes/LEXAR/Codex/session-notes/2026-07-25/hermes-armE-promotion/artifacts/full451-{web,enterprise}.log` (+ `monitor.sh`, `monitor-state.tsv`)
+Stage order per domain: Building prompts (agentic/state curation) → **Generating** (the fixed 9B reader; the long
+pole) → Scoring → per_question.jsonl appears ONLY at the end. `scored=0` while `traces=240/211` is NORMAL mid-run.
+RULE: for any run, locate its stdout log via `lsof -p <pid> | grep 1w` before concluding it is stalled.
+
+## 11. INCIDENT 07-25 — macOS revoked removable-volume access at the app upgrade
+Every `/Volumes/LEXAR` path returned EPERM (read AND write, sandboxed and not) while the internal disk, `~/.claude`
+and `gh` worked; disk was healthy. Fix is owner-only: System Settings → Privacy & Security → Files and Folders /
+Full Disk Access → grant Claude. Already-running child processes KEEP their pre-revocation grant (the arm-E run
+survived untouched). LESSON: on a total-volume EPERM, check `ls /Volumes/*` — if the internal disk is OK and one
+volume is DENIED, it is TCC, not hardware; preserve findings to `~/.claude` + GitHub (both stayed writable) and
+ask the owner rather than diagnosing the disk.
