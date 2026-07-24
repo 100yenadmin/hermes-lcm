@@ -203,6 +203,54 @@ Owner articulated the product philosophy; the week's evidence supports it; it is
    live replay with compaction — external benchmarks stay useful but subordinate ("did the agent accomplish
    the goal" outranks any leaderboard number).
 
+## 6c. DECISION RECORD — gate mechanism FAMILIES, not single mechanisms (shadow-audit, 07-25)
+
+A shadow review named the program's load-bearing self-contradiction and it is CORRECT: the multiplicative-funnel
+finding (a recovery needs candidate AND delivery AND reader-contract to all succeed) is logically incompatible
+with the inherited codex-era doctrine of "one mechanism per release, net ≥+N alone." A single-stage fix
+STRUCTURALLY cannot clear a whole-funnel net gate when most failures have >1 blocked stage — it is set up to
+quarantine even when it perfectly does its job (H3.1: +9/−2 on its target cohort, quarantined on whole-funnel
+net anyway = a false negative induced by a gate mismatched to the problem's causal shape).
+
+**Corrected doctrine (binding):**
+1. Gate mechanism FAMILIES (recall + delivery + reader-contract), each COMPONENT carrying its own
+   component-level evidence, against the whole-funnel net. Do NOT require a single mechanism to clear the
+   whole-funnel bar alone.
+2. This is ALREADY LIVE on the static lane: wave-3 arm E (diversity-cap + adaptive-excerpt + state-quota) is
+   a composed family gated on the composed net (36.7%/18.6% dev-loop), not three separate ≥+N gates. §6c makes
+   the principle explicit rather than contextual.
+3. **H3.1 rehoming:** the quarantined V2 anti-magnet composition (lexical-floor + arm-quota, +9/−2 core
+   validated) is NOT dead — it is a CANDIDATE COMPONENT for the wave-3 family. BUT (funnel logic cuts both
+   ways, proven by iteration-4 arm G: adding anti-boilerplate composition to arm E REGRESSED accuracy
+   36.7→30.0 by demoting needle-bearing states) re-homing is EMPIRICAL: test H3.1's mechanism as a knob,
+   gate on composed net, keep only if it improves the composed metric. Do not auto-promote a validated
+   component — compose-and-measure.
+4. **Re-validate cross-judge before trusting H3.1's number:** its +9/−2 was measured under gpt-5.6-sol as
+   BOTH answerer and judge (a self-preference gradient — audit is right this was never flagged). The live
+   wave-3 dev loop already uses the official split (Qwen reader / gpt-5.2 judge — the sol-both criticism does
+   NOT apply to the current static loop), so any H3.1 re-home is measured under the official pairing, not
+   trusted from its sol-both origin.
+
+## 6d. PROCESS LESSONS banked from the same audit (binding)
+- **Deterministic cleanup precedes expensive LLM attribution.** H2's 54-agent/6.7M-token attribution ran on
+  the un-rescored 317-failure set; the comparator rescore (zero model calls) later proved ~71 were
+  scorer-mangled correct answers. Always run the free deterministic pass first, hand the LLM a clean set.
+- **Sober framing:** honest 3-day ledger = V1 +3 real, V2 +24 real instrument delta, ZERO new-capability
+  promotions yet. The 119→205 was ~+62 comparator-correction + SpendGuard, i.e. measurement recovery, not
+  capability. Arm E is the first live shot at a real promotion and is NOT banked until the full-451 net-gate
+  clears. Do not narrate measurement wins as capability wins.
+- **Budget the EXPENSIVE lane too:** OpenRouter tracked to the cent ($/$15) while Sol/codex internal runs
+  (dozens of 120–500q passes + a 6.7M-token workflow) went unbudgeted. Keep a rough internal-lane tally.
+- **A number told to the owner must survive the rescore BEFORE it is told** (the +86→+24 reached check-in #1
+  first). **Outward actions need a completion record, not faith** (the tag-push casualty). **Durable crons are
+  the default** for anything outliving a session (the checkpoint-cron death). All now standing rules.
+- **Bound the corpus ceiling before spending on recall:** a deterministic all-451 gold-vs-stored-text audit
+  (dispatched 07-25, → CORPUS-COVERAGE-CEILING.md) tells us how much headroom is real vs ingest-capped —
+  instrument-first, one layer deeper, before more H5-class work.
+- **H5 is mostly WIRING not research** (audit): the v1–v3 chunk-embedding + int8 two-stage KNN stack is
+  already in-tree post-R1 = state-granularity retrieval. Any H5 follow-up dispatch says "evaluate wiring the
+  recall stack already shipped," not "explore from scratch" — VERIFY in-tree before dispatching.
+
 ## 6. Pointers
 GATE AUTHORITY NOTE: every gate summary in this document is an abbreviation — the GitHub ISSUE BODY carries the
 complete, binding gate text; score against the issue verbatim.
