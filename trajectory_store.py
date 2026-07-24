@@ -55,6 +55,21 @@ _MAX_QUERY_TEXT_CHARS = 8_000
 _MAX_ADJACENCY_RADIUS = 8
 _MAX_DIVERSITY_CAP = 24
 _MAX_SHARP_TOKEN_BUDGET = 4_000
+# Knob G (HERMES_LCM_ANTIBOILERPLATE): additive re-weighting inside the C1
+# per-trajectory MMR survivor selection. A candidate is penalized by how much
+# it lexically resembles the OTHER pooled states of its own trajectory
+# (boilerplate looks like its siblings) and rewarded for query-term density, so
+# a trajectory's allotted seats go to query-relevant states rather than repeated
+# task headers / page furniture. Both terms are in [0, 1]; the weights keep the
+# base position-relevance signal dominant while giving the two signals real
+# re-ranking influence.
+_ANTIBOILERPLATE_BOILERPLATE_WEIGHT = 0.30
+_ANTIBOILERPLATE_DENSITY_WEIGHT = 0.30
+# Knob H (HERMES_LCM_TITLE_BOOST): contiguous question n-gram sizes matched
+# against a candidate's normalized title/heading/field-label text at the lexical
+# candidate stage.
+_TITLE_BOOST_MIN_GRAM = 2
+_TITLE_BOOST_MAX_GRAM = 4
 _MAX_SOURCE_JSON_CHARS = 16_000_000
 _MAX_TEXT_CHARS = 2_000_000
 _MAX_SEMANTIC_DOCUMENT_CHARS = 48_000
@@ -2125,9 +2140,110 @@ class TrajectoryStore:
         }
 
     @staticmethod
+    def _query_term_set(query: str) -> frozenset[str]:
+        """Tokenize a query into the same lexical signature space as states.
+
+        Mirrors ``_candidate_term_set`` tokenization so query-term density is
+        measured against the identical vocabulary the MMR signatures use.
+        """
+        return frozenset(
+            token
+            for token in re.findall(r"[a-z0-9][a-z0-9_-]+", query.casefold())
+            if len(token) >= 3 and token not in _STOPWORDS
+        )
+
+    @staticmethod
+    def _title_field_text(row: Any) -> str:
+        """Normalized title/heading/field-label text for the Knob H boost.
+
+        Punctuation folds to single spaces and the result is padded with a
+        leading/trailing space so a matched n-gram is checked at word
+        boundaries via a plain substring test.
+        """
+        raw = " ".join(
+            str(row[key] or "")
+            for key in ("goal", "url", "text")
+        )[:12_000].casefold()
+        collapsed = re.sub(r"[^a-z0-9]+", " ", raw)
+        return f" {' '.join(collapsed.split())} "
+
+    @staticmethod
+    def _query_title_ngrams(query: str) -> list[str]:
+        """Contiguous 2-4 gram question phrases for the Knob H title boost.
+
+        Grams composed entirely of stopwords are dropped (a pure ``what is
+        the`` gram carries no signal); the remaining grams are normalized the
+        same way as ``_title_field_text`` and returned in stable first-seen
+        order.
+        """
+        words = [
+            word.casefold()
+            for word in re.findall(r"[A-Za-z0-9][A-Za-z0-9_-]*", query)
+        ]
+        grams: list[str] = []
+        seen: set[str] = set()
+        for size in range(_TITLE_BOOST_MIN_GRAM, _TITLE_BOOST_MAX_GRAM + 1):
+            for start in range(0, max(0, len(words) - size + 1)):
+                window = words[start:start + size]
+                if all(token in _STOPWORDS for token in window):
+                    continue
+                normalized = re.sub(r"[^a-z0-9]+", " ", " ".join(window)).strip()
+                if not normalized or normalized in seen:
+                    continue
+                seen.add(normalized)
+                grams.append(normalized)
+        return grams
+
+    @classmethod
+    def _apply_title_boost(
+        cls,
+        rows: Sequence[Any],
+        query: str,
+    ) -> tuple[list[Any], dict[str, Any]]:
+        """Knob H: stable-reorder the lexical pool by exact title n-gram hits.
+
+        A candidate is boosted by the number of DISTINCT contiguous question
+        2-4 grams that appear (case/punctuation-normalized) in its
+        title/heading/field-label text. The reorder is stable: candidates keep
+        their original relative order within an equal-boost band, so with no
+        matches the pool is byte-identical to the input. Pure-lexical and
+        deterministic -- no model calls.
+        """
+        grams = cls._query_title_ngrams(query)
+        boosts: dict[int, int] = {}
+        matched: list[dict[str, Any]] = []
+        if grams:
+            for row in rows:
+                field_text = cls._title_field_text(row)
+                hits = [gram for gram in grams if f" {gram} " in field_text]
+                if hits:
+                    state_id = int(row["state_id"])
+                    boosts[state_id] = len(hits)
+                    matched.append({"state_id": state_id, "phrases": hits})
+        reordered = [
+            row
+            for _key, row in sorted(
+                enumerate(rows),
+                key=lambda item: (
+                    -boosts.get(int(item[1]["state_id"]), 0),
+                    item[0],
+                ),
+            )
+        ]
+        telemetry = {
+            "ngrams": grams,
+            "boosted": matched,
+            "boosted_count": len(matched),
+        }
+        return reordered, telemetry
+
+    @staticmethod
     def _cap_composed_pool(
         rows: Sequence[Any],
         cap: int,
+        *,
+        antiboilerplate: bool = False,
+        query_terms: frozenset[str] | None = None,
     ) -> tuple[list[Any], dict[str, Any]]:
         """Apply one global per-trajectory cap after all candidate arms compose.
 
@@ -2135,7 +2251,16 @@ class TrajectoryStore:
         MMR-style relevance/redundancy score. The returned pool preserves the
         original cross-trajectory order, so the cap changes only which states
         survive, not unrelated tie-breaking.
+
+        When ``antiboilerplate`` is set (Knob G, default-off) the per-candidate
+        MMR score is additionally penalized by the candidate's mean lexical
+        similarity to the OTHER pooled states of its own trajectory and rewarded
+        by its query-term density, so a trajectory's seats go to query-relevant
+        states rather than repeated task-header boilerplate. ``query_terms`` is
+        the tokenized query used for the density reward; both signals are inert
+        when ``antiboilerplate`` is ``False`` (byte-identical to the base cap).
         """
+        query_terms = query_terms or frozenset()
         unique_rows: list[Any] = []
         seen_state_ids: set[int] = set()
         for row in rows:
@@ -2149,6 +2274,7 @@ class TrajectoryStore:
             grouped.setdefault(str(row["trajectory_id"]), []).append((position, row))
         survivor_ids: set[int] = set()
         details: list[dict[str, Any]] = []
+        antiboilerplate_scores: list[dict[str, Any]] = []
         for trajectory_id, candidates in grouped.items():
             if len(candidates) <= cap:
                 survivor_ids.update(int(row["state_id"]) for _position, row in candidates)
@@ -2157,6 +2283,31 @@ class TrajectoryStore:
                 int(row["state_id"]): TrajectoryStore._candidate_term_set(row)
                 for _position, row in candidates
             }
+            boilerplate: dict[int, float] = {}
+            density: dict[int, float] = {}
+            if antiboilerplate:
+                for _position, row in candidates:
+                    state_id = int(row["state_id"])
+                    signature = signatures[state_id]
+                    sibling_scores: list[float] = []
+                    for _other_position, other_row in candidates:
+                        other_id = int(other_row["state_id"])
+                        if other_id == state_id:
+                            continue
+                        other_signature = signatures[other_id]
+                        union = signature | other_signature
+                        sibling_scores.append(
+                            len(signature & other_signature) / len(union)
+                            if union else 0.0
+                        )
+                    boilerplate[state_id] = (
+                        sum(sibling_scores) / len(sibling_scores)
+                        if sibling_scores else 0.0
+                    )
+                    density[state_id] = (
+                        len(signature & query_terms) / len(signature)
+                        if signature else 0.0
+                    )
             selected: list[tuple[int, Any]] = []
             remaining = list(candidates)
             while remaining and len(selected) < cap:
@@ -2167,7 +2318,8 @@ class TrajectoryStore:
                     relevance = 1.0 - (
                         original_position / max(1, len(unique_rows) - 1)
                     )
-                    signature = signatures[int(row["state_id"])]
+                    state_id = int(row["state_id"])
+                    signature = signatures[state_id]
                     redundancy = 0.0
                     for _selected_position, selected_row in selected:
                         selected_signature = signatures[int(selected_row["state_id"])]
@@ -2178,13 +2330,32 @@ class TrajectoryStore:
                         )
                         redundancy = max(redundancy, similarity)
                     mmr_score = (0.72 * relevance) - (0.28 * redundancy)
-                    key = (mmr_score, -original_position, -int(row["state_id"]))
+                    if antiboilerplate:
+                        mmr_score += (
+                            _ANTIBOILERPLATE_DENSITY_WEIGHT * density[state_id]
+                        ) - (
+                            _ANTIBOILERPLATE_BOILERPLATE_WEIGHT
+                            * boilerplate[state_id]
+                        )
+                    key = (mmr_score, -original_position, -state_id)
                     if best_key is None or key > best_key:
                         best_key = key
                         best_item = item
                 assert best_item is not None
                 selected.append(best_item)
                 remaining.remove(best_item)
+            if antiboilerplate:
+                antiboilerplate_scores.extend(
+                    {
+                        "state_id": int(row["state_id"]),
+                        "boilerplate": round(boilerplate[int(row["state_id"])], 6),
+                        "density": round(density[int(row["state_id"])], 6),
+                        "selected": int(row["state_id"]) in {
+                            int(sel_row["state_id"]) for _pos, sel_row in selected
+                        },
+                    }
+                    for _position, row in candidates
+                )
             selected_ids = [int(row["state_id"]) for _position, row in selected]
             removed_ids = [
                 int(row["state_id"])
@@ -2203,7 +2374,7 @@ class TrajectoryStore:
         filtered = [
             row for row in unique_rows if int(row["state_id"]) in survivor_ids
         ]
-        return filtered, {
+        telemetry: dict[str, Any] = {
             "cap": cap,
             "pool_before": len(unique_rows),
             "pool_after": len(filtered),
@@ -2211,6 +2382,13 @@ class TrajectoryStore:
             "trajectories": details,
             "survivor_state_ids": [int(row["state_id"]) for row in filtered],
         }
+        if antiboilerplate:
+            telemetry["antiboilerplate"] = {
+                "density_weight": _ANTIBOILERPLATE_DENSITY_WEIGHT,
+                "boilerplate_weight": _ANTIBOILERPLATE_BOILERPLATE_WEIGHT,
+                "scored": antiboilerplate_scores,
+            }
+        return filtered, telemetry
 
     @staticmethod
     def _exact_query_phrases(query: str) -> list[str]:
@@ -2789,6 +2967,8 @@ class TrajectoryStore:
         diversity_cap: int = 0,
         adaptive_excerpt: bool = False,
         sharp_token_budget: int = 0,
+        antiboilerplate: bool = False,
+        title_boost: bool = False,
     ) -> tuple[TrajectoryHit, ...]:
         if self.status != "complete":
             raise CorpusIdentityError("trajectory corpus must be finalized before query")
@@ -2805,6 +2985,8 @@ class TrajectoryStore:
             _MAX_SHARP_TOKEN_BUDGET,
         )
         adaptive_excerpt = bool(adaptive_excerpt)
+        antiboilerplate = bool(antiboilerplate)
+        title_boost = bool(title_boost)
         text_char_limit = min(
             max(256, int(text_char_limit)),
             _MAX_QUERY_TEXT_CHARS,
@@ -2825,6 +3007,16 @@ class TrajectoryStore:
             )
         else:
             global_rows = self._fts_rows(expression, candidate_limit)
+        # Knob H (title boost, default-off): stable-reorder the lexical
+        # candidate pool so states whose title/heading/field-label text exactly
+        # contains a 2-4 gram question phrase rank ahead of same-band peers.
+        # ``title_boost is False`` (default) leaves ``global_rows`` untouched and
+        # reproduces current bytes.
+        title_boost_telemetry: dict[str, Any] | None = None
+        if title_boost:
+            global_rows, title_boost_telemetry = self._apply_title_boost(
+                global_rows, query
+            )
         semantic_ranks: list[tuple[int, float]] = []
         semantic_attempt: TrajectorySemanticAttempt | None = None
         attempt_started = time.monotonic()
@@ -3015,7 +3207,12 @@ class TrajectoryStore:
             # arm independently would allow a capped hub to re-enter through a
             # different arm.
             rows, diversity_telemetry = self._cap_composed_pool(
-                rows, diversity_cap
+                rows,
+                diversity_cap,
+                antiboilerplate=antiboilerplate,
+                query_terms=(
+                    self._query_term_set(query) if antiboilerplate else None
+                ),
             )
             diversity_survivors = {
                 int(row["state_id"]) for row in rows
@@ -3217,6 +3414,10 @@ class TrajectoryStore:
                 "quota": state_semantic_quota,
                 "admitted": state_semantic_admitted,
             }
+        if title_boost_telemetry is not None:
+            # Knob H: present only when title boost is active so the default
+            # telemetry payload stays byte-identical (golden 451/451).
+            self._last_query_telemetry["title_boost"] = title_boost_telemetry
         return tuple(hits)
 
     def resolve_exact_ref(self, exact_ref: str) -> TrajectoryHit:

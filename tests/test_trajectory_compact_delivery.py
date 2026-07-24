@@ -141,12 +141,15 @@ def test_all_w3b_knobs_default_off_preserve_bytes_and_telemetry(tmp_path: Path):
         diversity_cap=0,
         adaptive_excerpt=False,
         sharp_token_budget=0,
+        antiboilerplate=False,
+        title_boost=False,
     )
     assert [hit.to_dict() for hit in explicit_off] == baseline_payload
     assert store.last_query_telemetry() == baseline_telemetry
     assert "diversity_cap" not in baseline_telemetry
     assert "adaptive_excerpt" not in baseline_telemetry
     assert "sharp_compilation" not in baseline_telemetry
+    assert "title_boost" not in baseline_telemetry
 
 
 def test_c1_caps_after_state_arm_composition_and_reports_trajectory(tmp_path: Path):
@@ -249,3 +252,150 @@ def test_c3_typed_queries_exact_title_template_and_budget(tmp_path: Path):
     }
     assert sharp["exact_title_boosts"]
     assert sharp["rendered_text_tokens_after"] <= budget
+
+
+def _cap_row(
+    state_id: int,
+    trajectory_id: str,
+    goal: str,
+    text: str,
+) -> dict[str, object]:
+    return {
+        "state_id": state_id,
+        "trajectory_id": trajectory_id,
+        "goal": goal,
+        "url": "",
+        "incoming_action": None,
+        "text": text,
+    }
+
+
+def _t1_selected(cap_telemetry: dict) -> list[int]:
+    entry = next(
+        item
+        for item in cap_telemetry["trajectories"]
+        if item["trajectory_id"] == "t1"
+    )
+    return list(entry["selected_state_ids"])
+
+
+def test_g_antiboilerplate_reweights_c1_survivor_selection():
+    # One trajectory ("t1") with two near-identical task-header boilerplate
+    # states ranked ahead of a distinct, query-relevant needle state. Padding
+    # states from a second trajectory shrink the per-position relevance gap so
+    # the boilerplate/density signals -- not raw rank -- decide the survivor.
+    rows = [
+        _cap_row(
+            1, "t1", "export dashboard",
+            "export dashboard task header repeated boilerplate navigation",
+        ),
+        _cap_row(
+            2, "t1", "export dashboard",
+            "export dashboard task header repeated boilerplate navigation footer",
+        ),
+        _cap_row(
+            3, "t1", "export dashboard",
+            "quarterly revenue figure answer distinct value column",
+        ),
+    ]
+    rows += [
+        _cap_row(100 + index, "pad", "unrelated pad", f"pad body token {index}")
+        for index in range(12)
+    ]
+    query_terms = TrajectoryStore._query_term_set(
+        "quarterly revenue figure answer column"
+    )
+
+    off_rows, off_telemetry = TrajectoryStore._cap_composed_pool(rows, 1)
+    assert _t1_selected(off_telemetry) == [1]
+    assert "antiboilerplate" not in off_telemetry
+
+    # Default-off keyword form is byte-identical to the positional default.
+    off_rows_kw, off_telemetry_kw = TrajectoryStore._cap_composed_pool(
+        rows, 1, antiboilerplate=False, query_terms=query_terms
+    )
+    assert [int(row["state_id"]) for row in off_rows_kw] == [
+        int(row["state_id"]) for row in off_rows
+    ]
+    assert off_telemetry_kw == off_telemetry
+
+    on_rows, on_telemetry = TrajectoryStore._cap_composed_pool(
+        rows, 1, antiboilerplate=True, query_terms=query_terms
+    )
+    assert _t1_selected(on_telemetry) == [3]
+    assert 3 in {int(row["state_id"]) for row in on_rows}
+
+    scored = {
+        entry["state_id"]: entry
+        for entry in on_telemetry["antiboilerplate"]["scored"]
+    }
+    # Needle has the query-term density; boilerplate siblings resemble each other.
+    assert scored[3]["density"] > scored[1]["density"]
+    assert scored[1]["boilerplate"] > scored[3]["boilerplate"]
+    assert scored[2]["boilerplate"] > scored[3]["boilerplate"]
+
+
+def test_h_title_boost_promotes_exact_ngram_matches():
+    rows = [
+        {
+            "state_id": 1,
+            "trajectory_id": "a",
+            "goal": "generic dashboard",
+            "url": "https://example.test/a/0",
+            "text": "some unrelated body text about panels and widgets",
+        },
+        {
+            "state_id": 2,
+            "trajectory_id": "b",
+            "goal": "products grid",
+            "url": "https://example.test/b/0",
+            "text": "column header Last Updated At value 2024-01-02",
+        },
+        {
+            "state_id": 3,
+            "trajectory_id": "c",
+            "goal": "orders",
+            "url": "https://example.test/c/0",
+            "text": "purchase date column with totals",
+        },
+    ]
+    reordered, telemetry = TrajectoryStore._apply_title_boost(
+        rows, "What is the Last Updated At column value?"
+    )
+    assert [int(row["state_id"]) for row in reordered][0] == 2
+    assert telemetry["boosted_count"] == 1
+    assert telemetry["boosted"][0]["state_id"] == 2
+    assert "last updated at" in telemetry["boosted"][0]["phrases"]
+
+    # No matching phrase leaves the pool order byte-identical.
+    same, empty = TrajectoryStore._apply_title_boost(
+        rows, "completely orthogonal unrelated inquiry"
+    )
+    assert [int(row["state_id"]) for row in same] == [
+        int(row["state_id"]) for row in rows
+    ]
+    assert empty["boosted_count"] == 0
+
+
+def test_h_title_boost_query_path_emits_telemetry(tmp_path: Path):
+    store = _build_store(tmp_path)
+    query = "widget export duplicate description field"
+
+    off = store.query(query, image_limit=0, include_adjacent=False)
+    off_payload = [hit.to_dict() for hit in off]
+    assert "title_boost" not in store.last_query_telemetry()
+
+    on = store.query(
+        query, image_limit=0, include_adjacent=False, title_boost=True
+    )
+    telemetry = store.last_query_telemetry()["title_boost"]
+    assert telemetry["boosted_count"] >= 1
+    assert any(
+        "duplicate description field" in " ".join(entry["phrases"])
+        for entry in telemetry["boosted"]
+    )
+    # The exact-phrase state is delivered under the boost.
+    assert any("alpha-answer" in hit.text for hit in on)
+    # Default-off path is unaffected by adding the knob at call time.
+    reconfirm = store.query(query, image_limit=0, include_adjacent=False)
+    assert [hit.to_dict() for hit in reconfirm] == off_payload
