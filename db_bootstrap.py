@@ -251,13 +251,16 @@ _V5_CORE_OPTIONAL_COLUMNS: dict[str, frozenset[str]] = {
 _V5_CORE_PRESENCE_ONLY = ("messages_fts", "nodes_fts")
 
 # Extra tables are tolerated only when they belong to a known opt-in feature
-# family (temporal-rollup / embedding / chunk / assertion) or are FTS5 shadow tables of the
-# core FTS indexes. Anything else means a newer build owns the schema.
+# family (temporal-rollup / embedding / chunk / assertion / query-view /
+# trajectory) or are FTS5 shadow tables of the core FTS indexes. Anything else
+# means a newer build owns the schema.
 _KNOWN_FEATURE_TABLE_PREFIXES = (
     "lcm_rollup",
     "lcm_embedding",
     "lcm_chunk",
     "lcm_assertion",
+    "lcm_query",
+    "lcm_trajectory",
 )
 
 # The known opt-in feature families whose derived tables an interim build may

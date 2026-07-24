@@ -177,6 +177,32 @@ def test_classify_interim_stamp_with_feature_marker_tables(tmp_path):
         conn.close()
 
 
+def test_classify_interim_stamp_with_query_view_and_trajectory_marker_tables(tmp_path):
+    """lcm_query_*/lcm_trajectory_* are opt-in, marker-gated sidecars just like
+    rollup/embedding/chunk/assertion -- an interim stamp plus only these extra
+    tables must still classify as an interim stamp, not genuinely_newer
+    (F-PR436-3: the prefix whitelist previously stopped at lcm_assertion)."""
+    db_path = tmp_path / "lcm.db"
+    _build_v5_db(db_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE lcm_query_views (view_id TEXT PRIMARY KEY);
+            CREATE TABLE lcm_trajectory_corpora (corpus_id TEXT PRIMARY KEY);
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    _stamp(db_path, db_bootstrap.SCHEMA_VERSION + 1)
+    conn = sqlite3.connect(db_path)
+    try:
+        assert classify_version_mismatch(conn) == db_bootstrap.VERSION_MISMATCH_INTERIM_STAMP
+    finally:
+        conn.close()
+
+
 def test_classify_genuinely_newer_on_unknown_table(tmp_path):
     db_path = tmp_path / "lcm.db"
     _build_v5_db(db_path)
