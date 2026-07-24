@@ -84,6 +84,50 @@ perturbation is real but modest (26/37 identical), so the rendering is plausibly
 
 If M7b is run, the gate must be frozen with the same two-sided structure, and 60q remains a **screen**.
 
+## 4b. `searches_per_question` — M10's metric, finally instrumented, and it confirms the diagnosis
+
+| | L3 (gate off) | M7 (gate on) | change |
+|---|---|---|---|
+| overall | 5.63 | **6.90** | **+23%** |
+| abstention gold | 5.18 | **7.94** | **+53%** |
+| answerable gold | 5.81 | **6.49** | **+12%** |
+
+The +53% on abstention is the mechanism working as designed — targeted absence searches cost searches, and
+they bought +4 questions. **The +12% on ANSWERABLE is the important number:** the agent burns extra searches
+proving absence on questions where nothing is absent. That is a **second, independent confirmation** that
+`directly_supported` packs are perturbed regardless of what we render (the first was spans +0.19 / +779
+tokens / 11-of-37 span counts differing), and it is why §4's 63.33% is a ceiling and not a forecast.
+
+It also explains the +2.4s latency directly, and retires the M10-derived hope that this mechanism would cut
+latency: **negative-evidence disclosure ADDS searches. It does not remove flailing.** (Consistent with M14:
+low effort had already removed the flailing.)
+
+**Design consequence for M7b — make the CONTRACT conditional, not just the rendering.** The current contract
+demands a targeted absence search unconditionally, before any status is known, which is exactly why
+answerable questions pay. A cheaper contract: *do the normal search first; only if it fails to surface the
+presumed entity, spend one targeted confirmation search and report it.* That removes most of the +12% while
+keeping the absence signal where it earns 8/10. M7b should carry both changes (conditional render +
+conditional search), and the upper bound should then be closer to attainable.
+
+## 4c. Instrument near-miss: the dispatch packet named the wrong repo
+
+My packet named `lme-v2-official` as the harness repo. **L3 did not run from there** — it ran from a
+worktree of a *different clone* (`/Volumes/LEXAR/repos/LongMemEval-V2` @ d8f1d90). `lme-v2-official` lacks
+`READER_PROVIDER_JSON` provider/quantization pinning (L3 pins **fp8 / SiliconFlow / no-fallbacks**), lacks
+the reader malformed-body retry and no-choices error class, and has *removed* the `--evaluator-base-url`
+argument L3 passes. Running where I specified would have broken parity **in the serving-precision
+dimension** — an invisible confound that no accuracy number would have revealed.
+
+Caught by the executing agent's own parity discipline, which branched from L3's actual commit instead.
+**Same class as L4's effort mismatch (M11 §7): the third config-parity near-miss in one day, and the second
+caught only because parity is checked mechanically rather than assumed.** Lesson: a dispatch packet must
+name the repo/commit the CONTROL actually ran from — derive it from the control's launch script, never from
+memory of which clone is canonical.
+
+**Verified, not assumed:** the declarative-only constraint held — `## Evidence Assessment` present and
+rendered first in 60/60 rows, **zero `answer_policy` strings and zero reader directives** in rendered
+context (2 audit flags were false positives quoting store UI copy). Tests 46 passed (baseline 35).
+
 ## 5. What this establishes for the program
 - **A real, working read-time absence channel exists** and lifts the abstention class (+4q, 8/10 where it
   fires) using the harness's own dormant vocabulary. That is a genuine result about read-time absence
