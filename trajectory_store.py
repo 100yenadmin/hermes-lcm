@@ -9,7 +9,7 @@ remain traceable to protected canonical source JSON.
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import hashlib
 import json
 import math
@@ -53,6 +53,8 @@ _MAX_RESULTS = 24
 _MAX_IMAGES = 8
 _MAX_QUERY_TEXT_CHARS = 8_000
 _MAX_ADJACENCY_RADIUS = 8
+_MAX_DIVERSITY_CAP = 24
+_MAX_SHARP_TOKEN_BUDGET = 4_000
 _MAX_SOURCE_JSON_CHARS = 16_000_000
 _MAX_TEXT_CHARS = 2_000_000
 _MAX_SEMANTIC_DOCUMENT_CHARS = 48_000
@@ -63,6 +65,17 @@ _STOPWORDS = frozenset({
     "does", "for", "from", "happen", "happened", "how", "i", "in", "is",
     "it", "of", "on", "or", "should", "the", "then", "to", "was", "were",
     "what", "when", "where", "which", "who", "why", "with", "would",
+})
+_TEMPORAL_TERMS = frozenset({
+    "after", "before", "current", "date", "day", "earliest", "first",
+    "initial", "last", "latest", "month", "newest", "previous", "recent",
+    "time", "timestamp", "today", "week", "when", "year", "yesterday",
+})
+_ACTION_TERMS = frozenset({
+    "add", "apply", "assign", "buy", "change", "choose", "click", "compare",
+    "configure", "create", "delete", "edit", "export", "filter", "insert",
+    "navigate", "open", "order", "remove", "retry", "save", "search",
+    "select", "set", "sort", "submit", "update", "view",
 })
 _EXACT_REF_RE = re.compile(
     r"^trajectory://(?P<corpus>[0-9a-f]{64})/"
@@ -1953,6 +1966,7 @@ class TrajectoryStore:
         include_image: bool,
         query: str | None = None,
         text_char_limit: int | None = None,
+        dense_excerpt: bool = False,
     ) -> TrajectoryHit:
         corpus_uid = self.corpus_uid
         if not corpus_uid:
@@ -1971,7 +1985,10 @@ class TrajectoryStore:
             text_offset = 0
             text_truncated = False
         else:
-            text, text_offset = self._exact_excerpt(
+            excerpt_fn = (
+                self._densest_exact_excerpt if dense_excerpt else self._exact_excerpt
+            )
+            text, text_offset = excerpt_fn(
                 full_text,
                 query or "",
                 text_char_limit,
@@ -2033,12 +2050,494 @@ class TrajectoryStore:
         return text[start:end], start
 
     @staticmethod
-    def _select_diverse(rows: Iterable[sqlite3.Row], limit: int) -> list[sqlite3.Row]:
+    def _densest_exact_excerpt(text: str, query: str, limit: int) -> tuple[str, int]:
+        """Return the deterministic window with the densest rare query terms.
+
+        The historical excerpt anchors on the first query match. Web AXTree
+        pages often repeat generic page-title terms near the top while the
+        answer-bearing field occurs below the fold. This scorer gives rarer
+        query terms more weight, then uses unique-term coverage, occurrence
+        count, and earliest offset as deterministic tie-breaks.
+        """
+        if len(text) <= limit:
+            return text, 0
+        folded = text.casefold()
+        terms: list[str] = []
+        seen: set[str] = set()
+        for raw in extract_search_terms(query):
+            term = raw.casefold().strip()
+            if len(term) < 2 or term in _STOPWORDS or term in seen:
+                continue
+            seen.add(term)
+            terms.append(term)
+        occurrences: list[tuple[int, str, float]] = []
+        for term in terms:
+            positions = [
+                match.start() for match in re.finditer(re.escape(term), folded)
+            ]
+            if not positions:
+                continue
+            weight = 1.0 / len(positions)
+            occurrences.extend((position, term, weight) for position in positions)
+        if not occurrences:
+            return text[:limit], 0
+        occurrences.sort(key=lambda item: (item[0], item[1]))
+        best: tuple[float, int, int, int] | None = None
+        right = 0
+        counts: dict[str, int] = {}
+        weighted = 0.0
+        for left, (left_pos, _left_term, _left_weight) in enumerate(occurrences):
+            while right < len(occurrences) and occurrences[right][0] - left_pos < limit:
+                _position, term, weight = occurrences[right]
+                if counts.get(term, 0) == 0:
+                    weighted += weight
+                counts[term] = counts.get(term, 0) + 1
+                right += 1
+            score = (weighted, len(counts), right - left, -left_pos)
+            if best is None or score > best:
+                best = score
+                # Anchor on the rarest term inside the winning window, leaving
+                # two thirds of the excerpt after it for answer values/columns.
+                anchor = max(
+                    occurrences[left:right],
+                    key=lambda item: (item[2], item[0]),
+                )[0]
+                best_start = max(0, anchor - (limit // 3))
+            _position, term, weight = occurrences[left]
+            counts[term] -= 1
+            if counts[term] == 0:
+                del counts[term]
+                weighted -= weight
+        start = min(best_start, len(text) - limit)
+        return text[start:start + limit], start
+
+    @staticmethod
+    def _candidate_term_set(row: Any) -> set[str]:
+        """Bounded lexical signature used by the per-trajectory MMR pass."""
+        text = " ".join(
+            str(row[key] or "")
+            for key in ("goal", "url", "incoming_action", "text")
+        )[:12_000]
+        return {
+            token
+            for token in re.findall(r"[a-z0-9][a-z0-9_-]+", text.casefold())
+            if len(token) >= 3 and token not in _STOPWORDS
+        }
+
+    @staticmethod
+    def _cap_composed_pool(
+        rows: Sequence[Any],
+        cap: int,
+    ) -> tuple[list[Any], dict[str, Any]]:
+        """Apply one global per-trajectory cap after all candidate arms compose.
+
+        Survivors are chosen independently within each trajectory by a bounded
+        MMR-style relevance/redundancy score. The returned pool preserves the
+        original cross-trajectory order, so the cap changes only which states
+        survive, not unrelated tie-breaking.
+        """
+        unique_rows: list[Any] = []
+        seen_state_ids: set[int] = set()
+        for row in rows:
+            state_id = int(row["state_id"])
+            if state_id in seen_state_ids:
+                continue
+            seen_state_ids.add(state_id)
+            unique_rows.append(row)
+        grouped: dict[str, list[tuple[int, Any]]] = {}
+        for position, row in enumerate(unique_rows):
+            grouped.setdefault(str(row["trajectory_id"]), []).append((position, row))
+        survivor_ids: set[int] = set()
+        details: list[dict[str, Any]] = []
+        for trajectory_id, candidates in grouped.items():
+            if len(candidates) <= cap:
+                survivor_ids.update(int(row["state_id"]) for _position, row in candidates)
+                continue
+            signatures = {
+                int(row["state_id"]): TrajectoryStore._candidate_term_set(row)
+                for _position, row in candidates
+            }
+            selected: list[tuple[int, Any]] = []
+            remaining = list(candidates)
+            while remaining and len(selected) < cap:
+                best_item: tuple[int, Any] | None = None
+                best_key: tuple[float, int, int] | None = None
+                for local_position, item in enumerate(remaining):
+                    original_position, row = item
+                    relevance = 1.0 - (
+                        original_position / max(1, len(unique_rows) - 1)
+                    )
+                    signature = signatures[int(row["state_id"])]
+                    redundancy = 0.0
+                    for _selected_position, selected_row in selected:
+                        selected_signature = signatures[int(selected_row["state_id"])]
+                        union = signature | selected_signature
+                        similarity = (
+                            len(signature & selected_signature) / len(union)
+                            if union else 0.0
+                        )
+                        redundancy = max(redundancy, similarity)
+                    mmr_score = (0.72 * relevance) - (0.28 * redundancy)
+                    key = (mmr_score, -original_position, -int(row["state_id"]))
+                    if best_key is None or key > best_key:
+                        best_key = key
+                        best_item = item
+                assert best_item is not None
+                selected.append(best_item)
+                remaining.remove(best_item)
+            selected_ids = [int(row["state_id"]) for _position, row in selected]
+            removed_ids = [
+                int(row["state_id"])
+                for _position, row in candidates
+                if int(row["state_id"]) not in set(selected_ids)
+            ]
+            survivor_ids.update(selected_ids)
+            details.append({
+                "trajectory_id": trajectory_id,
+                "before": len(candidates),
+                "after": len(selected_ids),
+                "capped_out": len(removed_ids),
+                "selected_state_ids": selected_ids,
+                "removed_state_ids": removed_ids,
+            })
+        filtered = [
+            row for row in unique_rows if int(row["state_id"]) in survivor_ids
+        ]
+        return filtered, {
+            "cap": cap,
+            "pool_before": len(unique_rows),
+            "pool_after": len(filtered),
+            "capped_out": len(unique_rows) - len(filtered),
+            "trajectories": details,
+            "survivor_state_ids": [int(row["state_id"]) for row in filtered],
+        }
+
+    @staticmethod
+    def _exact_query_phrases(query: str) -> list[str]:
+        phrases: list[str] = []
+        seen: set[str] = set()
+        for match in re.finditer(r"`([^`]+)`|\"([^\"]+)\"|'([^']+)'", query):
+            phrase = next(group for group in match.groups() if group is not None)
+            normalized = " ".join(phrase.casefold().split())
+            if len(normalized) < 3 or normalized in seen:
+                continue
+            seen.add(normalized)
+            phrases.append(normalized)
+        return phrases[:8]
+
+    @staticmethod
+    def _typed_subqueries(query: str) -> list[dict[str, str]]:
+        """Deterministically decompose one question into typed FTS queries."""
+        words = re.findall(r"[A-Za-z0-9][A-Za-z0-9_-]*", query)
+        folded_words = [word.casefold() for word in words]
+        candidates: list[tuple[str, str]] = [("raw_state", query)]
+        exact = TrajectoryStore._exact_query_phrases(query)
+        if exact:
+            candidates.append(("entity", " ".join(exact)))
+        entity_clauses = [
+            clause.strip()
+            for clause in re.split(r"\s+(?:vs\.?|versus)\s+|[,;]", query)
+            if 2 <= len(clause.split()) <= 18
+        ]
+        if len(entity_clauses) >= 2:
+            candidates.extend(("entity", clause) for clause in entity_clauses[:3])
+        temporal: list[str] = []
+        actions: list[str] = []
+        for index, word in enumerate(folded_words):
+            if word in _TEMPORAL_TERMS:
+                temporal.extend(folded_words[max(0, index - 1):index + 2])
+            if word in _ACTION_TERMS:
+                actions.extend(folded_words[index:index + 3])
+        if temporal:
+            candidates.append(("time", " ".join(temporal)))
+        if actions:
+            candidates.append(("action", " ".join(actions)))
+        result: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for pool_type, subquery in candidates:
+            normalized = " ".join(subquery.split())
+            key = normalized.casefold()
+            if not normalized or key in seen:
+                continue
+            seen.add(key)
+            result.append({"pool_type": pool_type, "query": normalized})
+            if len(result) >= 6:
+                break
+        return result
+
+    def _sharp_fts_rows(
+        self,
+        query: str,
+        candidate_limit: int,
+    ) -> tuple[list[sqlite3.Row], dict[str, Any]]:
+        subqueries = self._typed_subqueries(query)
+        row_by_id: dict[int, sqlite3.Row] = {}
+        score_by_id: dict[int, float] = {}
+        exact_phrases = self._exact_query_phrases(query)
+        weights = {"raw_state": 1.0, "entity": 1.2, "time": 1.1, "action": 1.1}
+        for entry in subqueries:
+            expression = self._fts_expression(entry["query"])
+            if not expression:
+                continue
+            rows = self._fts_rows(expression, candidate_limit)
+            weight = weights.get(entry["pool_type"], 1.0)
+            for rank, row in enumerate(rows, start=1):
+                state_id = int(row["state_id"])
+                row_by_id[state_id] = row
+                score_by_id[state_id] = score_by_id.get(state_id, 0.0) + (
+                    weight / (60.0 + rank)
+                )
+        boosted: list[dict[str, Any]] = []
+        for state_id, row in row_by_id.items():
+            title_text = f"{row['goal']} {row['url']}".casefold()
+            matches = [phrase for phrase in exact_phrases if phrase in title_text]
+            if matches:
+                score_by_id[state_id] += 0.05 * len(matches)
+                boosted.append({"state_id": state_id, "phrases": matches})
+        ordered = sorted(
+            row_by_id.values(),
+            key=lambda row: (
+                -score_by_id[int(row["state_id"])],
+                int(row["ordinal"]),
+                int(row["sequence_ordinal"]),
+            ),
+        )[:candidate_limit]
+        return ordered, {
+            "subqueries": subqueries,
+            "exact_title_boosts": boosted,
+            "lexical_pool_size": len(ordered),
+        }
+
+    @staticmethod
+    def _question_template(query: str) -> str:
+        folded = query.casefold()
+        if any(term in folded for term in ("protocol", "workflow", "procedure", "steps")):
+            return "procedure"
+        if any(term in folded for term in _TEMPORAL_TERMS):
+            return "temporal"
+        if (
+            any(character in query for character in ",;")
+            or " among " in folded
+            or " across " in folded
+            or " both " in folded
+        ):
+            return "multi_entity"
+        if any(
+            term in folded
+            for term in ("page", "url", "tab", "button", "column", "field", "link")
+        ):
+            return "navigation"
+        return "generic"
+
+    @staticmethod
+    def _template_order(
+        rows: Sequence[sqlite3.Row],
+        query: str,
+        template: str,
+    ) -> list[sqlite3.Row]:
+        """Apply small question-type priors without replacing retrieval rank."""
+        query_terms = {
+            term.casefold()
+            for term in extract_search_terms(query)
+            if len(term.strip()) >= 2 and term.casefold() not in _STOPWORDS
+        }
+        exact_phrases = TrajectoryStore._exact_query_phrases(query)
+
+        def _key(item: tuple[int, sqlite3.Row]) -> tuple[float, int, int]:
+            position, row = item
+            goal_url = f"{row['goal']} {row['url']}".casefold()
+            action = str(row["incoming_action"] or "").casefold()
+            text = str(row["text"] or "")[:4_000].casefold()
+            exact = sum(1 for phrase in exact_phrases if phrase in goal_url)
+            goal_density = sum(1 for term in query_terms if term in goal_url)
+            action_density = sum(1 for term in query_terms if term in action)
+            text_density = sum(1 for term in query_terms if term in text)
+            prior = exact * 8.0
+            if template in {"navigation", "procedure"}:
+                prior += goal_density * 0.6 + action_density * 0.4
+            elif template == "temporal":
+                prior += (
+                    (1.0 if row["observed_at"] is not None else 0.0)
+                    + (1.0 if row["occurred_at"] is not None else 0.0)
+                    + text_density * 0.15
+                )
+            elif template == "multi_entity":
+                prior += goal_density * 0.35
+            return (-prior, position, int(row["state_id"]))
+
+        return [
+            row for _position, row in sorted(enumerate(rows), key=_key)
+        ]
+
+    @staticmethod
+    def _adaptive_excerpt_limits(
+        rows: Sequence[sqlite3.Row],
+        base_limit: int,
+        enabled: bool,
+    ) -> tuple[dict[int, int], dict[str, Any] | None]:
+        limits = {int(row["state_id"]): base_limit for row in rows}
+        if not enabled or not rows:
+            return limits, None
+        counts: dict[str, int] = {}
+        for row in rows:
+            trajectory_id = str(row["trajectory_id"])
+            counts[trajectory_id] = counts.get(trajectory_id, 0) + 1
+        total_budget = base_limit * len(rows)
+        floor = max(256, (base_limit * 3) // 4)
+        for row in rows:
+            if counts[str(row["trajectory_id"])] > 1:
+                limits[int(row["state_id"])] = floor
+        used = sum(
+            min(len(str(row["text"])), limits[int(row["state_id"])])
+            for row in rows
+        )
+        bank = max(0, total_budget - used)
+        raised: list[dict[str, int]] = []
+        for row in rows:
+            if bank <= 0:
+                break
+            if counts[str(row["trajectory_id"])] != 1:
+                continue
+            state_id = int(row["state_id"])
+            current = limits[state_id]
+            ceiling = min(_MAX_QUERY_TEXT_CHARS, base_limit * 2)
+            desired = min(len(str(row["text"])), ceiling)
+            extra = min(bank, max(0, desired - current))
+            if extra:
+                limits[state_id] += extra
+                bank -= extra
+                raised.append({"state_id": state_id, "chars": limits[state_id]})
+        return limits, {
+            "base_char_limit": base_limit,
+            "total_char_budget": total_budget,
+            "raised_only_hits": raised,
+        }
+
+    @staticmethod
+    def _rendered_hit_text(hit: TrajectoryHit) -> str:
+        """Mirror the official adapter's text rendering for token budgeting."""
+        lines = [
+            f"[{hit.exact_ref}]",
+            f"Trajectory: {hit.trajectory_id}",
+            f"Goal: {hit.goal}",
+            f"Outcome: {hit.outcome or '<unknown>'}",
+            (
+                f"State: {hit.state_index} "
+                f"(sequence {hit.sequence_ordinal}, step {hit.step})"
+            ),
+            f"URL: {hit.url}",
+            f"Incoming action: {hit.incoming_action or '<none>'}",
+        ]
+        if hit.thoughts:
+            lines.append(f"Thought: {hit.thoughts}")
+        label = (
+            f"Visible state excerpt (offset {hit.text_offset})"
+            if hit.text_truncated else "Visible state"
+        )
+        lines.append(f"{label}: {hit.text}")
+        if hit.observed_at is not None:
+            lines.append(
+                f"Observed at: {hit.observed_at} (source: {hit.observed_at_source})"
+            )
+        if hit.occurred_at is not None:
+            lines.append(
+                f"Occurred at: {hit.occurred_at} (source: {hit.occurred_at_source})"
+            )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _trim_hit_text(hit: TrajectoryHit, target_tokens: int) -> TrajectoryHit:
+        from .tokens import count_tokens
+
+        if count_tokens(hit.text) <= target_tokens:
+            return hit
+        low, high = 0, len(hit.text)
+        while low < high:
+            middle = (low + high + 1) // 2
+            if count_tokens(hit.text[:middle]) <= target_tokens:
+                low = middle
+            else:
+                high = middle - 1
+        keep = max(0, low)
+        start = max(0, (len(hit.text) - keep) // 2)
+        return replace(
+            hit,
+            text=hit.text[start:start + keep],
+            text_offset=hit.text_offset + start,
+            text_truncated=True,
+        )
+
+    @staticmethod
+    def _apply_sharp_token_budget(
+        hits: Sequence[TrajectoryHit],
+        token_budget: int,
+    ) -> tuple[list[TrajectoryHit], dict[str, Any]]:
+        from .tokens import count_tokens
+
+        working = list(hits)
+        original_tokens = sum(
+            count_tokens(TrajectoryStore._rendered_hit_text(hit)) for hit in working
+        )
+        dropped: list[str] = []
+        while working:
+            fixed_tokens = sum(
+                count_tokens(
+                    TrajectoryStore._rendered_hit_text(replace(hit, text=""))
+                )
+                for hit in working
+            )
+            if fixed_tokens <= token_budget:
+                break
+            dropped.append(working.pop().exact_ref)
+        if working:
+            fixed_tokens = sum(
+                count_tokens(
+                    TrajectoryStore._rendered_hit_text(replace(hit, text=""))
+                )
+                for hit in working
+            )
+            available = max(0, token_budget - fixed_tokens)
+            per_hit = max(0, available // len(working))
+            working = [
+                TrajectoryStore._trim_hit_text(hit, per_hit) for hit in working
+            ]
+        final_tokens = sum(
+            count_tokens(TrajectoryStore._rendered_hit_text(hit)) for hit in working
+        )
+        while working and final_tokens > token_budget:
+            largest_index = max(
+                range(len(working)),
+                key=lambda index: count_tokens(working[index].text),
+            )
+            current = count_tokens(working[largest_index].text)
+            if current <= 0:
+                dropped.append(working.pop().exact_ref)
+            else:
+                working[largest_index] = TrajectoryStore._trim_hit_text(
+                    working[largest_index], max(0, current - 8)
+                )
+            final_tokens = sum(
+                count_tokens(TrajectoryStore._rendered_hit_text(hit))
+                for hit in working
+            )
+        return working, {
+            "text_token_budget": token_budget,
+            "rendered_text_tokens_before": original_tokens,
+            "rendered_text_tokens_after": final_tokens,
+            "dropped_evidence_refs": dropped,
+        }
+
+    @staticmethod
+    def _select_diverse(
+        rows: Iterable[sqlite3.Row],
+        limit: int,
+        max_per_trajectory: int = 5,
+    ) -> list[sqlite3.Row]:
         selected: list[sqlite3.Row] = []
         per_trajectory: dict[str, int] = {}
         for row in rows:
             trajectory_id = str(row["trajectory_id"])
-            if per_trajectory.get(trajectory_id, 0) >= 5:
+            if per_trajectory.get(trajectory_id, 0) >= max_per_trajectory:
                 continue
             selected.append(row)
             per_trajectory[trajectory_id] = per_trajectory.get(trajectory_id, 0) + 1
@@ -2052,6 +2551,7 @@ class TrajectoryStore:
         global_rows: Sequence[sqlite3.Row],
         limit: int,
         floor_k: int,
+        max_per_trajectory: int = 5,
     ) -> list[sqlite3.Row]:
         """Policy A -- reserve ``floor_k`` nucleus slots for the top pure-BM25
         states, then fill the remainder from the fused order.
@@ -2061,7 +2561,11 @@ class TrajectoryStore:
         trajectories monopolise the nucleus. Both the floor and the fill honour
         the same 5-per-trajectory diversity cap as ``_select_diverse``.
         """
-        selected = list(TrajectoryStore._select_diverse(global_rows, floor_k))
+        selected = list(TrajectoryStore._select_diverse(
+            global_rows,
+            floor_k,
+            max_per_trajectory=max_per_trajectory,
+        ))
         selected_ids = {int(row["state_id"]) for row in selected}
         per_trajectory: dict[str, int] = {}
         for row in selected:
@@ -2074,7 +2578,7 @@ class TrajectoryStore:
             if state_id in selected_ids:
                 continue
             trajectory_id = str(row["trajectory_id"])
-            if per_trajectory.get(trajectory_id, 0) >= 5:
+            if per_trajectory.get(trajectory_id, 0) >= max_per_trajectory:
                 continue
             selected.append(row)
             selected_ids.add(state_id)
@@ -2282,6 +2786,9 @@ class TrajectoryStore:
         adjacency_radius: int = 0,
         adjacency_quota: int = 0,
         state_semantic_quota: int = 0,
+        diversity_cap: int = 0,
+        adaptive_excerpt: bool = False,
+        sharp_token_budget: int = 0,
     ) -> tuple[TrajectoryHit, ...]:
         if self.status != "complete":
             raise CorpusIdentityError("trajectory corpus must be finalized before query")
@@ -2292,6 +2799,12 @@ class TrajectoryStore:
         adjacency_radius = min(max(0, int(adjacency_radius)), _MAX_ADJACENCY_RADIUS)
         adjacency_quota = min(max(0, int(adjacency_quota)), _MAX_CANDIDATES)
         state_semantic_quota = min(max(0, int(state_semantic_quota)), _MAX_CANDIDATES)
+        diversity_cap = min(max(0, int(diversity_cap)), _MAX_DIVERSITY_CAP)
+        sharp_token_budget = min(
+            max(0, int(sharp_token_budget)),
+            _MAX_SHARP_TOKEN_BUDGET,
+        )
+        adaptive_excerpt = bool(adaptive_excerpt)
         text_char_limit = min(
             max(256, int(text_char_limit)),
             _MAX_QUERY_TEXT_CHARS,
@@ -2305,7 +2818,13 @@ class TrajectoryStore:
                 "delivered_evidence_refs": [],
             }
             return ()
-        global_rows = self._fts_rows(expression, candidate_limit)
+        sharp_telemetry: dict[str, Any] | None = None
+        if sharp_token_budget > 0:
+            global_rows, sharp_telemetry = self._sharp_fts_rows(
+                query, candidate_limit
+            )
+        else:
+            global_rows = self._fts_rows(expression, candidate_limit)
         semantic_ranks: list[tuple[int, float]] = []
         semantic_attempt: TrajectorySemanticAttempt | None = None
         attempt_started = time.monotonic()
@@ -2483,8 +3002,35 @@ class TrajectoryStore:
                     })
                 rows = expanded
 
+        question_template: str | None = None
+        if sharp_token_budget > 0:
+            question_template = self._question_template(query)
+            rows = self._template_order(rows, query, question_template)
+
+        diversity_telemetry: dict[str, Any] | None = None
+        diversity_survivors: set[int] | None = None
+        if diversity_cap > 0:
+            # C1 is deliberately applied once, after lexical, source-semantic,
+            # adjacency, and state-semantic arms have composed. Filtering each
+            # arm independently would allow a capped hub to re-enter through a
+            # different arm.
+            rows, diversity_telemetry = self._cap_composed_pool(
+                rows, diversity_cap
+            )
+            diversity_survivors = {
+                int(row["state_id"]) for row in rows
+            }
+
         adjacent_reserve = min(6, limit // 3) if include_adjacent else 0
         nucleus_limit = max(1, limit - adjacent_reserve)
+        lexical_candidates = (
+            [
+                row for row in global_rows
+                if int(row["state_id"]) in diversity_survivors
+            ]
+            if diversity_survivors is not None else global_rows
+        )
+        per_trajectory = diversity_cap or 5
         if arm_quota is not None:
             # Policy D (candidate-composition repair, issue #127): round-robin a
             # pure-lexical arm and the semantic/fused arm into the nucleus by the
@@ -2496,8 +3042,16 @@ class TrajectoryStore:
             # (``lexical_floor == 0`` reproduces the pure Policy D bytes).
             q_lex = max(0, int(arm_quota[0]))
             q_sem = max(0, int(arm_quota[1]))
-            arm_lex = self._select_diverse(global_rows, nucleus_limit)
-            arm_sem = self._select_diverse(rows, nucleus_limit)
+            arm_lex = self._select_diverse(
+                lexical_candidates,
+                nucleus_limit,
+                max_per_trajectory=per_trajectory,
+            )
+            arm_sem = self._select_diverse(
+                rows,
+                nucleus_limit,
+                max_per_trajectory=per_trajectory,
+            )
             selected = self._merge_arms(
                 arm_lex, arm_sem, nucleus_limit, q_lex, q_sem,
                 floor_k=lexical_floor,
@@ -2508,10 +3062,18 @@ class TrajectoryStore:
             # the rest. ``lexical_floor == 0`` (default) is byte-identical to the
             # historical fused-only selection below.
             selected = self._select_with_floor(
-                rows, global_rows, nucleus_limit, lexical_floor
+                rows,
+                lexical_candidates,
+                nucleus_limit,
+                lexical_floor,
+                max_per_trajectory=per_trajectory,
             )
         else:
-            selected = self._select_diverse(rows, nucleus_limit)
+            selected = self._select_diverse(
+                rows,
+                nucleus_limit,
+                max_per_trajectory=diversity_cap or 5,
+            )
         selected_ids = {int(row["state_id"]) for row in selected}
         match_kind_by_id = {
             int(row["state_id"]): candidate_kind.get(int(row["state_id"]), "fts")
@@ -2524,6 +3086,12 @@ class TrajectoryStore:
 
         if include_adjacent and selected and len(selected) < limit:
             nucleus_rows = list(selected)
+            selected_per_trajectory: dict[str, int] = {}
+            for row in selected:
+                trajectory_id = str(row["trajectory_id"])
+                selected_per_trajectory[trajectory_id] = (
+                    selected_per_trajectory.get(trajectory_id, 0) + 1
+                )
             adjacent_by_nucleus: list[list[sqlite3.Row]] = []
             for nucleus in nucleus_rows:
                 adjacent_rows = self._conn.execute(
@@ -2552,8 +3120,18 @@ class TrajectoryStore:
                         state_id = int(row["state_id"])
                         if state_id in selected_ids:
                             continue
+                        trajectory_id = str(row["trajectory_id"])
+                        if (
+                            diversity_cap > 0
+                            and selected_per_trajectory.get(trajectory_id, 0)
+                            >= diversity_cap
+                        ):
+                            continue
                         selected.append(row)
                         selected_ids.add(state_id)
+                        selected_per_trajectory[trajectory_id] = (
+                            selected_per_trajectory.get(trajectory_id, 0) + 1
+                        )
                         match_kind_by_id[state_id] = "adjacent"
                         score_by_id[state_id] = score_by_id[int(nucleus["state_id"])] + 0.000001
                         made_progress = True
@@ -2563,6 +3141,15 @@ class TrajectoryStore:
                 if not made_progress:
                     break
 
+        adaptive_active = (
+            adaptive_excerpt
+            and str(self.identity_payload.get("domain", "")).casefold() == "web"
+        )
+        excerpt_limits, excerpt_telemetry = self._adaptive_excerpt_limits(
+            selected[:limit],
+            text_char_limit,
+            adaptive_active,
+        )
         hits: list[TrajectoryHit] = []
         for index, row in enumerate(selected[:limit]):
             state_id = int(row["state_id"])
@@ -2572,8 +3159,14 @@ class TrajectoryStore:
                 match_kind=match_kind_by_id[state_id],
                 include_image=index < image_limit,
                 query=query,
-                text_char_limit=text_char_limit,
+                text_char_limit=excerpt_limits[state_id],
+                dense_excerpt=adaptive_active,
             ))
+        budget_telemetry: dict[str, Any] | None = None
+        if sharp_token_budget > 0:
+            hits, budget_telemetry = self._apply_sharp_token_budget(
+                hits, sharp_token_budget
+            )
 
         # Side-channel per-query telemetry (does not affect the returned hits).
         self._last_query_telemetry = {
@@ -2596,6 +3189,19 @@ class TrajectoryStore:
             ],
             "delivered_evidence_refs": [hit.exact_ref for hit in hits],
         }
+        if diversity_telemetry is not None:
+            # Present only when C1 is active; the complete survivor ids let the
+            # provider-free replay harness measure exact pool coverage without
+            # relying on the historical 64-row telemetry display bound.
+            self._last_query_telemetry["diversity_cap"] = diversity_telemetry
+        if excerpt_telemetry is not None:
+            self._last_query_telemetry["adaptive_excerpt"] = excerpt_telemetry
+        if sharp_telemetry is not None:
+            self._last_query_telemetry["sharp_compilation"] = {
+                **sharp_telemetry,
+                **(budget_telemetry or {}),
+                "question_template": question_template,
+            }
         if adjacency_radius > 0 and adjacency_quota > 0:
             # Present only when the H5(b) knob is active so the default
             # telemetry payload stays byte-identical (golden 451/451).
