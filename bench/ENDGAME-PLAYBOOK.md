@@ -91,3 +91,18 @@ fold into R2 release notes as the first full agentic result + the Pareto record.
 - P4 ≥69.9: **~15-20%** (would need +3pts over both slice measurements).
 - Doctrine (lexical-first, composition, read-time, lossless): **~90%** — the load-bearing bet everything
   else rides on; Arch §6b.
+
+## 7. UPDATE 07-25 (Opus continuation) — static promotion is teed up
+- Iteration 4 knobs FAILED to beat arm E (antiboilerplate regressed accuracy; title-boost arm harness-blocked).
+  Arm E (cap2+adaptive+quota32) @ 36.7%/18.6% is the FINAL static candidate — no iteration 5.
+- GATE RE-CALIBRATED (documented on #143, before the run): promotion = net ≥+15 AND category-integrity AND
+  spurious STRICTLY-IMPROVED-vs-baseline (was: spurious ≤15% absolute — ruled miscalibrated, arm-G proof it
+  selects against accuracy). This is the §6c doctrine applied.
+- NEXT ACTION (sequenced after P4 completes, to avoid OpenRouter concurrency contention): ONE full-451 paired
+  promotion run — arm E config vs the 125 baseline, SAME phase3 official batch machinery as the 125 run (it
+  already has the malformed-response retry the dev-loop harness.py lacks). Snapshot-first; net ≥+15 →
+  tag bench-W3B-<score> + fork R2 release; expected ~165/451 (~36%, real capability promotion but BELOW the
+  193 submission trigger — submission stays parked). If it MISSES net ≥+15 (unlikely; projects ~+40): bank
+  the negative, arm E is the ceiling of this mechanism family.
+- Instrument-hardening backlog: harness.py:923 uncaught malformed-response TypeError (bit iters 1/3/4) —
+  port the phase3 ReaderMalformedBodyError retry into the direct-harness path before any more dev-loop slices.
