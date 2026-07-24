@@ -106,3 +106,16 @@ fold into R2 release notes as the first full agentic result + the Pareto record.
   the negative, arm E is the ceiling of this mechanism family.
 - Instrument-hardening backlog: harness.py:923 uncaught malformed-response TypeError (bit iters 1/3/4) —
   port the phase3 ReaderMalformedBodyError retry into the direct-harness path before any more dev-loop slices.
+
+## 8. BACKLOG note (owner Q 07-25) — agentic curation cost
+"Building prompts" in the agentic path = one live codex-agent curation PER QUESTION (verified: 451 sandboxes,
+store read-only reused, not rebuilt). Inherent to read-time curation, but the agent re-searches the store from
+scratch each question. Future optimization: cache/share store-search results across questions (the CURATION is
+question-specific and can't be cached, but the underlying SEARCH hits can). Latency lever for LAFS + cost.
+
+## 9. UPDATE 07-25 (Opus) — arm-E promotion fully pre-flighted + de-risked
+- Runner = `evaluation/harness.py --load-memory-dir` (NOT phase3 run_eval — it drops the state-quota knob). Launcher staged: artifacts/W3B-PROMOTION-PREP/launch-armE-full451.sh (cd→wt-w3b-dev @5bb7b85).
+- Malformed-response crash-guard PORTED onto the runner (adapter 5bb7b85; the harness.py:923 fault that crashed 4 prior runs is now typed+retried).
+- FIRE-SEQUENCE (when P4 done): (1) score P4 #148; (2) fresh 2q knob-probe on the post-port launcher (confirm cap+adaptive+quota telemetry engaged, no crash-path regression); (3) if clean → `launch-armE-full451.sh web` + `... enterprise`. Gate: net ≥+15 vs 125 AND category-integrity AND spurious strictly-improved (§6c recalibration). ~$2-5, ~5-6h. Expect ~165/451 (real promotion, below 193 submission trigger → submission stays parked).
+- Wave-3.5 (SPEC-W35-FAMILY / #155) is the successor family AFTER this promotion banks — C4 delivery-seat-selection flagship. Do NOT start it before the promotion.
+- Tracked non-blocker: test_w3b_env_passthroughs fails as a test-import artifact (loads adapter store not the wt-h5-recall@8c0c45f product store the launcher uses); probe proved runtime knobs engage. Worth a proper test-fix in wave-3.5 but not blocking the promotion.
