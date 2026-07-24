@@ -56,6 +56,16 @@ same method): 7/10 needle-absent (hub-crowding generalizes, weaker) + 3/10 needl
 fixed ~2.5-2.9K-char per-state AXTree excerpt window — a web-only delivery bug (W3b component 2: adaptive/
 needle-aware excerpt windows). Compactness remains the live thesis for the static→agentic gap (M3).
 
+**M5 — Corpus-coverage ceiling (deterministic all-451 audit, 07-25, no model calls; CORPUS-COVERAGE-CEILING.md):**
+only **1/451 (0.22%)** questions have gold material ABSENT from the stored state text (enterprise c9568c9b,
+"risk level"); web 0/240. Of the ~72-point gap between official 27.7% and 100%, **at most ~0.4 points is a real
+corpus/ingest limit — the entire remaining ~72 points is retrieval + ranking + delivery + reasoning headroom.**
+This VALIDATES the whole program direction and the owner's lossless-raw thesis: storage is essentially complete;
+there is no ingest work to do; every point is won in the read-time path (composition/delivery/consumer). It also
+means the recall floor (H5 family) is NOT corpus-bounded — states exist, they must be reached and delivered.
+(Refines the shadow-audit's "4 absent cases" to a rigorous 1; the naive audit's 40 were 39 method false-positives
+— MC options are always echoed in the prompt.)
+
 ## 2. DECISION RECORD — the official protocol becomes the primary static instrument (NEW, 07-24)
 
 The full 451-question official run cost **≈$1.1 and ~3.5h wall** (parallelizable to <1h in 4 batches). The Sol
