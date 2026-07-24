@@ -40,7 +40,8 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from benchmarking.h3_composition_replay import (  # noqa: E402
-    _H1, _H31, _RUN_ROOT, ReplayContext, golden_gate, measure_latency,
+    _H1, _H31, _REPO_ROOT, _RUN_ROOT, ReplayContext, _bootstrap_package,
+    golden_gate, measure_latency,
 )
 from benchmarking.h5_recall_replay import (  # noqa: E402
     _LOSS_8, H5Context,
@@ -59,9 +60,14 @@ class CachedVoyageQueryProvider:
     model_id = "voyage-4"
 
     def __init__(self, model: str = "voyage-4", timeout: float = 30.0) -> None:
-        from hermes_lcm.embedding_provider import VoyageProvider
+        from hermes_lcm.embedding_provider import EmbeddingSpendGuard, VoyageProvider
 
-        self._real = VoyageProvider(model, timeout=timeout)
+        # Disable the interactive per-minute call-rate guard: this offline sweep
+        # embeds the 451 unique queries in a tight loop (each is cheap, ~cents
+        # total), which is exactly the bulk pattern for_backfill=True exempts.
+        self._real = VoyageProvider(
+            model, timeout=timeout, spend_guard=EmbeddingSpendGuard(max_calls=0)
+        )
         self.model_id = model
         self._cache: dict[str, list[float]] = {}
         self.last_usage_tokens = 0
@@ -146,6 +152,7 @@ def main() -> int:
               flush=True)
         return 3
 
+    _bootstrap_package(_REPO_ROOT)
     provider = CachedVoyageQueryProvider()
     ctx = StateReplayContext(
         args.run_root, args.h1_artifacts, args.h31_artifacts, args.db_dir, provider
