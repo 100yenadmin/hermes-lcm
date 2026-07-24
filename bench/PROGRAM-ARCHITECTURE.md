@@ -118,6 +118,31 @@ optionally + a frontier reader — EXPLICITLY non-leaderboard-comparable, a prod
 frontier signal already exists (Sol-internal static 45.5% vs 9B 27.7% = the consumer-capacity gap). P5 is
 owner-gated (new frontier-agent spend). Both truths wanted: P4=public standing, P5=deployable ceiling.
 
+## 2f. ★ DECISION RECORD — LAFS is accuracy X latency; latency is now a FIRST-CLASS objective (M8, 07-25)
+Verified by running the benchmark's own scorer (leaderboard/compute_lafs.py, fixed small frontier, T=1..200s):
+**every banked result and BOTH predeclared submission triggers score exactly 0.0000** (static 27.7%@0.109s;
+agentic 66.1%@196.9s; triggers 42.8% and 69.9%; even M7's 72.1%@197s). A point dominated on both axes by a
+reference point contributes zero area. What scores: agentic 66.1% at 50s = 1.09, at 20s = 2.82 (NO new accuracy
+work); static >51.0% at our 0.109s (51.5%=0.31, 55%=2.49). Getting static +23.8 accuracy points = 0.31; cutting
+agentic latency 197s->20s = 2.82 (~9x, less work). Latency is a MULTIPLIER on accuracy work, not an alternative
+(M7 = 0.00 at 197s, 1.97 at 50s). Measured cause of the 197s: 11,099 agent output tokens/question at 56.4 tok/s
+= the pinned agent's own reasoning; our store's retrieval is 0.109s. CONSEQUENCES: (1) the §2d agent pin has
+served its purpose (the vanilla A/B is banked) and no longer constrains the LEADERBOARD point — agent
+effort/turn-cap/fan-out may now be varied for the submission point, with the A/B result kept separately labeled;
+(2) static's real bar is >51.0%, not 42.8% — worthless below the cliff, steepest slope in the program above it
+(~0.62 LAFS/point); (3) #151's trigger is rewritten to lafs_gain_for_submission(...) > 0, computed, never
+inferred from headline accuracies. PRIORITY ORDER: agentic latency reduction FIRST, then M7, then static
+re-aimed at >51.0 or defunded. Full analysis: bench/FINDING-M8-LAFS-METRIC-ERROR.md.
+
+## 2g. STANDING RULE — run-config parity check before any gate (M9, 07-25)
+The arm-E full-451 promotion was killed at ~20% because it ran with unpinned decoding (temperature/top_p/top_k
+= null -> provider defaults) while its 125 baseline pins 0.6/0.95/20. Scope: dev iterations 1-2 (arms A/B/C) are
+pinned and valid; **iterations 3-4 (arms E/F/G/H) are ALL unpinned**, so arm E's 36.7% was never validly
+comparable and armC (33.3%/23.3%) is the last VALIDATED static candidate. RULE: before any run is used in a gate,
+diff its run_args.json (decoding params, reader/judge model, store path, question set) against the comparison
+baseline's; make it part of the pre-launch probe. A number is not a measurement until its config matches what it
+is compared to.
+
 ## 3. Lane architecture
 
 ### Lane S — static compactness (wave-3; epic issue W3)
