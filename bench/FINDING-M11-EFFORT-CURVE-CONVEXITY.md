@@ -137,3 +137,49 @@ run +/-3 points historically, and the 95% CI on a 60q proportion is ~+/-12 point
 
 **Next:** M7 pilot (#157), executed at **low** effort, with `searches_per_question` instrumented as
 the leading indicator per M10.
+
+---
+
+## 7. L4 CONTENTION PROBE — inconclusive, and a parity failure caught by our own rule
+
+**The probe did not run the configuration it was meant to.** L4's `run_args.json` diffed against L3
+shows the intended concurrency change (`prompt_build_max_workers` 3→1, `reader_max_concurrent_requests`
+3→1) **plus an unintended one: `reasoning_effort: high`, not `low`.** L4 is therefore not comparable to
+L3 at all; its correct control is L1, the other high-effort arm. Caught by the M9 parity diff before the
+number was used — the first time that rule has paid for itself on an incoming result rather than an
+outgoing one. (Read naively against L3 it appeared uncontended runs were 2.3x SLOWER, which is
+incoherent; the parity diff explained it immediately.)
+
+**Corrected comparison (both arms effort=high, only concurrency differs), 6 paired qids:**
+
+| | mean | median |
+|---|---|---|
+| L4 concurrency=1 | 125.4s | 122.1s |
+| L1 concurrency=3 | 167.8s | 168.1s |
+
+Point estimate: contention factor **1.34x**. **But it is not established:** sd=0.40, n=6,
+**95% CI 0.93–1.76 — includes 1.0.** Per-question ratios run 0.86 to 1.93 and **two of six questions
+were FASTER contended.** Conclusion: **we may not claim a corrected latency number from this probe.**
+Directionally consistent with contention existing; underpowered to establish it.
+
+Even taking the point estimate at face value it does not rescue a score: 56.67% @ 38.6s still computes
+**0.0000**, because we are stranded between the two windows — accuracy below the 58.6% floor of window A,
+latency above the 26.9s ceiling of window B. What the correction *would* do is multiply future accuracy
+gains: 62.7% → 0.798 (from 0.574), 66.1% → 1.460 (from 1.050).
+
+**ACTION:** if the latency figure ever becomes load-bearing (submission, publication, a gate), run a
+properly powered uncontended probe — same effort as the arm being corrected, ≥30 questions. Until then
+**all latency figures are reported as CONTENDED**, per the standing rule.
+
+## 8. ★ RUN-TO-RUN VARIANCE — the mechanism behind "60q is a screen"
+
+On the same 6 questions at the same effort, **L1 scored 3/6 and L4 scored 5/6.** A 33-point swing with
+no mechanism change. The cause is not a bug: decoding is pinned at temperature 0.6 / top_p 0.95 /
+top_k 20 — pinned for **comparability**, not determinism. The reader is stochastic by construction, so
+every arm carries irreducible sampling noise, and two arms differing by a couple of questions on a small
+slice tell us nothing.
+
+This is the strongest available justification for the §2b/§0 rule: **the 60q slice is a screen, not a
+promotion instrument**, and no mechanism story may rest on a sub-significant subset difference. It also
+means a full-451 comparison is not noise-free either — paired/same-question comparison (as used here)
+is materially better than comparing headline percentages, and should be the default for any future gate.
