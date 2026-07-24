@@ -190,6 +190,37 @@ Instrument note under 2g: L3/web took one reader-side HTTP 504 scored as a wrong
 as-measured 56.67%, excluding the artifact 57.63%. L1/L2 took zero. Changes no decision here, recorded because
 a single question is material at a 1.94-point margin. **Count provider-error rows before comparing two arms.**
 
+## 2i. ★ CORRECTION — the A/B capability claim is NULL on accuracy, STRONG on latency (M12, 07-25)
+
+The claim "hermes 66.1% @197s vs vanilla 63.3% @256s — first evidence the memory measurably helps an
+agent" is **withdrawn as an ACCURACY claim.** Two defects: (a) it compared hermes@**451** against
+vanilla@**60q** — different question sets, no vanilla@451 exists; (b) McNemar on the paired 60q data is
+null for ALL THREE hermes arms vs the same vanilla control — P3 40/60 (p=0.727), P3R 38/60 (**p=1.000,
+delta zero**), P4-valslice 40/60 (p=0.774). The spread across our OWN arms (40/38/40, range 2 questions)
+equals the claimed effect (+2 questions), i.e. run-to-run noise at temp 0.6 per M11 §8. P3R, the
+*post-fix* run, scored LOWER than P3.
+
+**What the same paired data DOES establish — and under LAFS it is the better half:** hermes is faster on
+**48/60 questions (80%)**, mean paired difference **-56.3s/question (-22%)**, 95% CI -32.4 to -80.1s,
+t=4.72, **sign test p<0.0001**. Same agent, model, reader; only variable is our memory. M8 made latency a
+first-class axis and M11 showed accuracy is flat across configs while latency is what moves — so a
+mechanism buying 22% latency at equal accuracy pushes us left along exactly the axis the metric rewards.
+
+**CORRECTED WORDING (binding — use this, retire the old):** *Against a vanilla-Codex control on the same
+60 questions with the same agent, model and reader, our memory makes the agent ~22% faster
+(-56.3s/question, 95% CI -32 to -80s, p<0.0001, faster on 80% of questions) at statistically
+indistinguishable accuracy (McNemar p=0.77). The accuracy difference is within run-to-run noise and is
+NOT claimed.*
+
+**Banked numbers are untouched** (static 125/451, agentic 298/451, V1 444/500) — only the A/B
+interpretation changes. **R2 fork release must carry the corrected claim**; publishing the old wording
+would ship an unsupported result. Full detail: `bench/FINDING-M12-AB-CLAIM-CORRECTION.md`.
+
+**New standing rules from this:** (1) never compare arms measured on different question sets — state n
+and manifest for both sides; (2) any claimed accuracy delta ships with its paired test (McNemar) and
+discordant counts, and a delta smaller than the spread across your own repeated arms is NOT a finding;
+(3) report run-to-run spread wherever repeated arms exist; (4) audit your own headline before publishing.
+
 ## 3. Lane architecture
 
 ### Lane S — static compactness (wave-3; epic issue W3)
