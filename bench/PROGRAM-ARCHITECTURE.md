@@ -81,6 +81,26 @@ tolerance) the official reader punishes. Therefore, effective immediately:
 Predeclared instrument rules carry over: snapshot-first, per-category integrity check on every full run,
 both-sides rescoring if any scorer changes.
 
+## 2b. DECISION RECORD — we do NOT own the reader/answer prompt (wave-3.5 design workflow, 07-25; CODE-VERIFIED)
+The official LME-V2 harness system/answer prompt is FIXED and shared across ALL leaderboard systems
+(evaluation/harness.py DOMAIN_SYSTEM_PROMPTS, ~L72-89: "output exactly \\boxed{UNKNOWN}... Do not guess"),
+and hermes-lcm's own adapter DELIBERATELY ships an EMPTY prompt override (qa-harness .../hermes-lcm/prompts.ts:
+"deliberately ships NO custom answer or judge prompt... a bespoke tuned prompt would inflate its numbers
+relative to providers scored under the defaults"). **CONSEQUENCE (binding on all future work): any
+'reader-contract' mechanism may only shape the `memory_context` CONTENT we return — never the instructions.**
+Editing the answer prompt would be BOTH leaderboard-invalid (non-comparable) AND a self-inflated number. This
+killed the M4 "calibrated-inference/analogy-license" proposal in wave-3.5 (it fought the fixed prompt =
+textbook design-for-Sol). Reader-contract work = evidence-embedded scaffolding at the compilation stage only.
+
+## 2c. NEXT FAMILY — wave-3.5 spec exists (bench/specs/SPEC-W35-FAMILY.md, 07-25)
+Synthesized+adversarially-critiqued design for the successor family AFTER arm-E promotion banks. Center of mass
+= DELIVERY seat-selection (C4 flagship; targets the 6/8 arm-E residuals that die at final seat-selection to
+boilerplate), NOT recall or reader-text (0/30 sampled unknowns were format-hostility). Components: C4 (seat
+precision) · C5 (bounded local cross-encoder rerank, smoke-gated, cut-if-no-composed-gain) · QD (recall
+widening for the 2/8 retrieval residuals) · RC (reader-contract scaffolding, smallest/last). Gated as a §6c
+FAMILY on composed whole-funnel net vs promoted arm-E. Sequenced: does NOT block/compete with the arm-E
+promotion run. Full spec + cut-list in the file.
+
 ## 3. Lane architecture
 
 ### Lane S — static compactness (wave-3; epic issue W3)
