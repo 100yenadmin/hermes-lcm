@@ -750,6 +750,59 @@ def test_selective_query_view_persistence_is_same_db_and_default_off(tmp_path):
     assert count == 1
 
 
+def test_persist_compiled_view_releases_lease_on_publish_failure(tmp_path, monkeypatch):
+    """A claim_build() lease must not survive a post-claim publish_ready()
+    exception -- otherwise the view sits status='building' for the full
+    300s lease and an immediate, correct retry reports busy instead of
+    rebuilding (F-PR436-2)."""
+    engine = _engine(tmp_path)
+    query_views = QueryViewStore(engine._config.database_path)
+    engine._query_views = query_views
+    source = _append(engine, "Maya owns the Atlas rollout.")
+    selector = _selector(
+        _claim("owner", source, "atlas-owner", entity="Maya", role="user")
+    )
+    try:
+        monkeypatch.setattr(
+            QueryViewStore,
+            "publish_ready",
+            lambda self, token, **kwargs: (_ for _ in ()).throw(
+                ValueError("simulated manifest rejection")
+            ),
+        )
+        failed_result = compile_evidence(
+            "Who owns the Atlas rollout?",
+            engine=engine,
+            baseline_refs=[source],
+            selector=selector,
+            enabled=True,
+            persist_view=True,
+        )
+        assert failed_result["persistence"]["status"] == "error"
+        assert failed_result["persistence"]["reason_code"] == "query_view_publish_failed"
+
+        row = query_views._conn.execute(
+            "SELECT status, build_nonce FROM lcm_query_views"
+        ).fetchone()
+        assert row["status"] != "building"
+        assert row["build_nonce"] == ""
+
+        monkeypatch.undo()
+        retried_result = compile_evidence(
+            "Who owns the Atlas rollout?",
+            engine=engine,
+            baseline_refs=[source],
+            selector=selector,
+            enabled=True,
+            persist_view=True,
+        )
+    finally:
+        query_views.close()
+        engine._store.close()
+
+    assert retried_result["persistence"]["status"] == "published"
+
+
 def test_selective_persistence_rejects_generic_or_ungrounded_state(tmp_path):
     engine = _engine(tmp_path)
     query_views = QueryViewStore(engine._config.database_path)
