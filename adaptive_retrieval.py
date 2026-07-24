@@ -172,7 +172,11 @@ class EvidenceRequirement:
 
 def requirements_digest(requirements: Sequence[EvidenceRequirement]) -> str:
     identity = [
-        {"slot_id": item.slot_id, "minimum_refs": item.minimum_refs}
+        {
+            "slot_id": item.slot_id,
+            "description": item.description,
+            "minimum_refs": item.minimum_refs,
+        }
         for item in sorted(requirements, key=lambda item: item.slot_id)
     ]
     return hashlib.sha256(
