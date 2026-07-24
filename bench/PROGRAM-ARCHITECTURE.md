@@ -180,6 +180,29 @@ while acknowledging the purist counter-theory (a memory system so good no-API-ca
 5. **Submission authority:** now fully delegated; the #151 trigger rule stands as the orchestrator's own
    standing decision (submit on static ≥193 or agentic ≥69.9 — the first public number frames the project).
 
+## 6b. DECISION RECORD — the product thesis: lossless raw + read-time intelligence (owner, 07-24 evening)
+
+Owner articulated the product philosophy; the week's evidence supports it; it is now binding design doctrine:
+1. **Store raw, losslessly. Think at read time.** Write-time summarization freezes today's model's judgment
+   into the permanent record and multiplies data; raw records let every future (better) model re-read the
+   original. THE RULE: never store at write time what you could not regenerate from the raw record; never
+   let a derived artifact answer when the raw record is reachable.
+2. **Write-time INDEXES are not summaries** — FTS, embeddings, titles/labels, timestamps are regenerable
+   pointers INTO raw data and are encouraged (the 'Last Updated At' miss was an index gap; iteration-4 knob H
+   is more lossless index). Lossy derivations as sources of truth are rejected.
+3. **Multi-call, sub-agent retrieval is the product path** (LCM-GREP/LCM-XPAND lineage): if one call lacks
+   confidence, fire another; orchestrators park retrieval on sub-agents while the conversation moves.
+   Evidence: same 9B reader — one-shot static 27.7% vs agent-curated multi-call 63-67% on identical stored
+   data; and the store made the agent FASTER than filesystem grep (216s vs 256s) — lossless ≠ slow when
+   indexes are good. Caveat baked in from P3R: each call must be precision-first (undisciplined
+   ranking/fusion made the agent WORSE); discipline per call, iteration across calls.
+4. **Scale favors this thesis**: at LME-V2's 25-115M-token regime no summary fits anyway — write-time
+   distillation competitors dominate only on in-window benchmarks. The earlier 'write-time distillation'
+   W4 candidate (Arch briefing) is WITHDRAWN accordingly.
+5. **Own benchmark = H7 sharpened**: score task-completion × latency × cost (the owner's three factors) on
+   live replay with compaction — external benchmarks stay useful but subordinate ("did the agent accomplish
+   the goal" outranks any leaderboard number).
+
 ## 6. Pointers
 GATE AUTHORITY NOTE: every gate summary in this document is an abbreviation — the GitHub ISSUE BODY carries the
 complete, binding gate text; score against the issue verbatim.
