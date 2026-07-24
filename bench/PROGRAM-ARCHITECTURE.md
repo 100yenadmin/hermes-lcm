@@ -155,6 +155,27 @@ diff its run_args.json (decoding params, reader/judge model, store path, questio
 baseline's; make it part of the pre-launch probe. A number is not a measurement until its config matches what it
 is compared to.
 
+## 2h. ★ DECISION RECORD — the agentic operating point is LOW effort (M11, 07-25)
+The P1 sweep (#158) measured the full effort dial on the frozen 60q manifest, decoding pinned:
+xhigh 66.1%@196.9s (P4, 451q) · high 61.67%@126.3s · medium 58.33%@99.0s · **low 56.67%@51.6s**. All score
+0.0000, but the SHAPE is the finding: the curve is **convex** — medium->low costs only 1.66 accuracy points
+and buys 47.4 seconds (0.35 pts/10s), ~3.5x cheaper than the leg above it, and on web accuracy is *identical*
+at medium and low (65.6% both) while latency nearly halves. An earlier "roughly 1:1" read of the L1->L2
+segment described the top of the curve only and does NOT generalise downward.
+
+**DECISION: low effort is the program's operating point** — not a fallback, but where every future accuracy
+point is banked, because under LAFS latency multiplies accuracy and the same number is worth ~8x more there
+(66.1% is 0.1271 @99.0s vs **1.0495** @51.6s; 62% is 0.0576 vs **0.4758**). Effort is now a SETTLED dial, not
+a lever still being searched. Consequences: (1) all subsequent agentic dev arms run at low effort unless a
+result specifically requires otherwise, and any deviation is stated with its LAFS cost; (2) the window opens
+at 58.6% accuracy at 51.6s, so the remaining distance is **1.94 points ~= 1.2 questions of 60**; (3) M7 (#157)
+is worth ~0.55 landed at low effort vs ~0.07 at medium — the SAME mechanism, an 8x difference from the
+operating point alone. Full detail: `bench/FINDING-M11-EFFORT-CURVE-CONVEXITY.md`.
+
+Instrument note under 2g: L3/web took one reader-side HTTP 504 scored as a wrong answer (qid edb69441);
+as-measured 56.67%, excluding the artifact 57.63%. L1/L2 took zero. Changes no decision here, recorded because
+a single question is material at a 1.94-point margin. **Count provider-error rows before comparing two arms.**
+
 ## 3. Lane architecture
 
 ### Lane S — static compactness (wave-3; epic issue W3)
