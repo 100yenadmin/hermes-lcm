@@ -101,6 +101,23 @@ widening for the 2/8 retrieval residuals) · RC (reader-contract scaffolding, sm
 FAMILY on composed whole-funnel net vs promoted arm-E. Sequenced: does NOT block/compete with the arm-E
 promotion run. Full spec + cut-list in the file.
 
+## 2d. DECISION RECORD — H6 agent model is FIXED at the published-point config (why gpt-5.4-mini, owner Q 07-25)
+The H6 agentic experiment is a CONTROLLED A/B: hold the official protocol fixed, vary ONLY the memory. The
+official protocol fixes reader=Qwen3.5-9B (the consumer, shared by all leaderboard systems), judge=gpt-5.2, and
+— for the agentic tier — agent=gpt-5.4-mini @ xhigh, which is the config the PUBLISHED Codex-69.9 point used
+(official repo defaults codex.py:39-40 + README; P0 recon on #145). gpt-5.4-mini is deliberately NOT frontier:
+a weak agent makes the MEMORY's contribution visible and keeps the number comparable to both the published 69.9
+AND our own vanilla-Codex baseline (which must use the same agent). Using Sol/frontier here would break both
+comparisons. Labeled "reproduced-with-defaults" + version-divergence disclosed (codex-cli 0.144.6 vs repo v0.117.0).
+This measures COMPETITIVENESS on the leaderboard's terms — NOT the product ceiling.
+
+## 2e. H6-P5 (proposed, owner-gated) — frontier-consumer product-ceiling variant
+P4 answers "competitive on the board's terms." It does NOT answer the frontier-future thesis (§6b): how good is
+the memory when a STRONG model consumes it. H6-P5 = hermes-agentic with a FRONTIER agent (Sol/latest) curating,
+optionally + a frontier reader — EXPLICITLY non-leaderboard-comparable, a product-ceiling measurement. Partial
+frontier signal already exists (Sol-internal static 45.5% vs 9B 27.7% = the consumer-capacity gap). P5 is
+owner-gated (new frontier-agent spend). Both truths wanted: P4=public standing, P5=deployable ceiling.
+
 ## 3. Lane architecture
 
 ### Lane S — static compactness (wave-3; epic issue W3)
