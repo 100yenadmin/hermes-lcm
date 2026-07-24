@@ -92,6 +92,7 @@ irreversible outside our fork.
   landed wake fully and do parallel plan work before ending a turn.
 - Artifacts → /Volumes/LEXAR/Codex/session-notes/YYYY-MM-DD/<slug>/artifacts/, never /tmp. Scratchpad =
   implementation-notes.html in the packet dir; timestamped entries at every decision.
+- ONE WORKTREE PER LANE: never run two agents (or an agent + a run) against the same checkout — a W3b builder commit switched the shared lme-v2-official HEAD mid-P3-run (07-24; harmless only by luck). Dedicated worktree or explicit lock per lane; restore expected branches after any shared-checkout use.
 - GitHub API budget: 5k/hr shared — don't poll gh in tight loops (burned once tonight); use ScheduleWakeup or
   sleep-tick micro-checks.
 
