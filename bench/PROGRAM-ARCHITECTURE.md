@@ -17,11 +17,23 @@ Make agent memory better for all agents, proven publicly on LongMemEval-V2 (prim
 | Static (fixed reader) | RAG 42.8 @ ~0.2s · RAG+notes 51.0 @ 0.2s · AgentRunbook-R 58.6 @ 26.9s | **ours: 27.7 (125/451)** |
 | Agentic (own agent) | Codex 69.9 @ 177.2s · AgentRunbook-C 74.9 @ 108.3s | not yet entered |
 
-Leaderboard metric = **LAFS Gain: Pareto frontier over (accuracy, query-latency)**. Strategic consequence:
-there are TWO winnable slots — a fast-compact static point AND a high-accuracy agentic point. We pursue both.
+Leaderboard metric = **LAFS Gain — the AREA between our accuracy-vs-latency curve and the fixed reference
+frontier, swept over latency budgets 1s..200s** (leaderboard/compute_lafs.py). A point beaten on BOTH axes by a
+reference point scores exactly 0. **★ SUPERSEDED TARGETS (M8, 07-25): the old "static >=42.8 -> >=51.0 ->
+agentic >=69.9 -> >=74.9" ladder is INVALID as a goal set — 42.8% scores 0.0000 and 69.9% at our 197s scores
+0.0000.** Verified with the repo's own scorer.
 
-Targets (in order of expected attainment): static ≥42.8 → static ≥51.0 (beats every published static system)
-→ agentic ≥69.9 (beats vanilla Codex with the SAME agent + our memory) → agentic ≥74.9. V1: 444 → ≥450.
+**CORRECT TARGETS (computed):**
+| target | LAFS |
+|---|---|
+| agentic 66.1% (already banked) at <=108.3s | >0 — on the frontier |
+| agentic 66.1% at 50s / 20s | 1.09 / 2.82 |
+| static >51.0% at our 0.109s (51.5 / 55 / 58.6) | 0.31 / 2.49 / 4.72 |
+| static 42.8%, agentic 69.9%@197s, M7 72.1%@197s | **0.0000 each** |
+
+Latency is a FIRST-CLASS objective and a multiplier on all accuracy work (M7 = 0.00 at 197s, 1.97 at 50s).
+Priority order: agentic latency -> M7 abstention -> static re-aimed at >51.0 or defunded. Full analysis:
+bench/FINDING-M8-LAFS-METRIC-ERROR.md; §2f carries the decision record.
 
 ## 1. The two load-bearing measurements (why this architecture)
 
