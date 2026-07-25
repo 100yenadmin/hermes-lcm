@@ -44,6 +44,37 @@ claim alongside the query-latency win.
 It also means the *honest* framing of a good Phase 1A result is **"flat read cost, linear write cost"** — not
 "scales for free".
 
+## 2b. ★ PROVIDER MISMATCH — Phase 1A is NOT on the production embedding stack
+
+Confirmed by the owner: **Voyage is the production embedding provider.** The banked 444's stores carry
+`lcm_embedding_profile` = `voyage / voyage-context-3 / 1024-dim / float32`. **Phase 1A is running
+`fastembed / BAAI/bge-small-en-v1.5 / 384-dim`.**
+
+| | provider | model | dims |
+|---|---|---|---|
+| production / banked 444 | **voyage** | `voyage-context-3` | **1024** |
+| Phase 1A (this probe) | fastembed | `bge-small-en-v1.5` | 384 |
+
+**Consequence for the scaling claim:** vector-search cost and recall both scale with dimensionality, and a
+1024-dim index is ~2.7x the vector volume per session. So a flat latency curve on 384-dim fastembed **does not
+transfer directly to production**. The *direction* (index vs linear scan) is a property of index structure and
+should hold; the *magnitude* will not. **Any published scaling number must state the provider, and a
+Voyage-provider run is a required follow-up before the claim is made about the product.**
+
+**Not restarting the probe over this.** The question it answers — does indexed retrieval degrade like O(n)
+file-scan — is about index structure, and the probe is 1.5h into its final ingest. Restarting would cost more
+than the caveat.
+
+**Accidental upside:** `fastembed` + `bge-small-en-v1.5` is **exactly OMEGA's disclosed stack**
+(omegamax.co/benchmarks). So Phase 1A measures scaling on the same embedding configuration as our closest
+competitor — a fair comparison against them, even though it is not our production config. Worth keeping for
+that purpose regardless of the Voyage rerun.
+
+**Also note the write-cost angle:** F21 §2 recorded ~2.2 sessions/second on fastembed/384-dim. Voyage at
+1024-dim is an API call per batch rather than local compute, so production write cost has a completely
+different shape (network-bound, rate-limited, paid) and the 2.2 sess/s figure must NOT be quoted as the
+production ingest rate.
+
 ## 3. Pre-registered: what would make me distrust the curve
 - **file-scan arm too fast at large N** — if arm B's latency does not grow roughly linearly, it is probably
   short-circuiting (early exit on first match, or not scanning the full corpus). A suspiciously flat arm B
