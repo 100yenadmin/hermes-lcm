@@ -88,5 +88,33 @@ a NO-GO *procedurally means*, so the verdict cannot be over- or under-read:
 not just the primary. Powering the primary and leaving the floor at coin-flip resolution is a half-fix, and I
 shipped it into this spec.
 
+## 5c. ★ M7 PREMISE RE-VALIDATED at n=128 — and it yields a sharp adjudication criterion
+
+Measured on the completed control (128 abstention questions, vs the original finding's smaller samples):
+
+| | control (n=128) | original M7 finding |
+|---|---|---|
+| reader **asserted** on abstention questions | **115/128 = 89.8%** | 122/128 = 95% |
+| of the 89 FAILED abstention questions, assertions | **76/89 = 85.4%** | 73 wrong hallucinations |
+| reader said UNKNOWN | 13/128 = 10.2% | 6/128 |
+| **score when the reader DID say UNKNOWN** | **0 / 13 = 0%** | **0 / 6 = 0%** |
+
+**The premise holds.** The dominant abstention failure is the reader confidently asserting against a false
+premise, not abstaining.
+
+**★ ADJUDICATION CRITERION (predeclared): a bare "UNKNOWN" is worth ZERO.** Now 0/19 across both samples. The
+official checker requires asserting the **specific negative conclusion** ("there is no second field"), not a
+bare refusal. Therefore, when reading M7b:
+
+- if the abstention gains come with **increased UNKNOWN responses** → the mechanism is teaching the reader to
+  refuse, which scores nothing. Gains would have to come from elsewhere, and the mechanism is mis-shaped.
+- if the gains come with **specific negative assertions** → the mechanism is doing exactly what is required.
+- **Report the UNKNOWN rate on the abstention subset for both arms.** A rise in UNKNOWN alongside a rise in
+  accuracy is a coincidence to be explained, not a success to be banked.
+
+Encouraging prior signal: in the M7 pilot, all 5 abstention gains were **non-UNKNOWN** — specific negative
+assertions. That is the behaviour we want, and it is what the declarative-evidence design (§2) was chosen to
+produce rather than an imperative "say you don't know."
+
 ## 6. Ship rule reminder
 helps both → default-on · leaderboard-only/product-harmful → config-gated off · product-only → ship anyway.
