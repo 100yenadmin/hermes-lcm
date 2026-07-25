@@ -18,6 +18,49 @@ from the frontier model itself and what you're actually improving. That gives yo
 **One real, measured advantage: speed.** Everything else attributed to us so far was either the agent's work
 or noise. This is the baseline the owner asked for, and it is deliberately unflattering.
 
+### 1b. ★ The V1 attribution is now DECOMPOSED, not just unflattering (F27 + F28, 2026-07-25)
+
+The owner's question was *"what percentage of performance comes from the frontier model itself and what are you
+actually improving."* For LongMemEval-V1 there is now a measured answer, from the banked 444/500's own artifact at
+zero spend.
+
+**Our layer's job is to put the right evidence in front of the reader. Measured, it does that:**
+
+| stage we own | measured | verdict |
+|---|---|---|
+| at least one gold session retrieved | **500/500 = 100.0%** | saturated |
+| every gold session retrieved | **486/500 = 97.2%** | saturated |
+| gold evidence *represented* in the 25-hit budget | failures get **more** gold hits than passes (11.5 vs 11.2) | adequate — no crowding-out |
+| evidence *structured* for the reader | renderer already groups by session, dates every item | adequate — nothing to add |
+
+**And the failures are not ours:** 52 of the 56 failures had the **complete** gold evidence in the prompt. On
+multi-session — our worst category and the largest single loss — **25 of its 26 failures had every gold session
+retrieved.**
+
+So the 11.2-point V1 gap decomposes as:
+
+- **≤4 questions (0.8 pts): retrieval.** Ours. Partial gold coverage.
+- **~14 questions (2.8 pts): abstention calibration.** Contested — the reader abstains *correctly* on 20
+  genuinely-unanswerable questions and incorrectly on 14 where evidence was present. A memory-layer *signal*
+  might move this; the M7/M7b lane tried and got a NO-GO.
+- **~38 questions (7.6 pts): the reader's synthesis.** **Not ours.** Complete, well-represented, grouped, dated
+  evidence in; wrong answer out.
+
+**The honest headline: on V1 roughly 90% of the remaining gap belongs to the frontier model, not to us.** Our
+memory layer is at its measurable ceiling on this benchmark.
+
+**Why this is the right answer to give, not a disappointing one.** It converts "we can't beat 444" from a failure
+into a *bound*: no memory system can win those 38 questions by retrieving or presenting better, so any competitor
+claiming a large V1 margin over us is either using a stronger reader, running extra reader passes, or decomposing
+questions in the agent — all of which are agent-layer work, not memory-layer work. That is a claim we can state
+publicly and defend with the decomposition above, and it reframes the competitive question from "who retrieves
+better" (settled, both saturated) to "who spends more reader compute" (an honest axis, and one where LAFS already
+prices the trade-off).
+
+**What it does NOT license.** It says nothing about V2's trajectory subsystem, and nothing about the scaling
+regime — where the corpus stops being grep-exhaustible and retrieval becomes load-bearing again. Both remain open,
+and Phase 1A (#159) is the test. **V1-small is where our ceiling is measured; it is not where our thesis lives.**
+
 ## 2. Why the advantage is so thin HERE — and it is structural, not a failure
 
 **The benchmark corpus is 1,870 trajectories total, and each question is handed 100 pre-selected candidates.**
