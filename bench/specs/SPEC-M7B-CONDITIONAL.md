@@ -58,5 +58,35 @@ M11–M15 showed direction alone is noise. One-primary law holds. 192q is powere
 default, labelled benchmark-only** (M16 ship rule). Floor breached again → the mechanism is not separable
 from its collateral; **stop the M7 family and say so** rather than producing M7c.
 
+## 5b. ★ GATE CALIBRATION NOTE — recorded BEFORE the M7b arm produced any numbers
+
+Computed from the completed control's enterprise half, while the web half was still scoring. **The answerable
+FLOOR is miscalibrated relative to the noise it must survive**, and this is stated in writing now so it cannot
+later be rationalised away (cf. `feedback_gate_proxy_calibration`: miscalibration must be documented in
+writing, not discovered at one-short).
+
+- answerable subset n=64 → **one question = 1.56 points**; the 2.0-point bar therefore permits losing **exactly
+  one** question. Two questions = 3.12 points = breach.
+- 95% CI half-width on a proportion at n=64 is **±11.7 points**. **The bar sits far inside the noise band.**
+- That variance is not hypothetical: M11 §8 measured identical config, identical 6 questions, different run →
+  3/6 vs 5/6.
+
+**The PRIMARY is fine** — abstention n=128 gives p≈0.00001 for an M7-sized lift. The enriched slice fixed the
+axis it was designed to fix. It did not fix the floor, because the floor rides on the 64 answerable questions.
+
+**The bar is NOT relaxed.** A breach is still a breach and still yields NO-GO. What is predeclared here is what
+a NO-GO *procedurally means*, so the verdict cannot be over- or under-read:
+
+| result | verdict | correct next action |
+|---|---|---|
+| primary passes (p<0.05) **and** floor holds | **PASS** | full-451 confirmation |
+| primary passes **and** floor breaches by **≤2 questions** | **NO-GO, floor INCONCLUSIVE** | confirmation run at larger n on the answerable side — **not** ship, and **not** abandon the mechanism |
+| primary passes **and** floor breaches by **≥3 questions** | **NO-GO, floor HARMFUL** | the mechanism is not separable from its collateral; stop the M7 family |
+| primary fails | **NO-GO** | floor is moot; the channel is not the constraint |
+
+**Design lesson for the Phase-2 eval loop:** an auto-powered slice generator must power **every gated axis**,
+not just the primary. Powering the primary and leaving the floor at coin-flip resolution is a half-fix, and I
+shipped it into this spec.
+
 ## 6. Ship rule reminder
 helps both → default-on · leaderboard-only/product-harmful → config-gated off · product-only → ship anyway.
