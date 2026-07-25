@@ -56,6 +56,35 @@ latency even with the *conditional* search. **Negative-evidence disclosure ADDS 
 does not remove flailing — consistent with M14 (low effort had already removed the tail). Any future proposal
 that assumes this family reduces latency should be rejected on these two measurements.
 
+## 5b. ★ THREE REFINEMENTS from the executing agent's final report (one corrects §5)
+
+**(a) The conditional search FAILED at its specific purpose — worse than §5 stated.** I wrote "+14% overall".
+The paired breakdown is sharper and less flattering: **answerable searches +33% (5.34 → 7.08)** vs abstention
+only +6% (6.53 → 6.95). **M7b now spends MORE searches on answerable questions than on abstention ones,
+inverting the intended pattern.** SPEC §2b existed precisely to remove M7's +12% answerable tax; measured, the
+tax got *worse*, and the +6.5s latency tracks it. The conditional-search design did not merely underdeliver —
+it regressed the thing it targeted.
+
+**(b) The render and the contract are SEPARABLE — and the contract alone carries part of the win.**
+**5 of the 17** abstention gains carry `directly_supported` and **had no section rendered at all**. Those gains
+come from the **contract change alone** (requiring the agent to search for and report absence), not from
+rendering anything to the reader. This is a decomposition, not a new lever — it does not change the +4 net
+effect size and so does not reopen the stop decision — but it is the single most useful lead for anyone who
+revisits this area: *the contract is doing work the rendering is not.*
+
+**(c) ★ Where the real ceiling is: `contradicts_premise` scores 19/19 = 100%.** Status × class on the abstention
+subset: **`contradicts_premise` 19/19**, `near_match_only` 9/40, `directly_supported` 15/67, `insufficient` 0/2.
+
+**When the agent correctly identifies a false premise, the reader gets it right every single time.** The channel
+is not lossy at all — it is *rarely invoked correctly*: 19 correct premise-contradictions out of 128 abstention
+questions. **The binding constraint is the AGENT's ability to detect a false premise, not the reader's handling
+of the signal.** That relocates the problem one stage upstream and is the most actionable thing this run
+produced. Read-time disclosure was the wrong stage to attack.
+
+Also cleaner than my §1 note: **both M7b provider-error rows are abstention questions**, so the answerable floor
+is **identical under all three adjustment conventions** — no adjustment choice can move it. The floor pass is
+robust.
+
 ## 6. DECISION — stop the M7 family; the channel is not the binding constraint
 
 Per the frozen outcome table ("primary fails → the channel is not the constraint") and the commitment recorded
@@ -77,4 +106,8 @@ against a requirement of ~+10. **We are not one more variant away.**
 The frontier product-check numbers from this run are **provisional**: the frontier reader wraps 56–62% of
 answers in LaTeX `\text{…}` and the scorer does not strip it, depressing **both** arms (control ≥+14,
 arm ≥+11 exact-match recoveries). Direction may survive; magnitude is not yet usable. **Answer normalisation is
-required before any frontier number is cited.** Filed as an instrument bug.
+required before any frontier number is cited.** Filed as instrument bug #162.
+
+**Second frontier caveat:** the transport records `requested_model=gpt-5.6-sol` but **`actual_model=None`**, so
+Sol's serving identity is *requested, not confirmed*. Two independent reasons no frontier number from this run is
+citable. Both must be fixed before the dual-consumer component of #160/#161 can be trusted.
