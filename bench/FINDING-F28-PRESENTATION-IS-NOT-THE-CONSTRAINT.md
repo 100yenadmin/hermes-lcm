@@ -81,9 +81,20 @@ Combined with F27, the honest V1 position is:
 
 **So V1 has very little headroom that belongs to us.** The remaining identified exception is abstention
 calibration — 14 false abstentions against 20 correct ones — where a memory-layer *signal* (not a reordering)
-could plausibly move the reader, and which the M7/M7b lane already probed with a NO-GO. That lane's failure now
-reads differently: it was not aiming at the wrong target, it was aiming at a target we may not be able to move
-from outside the reader.
+could plausibly move the reader.
+
+> **⚠ CORRECTION (same day, before this finding was acted on).** An earlier version of this paragraph said the
+> M7/M7b lane "already probed" this with a NO-GO and that its failure "now reads differently". **That was wrong,
+> and I had asserted the link from memory instead of checking F20.** M7/M7b are a **V2** experiment targeting
+> **under**-abstention: their 128-question primary is questions whose gold answer *is* an abstention, where the
+> control shows the reader **asserting** 115/128 = 89.8% of the time (F20 §; SPEC-M7B-CONDITIONAL §"targeted, NOT
+> over-abstention"). F27's 14 questions are the **opposite** failure on the **opposite** benchmark: V1 answerable
+> questions where the reader wrongly abstains.
+>
+> Two consequences. (1) M7b's NO-GO is **not evidence** about the V1 over-abstention target and must not be cited
+> as such. (2) The V1 over-abstention target is therefore **entirely unprobed** — which is better news than the
+> incorrect version implied: it is a small (14-question), untried target rather than a re-run of a failed lane.
+> Any spec for it must build its own instrument; M7b's enriched slice is the wrong population.
 
 ## 5. Consequences for the program
 
@@ -96,7 +107,8 @@ from outside the reader.
   technique, because ours are already adequate. If OMEGA reaches 30/30 on preference and beats us overall, ask
   specifically what *signal* they put in front of the reader — not what they retrieve or how they order it.
 - **This is the second time in one day that a favourable-looking framing of mine died on contact with its own
-  artifact** (F27 §0 was the first). Both were caught by checking the premise rather than the conclusion. That is
+  artifact** (F27 §0 was the first) — and §4's corrected paragraph makes three, that one an unchecked cross-lane
+  claim in my own prose rather than in a spec. Both were caught by checking the premise rather than the conclusion. That is
   the practice to keep, and it argues for a standing habit: **before any spec is dispatched, verify its stated
   cause in the source or the artifact.** Added to PROGRAM-ARCHITECTURE §6e.10.
 
