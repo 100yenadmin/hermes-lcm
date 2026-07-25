@@ -1,0 +1,62 @@
+# SPEC M7b — conditional absence disclosure, on an enriched slice, dual-consumer
+
+**Issue:** #157 · **Author:** orchestrator · **Date:** 2026-07-25 · **Status:** FROZEN before run
+**Depends on:** M15 (M7 NO-GO diagnosis) · M16 (enriched slice + dual-consumer architecture)
+
+## 1. Why this variant exists
+M7 met its primary (abstention 29.4%→52.9%, +4q) and breached its answerable floor (−7.0 pts
+artifact-adjusted). Diagnosis (M15): **all 7 answerable losses carried `directly_supported`** and the reader
+went UNKNOWN on **0** of them — so the harm is pack-quality collateral on questions the mechanism never
+targeted, NOT over-abstention. Absence statuses score **8/10** where they fire. Two independent measures show
+`directly_supported` packs were perturbed anyway: spans +0.19 / ctx +779 tok / 11-of-37 differing, and
+**answerable searches +12% (5.81→6.49)**.
+
+## 2. The two changes (both required — rendering alone is insufficient)
+**(a) Conditional RENDER.** Emit `## Evidence Assessment` only when `evidence_status` ∈
+{`near_match_only`, `contradicts_premise`, `insufficient`}. Never on `directly_supported`.
+**(b) Conditional SEARCH.** The M7 contract demanded a targeted absence search *unconditionally, before any
+status was known* — the direct cause of the +12% answerable tax. New contract wording: *do the normal
+search first; only if it fails to surface the entity/field/relation the question presumes, spend ONE targeted
+confirmation search and record the queries and hit counts.*
+Everything else identical to M7: gate enabled, declarative-only rendering (no `answer_policy` verbatim, no
+reader directives — that constraint held 60/60 and remains binding), low effort, decoding pinned 0.6/0.95/20.
+
+**Also test render POSITION.** M7 prepended the section FIRST, taking the slot a weak 9B reader weights most
+(M1/M4) — a plausible contributor to the collateral. Place it AFTER Support Analysis. If that inverts a
+result, it is a finding about the reader, not a bug.
+
+## 3. Slice — ENRICHED (M16), not random
+**All 128 abstention questions + 64 randomly sampled answerable = 192q**, frozen manifest with sha256.
+Rationale: a random 60q slice holds only ~17 abstention questions and cannot see a real effect (p=0.22 for
+the +23.5pt lift we actually measured). At n=128 the same effect reads p<0.0001 and even a modest +8pt
+effect reads p=0.011.
+**A matched CONTROL arm (gate off, same manifest, same config) is part of the run, not optional** — L3 does
+not cover this slice, and per M12 comparisons must be paired on identical questions.
+
+## 4. Dual-consumer measurement (M16 §2b) — the product objective is not the leaderboard objective
+- **PRIMARY (leaderboard):** official fixed Qwen3.5-9B reader.
+- **PRODUCT CHECK (Sol):** re-read the **same stored `memory_context` packs** with a frontier reader.
+  Curation is the expensive shared stage, so this is a reader-only second pass (~1.2x, not 2x). Do NOT
+  re-run the agent.
+Report both. **Sol is the product the owner and customers actually run**; a mechanism that helps the weak
+reader and harms the frontier one is a product regression and must not ship default-on.
+
+## 5. PREDECLARED GATE (frozen — not revisable at one-short)
+| axis | measure | bar |
+|---|---|---|
+| **PRIMARY** | abstention-subset accuracy, n=128, paired | **up AND McNemar p<0.05** |
+| **FLOOR (hard)** | answerable-subset accuracy, n=64, paired | **not down >2.0 pts** (artifact-adjusted) |
+| **PRODUCT** | frontier-reader accuracy on same packs | **not down** vs control |
+| SECONDARY | overall accuracy, latency, `searches_per_question` by class | reported |
+| INSTRUMENT | provider-error rows, both arms, both readers | counted BEFORE any comparison |
+
+Primary now requires **significance**, not just direction — the enriched slice makes that affordable and
+M11–M15 showed direction alone is noise. One-primary law holds. 192q is powered on the primary but remains a
+**screen for banking**: promotion to a published/submitted number still requires the full 451 (M16 Tier 2).
+
+**Outcomes.** Both pass → full-451 confirmation. Primary passes, product harmed → **config-gate it off by
+default, labelled benchmark-only** (M16 ship rule). Floor breached again → the mechanism is not separable
+from its collateral; **stop the M7 family and say so** rather than producing M7c.
+
+## 6. Ship rule reminder
+helps both → default-on · leaderboard-only/product-harmful → config-gated off · product-only → ship anyway.
