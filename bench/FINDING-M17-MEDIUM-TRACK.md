@@ -73,6 +73,26 @@ track worth measuring rather than assumed.
 3. **Re-derive the operating point per tier.** Effort is a per-track decision, not a program constant.
 4. **Check whether LME-V1 also has larger tiers** (owner believes so; we ran small there too at 444/500).
 
+## 5b. CONFIRMED — LME-V1 has the same story, and a BIGGER jump
+
+Checked at the owner's prompting. Locally we hold only `longmemeval-data/longmemeval_s` (265MB) — **the small
+variant**. The canonical LongMemEval-V1 release also ships **`longmemeval_m`**, roughly **10-13x larger per
+question** (~1.5M tokens of haystack vs ~115k), plus `longmemeval_oracle` (evidence-only).
+
+**Our banked 444/500 on V1 is the SMALL variant.** `longmemeval_m` is the variant where retrieval actually
+matters — a larger scale jump than V2's 5x, and squarely our thesis territory. Acquiring it is a download
+(HuggingFace), not a spend; LEXAR has room.
+
+**Combined ladder now available on REAL published data, no synthesis at all:**
+
+| dataset | variant we ran | larger variant available | scale factor |
+|---|---|---|---|
+| LME-V2 | small (100 cand) | **medium (500 cand)** | ~5x |
+| LME-V1 | small (~115k tok) | **`longmemeval_m` (~1.5M tok)** | **~13x** |
+
+That is a two-benchmark, two-scale grid on official data — strictly better evidence than the scope-widening
+ladder I specced, and it carries published competitor numbers to compare against.
+
 ## 6. Process lesson (third of its kind today)
 M12 (cross-question-set comparison), M15 §4c (wrong repo in a dispatch packet), and now M17 (an entire larger
 tier unexamined) share one root: **asserting a property of the data instead of enumerating it.** The fix is
