@@ -1,6 +1,28 @@
 # SPEC — Multi-session synthesis presentation (V1 lane #150, primary)
 
-**Status:** FROZEN on authoring, 2026-07-25. Gate declared **before** any run, per §2b.
+> ## ⛔ WITHDRAWN 2026-07-25, BEFORE DISPATCH — see `bench/FINDING-F28-PRESENTATION-IS-NOT-THE-CONSTRAINT.md`
+>
+> **The premise in §2 is false.** Verified against the pinned harness source and the banked artifact within hours
+> of authoring this spec:
+> 1. `renderEvidenceCards` **already groups evidence by session** with a date on every item — it is not
+>    "interleaved with distractors and stripped of cross-session structure" as §2 claims. The only real
+>    difference this spec proposed was group *ordering* (hit-rank vs chronological), a permutation of the same
+>    bytes.
+> 2. Gold evidence is **not under-represented**: multi-session FAILURES receive *more* gold hits than passes
+>    (11.5 vs 11.2 of 25), with identical top-session share (0.20) and distinct-session count (8.9).
+>
+> With retrieval already excluded by F27 (98.5% all-golds on multi-session), all three presentation mechanisms are
+> ruled out with data. The reader gets complete, well-represented, session-grouped, dated evidence and still
+> answers wrong — a reasoning failure we do not own on this benchmark.
+>
+> **This spec was never run and no tokens were spent on it.** It is kept, unedited below, as the record of a
+> mechanism hypothesis that died on contact with its own artifact, and because its gate design (paired, full
+> category, pre-declared floor, one-primary) remains the correct template for the next spec that has a live
+> premise.
+
+---
+
+**Status:** ~~FROZEN on authoring, 2026-07-25~~ → **WITHDRAWN, not dispatched.** Gate declared before any run, per §2b.
 **Supersedes** #150's preference-application framing (F27 §0 corrected the premise).
 **Base:** parameterised — whichever provider wins the pending full-500 wave-1 comparison (`bench/w3b-on-wave1`
 vs the banked #423 base). The spec is written against *the winning base*, and the base must be pinned by commit

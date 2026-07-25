@@ -453,3 +453,11 @@ order until corrected.
 than the source haystack, so any `index -> session` join silently shifts. Join on a stable key (the
 `<store>.dates.json` sidecar timestamp), and treat a plausible-looking-but-incoherent result — accuracy above
 retrieval recall — as proof the join is broken, not as a finding.
+
+**§6e.10 — Verify a spec's stated CAUSE in the source or artifact BEFORE dispatching it (F28).** Twice on
+2026-07-25 a favourable-looking framing of mine died on contact with its own artifact: the "preference 1/6"
+selection artifact (F27 §0) and the "evidence is interleaved and structure-less" premise behind
+SPEC-MULTISESSION-SYNTHESIS (F28 §1) — the harness already grouped by session, and failures turned out to receive
+*more* gold evidence than passes. Both were caught by checking the premise rather than the conclusion, and the
+second was caught before any tokens were spent. The rule: a spec's causal claim is read out of the code or the
+data it refers to, in the same pass that writes the spec — never from memory of what the system does.
