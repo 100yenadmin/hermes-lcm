@@ -38,6 +38,27 @@ depend on retrieval quality start actually needing it.
 Combined with M17, the strategic picture is settled: **every number this program has banked comes from a tier
 with no retrieval problem.** 125/451, 298/451, and the V1 444/500 are all small-variant results.
 
+## 3b. IMPORTANT SCOPE LIMIT — what M18 does and does NOT invalidate
+
+This finding is easy to over-apply. Be precise:
+
+**M18 invalidates RETRIEVAL claims made from the small tier.** Any statement of the form "our store retrieves
+better / our memory finds the right evidence" cannot be supported by small-tier results, in either direction.
+That includes the negative: vanilla Codex's parity with us says nothing about retrieval quality.
+
+**M18 does NOT invalidate READING claims.** The small tier is a perfectly valid test of *delivery into a
+consumer* — which is what M1/M3 identified as the static→agentic gap, and what the whole M7 family targets.
+Negative-evidence disclosure is a mechanism about how the reader handles absence in a curated pack; it does
+not depend on retrieval selectivity. **So M7/M7b remain valid experiments on the small tier and must not be
+discarded on the strength of M18.**
+
+Likewise still valid from small-tier data: the M12 latency result (a wall-clock measurement of the query path,
+not a retrieval-quality claim), M11's effort/latency curve (for the small track), M14's latency-distribution
+finding, and M5's corpus-coverage audit.
+
+**Rule of thumb: small tier = reading instrument. Medium tier = reading AND retrieval instrument.** Label every
+future claim with which instrument supports it.
+
 ## 4. Practical blocker for the medium run (must be planned, not assumed)
 The current store holds **exactly 100 trajectory sources per domain** (`lcm_trajectory_sources`: web 100,
 enterprise 100 = 200 total) — precisely the small tier's union. **Medium needs 1,473 distinct trajectories,
