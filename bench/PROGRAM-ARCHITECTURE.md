@@ -401,6 +401,34 @@ net anyway = a false negative induced by a gate mismatched to the problem's caus
   already in-tree post-R1 = state-granularity retrieval. Any H5 follow-up dispatch says "evaluate wiring the
   recall stack already shipped," not "explore from scratch" — VERIFY in-tree before dispatching.
 
+## 6e. PROCESS LESSONS from the M7/M7b cycle (binding; both caught by a subagent, not by me)
+
+**(1) Asymmetric artifact adjustment is the comparator bug wearing a different hat.** M15 reported a −7.0
+answerable floor that credited the treatment arm's 2 provider-error rows while ignoring the control's 1.
+Symmetric treatment gives −9.3 or −10.0. The verdict survived only because the error happened to run against
+the mechanism. **RULE: adjust BOTH arms or NEITHER, and state which in the same sentence as the number.** A
+one-sided artifact credit is indistinguishable from cherry-picking even when honest — and this one flattered
+the mechanism under test. Same family as the day-1 comparator bug (false +86, truly +24) whose rule
+(`feedback_rescore_both_sides_before_delta_claims`) was reaffirmed the same morning it was broken.
+
+**(2) Verify the CAUSE from the artifact, not from memory of your own spec.** I ruled correctly that the M7b
+control should hold everything constant but the gate, then justified it with a false claim about what the
+control's `INSTRUCTION.md` contained — a file that is byte-identical to L3's. The conclusion was checked; the
+cause was asserted. **A published inference died with it.** Same family as M17/M18 (asserting a property of the
+data instead of enumerating it). **RULE: when a decision record states a cause, the cause gets a hash, a line
+number, or a diff — not a recollection.**
+
+**(3) The subagent caught both.** Cross-checking is not ceremony. Two of the sharpest corrections in the
+program came from the agent executing my own spec, and a third class came from the owner asking plain
+questions. Dispatch prompts should keep inviting contradiction of the orchestrator's premises.
+
+## 6f. FINDING-NUMBER BOUNDARY (owner decision, 07-25)
+Findings **M1–M19** keep their numbers; their files are `bench/FINDING-M*.md`, which disambiguates on disk.
+**All new findings are numbered F20+.** Rationale: the M-series collided with GitHub milestone numbering
+(milestone `M7 Memory-Guided Action` vs finding M7 abstention-mass; milestone `M19 LongMemEval-V1` vs finding
+M19 single-store) making bare "M19" ambiguous in prose. The boundary stops the collision growing without
+churning 19 files and their commit/issue references.
+
 ## 6. Pointers
 GATE AUTHORITY NOTE: every gate summary in this document is an abbreviation — the GitHub ISSUE BODY carries the
 complete, binding gate text; score against the issue verbatim.

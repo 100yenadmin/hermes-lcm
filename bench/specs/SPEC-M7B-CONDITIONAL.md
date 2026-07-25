@@ -33,6 +33,13 @@ effect reads p=0.011.
 **A matched CONTROL arm (gate off, same manifest, same config) is part of the run, not optional** — L3 does
 not cover this slice, and per M12 comparisons must be paired on identical questions.
 
+**★ PREMISE CORRECTION (see FINDING-M15 §8):** an earlier version of this spec justified the control ruling by
+claiming the control's `INSTRUCTION.md` carries "M7-era instruction improvements". **It does not** — the
+control's `INSTRUCTION.md` is **byte-identical to L3's** (`450668d0…`) and the bullet cited as evidence is
+verbatim in d8f1d90. The ruling's outcome is unchanged (hold everything constant except the gate + conditional
+logic; carry no L3 numbers across), but **non-comparability with L3 is purely SLICE-BASED**, and any inference
+of the form "instruction changes barely move X" drawn from control-vs-L3 is void.
+
 ## 4. Dual-consumer measurement (M16 §2b) — the product objective is not the leaderboard objective
 - **PRIMARY (leaderboard):** official fixed Qwen3.5-9B reader.
 - **PRODUCT CHECK (Sol):** re-read the **same stored `memory_context` packs** with a frontier reader.
@@ -45,7 +52,7 @@ reader and harms the frontier one is a product regression and must not ship defa
 | axis | measure | bar |
 |---|---|---|
 | **PRIMARY** | abstention-subset accuracy, n=128, paired | **up AND McNemar p<0.05** |
-| **FLOOR (hard)** | answerable-subset accuracy, n=64, paired | **not down >2.0 pts** (artifact-adjusted) |
+| **FLOOR (hard)** | answerable-subset accuracy, n=64, paired | **not down >2.0 pts** vs THIS run's CONTROL (artifact-adjusted **symmetrically** — see M15 §7; never against M7's superseded −7.0) |
 | **PRODUCT** | frontier-reader accuracy on same packs | **not down** vs control |
 | SECONDARY | overall accuracy, latency, `searches_per_question` by class | reported |
 | INSTRUMENT | provider-error rows, both arms, both readers | counted BEFORE any comparison |
