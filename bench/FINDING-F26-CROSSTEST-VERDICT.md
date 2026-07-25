@@ -66,6 +66,45 @@ The enriched slice amplifies variance because it is loaded with boundary questio
 figures are correct for their own instrument; do not transfer either.** F24's rule (always run a control repeat)
 stands and is now doubly justified.
 
+## 5b. ★ REFINEMENT: the full-500 "2 questions" figure hides 18 individual flips
+
+§5 said representative-run variance is ≈2 questions (444 vs 442 on 500). **That is the NET. The flip count is
+18 discordant pairs** between those two identical runs. So roughly 18 questions changed verdict and the changes
+nearly cancelled.
+
+**This is the more useful characterisation, and it is worse than the net suggests:**
+- **per-question** verdicts are unstable at ~3.6% of the set (18/500);
+- a **net** difference is a lossy summary — two runs can differ on 18 questions and report a 2-question gap;
+- therefore **any mechanism whose effect is smaller than ~18 questions on 500 needs paired analysis with
+  discordant counts to be seen at all**, and a headline-percentage comparison will hide it in both directions.
+
+The three figures now on record, each correct for its own instrument: **net ≈2 / flips ≈18 on a representative
+500**; **net ≈6 on a hard-enriched 100**. Quote the one that matches the instrument, and always report
+discordants.
+
+## 5c. ★ TWO MORE PARITY ERRORS IN MY DISPATCH (caught by the executing agent)
+
+**(a) Judge effort.** I specified `reasoningEffort: medium` for **both** answerer and judge. The banked run's
+`judgeProvenance.reasoningEffort` is **`low`** (only the *answerer* is medium). Running a medium judge against a
+low-judged baseline would have been an asymmetric instrument — a *scoring* change disguised as a code comparison.
+The agent matched the banked run instead of my packet. **Rule: pin the JUDGE's provenance as carefully as the
+answerer's; a judge upgrade is an instrument change (cf. the day-1 comparator bug).**
+
+**(b) Store premise.** `mb-workdir-500q` holds *fastembed* stores backing a **331/500 gpt-4o** run — an entirely
+different experiment. The banked 444 used **voyage / voyage-context-3**. Using the set I named would have
+confounded the comparison with a different embedding model *and* a different answerer.
+
+Also recorded: the agent pinned the harness to `wt-v1l1 @ 2c20cee` — HEAD at the time the 444 executed — because
+four later evidence-card commits postdate it and would not have been parity. I had not thought to pin the harness
+at all.
+
+## 5d. Phase 1A contention window (must be honoured when reading #159)
+The cross-test's search phase ran `08:43:46Z–08:44:50Z` UTC with concurrency held to 2, while Phase 1A was at
+~470% CPU. **Phase 1A latency samples inside that ~64-second window may be perturbed** and are flagged in the
+cross-test manifest. When Phase 1A reports, check whether any of its query-latency samples fall in that window
+before citing its slope. My earlier claim that the two lanes "genuinely don't contend" was too confident — the
+ingest phases didn't, but a 64-second search burst overlapped.
+
 ## 6. Decisions
 - **Do not switch the V1 base to wave-1.** It does not improve V1.
 - **Do not close #423.** Its 6 answer-layer commits remain the only thing measured to matter on V1, and wave-1
@@ -76,6 +115,11 @@ stands and is now doubly justified.
   because wave-1 is expected to lift V1.
 - **All V1 effort goes to the answer layer**, and specifically to preference application, which is 1/6 and
   immovable across both codebases.
+- **★ FIX #164 BEFORE SHIPPING wave-1.** The cross-test found a hard answer failure: wave-1 retrieval can emit a
+  `summary`-kind hit with no `store_id` (1 of 2,500 hits), and `evidence_cards_v1` **fail-closes the entire
+  prompt**, losing the whole answer rather than dropping one card. #423 never triggers it (2,500/2,500
+  `message_excerpt`). This affects **PR #436 (just made mergeable)** and **`bench/w3b-on-wave1` (the recommended
+  local checkout)**. Scoring impact here was nil, but on the release path it is a user-visible total failure.
 
 ## 7. Process note
 Fifth instance in two days of a subagent's unrequested addition changing the outcome: the placebo arm here, the
