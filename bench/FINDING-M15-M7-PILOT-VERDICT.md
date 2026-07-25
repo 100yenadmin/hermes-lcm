@@ -137,3 +137,49 @@ context (2 audit flags were false positives quoting store UI copy). Tests 46 pas
 - M14 established M7 was the only live path to a non-zero score. It failed as specified. **M7b is a
   diagnosed, targeted follow-on — not another knob** — but if it also fails, the honest conclusion is that
   the program needs a genuinely new mechanism, and that should be stated rather than absorbed by variants.
+
+---
+
+## 7. ★ CORRECTION — the −7.0 answerable floor was an ASYMMETRIC adjustment (superseded)
+
+**Caught by the executing M7b agent, not by me.** §1 and §2 report an artifact-adjusted answerable floor of
+**−7.0 points**. That figure **credited M7's 2 provider-error rows while leaving L3's 1 row uncredited** —
+an asymmetric adjustment, which is exactly the error class that
+`feedback_rescore_both_sides_before_delta_claims` exists to prevent. (That rule was written after an
+asymmetric comparator fix manufactured a false +86 that was truly +24. I reaffirmed the rule earlier the
+same day and then broke it.)
+
+| treatment | answerable floor delta |
+|---|---|
+| **−7.0** (credit M7's 2, ignore L3's 1) | **SUPERSEDED — asymmetric, do not cite** |
+| credit both arms' provider errors | **−9.3** |
+| drop both arms' provider-error rows | **−10.0** |
+
+**The NO-GO verdict is unchanged** — the error ran *against* M7, so the real breach is larger than reported,
+not smaller. But the number was wrong by 2.3–3.0 points and **M7b's floor must not be benchmarked against
+−7.0.** M7b's correct paired baseline is its own CONTROL arm (42/64 = 65.6%), which required no adjustment
+at all: it recorded **zero** provider errors.
+
+**Rule, sharpened:** adjust **both arms or neither**, and **state which** in the same sentence as the number.
+A one-sided artifact credit is indistinguishable from cherry-picking, even when it is an honest slip — and
+here it happened to flatter the mechanism under test.
+
+## 8. ★ CORRECTION — my control ruling was right for the wrong reason
+
+Also caught by the executing agent. I ruled that the M7b control should hold everything constant except the
+gate, and justified it by claiming the control's `INSTRUCTION.md` carries "M7-era instruction improvements",
+citing the bullet *"Prefer the CLI's top-ranked hits when selecting `trajectory_spans`…"*.
+
+**That bullet is verbatim in d8f1d90 and in L3.** The control's `INSTRUCTION.md` hashes to `450668d0…` —
+**byte-identical to L3's.** There were no M7-era instruction changes in it.
+
+- The ruling's **outcome stands**: hold everything constant but the gate; carry no L3 numbers across.
+- The ruling's **stated reason was false**, and non-comparability with L3 is **purely slice-based** (L3 ran a
+  different 60q manifest).
+- **A published inference is void:** I reported that "the control's 30.5% abstention vs L3's 29.4% confirms
+  the instruction changes barely move abstention." There were no instruction changes to move it. Those two
+  numbers are simply two different slices landing close — a weak consistency signal, nothing more.
+
+**Lesson:** I verified the *conclusion* and asserted the *cause* from memory of what I had specified rather
+than from the artifact. Same failure family as M17/M18 (asserting a property of the data instead of
+enumerating it) — and the cause is what a later reader would build on.
