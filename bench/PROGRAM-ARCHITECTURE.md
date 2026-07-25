@@ -437,3 +437,19 @@ Evidence: hermes-benchprog-h4/artifacts/OFFICIAL-RESULTS.md (+OFFICIAL-FULL-RAW)
 W2A-* artifacts · check-in #2 (#107 comment). Ops: bench/RUNBOOK.md (fork) · ~/.claude/runbooks/
 hermes-benchmark-ops.md · OPUS-DRIVE-LOOP.md (continuation operating system). Tracker: #107 map + the
 wave-3/H6/H7 milestones+issues posted 07-24.
+
+**§6e.7 — A gate-relevant statistic ships with its producer script (F27).** F25's 99.67% gold-session recall was
+reported with only its output JSON persisted; the script was inline and lost. When F27 needed to re-check it, the
+number had to be re-measured from scratch — and the naive re-measurement disagreed by 34 points before the method
+error was found. Persist the script beside the output, in the artifacts dir, always.
+
+**§6e.8 — An enriched-slice rate is not a rate (F27).** Enriched slices buy paired power on a target class. They
+cannot yield a category accuracy and must never be placed beside a competitor's full-set number. Report enriched
+results as flip counts against the same questions' own baseline. Measured cost of breaking this: the "preference
+application is 1/6 vs OMEGA's 30/30" claim, which was really 25/30 vs 30/30, and which mis-set the V1 priority
+order until corrected.
+
+**§6e.9 — Positional identity across an ingest boundary is invalid (F27).** 86 of 94 V1 stores hold FEWER sessions
+than the source haystack, so any `index -> session` join silently shifts. Join on a stable key (the
+`<store>.dates.json` sidecar timestamp), and treat a plausible-looking-but-incoherent result — accuracy above
+retrieval recall — as proof the join is broken, not as a finding.

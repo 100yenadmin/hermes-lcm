@@ -127,3 +127,23 @@ repeat baseline (F24), `retrieval-diff.json` (F25), the asymmetric-adjustment ca
 (M15 §7/§8). **Standing dispatch item, now proven five times over: require a placebo/control-repeat arm and an
 "is the mechanism even engaged?" check in every A/B.** My dispatch asked for a two-arm paired comparison; a
 two-arm comparison here would have reported +7 at p=0.065 and been wrong.
+
+---
+
+## ⚠ CORRECTION 2026-07-25 (see F27) — §3's "1/6" and §5's "all V1 effort to preference application"
+
+§3 reported "preference application scores **1/6** in ALL THREE ARMS" and read it as "the strongest confirmation
+yet that it is a *missing mechanism*". §5 then routed all V1 effort there. **The rate was a selection artifact.**
+
+The 100q slice is failure-enriched: **the banked 444 itself scores 44/100 on it** (vs 88.8% on all 500), and its
+6 preference questions are exactly the 5 known banked failures plus 1 pass. **1/6 is what the banked run scores
+on those same 6.** All three arms hitting 1/6 therefore means they *reproduced* the baseline, not that a
+mechanism is missing. The true banked preference number is **25/30 = 83.3%** (F23's table was correct).
+
+What survives: our 5 hardest preference questions are stable across both codebases. What does not: any statement
+of the form "preference application is 1/6", and the priority ordering built on it. F27 re-derives the priority
+from the full 500 — **multi-session wrong answers (25 questions) outrank false abstention (14), and preference
+is 5** — and locates the preference failures precisely: 4 of 5 are false abstentions with the gold session
+retrieved.
+
+§4's citation of F25 is **unaffected and now independently confirmed** (F27 §4: 100% any-gold, 94.7% all-golds).
