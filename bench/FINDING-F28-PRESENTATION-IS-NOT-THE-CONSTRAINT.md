@@ -108,9 +108,11 @@ could plausibly move the reader.
   specifically what *signal* they put in front of the reader — not what they retrieve or how they order it.
 - **This is the second time in one day that a favourable-looking framing of mine died on contact with its own
   artifact** (F27 §0 was the first) — and §4's corrected paragraph makes three, that one an unchecked cross-lane
-  claim in my own prose rather than in a spec. Both were caught by checking the premise rather than the conclusion. That is
-  the practice to keep, and it argues for a standing habit: **before any spec is dispatched, verify its stated
-  cause in the source or the artifact.** Added to PROGRAM-ARCHITECTURE §6e.10.
+  claim in my own prose rather than in a spec. All three were caught the same way — by checking the premise rather
+  than the conclusion — and the cheapest two were caught before anything was spent. Hence the standing habit:
+  **verify a stated cause in the source or the artifact before dispatching a spec, and before asserting a link
+  between lanes.** Added to PROGRAM-ARCHITECTURE §6e.10, which the third instance shows applies to prose as well
+  as to specs.
 
 ## 6. What this does not claim
 
