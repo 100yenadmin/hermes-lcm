@@ -82,3 +82,37 @@ It cannot tell us whether the answer layer improves, cannot move 444/500, and ca
 production recall. It also cannot speak to V1-small retrieval, which F27 already closed at 100% any-gold /
 97.2% all-golds. Its whole job is the scaling shape of retrieval, on a non-production embedder, with no reader in
 the loop. Keep the claim that size.
+
+---
+
+## 6. Pre-registered SEQUENCING option (decided before the schedule pressure, not during it)
+
+The query chain is 28 sequential runs (~3,320 queries), ordered `B, A3, A2, A1` then the no-deadline
+`A3u, A2u`. The uncensored tail carries a 3600s-per-query budget, so its duration is open-ended — plausibly
+hours. The full-500 wave-1 release run is gated behind the *whole* chain, so the tail can delay the release
+number by hours.
+
+**The temptation, named in advance:** when the censored arms finish and the primary curve exists, it will be
+tempting to start the release run immediately and let the uncensored arms run alongside it, because by then the
+interesting curve is already in hand and the release number is what people are waiting for.
+
+**The rule.** Releasing the gate early is permitted **only** on this reasoning, and it must be stated in the
+report if used: the `u`-arms' claim is *"recall reaches X given unlimited time"* — a **recall ceiling**, not a
+latency figure (§3f). Contention corrupts latency, not reachability. So if the `u`-arms are read for recall only:
+
+1. the release run may start once `B/A3/A2/A1` have completed **all five rungs**, and
+2. every `u`-arm number is labelled **CONTENDED** and **no latency figure from a `u`-arm is reported at all** —
+   not as a mean, not as a p95, not "roughly".
+
+**If either condition cannot be met, wait for the full chain.** In particular, if we later want a `u`-arm latency
+number, this option is void retroactively and the arms must be re-run clean.
+
+**What is NOT permitted:** starting the release run while any of `B/A3/A2/A1` is still running, at any rung, for
+any reason. Those four arms are the primary curve and the entire latency claim; contaminating them to save
+wall-clock would spend the experiment to save the schedule. The 100q cross-test already put a 64-second window of
+contention into this run (§3b) and that single window is a permanent caveat on it — the cost of contention here is
+not hypothetical.
+
+**Decision procedure when the censored chain completes:** measure actual elapsed time for the censored arms, use
+it to project the `u`-tail, and only then choose. If the projected tail is under ~1 hour, just wait — the option
+buys little and costs a caveat.
