@@ -38,6 +38,28 @@ depend on retrieval quality start actually needing it.
 Combined with M17, the strategic picture is settled: **every number this program has banked comes from a tier
 with no retrieval problem.** 125/451, 298/451, and the V1 444/500 are all small-variant results.
 
+## 3a. CORRECTION to my own selectivity figure — compute it PER DOMAIN
+
+I first reported medium selectivity as 0.34. That divided by the **combined cross-domain union (1,473)**, but
+retrieval happens **within** a domain, so the figure was wrong. Corrected, per domain:
+
+| domain | small union | medium union | ingest factor | medium candidates/q | **distinct candidate sets** | selectivity |
+|---|---|---|---|---|---|---|
+| enterprise | 100 | **874** | **8.7x** | 500 | **211 of 211 questions — every one UNIQUE** | **0.572** |
+| web | 100 | **599** | 6.0x | 387–500 | **222 of 240** | **0.829** |
+| total | 200 | 1,473 | 7.4x | | | |
+
+**What survives, strengthened:** the qualitative shift is the real story. Small gives **one shared candidate
+set per domain** for every question; medium gives a **near-unique set per question** (211/211 in enterprise).
+That is the difference between "no retrieval decision exists" and "a retrieval decision exists for every
+question", and it is not a matter of degree.
+
+**What must be tempered:** the *pool-narrowing* in medium is modest — a question sees 57% of its domain pool in
+enterprise and **83% in web**. So medium is not a hard retrieval problem either; it is a real but gentle one.
+**Do not oversell medium as the scaling test.** Enterprise is the more discriminating domain (0.572, 8.7x
+ingest) and should be weighted accordingly when reading results. For genuinely sharp selectivity we still need
+the larger variants (V1 `longmemeval_m`, ~13x) or the scope-widening ladder.
+
 ## 3b. IMPORTANT SCOPE LIMIT — what M18 does and does NOT invalidate
 
 This finding is easy to over-apply. Be precise:
