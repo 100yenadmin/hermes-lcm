@@ -84,7 +84,7 @@ Two things fall out that change where V1 effort should go:
 **(a) The biggest single bucket is multi-session wrong answers — 25 questions, 5.0 points of the 11.2 available.**
 Not abstention; not preference. Multi-session is also our worst category (80.5%). Its failures are almost
 entirely *committed wrong answers* (25 of 26), which is the signature of cross-session synthesis failure rather
-than refusal.
+than refusal — and §4 confirms it directly: **25 of those 26 failures had every gold session retrieved.**
 
 **(b) False abstention is worth ≤14 questions (2.8 points)**, and it is spread across four categories rather than
 concentrated in preference. Preference is the *cleanest* instance (4 of 5 failures, evidence at rank 0), which
@@ -112,26 +112,55 @@ locus for these 5.
 declared before the run: paired, on the enriched preference set plus a non-preference control set to catch
 collateral damage, with the floor condition that no currently-passing preference question breaks.
 
-## 4. F25 independently CONFIRMED — and the mapping trap that nearly made me refute it
+## 4. F25 independently CONFIRMED at FULL 500 — retrieval is not the constraint, at any gold count
 
-**Result: retrieval is saturated. ANY-gold = 94/94 = 100.0%, ALL-golds = 89/94 = 94.68%** on the cross-test
-questions, measured against the banked 444's own hits. F25 reported all-gold 98/100 with mean 0.9967 on the same
-slice; the two agree within the 94-vs-100 question difference. **F25 stands, by an independent method.**
+Measured on all 500 questions of the banked 444, joining gold sessions by timestamp (§4b). **All 500 mapped, 0
+unmapped.**
 
-The conditional accuracy is the load-bearing number:
+| metric | result |
+|---|---|
+| **at least one gold session retrieved** | **500/500 = 100.00%** |
+| **every gold session retrieved** | **486/500 = 97.20%** |
+| mean distinct sessions among the 25 hits | 9.3 |
 
-| condition | n | accuracy | abstentions |
+Conditional accuracy — the load-bearing decomposition:
+
+| condition | n | accuracy | failures | abstentions |
+|---|---|---|---|---|
+| **every gold retrieved** | 486 | 89.3% | **52** | 33 |
+| partial gold coverage | 14 | 71.4% | 4 | 1 |
+| no gold retrieved | 0 | — | — | — |
+
+*Reconciliation check: 486×89.3% + 14×71.4% = 444 — matches the banked score exactly.*
+
+**52 of the 56 failures had the complete gold evidence in hand.** Retrieval accounts for at most 4 questions of
+the 11.2-point gap. All five preference failures retrieved their (single) gold session.
+
+Recall does not degrade with multi-hop difficulty in any way that explains our losses:
+
+| gold sessions | n | all-golds recall | accuracy |
 |---|---|---|---|
-| **every gold session retrieved** | 89 | **41/89 = 46.1%** | 12 |
-| partial gold coverage | 5 | 1/5 = 20.0% | 1 |
-| no gold retrieved | 0 | — | — |
+| 1 | 175 | 100.0% | 91.4% |
+| 2 | 242 | 99.6% | 89.3% |
+| 3 | 49 | 83.7% | 83.7% |
+| 4 | 19 | 89.5% | 89.5% |
+| 5 | 12 | 91.7% | 75.0% |
+| 6 | 3 | 33.3% | 33.3% |
 
-**48 of the 52 failures on this slice had the complete gold evidence in hand.** (These are enriched-slice
-questions, so 46.1% is not a category rate — but the *decomposition* is valid: retrieval is not the binding
-constraint on the questions we lose.) All five preference failures had their gold session retrieved (each has
-exactly 1 gold; each retrieved it).
+Only the 6-gold cell (n=3) shows retrieval as plausibly binding. Everything else is answer-layer.
 
-**⚠ The trap — positional session mapping is invalid.** I first measured any-gold at **66.2%** against an
+**★ Multi-session — the decisive cell.** 131/133 = 98.5% all-golds recall, and **25 of its 26 failures had EVERY
+gold session retrieved** (1 partial, 0 with nothing). Multi-session failure is therefore **pure cross-session
+synthesis failure**: complete evidence in the prompt, wrong answer out. This is the single largest identified
+loss in V1 (25 questions, 5.0 points) and it is unambiguously not a retrieval problem.
+
+On the enriched 100q cross-test slice the same method gives any-gold 94/94 = 100.0% and all-golds 89/94 = 94.68%,
+against F25's reported 98/100 all-gold / mean 0.9967 — agreeing within the 94-vs-100 difference. **F25 stands,
+now by an independent method and at full scale.**
+
+### 4b. Method, and two traps
+
+**⚠ Trap 1 — positional session mapping is invalid.** I first measured any-gold at **66.2%** against an
 accuracy of 88.8%, which is incoherent (you cannot answer more often than you retrieve the evidence). That
 incoherence is what exposed the method error, and the cause is worth recording:
 
@@ -146,6 +175,14 @@ incoherence is what exposed the method error, and the cause is worth recording:
 - A red herring en route: three spot-checks showed evidence text in session N while gold mapped to N+1, looking
   like an off-by-one. It is not — those are LongMemEval's **designed topical distractor sessions** adjacent to
   the gold. Text matching cannot identify a gold session in this dataset; that is the dataset's whole point.
+
+**⚠ Trap 2 — the `_abs` variant filter (my error, caught inline).** 30 of the 500 questions are LongMemEval
+*abstention variants* whose ids end `_abs` and whose stores are named `<qid>_abs-<container>`. My first pass
+filtered any sidecar containing `_abs-` as a presumed duplicate, silently dropping exactly those 30 questions; a
+second pass then folded them onto the base qid, which mapped 13 questions to the **wrong store** (a different
+haystack) and produced a nonsensical "13 questions with 0 golds and 100% accuracy" row. Correct handling: no
+filter — `<qid>_abs` is its own question, present in both the dataset and the report. The tell was the impossible
+row, not a failing assertion.
 
 Also true, and still worth knowing: `searchResults` is exactly 25 hits for 500/500 questions — a fixed top-k. It
 did not obstruct this measurement, but it is a snapshot of one search, so **do not** treat it as the complete
