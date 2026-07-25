@@ -4,8 +4,8 @@
 **Spend:** zero — pure re-analysis of an existing artifact.
 **Artifacts:** `/Volumes/LEXAR/Codex/session-notes/2026-07-25/hermes-preference-gap/artifacts/`
 (`pref_diag.py`, `slice_check.py`, `retrieval_check.py`, `abstain_mass.py`, `gold_map2.py`,
-**`recall_by_date.py` ← the correct recall method**, `shift_test.py`/`recall_v3.py` ← the wrong ones, kept as
-counter-examples; outputs `pref_rows.json`, `failure_split.json`, `recall_by_date.json`)
+**`recall_full500.py` ← the definitive recall method (all 500)**, `recall_by_date.py` ← same method on the 100q slice, `shift_test.py`/`recall_v3.py` ← the wrong ones, kept as
+counter-examples; outputs `pref_rows.json`, `failure_split.json`, `recall_by_date.json`, `recall_full500.json`)
 
 ---
 
