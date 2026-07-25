@@ -1,4 +1,34 @@
-# M18 — The `small` tier has NO retrieval problem: 2 distinct candidate sets for 451 questions
+# M18 — The `small` tier's candidate pool is SHARED and TINY, so exhaustive scan is cheap
+
+_Original title claimed "NO retrieval problem". **That was an overstatement — see §0.** The measurement
+(2 distinct candidate sets for 451 questions) is correct; the interpretation was too strong._
+
+## 0. ★ SELF-CORRECTION (same day, before this drove a spend)
+
+I wrote that the small tier "contains no retrieval task — not a small one, none." **Too strong.** Each
+individual question still requires locating 1–2 gold trajectories among 100 candidates — a needle density of
+~0.01–0.02, which is a real per-question retrieval task.
+
+What is actually true, and it is still decisive:
+
+| | V2 small | V2 medium (enterprise) | **V1 `longmemeval_s`** |
+|---|---|---|---|
+| candidate pool per question | 100 | 500 | ~50 (39–66) |
+| **pool SHARED across questions?** | **yes — 2 sets for 451 q** | no — 211 unique of 211 | **no — 500 unique of 500** |
+| union / total corpus | **200** | 874 | **19,829** |
+| needle density | ~0.01–0.02 | ~0.002–0.004 | 2/50 = **0.04** |
+| mean overlap between questions | **1.00** | 0.48 | **0.001** |
+
+**The precise defect in V2 small is not the absence of a retrieval decision — it is that the pool is SHARED
+and TINY (200 trajectories total).** A 100-file exhaustive scan is cheap, so an index has nothing to beat.
+That is exactly what I said in VISION §2 originally; M18's stronger framing was a regression, not an
+improvement, and I am reverting to the accurate version.
+
+**The attribution conclusion is unchanged:** vanilla Codex greps 100 fixed files and that is competitive
+because the pool is small, not because retrieval is absent. Our indexed architecture is still untested at
+scale — for a reason I can state correctly.
+
+## 1. The measurement (unchanged, correct)
 
 **Date:** 2026-07-25 · **Status:** decisive — explains the entire attribution result
 **Supersedes the explanation in:** VISION-AND-ATTRIBUTION §2 (right conclusion, understated cause)
@@ -27,7 +57,8 @@ Earlier I framed this as "the corpus is small so grep is competitive." Too weak.
 that the tier we have spent the entire program on **does not exercise retrieval at all**, so a memory
 system's core function is unmeasured by construction.
 
-It also retires any residual worry that our architecture underperformed. It was never tested.
+It also retires any residual worry that our architecture underperformed: **it was never tested at a scale
+where an index matters.** (Not "never tested at all" — the per-question needle-finding did happen.)
 
 ## 3. `medium` is different in KIND, not degree
 433 distinct candidate sets, 34% selectivity, 0.48 mean overlap. **Medium is the first tier where a
