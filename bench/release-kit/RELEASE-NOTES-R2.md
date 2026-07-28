@@ -23,9 +23,9 @@ pinned, reproducible run (methods and finding docs ship in `bench/`):
 
 **What we found wrong in our own product — and fixed in this release:**
 - A 25k-vector recency window silently blinded semantic recall on large stores (recall → 0.000 at 389×).
-  Fixed: full batched scan. Re-measured: ⟨TBD F34 curve⟩.
+  Fixed: full batched scan. Re-measured: recall 0.000 → 0.233 at 389×, out-recalling file-scan at every corpus size; the remaining decline parallels file-scan's own crowding curve (F34).
 - Raw natural-language queries could return nothing at scale (FTS5 rejection → LIKE scan → timeout).
-  Fixed: in-product query sanitization. Re-measured: ⟨TBD F34⟩.
+  Fixed: in-product query sanitization. Re-measured: raw questions now match the sanitized form everywhere — 0% empty at all sizes, latency ratio 1.05 (F34).
 - A missing `store_id` on summary hits could cost whole answers under strict evidence validation (measured
   1.6% of questions on one run). Fixed.
 
