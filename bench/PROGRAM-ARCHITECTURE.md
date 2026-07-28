@@ -483,3 +483,11 @@ agent that catches a drifted pin and restores it (PATH-pin, no global mutation) 
 usage differ by ~7× (290,779 vs 2,159,056 on the same run — wire counts both roles, input+output, and transport
 overhead). Every ceiling, cost estimate, and comparison states which unit it is in; historical ceilings are all
 harness-unit. An executing agent that flags the ambiguity instead of silently picking a unit is doing it right.
+
+**§6e.15 — Transmit the DEFECT to a fixer, not a prescribed mechanism (PR #169 finding-5 near-miss).** The
+orchestrator's fix instruction for a review finding ("lowercase bare uppercase AND/OR/NOT") was a mechanism
+prescription made without sweeping the sanitizer's callers; applied as written it inverted the Phase 1B
+harness's own deliberate OR-disjunction (FTS recall@10 1.0 → 0.0) — the instrument the branch exists to serve.
+The repo's test suite caught it; the author shipped the correct fix (an explicit allow_operators mode split,
+which is what the reviewer's finding actually described). Rule: route findings by restating the defect and its
+repro; if you prescribe a mechanism, the gate-every-caller sweep is YOURS to do first.
