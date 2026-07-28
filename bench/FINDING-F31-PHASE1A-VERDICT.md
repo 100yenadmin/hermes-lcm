@@ -85,3 +85,24 @@ transfer: the scan cap and the query-form death are code, not corpus.**
 4. R2 language: the §2 "no scaling language before the curve" rule stands — the curve now says *"fast at scale;
    recall ceiling found and being fixed"*. The candour framing (§3b of the R2 draft) gets stronger, not weaker:
    we measured our own ceiling and published it.
+
+---
+
+## 8. A2u attachment (chain completed 02:51 — 28/28 runs; recall-only per the §6 early-release condition)
+
+The no-deadline raw-query arm, **CONTENDED** (the release run and other work shared the machine) and therefore
+**recall figures only** — u-arm latency is void as pre-registered:
+
+| rung | A2u all-gold | empty |
+|---|---|---|
+| 500 | 0.900 | 0.00 |
+| 2,000 | 0.550 | 0.00 |
+| 8,000 | 0.200 (deg: scan cap) | 0.00 |
+| 19,829 | **0.000** (deg: scan cap) | **0.00** |
+
+**This cleanly decomposes the two ceilings.** With the timeout removed, the raw-query path returns results at
+every rung (empty = 0 everywhere — ceiling #2 is purely the 8s budget) and reaches 0.90 all-gold at the small
+rung — but still hits **exactly 0.000 at 389×**, with the degraded reason naming the 25k scan cap. Ceiling #1
+(#167) is therefore independent of ceiling #2 (#168): unlimited patience does not recover recall, because the
+gold vectors are outside the scanned window. Each defect is confirmed by an arm that isolates it. Phase 1A is
+complete: 28/28 runs, both ceilings measured, the fix acceptance criteria in #167/#168 unchanged.
