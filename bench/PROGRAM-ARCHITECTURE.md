@@ -472,3 +472,9 @@ claim sentence itself ("session-level recall", "answer-turn recall"), and when a
 "no memory system can win those questions" bound was contradicted by F22's own leaderboard table (OMEGA 466 on a
 GPT-4.1 reader), in-tree, for three days. A claim that survives its own thread is not yet a claim that survives
 the corpus. Grep the findings index for every number and named competitor before a strategy/vision doc ships.
+
+**§6e.13 — The transport binary version is part of the parity pin set (F32).** The machine's codex CLI silently
+upgraded between a banked run and its comparison run; running the new binary would have been an instrument change
+disguised as a code comparison. The M9 parity diff now includes: answerer/judge model + effort + transport name
+AND VERSION (sha-matched binary), harness commit, store manifest, question set, presentation mode. An executing
+agent that catches a drifted pin and restores it (PATH-pin, no global mutation) is doing the job right.
