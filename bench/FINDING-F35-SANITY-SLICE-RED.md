@@ -15,10 +15,11 @@ rows with a summary hit.
 > nested/derived as first written — all 45 are depth-0, `source_type='messages'`, but with **`source_ids='[]'`**:
 > the ingest path never recorded lineage. #164a filled zero for lack of lineage data, not nesting. The
 > citability conclusion is unchanged; the repair path differs (there is nothing to walk on this corpus — the
-> summary arm contributes leads, not evidence, until lineage is recorded at ingest). One fix unmasked the
-other's incompleteness: an interaction bug that no per-fix test could see — the #164a regression test rendered
-the OLD failure population (message-sourced, F32's 8 qids) clean while the NEW population (nested summaries,
-woken by #168) is 100% uncitable.
+> summary arm contributes leads, not evidence, until lineage is recorded at ingest).
+
+One fix unmasked the other's incompleteness: an interaction bug that no per-fix test could see — the #164a
+regression test rendered the OLD failure population (F32's 8 qids) clean while the NEW population
+(lineage-empty summaries, woken by #168) is 100% uncitable.
 
 **The dropped rows are not a weak tail** (baselines scored 8–10/16 on them) — this costs real points and blocks
 the release. **Gate 4: RED.**
