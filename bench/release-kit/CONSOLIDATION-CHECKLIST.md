@@ -4,14 +4,13 @@
 green and the architect's confidence is ≥95%. Fork-first review cycles, then upstream via PR #436.
 
 ## The consolidated base (supersedes F32 §2's "ship e99f342 exactly" — intent preserved, see F32 note)
-`bench/w3b-on-wave1` @ e99f342 **+ PR #169** (the two Phase 1A ceilings) **+ #434 cherry-pick** (query-path
-spend-guard configurability — verified ABSENT from wave-1) **+ #164(a)** (store_id on summary hits — prevents
+`bench/w3b-on-wave1` @ e99f342 **+ PR #169** (the two Phase 1A ceilings) **+ #434 provenance markers** (its fields were ALREADY IN the wave-1 base at e99f342 — my earlier absence check used wrong grep terms, caught by the codex handoff; the F32 run therefore already validated the fix) **+ #164(a)** (store_id on summary hits — prevents
 the measured 1.6% fail-close loss). Released artifact == validated artifact: validation is Phase 1B + the
 sanity slice below, run ON the consolidated base.
 
 ## Gates (ALL must be green before upstream push)
-1. ☐ PR #169 cross-model review verdict processed (sol·max, running); mandatory fixes applied + re-reviewed.
-2. ☐ #434 cherry-pick + #164(a) fix landed on the consolidation branch; targeted tests green.
+1. ☑ PR #169 MERGED after full review cycle (61d5b14) (sol·max, running); mandatory fixes applied + re-reviewed.
+2. ☑ #170: #434 provenance + #164(a) store_id fix landed (validator: 8/8 F32 fail-closed qids render clean); targeted tests green; store_id commit reviewed by the architect (cross-model: codex-authored → Claude review).
 3. ☐ **Phase 1B**: F31 instrument re-run on the consolidated base — A3 recall does NOT collapse across the
    ladder (shape, not level, per #167 acceptance); A2 returns non-empty at 8k+ with p50 within 2× of A3
    (#168 acceptance); latency curve still sub-linear and ≤ file-scan at top rung. → F34 verdict doc.
