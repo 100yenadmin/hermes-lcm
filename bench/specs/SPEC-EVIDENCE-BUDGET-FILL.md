@@ -1,4 +1,24 @@
-# SPEC — Evidence budget-fill with turn-complete inclusion (V1 lane #150 / task #25)
+# SPEC v1 — Evidence budget-fill (SUPERSEDED — red-team verdict: REVISE, 92% confidence, five voiding defects)
+
+> ## ⛔ v1 KILLED BY THE PRE-FREEZE RED-TEAM, 2026-07-29 — see SPEC-EVIDENCE-ORACLE-THEN-EXPANSION.md (v2)
+> The adversarial pass this spec required found, with source/data reproduction
+> (`session-notes/2026-07-29/hermes-spec-redteam/artifacts/`):
+> 1. **The mechanism reaches 0% of its pool** — no missing answer turn is truncation-caused; 92% are whole
+>    turns absent from delivery while their session IS delivered. The lever is session EXPANSION (v1's
+>    demoted "variant B"), not turn completion.
+> 2. **v1's own mechanism check was a guaranteed false negative** (the coverage metric cannot move under the
+>    v1 treatment, by construction of `covered()`).
+> 3. **The c≤5 floor sits under measured noise** (null pairs show c=8/c=10) — 81% chance of a false
+>    "more context hurts" conclusion.
+> 4. **The treatment would fail-close ~68% of hits** via the evidence-cards `chunk_span` validation (#165's
+>    mechanism at full blast) unless `content_offset`/`content_returned_chars` are emitted on every hit.
+> 5. **The "14% of budget" premise was the enriched-slice-rate error again** (4th documented instance): the
+>    2,400 cap covers only the top-8 hydrated hits; ranks 9–25 are capped at `_LCM_RECALL_SNIPPET_CHARS=300`
+>    with 55.7% at cap. Plus cost-model self-contradiction (1.41× real vs 4× claimed) and a near-unwinnable
+>    gate (needs b≥15 at c=5 against a flippable ceiling of ~22–35).
+> **Kept unedited below as the record. v2 adopts the red-team's design: oracle pilot first.**
+
+## (v1 original) SPEC — Evidence budget-fill with turn-complete inclusion (V1 lane #150 / task #25)
 
 **Status:** DRAFT-COMPLETE 2026-07-29, authored with all premises verified. **Freezes only after one
 adversarial red-team pass** (standing audit cadence; two of the last three specs died of unverified premises —
