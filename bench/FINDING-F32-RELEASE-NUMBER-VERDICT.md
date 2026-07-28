@@ -42,7 +42,12 @@ Corollary, stated plainly: **#423's six answer-layer commits add no measurable V
 ties the run that had them. Porting them onto wave-1 is unification hygiene at best; it leaves the capability
 roadmap entirely (it was already deprioritised; this retires it).
 
-**Ship-as-measured rule:** R2 releases commit `e99f342` exactly as measured. The #164(a) `store_id` product fix
+**Ship-as-measured rule (AMENDED 2026-07-29 by the owner's Phase-1B-first decision + publish-authority
+grant):** the released artifact is now the CONSOLIDATED base (e99f342 + the #169 ceiling fixes + the #434
+cherry-pick + the #164a store_id fix), and "as measured" transfers to it: Phase 1B re-run + a paired V1
+sanity slice validate the consolidated base itself before upstream push (release-kit/CONSOLIDATION-CHECKLIST).
+The rule's intent — released code == validated code — is preserved; the validation set moved with the train.
+Original text: R2 releases commit `e99f342` exactly as measured. The #164(a) `store_id` product fix
 (which would prevent the 8 fail-closed rows in future runs) lands in the NEXT train alongside the Phase 1B
 fixes — releasing measured-code-plus-one-fix would make the released artifact differ from the measured one, and
 we just spent a week learning what silent instrument/code deltas cost.
