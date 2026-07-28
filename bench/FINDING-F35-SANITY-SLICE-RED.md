@@ -9,8 +9,13 @@ stores 200/200 unchanged, codex 0.144.6 PATH-pinned). 291k harness-unit tokens.
 **Fail-closes: 2 (F32, same qids) → 16.** All #164-signature. Root cause chain, confirmed by direct artifact
 counts: the #168 sanitization fix made the product's internal **summary-arm FTS queries work for the first time**
 on V1 — rows with ≥1 summary hit went **2/100 → 16/100** (5 → 29 summary hits). Every one of the 29 is
-**uncitable** (`store_id` null; the #164a fix populated **zero** — the delivered summary nodes are not
-message-sourced), and the fail-closed rows are **exactly** the rows with a summary hit. One fix unmasked the
+**uncitable** (`store_id` null; the #164a fix populated **zero**), and the fail-closed rows are **exactly** the
+rows with a summary hit.
+> **Mechanism correction (round-2 fix agent, verified against the stores):** the summary nodes are NOT
+> nested/derived as first written — all 45 are depth-0, `source_type='messages'`, but with **`source_ids='[]'`**:
+> the ingest path never recorded lineage. #164a filled zero for lack of lineage data, not nesting. The
+> citability conclusion is unchanged; the repair path differs (there is nothing to walk on this corpus — the
+> summary arm contributes leads, not evidence, until lineage is recorded at ingest). One fix unmasked the
 other's incompleteness: an interaction bug that no per-fix test could see — the #164a regression test rendered
 the OLD failure population (message-sourced, F32's 8 qids) clean while the NEW population (nested summaries,
 woken by #168) is 100% uncitable.
