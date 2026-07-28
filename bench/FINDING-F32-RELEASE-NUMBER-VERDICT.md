@@ -60,9 +60,11 @@ Both arms carry the **same 2,400-char per-hit cap**; the delivered distribution 
 (median 340, mean 760, p90 2,400, 10.9% of hits at cap; avgContextTokens 3,095 vs 3,102). My pre-run premise
 ("banked ≈300-char excerpts vs wave-1's 2,400 cap") was wrong — ~300 was the *median hit length under the same
 cap* in both arms. **The run could not test the excerpt-size lever because the lever was never engaged.** This
-is a null by construction, not evidence against #25 — and the useful numbers survive: median delivery runs at
-**14% of the existing per-hit budget**, and 435 hits truncated at cap. The #25 spec targets utilisation (fill
-toward budget, turn-complete), not a cap raise.
+is a null by construction, not evidence against #25 — and the useful numbers survive — with a structural correction from the
+spec red-team (same day): delivery is **two-tier**. Only the top-8 hydrated hits carry the 2,400 cap
+(10.9% of THOSE at cap); ranks 9–25 are capped at `_LCM_RECALL_SNIPPET_CHARS = 300`, and **55.7% of them sit
+exactly at that cap**. "Median 340 = 14% of budget" conflated the tiers — the enriched-slice-rate error, 4th
+instance. The #25 lane proceeds per SPEC v2 (oracle pilot → session expansion), not utilisation-fill.
 
 ## 5. Two parity catches by the executing agent (credit where due; both now standing practice)
 
