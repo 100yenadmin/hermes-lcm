@@ -1,5 +1,14 @@
 # F27 — The V1 preference gap is FALSE ABSTENTION, and the "1/6" figure was a selection artifact
 
+> ## ⛔ PARTIALLY REFUTED BY INDEPENDENT AUDIT 2026-07-29 — see F29
+> §4's headline inference is a **granularity error**: it measures gold **session-id presence** among 25 hits and
+> reads it as "complete gold evidence in the prompt". At answer-turn level (dataset-native `has_answer` flags):
+> all-answer-turns retrieved **85.6%**, 19 questions with ZERO answer-turn evidence, failures = 31 complete /
+> 13 partial / 9 none (not 52-of-56), retrieval-addressable ≈ **3.4 pts** (not ≤0.8). Accuracy is monotone in
+> evidence completeness (92.4% / 74.0% / 52.6%). §0 (the enriched-slice correction) and the session-LEVEL
+> saturation stand; every "complete evidence" sentence below is void. Precision caveats on 97.2%/100% and the
+> abstention floor: F29 §3.
+
 **Date:** 2026-07-25 · **Instrument:** banked 444 report.json (`v1l1-full500-primary-2026-07-23T18-26-13-780Z`)
 **Spend:** zero — pure re-analysis of an existing artifact.
 **Artifacts:** `/Volumes/LEXAR/Codex/session-notes/2026-07-25/hermes-preference-gap/artifacts/`

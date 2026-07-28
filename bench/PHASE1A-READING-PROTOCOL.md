@@ -116,3 +116,24 @@ not hypothetical.
 **Decision procedure when the censored chain completes:** measure actual elapsed time for the censored arms, use
 it to project the `u`-tail, and only then choose. If the projected tail is under ~1 hour, just wait — the option
 buys little and costs a caveat.
+
+---
+
+## §3g–§3i — instrument amendments from the 2026-07-29 audit (accepted BEFORE any adjudication; F29 §5)
+
+**(g) B×S0 is NON-FUNCTIONAL — excluded.** The per-question S0 filescan scopes were never materialised; all 150
+B×S0 queries return 0 hits (`rg` exit 2). Any B×S0 row in the results is garbage; the B curve is its four ladder
+rungs. Do not interpolate an S0 point for B.
+
+**(h) Cross-arm cap unfairness — carry the bias direction on every A-vs-B recall comparison.** A-arms apply
+LIMIT=25 to raw sub-session hits BEFORE session dedup (≈9 distinct sessions scored per query); B is scored on
+session-level results. Session-recall comparisons are biased in B's FAVOUR. Report the bias with the number, or
+recompute on a matched distinct-session basis. Latency comparisons are unaffected.
+
+**(i) Persona-collapse confound — recall degradation is over-determined for persona-keyed questions.** One store
+holding 500 personas makes first-person questions (single-session-user, knowledge-update, preference) partially
+ill-posed for ANY memory system: rival personas' semantically-equivalent sessions legitimately crowd the top-25,
+and gold-only scoring counts that as failure. Before attributing ANY recall drop to the index, quantify
+rival-persona collisions per question type. Latency claims are unaffected. A recall drop concentrated in
+persona-keyed types with high collision counts indicts the corpus design, not the index; a drop in
+persona-neutral types is real signal.

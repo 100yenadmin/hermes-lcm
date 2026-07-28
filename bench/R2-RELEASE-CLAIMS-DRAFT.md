@@ -17,12 +17,12 @@
 > R1 implied an accuracy advantage. Paired re-measurement (three arms, McNemar) found **no measurable accuracy
 > effect** — the accuracy claim is withdrawn. The speed claim replaced it because that is what the data supports.
 
-**The attribution statement (the honest differentiator — see §3 for framing choice):**
-> On V1 our retrieval is **saturated**: at least one gold session retrieved on 500/500 questions, every gold
-> session on 486/500 (97.2%). 52 of the model's 56 failures occurred with the complete gold evidence already in
-> the prompt. The remaining V1 gap belongs overwhelmingly to the reader model's synthesis, not to memory. **No
-> memory system wins those questions by retrieving or presenting better** — claims of large V1 margins imply
-> reader-side spend (stronger model, more passes), which buyers should price accordingly.
+**The attribution statement (CORRECTED per F29 — see §3 for framing choice):**
+> On V1 our retrieval finds the right **sessions** essentially always (~97% session-level), and the right
+> **evidence** 86% of the time — and accuracy tracks evidence completeness monotonically (92.4% with complete
+> evidence, 74.0% partial, 52.6% none). That decomposition is the roadmap: ~3.4 points of the remaining gap is
+> evidence-completeness work we own; the rest is the reader. We publish the measurement and the method
+> (answer-turn recall, not session recall) so buyers can hold every memory vendor to it.
 
 **Token cost:** flat (+3.2%, CI spans zero). Say "no token overhead", never "saves tokens".
 **Compression:** NOT claimed — the coding agent compresses; vanilla does it too (H2). R1's silence stays silent.

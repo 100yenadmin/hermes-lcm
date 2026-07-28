@@ -46,8 +46,11 @@ So the 11.2-point V1 gap decomposes as:
 - **~38 questions (7.6 pts): the reader's synthesis.** **Not ours.** Complete, well-represented, grouped, dated
   evidence in; wrong answer out.
 
-**The honest headline: on V1 roughly 90% of the remaining gap belongs to the frontier model, not to us.** Our
-memory layer is at its measurable ceiling on this benchmark.
+> **⛔ WITHDRAWN 2026-07-29 (F29):** the "~90% belongs to the model" attribution and the bound below rested on
+> session-level recall read as evidence completeness. Answer-turn measurement: **~30% of the gap (≈3.4 pts) is
+> retrieval-addressable**; and F22's leaderboard (OMEGA 466 / Mastra ~474 on GPT-4.1) directly contradicts the
+> "no memory system can win those questions" claim. The corrected attribution: our layer is saturated at
+> session granularity, ~86% at evidence granularity, and the difference is ours to win.
 
 **Why this is the right answer to give, not a disappointing one.** It converts "we can't beat 444" from a failure
 into a *bound*: no memory system can win those 38 questions by retrieving or presenting better, so any competitor

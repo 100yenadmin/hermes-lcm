@@ -461,3 +461,14 @@ SPEC-MULTISESSION-SYNTHESIS (F28 §1) — the harness already grouped by session
 *more* gold evidence than passes. Both were caught by checking the premise rather than the conclusion, and the
 second was caught before any tokens were spent. The rule: a spec's causal claim is read out of the code or the
 data it refers to, in the same pass that writes the spec — never from memory of what the system does.
+
+**§6e.11 — A claim's granularity must match its metric's granularity (F29).** Session-id presence ≠ evidence
+completeness ≠ answer-turn coverage. F27 measured the first and published the second; the gap between them hid
+~3.4 pts of addressable retrieval work and nearly retired a live lane. Name the measurement level inside the
+claim sentence itself ("session-level recall", "answer-turn recall"), and when a finer level exists in the data
+(LongMemEval's has_answer flags), measure it before publishing the coarser one as if it were the finer.
+
+**§6e.12 — Reconcile every strategic claim against the FULL findings index before publication (F29).** The
+"no memory system can win those questions" bound was contradicted by F22's own leaderboard table (OMEGA 466 on a
+GPT-4.1 reader), in-tree, for three days. A claim that survives its own thread is not yet a claim that survives
+the corpus. Grep the findings index for every number and named competitor before a strategy/vision doc ships.

@@ -1,5 +1,13 @@
 # F28 — V1 multi-session failure is NOT a presentation problem: three mechanisms ruled out, spec withdrawn
 
+> ## ⚠ AUDITED 2026-07-29 — core conclusion SURVIVES (reinforced by placebo cross-check); two parts struck. See F29.
+> Struck: §2's "failures receive MORE gold evidence" (unnormalized-rate artifact — reverses per gold session)
+> and §3's "golds not retrieved: excluded" row (inherits F27's session-vs-evidence conflation). Survives,
+> reinforced: no reliable grouping/ordering/crowding lever exists — both audit refutation attempts failed
+> verification (the claimed "fix" run was a different harness build scoring 442, and its flipped questions also
+> flip on F26's placebo). NOT tested by this finding and now the live lane: **within-session evidence
+> completeness** (session expansion; answer-turn coverage) — F29 §6.
+
 **Date:** 2026-07-25 · **Spend:** zero — re-analysis of the banked 444 plus a read of the pinned harness source.
 **Consequence:** `bench/specs/SPEC-MULTISESSION-SYNTHESIS.md` is **WITHDRAWN before dispatch.** Its premise was
 false and I falsified it myself, hours after writing it, by checking the premise instead of the conclusion.
