@@ -7,7 +7,8 @@ our correction history, and the bugs we found in our own product — so you can 
 | claim | number | evidence |
 |---|---|---|
 | End-to-end speedup vs agent file-scan (LongMemEval-V1) | **−56.3 s/question (22%), p<0.0001** | M12 |
-| Retrieval latency at ~200k messages (389× store) | **267 ms p50, sub-linear** ⟨update F34⟩ | F31/F34 |
+| Retrieval recall at ~200k messages (389× store) | **beats file-scan at every rung; cliff eliminated** | F34 |
+| Retrieval latency (full-coverage scan) | **20–45 ms ≤2k sessions · 5.6 s at 20k — ANN next train** | F34 |
 | LongMemEval-V1 | **⟨TBD⟩/500** | F32 + slice |
 | LongMemEval-V2 (agentic, fixed 9B reader) | **298/451** | H6-P4 |
 | Evidence-delivery → accuracy causality | **23/35 flips, p=1.9×10⁻⁵** | F33 |

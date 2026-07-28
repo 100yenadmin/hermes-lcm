@@ -10,9 +10,13 @@ pinned, reproducible run (methods and finding docs ship in `bench/`):
 **What we can prove:**
 - **22% faster end-to-end at equal accuracy** on LongMemEval-V1 (−56.3 s/question, p<0.0001, 48/60 paired
   questions faster): indexed retrieval replaces the agent's file-scan exploration.
-- **Fast at scale:** on a 389×-scaled store (~200k messages), retrieval answers in **267 ms p50 — faster than
-  file-scan at every corpus size we measured**, growing sub-linearly while file-scan grows linearly.
-  (Provider stamp: measured on fastembed/384-dim; shapes, not absolute levels, are the claim.)
+- **Complete at scale — and we publish the cost:** on a 389×-scaled store (~200k messages), retrieval now
+  out-recalls file-scan at every corpus size we measured, with the recall cliff we found in our own product
+  eliminated. Below ~2k sessions it also answers in ~20–45 ms. Above that, full-coverage brute-force scanning
+  costs real latency (1.8 s at 8k sessions, 5.6 s at 20k) — the ANN index that removes this cost is the next
+  release, and this curve ships in the notes so you can hold us to it. (An earlier internal number — "267 ms
+  at 200k messages" — described the broken build that silently scanned 13% of memory; we caught it in the
+  retest and it does not ship.) (Provider stamp: fastembed/384-dim; shapes, not levels.)
 - **Evidence delivery is causal:** answer accuracy tracks delivered-evidence completeness monotonically
   (92.4% complete / 74.0% partial / 52.6% none), and injecting the missing evidence flips 23 of 35 wrong
   answers (p=1.9×10⁻⁵). We publish the metric (answer-turn recall) so anyone can hold any memory vendor to it.
