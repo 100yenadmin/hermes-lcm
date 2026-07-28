@@ -1,5 +1,11 @@
 # F25 — V1 retrieval is SATURATED (99.7% gold recall). The gap is the ANSWER LAYER, not retrieval.
 
+> **Producer-script note (§6e.7, added 2026-07-29):** this finding's original inline script was never persisted —
+> the number had to be re-derived from scratch by F27 (method: `recall_full500.py` in
+> `session-notes/2026-07-25/hermes-preference-gap/artifacts/`, the surviving reference implementation).
+> **Granularity caveat (F29):** all figures here are SESSION-level recall. Session-level saturation stands;
+> it must not be read as evidence completeness — answer-turn recall is 85.6% (F29 §1).
+
 **Date:** 2026-07-26 · **Source:** the cross-test's `retrieval-diff.json` — an artifact the executing agent
 produced that I did not request. It answers the cross-test before the scores arrive.
 
