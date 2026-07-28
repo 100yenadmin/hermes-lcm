@@ -478,3 +478,8 @@ upgraded between a banked run and its comparison run; running the new binary wou
 disguised as a code comparison. The M9 parity diff now includes: answerer/judge model + effort + transport name
 AND VERSION (sha-matched binary), harness commit, store manifest, question set, presentation mode. An executing
 agent that catches a drifted pin and restores it (PATH-pin, no global mutation) is doing the job right.
+
+**§6e.14 — A token budget names its unit (F33).** The harness's `report.totalTokens` and the transport's wire
+usage differ by ~7× (290,779 vs 2,159,056 on the same run — wire counts both roles, input+output, and transport
+overhead). Every ceiling, cost estimate, and comparison states which unit it is in; historical ceilings are all
+harness-unit. An executing agent that flags the ambiguity instead of silently picking a unit is doing it right.

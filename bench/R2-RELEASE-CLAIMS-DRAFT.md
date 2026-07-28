@@ -20,9 +20,11 @@
 **The attribution statement (CORRECTED per F29 — see §3 for framing choice):**
 > On V1 our retrieval finds the right **sessions** essentially always (~97% session-level), and the right
 > **evidence** 86% of the time — and accuracy tracks evidence completeness monotonically (92.4% with complete
-> evidence, 74.0% partial, 52.6% none). That decomposition is the roadmap: ~3.4 points of the remaining gap is
-> evidence-completeness work we own; the rest is the reader. We publish the measurement and the method
-> (answer-turn recall, not session recall) so buyers can hold every memory vendor to it.
+> evidence, 74.0% partial, 52.6% none). And we verified the relationship is CAUSAL, not correlational: injecting
+> the missing evidence into otherwise-identical prompts flips 23 of 35 wrong answers to correct (p=1.9e-05,
+> oracle experiment, F33). That decomposition is the roadmap: the evidence-delivery gap is work we own; the
+> rest is the reader. We publish the measurement and the method (answer-turn recall, not session recall) so
+> buyers can hold every memory vendor to it.
 
 **Token cost:** flat (+3.2%, CI spans zero). Say "no token overhead", never "saves tokens".
 **Compression:** NOT claimed — the coding agent compresses; vanilla does it too (H2). R1's silence stays silent.
