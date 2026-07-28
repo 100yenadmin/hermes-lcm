@@ -30,9 +30,11 @@
 ## 2. What R2 must NOT say
 
 - Any accuracy delta on V1 or V2-small without a fresh paired McNemar attached.
-- Any "scales better" language **unless Phase 1A's censored curve supports it** — pending. If A-arms hold recall
-  flat at 389× where file-scan latency grows ~linearly (B: 4.4 ms → 411 ms p50), the scaling sentence writes
-  itself and cites the curve. If file-scan wins both axes at 19,829, R2 says that too (protocol §2 row 4).
+- The scaling sentence, now that the curve exists (F31): **"fast at scale — 267 ms p50 at ~200k messages,
+  faster than file-scan at every rung, sub-linear vs linear"** is claimable WITH the provider stamp. Any recall-
+  at-scale claim is FORBIDDEN until Phase 1B (the F31 ceilings #167/#168 are fixed and the instrument re-run).
+  If asked: we found our own recall ceiling at 25k vectors, published it, and are fixing it — that is the story,
+  and it is a strength in the candour framing.
 - Any Phase 1A recall LEVEL as a production number — fastembed 384-dim ≠ production Voyage 1024-dim; shapes
   transfer, levels do not (protocol §3c).
 - "1/6 preference" or any enriched-slice rate (F27 §0). Preference is 25/30.
