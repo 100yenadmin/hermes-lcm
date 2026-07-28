@@ -41,7 +41,14 @@
 - LAFS: every banked configuration scores 0.0000 against the reference frontier. R2 does not mention LAFS as a
   win; if asked, that is the number and the reason the scaling regime is the roadmap.
 
-## 3. OWNER CHOICE — the one sentence that sets R2's posture (F27 §Q1)
+## 3. FRAMING: DECIDED — candour lead (owner, 2026-07-29). TIMING: DECIDED — R2 ships AFTER Phase 1B.
+
+Owner selected **(b) the candour lead**, and chose to hold the release until Phase 1B lands: fix #167 (scan
+coverage) + #168 (query sanitization), re-run the F31 instrument, and release with the completed scaling story
+("we found our own ceilings, fixed them, and here is the re-measured curve"). If Phase 1B's re-run surprises us
+negatively, that result ships too — that is what the candour framing means.
+
+### (original decision framing, retained for the record)
 
 Both are true; they read very differently. Pick one as the lead:
 
