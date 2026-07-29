@@ -511,3 +511,14 @@ statement-count ceilings on the zero-scan hit path (the F43 repair is pinned by 
 statements"), and the gate run publishing which mechanism actually served each rung
 (`scoring=int8_quantized/float32_exact`). Telemetry written for one debugging session becomes a permanent
 regression test — that conversion, not the fix itself, is what makes the next silent regression impossible.
+
+**§6e.18 — A byte-identity probe proves the PINNED CORPUS only; it is not a default-path contract (PR #183
+round 5).** Five consecutive rounds shipped "flag-off byte-identical, sha-pinned" — and the pin was telling
+the truth while the contract was broken anyway: a punctuation-normalization helper added for the prose path
+was also used by the flag-off CJK/emoji LIKE fallback, changing default extraction (`launch 🚀?` stopped
+matching its literal), and the probe corpus simply contained no emoji-with-punctuation row. Cross-model
+review caught it; the probe never could have. Rule: when a change is defended by a byte-identity probe, ask
+what surface the change touches that the probe corpus does NOT cover — and either extend the corpus (new
+recorded baseline, logged) or add a targeted regression pinned to MEASURED base behavior (`git show
+base:...`, not memory of it). A green pin on an unrepresentative corpus is §6e.8's enriched-slice fallacy
+wearing a hash.
