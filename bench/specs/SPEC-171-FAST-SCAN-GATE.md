@@ -1,4 +1,14 @@
-# SPEC — #171 fast-scan (reframed from "ANN"): design decision + pre-registered parity gate. FROZEN on commit.
+# SPEC — #171 fast-scan: design + parity gate **v2** (re-registered after F39 KILL; v1 preserved in git history). FROZEN on commit.
+
+## v2 changes (F39 adjudication — registered BEFORE the re-run)
+- **R2′ replaces R2:** residency is dtype-AGNOSTIC — the resident int8 matrix is quantized FROM float32
+  vectors at build time (same RAM budget). Scoring on resident paths therefore differs from exact
+  float32 — recall parity is exactly what this gate tests, not an assumption.
+- **Size-aware path selection:** below a measured N threshold the original simple loader serves (kills
+  the small-rung regression by construction). The threshold is chosen by measurement, stated in the PR.
+- **PASS-5 gains failure semantics (v1 authoring gap):** small-rung p50 ≤1.25× F34 = PASS; (1.25,1.6]× =
+  GRAY; >1.6× = KILL.
+- All other clauses unchanged from v1.
 
 ## Design decision (architect, 2026-07-29; full design legwork archived at
 ## session-notes/2026-07-29/hermes-r3-1/artifacts/DESIGN-171-FAST-SCAN.md)
