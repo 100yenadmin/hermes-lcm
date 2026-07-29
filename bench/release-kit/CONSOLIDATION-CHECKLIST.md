@@ -18,18 +18,18 @@ sanity slice below, run ON the consolidated base.
    F32 pins — flips within the measured noise reference (≤18 discordant, |net| ≤ 6). Full 500 re-run ONLY if
    the slice moves beyond that. → It did; **full-500 confirm GREEN (F37): 455/500, 0 fail-closes, +11 vs
    banked (p=0.061, reported as measured)** — release V1 number banked, kit slots filled.
-5. ☐ **Fork mono-PR review cycles**: consolidated branch → fork PR → Codex + CodeRabbit + evaOS review bot;
+5. ☑ **Fork mono-PR review cycles** (7 rounds, 73 findings: 35→11→6→8→3→4→6, all fixed/refuted/deferred-with-issue #172 #176 #177 #178 #179; CI green every round head; stopping rule declared+posted; fork #175 MERGED 2026-07-29): consolidated branch → fork PR → Codex + CodeRabbit + evaOS review bot;
    iterate until a CLEAN ROUND (no new HIGH+ findings), minimum 2 rounds, cap 5 (owner suggested 4–5;
    diminishing-returns stop allowed after 2 clean).
-6. ☐ Release docs final: RELEASE-NOTES-R2 (candour lead, locked), README section, #436 body updated,
+6. ☑ Release docs final: RELEASE-NOTES-R2 (candour lead, locked), README section, #436 body updated,
    evidence links resolve on the fork.
-7. ☐ #436 branch (`upstream-wave-1`) updated to the consolidated content (merge, no force-push if possible);
+7. ☑ #436 branch (`upstream-wave-1`) updated (ccc76ee, merge not force-push; docs conflicts resolved — tool count 15 from merged code; CHANGELOG: upstream v0.20.0 stands, train under Unreleased) to the consolidated content (merge, no force-push if possible);
    CI green including 3.13.
-8. ☐ Closeouts: #434 closed w/ prepared comment (only AFTER its fix is verifiably in #436); #423 already
+8. ☑ Closeouts (#434 closed w/ prepared comment; #423 already closed; fork #169/#174/#175 merged): #434 closed w/ prepared comment (only AFTER its fix is verifiably in #436); #423 already
    closed (verified 2026-07-29); fork-side #169 + consolidation PR merged.
-9. ☐ Architect's 95% statement written into the release notes PR comment: what was validated, what wasn't,
+9. ☑ Architect's 95% statement (posted: stephenschoettler/hermes-lcm#436 comment 5115182904) written into the release notes PR comment: what was validated, what wasn't,
    known issues (#165 harness-side; anything open).
-10. ☐ Upstream: push #436 update, comment tagging the maintainer with the review guide, monitor per
+10. ☑ Upstream: pushed + maintainer tagged w/ review guide (2026-07-29); shepherding active, comment tagging the maintainer with the review guide, monitor per
     pr-shepherding standard (never push-and-abandon).
 
 ## Explicitly NOT gated on
