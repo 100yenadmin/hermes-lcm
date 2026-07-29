@@ -11,10 +11,10 @@ sanity slice below, run ON the consolidated base.
 ## Gates (ALL must be green before upstream push)
 1. ☑ PR #169 MERGED after full review cycle (61d5b14) (sol·max, running); mandatory fixes applied + re-reviewed.
 2. ☑ #170: #434 provenance + #164(a) store_id fix landed (validator: 8/8 F32 fail-closed qids render clean); targeted tests green; store_id commit reviewed by the architect (cross-model: codex-authored → Claude review).
-3. ☐ **Phase 1B**: F31 instrument re-run on the consolidated base — A3 recall does NOT collapse across the
+3. ☑ **Phase 1B** (F34): F31 instrument re-run on the consolidated base — A3 recall does NOT collapse across the
    ladder (shape, not level, per #167 acceptance); A2 returns non-empty at 8k+ with p50 within 2× of A3
    (#168 acceptance); latency curve still sub-linear and ≤ file-scan at top rung. → F34 verdict doc.
-4. ☐ **V1 sanity slice**: paired ~100q (the F26 slice, known baseline 44/100) on the consolidated base under
+4. ☑ **V1 sanity slice** (F35 RED → citable fix, 8-round cycle, PR #174 → F36 GREEN: fail-close 16→0, gain real +18/p=4e-05, stable across the rebuild; full-500 confirm triggered): paired ~100q (the F26 slice, known baseline 44/100) on the consolidated base under
    F32 pins — flips within the measured noise reference (≤18 discordant, |net| ≤ 6). Full 500 re-run ONLY if
    the slice moves beyond that.
 5. ☐ **Fork mono-PR review cycles**: consolidated branch → fork PR → Codex + CodeRabbit + evaOS review bot;
