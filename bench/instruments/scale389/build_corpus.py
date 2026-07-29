@@ -15,7 +15,6 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from bench.instruments.scale389.metrics import answer_turns_from_question
 from bench.tools.pinverify import sha256_file
 
 
@@ -26,6 +25,25 @@ DEFAULT_OUTPUT = Path(
 )
 SEED = 20260725
 DEFAULT_SCALES = (500, 2000, 8000, 19829)
+
+
+def _raw_answer_turns(question: dict[str, Any]) -> list[dict[str, str]]:
+    """Persist answer labels while building the corpus from raw input."""
+    ids = question["haystack_session_ids"]
+    dates = question["haystack_dates"]
+    sessions = question["haystack_sessions"]
+    turns: list[dict[str, str]] = []
+    for session_id, date, messages in zip(ids, dates, sessions):
+        for message in messages:
+            if message.get("has_answer") is True:
+                turns.append(
+                    {
+                        "session_id": str(session_id),
+                        "date": str(date),
+                        "content": str(message.get("content", "")),
+                    }
+                )
+    return turns
 
 
 def build_corpus(
@@ -52,7 +70,7 @@ def build_corpus(
         questions.append(
             {
                 "answer": raw["answer"],
-                "answer_turns": answer_turns_from_question(raw),
+                "answer_turns": _raw_answer_turns(raw),
                 "gold": sorted(set(raw["answer_session_ids"])),
                 "haystack": list(ids),
                 "question": raw["question"],

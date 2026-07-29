@@ -98,20 +98,36 @@ def exercise_turn_join(
     for question in dataset:
         if question["question_id"] not in primary_ids:
             continue
-        turns = answer_turns_from_question(question)
+        corpus_question = {
+            "gold": list(question["answer_session_ids"]),
+            "question_id": question["question_id"],
+        }
+        turns = answer_turns_from_question(
+            corpus_question, qeval_path.parent / "union.jsonl"
+        )
         if turns and all(len(turn["content"]) >= 25 for turn in turns):
-            candidates.append((question, turns))
+            candidates.append((question, turns, corpus_question))
     if not candidates:
         raise AssertionError("F34 primary set has no usable labeled answer-turn fixture")
 
-    question, turns = candidates[0]
+    question, turns, corpus_question = candidates[0]
     sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
     complete_hits = [
         {"content": turn["content"], "session_id": turn["session_id"]}
         for turn in turns
     ]
-    complete = answer_turn_delivery_metrics(question, complete_hits, sidecar)
-    incomplete = answer_turn_delivery_metrics(question, complete_hits[:-1], sidecar)
+    complete = answer_turn_delivery_metrics(
+        corpus_question,
+        complete_hits,
+        sidecar,
+        qeval_path.parent / "union.jsonl",
+    )
+    incomplete = answer_turn_delivery_metrics(
+        corpus_question,
+        complete_hits[:-1],
+        sidecar,
+        qeval_path.parent / "union.jsonl",
+    )
     values = [
         incomplete["answer_turn_delivered_complete"],
         complete["answer_turn_delivered_complete"],

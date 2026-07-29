@@ -6,6 +6,7 @@ import pytest
 
 from bench.instruments.scale389.metrics import (
     answer_turn_delivery_metrics,
+    answer_turns_from_question,
     emit_probe_question_pin,
     select_questions,
     session_gold_metrics,
@@ -70,6 +71,65 @@ def test_answer_turn_join_refuses_positional_identity():
             ],
             {"gold-1": "2026-01-01"},
         )
+
+
+def test_answer_turn_fallback_uses_corpus_union_and_fails_on_missing_gold(tmp_path):
+    union_path = tmp_path / "corpus" / "union.jsonl"
+    union_path.parent.mkdir()
+    union_path.write_text(
+        json.dumps(
+            {
+                "date": "2023/02/22 (Wed) 20:54",
+                "messages": [
+                    {
+                        "content": "The corpus-assigned answer is ALBATROSS-441.",
+                        "has_answer": True,
+                        "role": "assistant",
+                    }
+                ],
+                "sid": "gold-1",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    question = {
+        "gold": ["gold-1"],
+        "haystack_dates": ["2023/05/25 (Thu) 15:36"],
+        "question_id": "q-f39-shape",
+    }
+    sidecar = {"gold-1": "2023/02/22 (Wed) 20:54"}
+    hits = [
+        {
+            "content": "The corpus-assigned answer is ALBATROSS-441.",
+            "session_id": "gold-1",
+        }
+    ]
+
+    assert answer_turns_from_question(question, union_path) == [
+        {
+            "content": "The corpus-assigned answer is ALBATROSS-441.",
+            "date": "2023/02/22 (Wed) 20:54",
+            "session_id": "gold-1",
+        }
+    ]
+    result = answer_turn_delivery_metrics(question, hits, sidecar, union_path)
+    assert result == {
+        "answer_turn_delivered_complete": 1,
+        "answer_turn_delivered_found": 1,
+        "answer_turn_delivered_total": 1,
+    }
+
+    union_path.write_text(
+        union_path.read_text(encoding="utf-8")
+        .replace('"sid": "gold-1"', '"sid": "other-session"'),
+        encoding="utf-8",
+    )
+    with pytest.raises(
+        ValueError,
+        match=r"corpus union .*union\.jsonl.*gold-1.*q-f39-shape",
+    ):
+        answer_turn_delivery_metrics(question, hits, sidecar, union_path)
 
 
 def test_session_metric_keeps_legacy_alias_with_explicit_label():

@@ -33,8 +33,17 @@ def content_matches(delivered: str, answer_turn: str) -> bool:
     )
 
 
-def answer_turns_from_question(question: dict[str, Any]) -> list[dict[str, str]]:
-    """Read persisted answer turns or derive them from a raw LongMemEval row."""
+def answer_turns_from_question(
+    question: dict[str, Any],
+    union_path: str | Path | None = None,
+    union_records: dict[str, dict[str, Any]] | None = None,
+) -> list[dict[str, str]]:
+    """Read persisted turns or derive them from the corpus union.
+
+    The persisted-turn path is used for corpus-built qeval rows. A row without
+    persisted turns must provide a corpus union path; raw dataset dates are not
+    an identity source for scoring.
+    """
     persisted = question.get("answer_turns")
     if persisted is not None:
         if not isinstance(persisted, list):
@@ -48,21 +57,71 @@ def answer_turns_from_question(question: dict[str, Any]) -> list[dict[str, str]]
             for turn in persisted
         ]
 
-    ids = question.get("haystack_session_ids")
-    dates = question.get("haystack_dates")
-    sessions = question.get("haystack_sessions")
-    if not all(isinstance(value, list) for value in (ids, dates, sessions)):
-        raise ValueError("question has neither answer_turns nor raw haystack labels")
-    if not (len(ids) == len(dates) == len(sessions)):
-        raise ValueError("raw haystack ids, dates, and sessions have different lengths")
+    question_id = str(question.get("question_id", "<unknown>"))
+    if union_path is None:
+        raise ValueError(
+            f"answer_turns missing for question {question_id!r}; "
+            "corpus union.jsonl path is required"
+        )
+    path = Path(union_path)
+    if path.is_dir():
+        path /= "union.jsonl"
 
+    if union_records is None:
+        try:
+            union_records = {}
+            with path.open(encoding="utf-8") as handle:
+                for line_number, line in enumerate(handle, 1):
+                    if not line.strip():
+                        continue
+                    row = json.loads(line)
+                    if not isinstance(row, dict) or not isinstance(
+                        row.get("sid"), str
+                    ):
+                        raise ValueError(
+                            f"line {line_number} is not a valid union record"
+                        )
+                    union_records[row["sid"]] = row
+        except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"cannot read corpus union {path} for question {question_id!r}: {exc}"
+            ) from exc
+
+    gold = question.get("gold")
+    if not isinstance(gold, list):
+        raise ValueError(
+            f"question {question_id!r} has no gold session ids for corpus union {path}"
+        )
     turns: list[dict[str, str]] = []
-    for session_id, date, messages in zip(ids, dates, sessions):
+    for value in gold:
+        session_id = str(value)
+        record = union_records.get(session_id)
+        if record is None:
+            raise ValueError(
+                f"corpus union {path} is missing gold session {session_id!r} "
+                f"for question {question_id!r}"
+            )
+        try:
+            corpus_session_id = str(record["sid"])
+            date = str(record["date"])
+            messages = record["messages"]
+            if not isinstance(messages, list):
+                raise TypeError("messages is not a list")
+        except (KeyError, TypeError) as exc:
+            raise ValueError(
+                f"cannot read corpus union {path} for question {question_id!r}: "
+                f"invalid record for session {session_id!r}: {exc}"
+            ) from exc
         for message in messages:
+            if not isinstance(message, dict):
+                raise ValueError(
+                    f"cannot read corpus union {path} for question {question_id!r}: "
+                    f"invalid message for session {session_id!r}"
+                )
             if message.get("has_answer") is True:
                 turns.append(
                     {
-                        "session_id": str(session_id),
+                        "session_id": corpus_session_id,
                         "date": str(date),
                         "content": str(message.get("content", "")),
                     }
@@ -88,13 +147,14 @@ def answer_turn_delivery_metrics(
     question: dict[str, Any],
     delivered_hits: Iterable[dict[str, Any]],
     sidecar_dates: dict[str, Any],
+    union_path: str | Path | None = None,
 ) -> dict[str, int | None]:
     """Score labeled answer turns against the exact delivered hit payload.
 
     The sidecar is the stable identity boundary. Every delivered session must
     occur in it; no hit or answer turn is mapped by ingest position.
     """
-    turns = answer_turns_from_question(question)
+    turns = answer_turns_from_question(question, union_path)
     if not turns:
         return {
             "answer_turn_delivered_complete": None,

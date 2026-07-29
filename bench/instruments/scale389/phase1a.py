@@ -43,12 +43,6 @@ CORPUS = Path(
         "hermes-v1-scale/artifacts/corpus",
     )
 )
-DATASET = Path(
-    os.environ.get(
-        "SCALE389_DATASET",
-        "/Volumes/LEXAR/hermes-work/longmemeval-data/longmemeval_s",
-    )
-)
 RESULTS = Path(
     os.environ.get(
         "SCALE389_RESULTS",
@@ -96,8 +90,6 @@ os.environ.setdefault(
 )
 
 _PROBE_BRIDGE_CLASS: type | None = None
-_RAW_QUESTIONS: dict[str, dict[str, Any]] | None = None
-
 
 def _probe_bridge_class() -> type:
     global _PROBE_BRIDGE_CLASS
@@ -190,28 +182,30 @@ def load_union() -> dict[str, dict[str, Any]]:
     return union
 
 
-def _raw_questions() -> dict[str, dict[str, Any]]:
-    global _RAW_QUESTIONS
-    if _RAW_QUESTIONS is None:
-        rows = json.loads(DATASET.read_text(encoding="utf-8"))
-        _RAW_QUESTIONS = {row["question_id"]: row for row in rows}
-    return _RAW_QUESTIONS
-
-
 def load_qeval() -> dict[str, Any]:
     qeval = json.loads((CORPUS / "qeval.json").read_text(encoding="utf-8"))
     missing = [
         row for row in qeval["questions"] if "answer_turns" not in row
     ]
     if missing:
-        raw = _raw_questions()
+        union_path = CORPUS / "union.jsonl"
+        try:
+            union = load_union()
+        except (
+            OSError,
+            json.JSONDecodeError,
+            KeyError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            raise ValueError(
+                f"cannot read corpus union {union_path} for question "
+                f"{missing[0]['question_id']!r}: {exc}"
+            ) from exc
         for row in missing:
-            source = raw.get(row["question_id"])
-            if source is None:
-                raise ValueError(
-                    f"dataset lacks qeval question {row['question_id']!r}"
-                )
-            row["answer_turns"] = answer_turns_from_question(source)
+            row["answer_turns"] = answer_turns_from_question(
+                row, union_path, union
+            )
     return qeval
 
 
@@ -586,6 +580,7 @@ def run_query_arm(arm: str, scale: str, uncensored_n: int) -> None:
                         question,
                         persisted,
                         load_dates(scale, question["question_id"]),
+                        CORPUS / "union.jsonl",
                     ),
                 }
                 rows.append(row)
@@ -650,6 +645,7 @@ def run_query_arm(arm: str, scale: str, uncensored_n: int) -> None:
                         question,
                         persisted,
                         load_dates(scale, question["question_id"]),
+                        CORPUS / "union.jsonl",
                     ),
                 }
                 rows.append(row)
