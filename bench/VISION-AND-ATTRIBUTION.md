@@ -64,6 +64,22 @@ prices the trade-off).
 regime — where the corpus stops being grep-exhaustible and retrieval becomes load-bearing again. Both remain open,
 and Phase 1A (#159) is the test. **V1-small is where our ceiling is measured; it is not where our thesis lives.**
 
+### 1c. ★ R2 REVISED THE ATTRIBUTION — two rows changed sign (2026-07-30, post-R2 addendum)
+
+The 07-25 table above was deliberately unflattering and is now measurably out of date in two places:
+
+| capability | 07-25 verdict | R2-era measurement | what changed |
+|---|---|---|---|
+| accuracy | "none measurable" (McNemar null ×3) | **V1 455/500, +11 vs banked 444 (b20/c9, p=0.061, reported as measured; direction consistent across all three baselines, placebo flat)** | The completeness lane worked: waking the provider's internal retrieval (#168) + citable delivery (gate-4 rebuild) produced genuine flips. F33 then showed the mechanism is interventionally supported — injecting missing gold answer turns flips 23/35 (p=1.9e-5; salience confound documented, so public claims use the observational gradient. |
+| retrieval latency | −56.3s/q at small tier | that claim stands, **plus F44 at 389×: 263.6ms @ 19,829 sessions = 24× vs the pre-fast-scan baseline, recall parity net 0** | The latency advantage now has a published scale curve behind it, not just the small-tier A/B. |
+
+Unchanged and still honest: compression is the agent's, not ours; token delivery is noise; V1-small is
+where our ceiling is measured, not where the thesis lives (F38: realistic remaining V1-small headroom
+≈1.6 pts). The thesis now runs through the scale regime (the 389× instrument family), the metric-standard
+play (answer-turn evidence-completeness), and — per the owner's 07-30 decision — the LoCoMo sidecar and
+the V1-medium tier as the official surfaces. The measurement discipline that produced §1's unflattering
+table is the same one that later moved two of its rows: that is the point of the discipline.
+
 ## 2. Why the advantage is so thin HERE — and it is structural, not a failure
 
 **The benchmark corpus is 1,870 trajectories total, and each question is handed 100 pre-selected candidates.**

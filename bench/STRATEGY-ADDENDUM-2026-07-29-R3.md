@@ -28,6 +28,10 @@ public claims use the observational gradient.
   only as a shared-store-cost secondary (weak fixed reader, empty leaderboard = visibility, not proof).
 - **LoCoMo sidecar (R3.1, cred play):** competitors publish 83–94% there; adapter built under bench/tools
   discipline — pins, fail-close accounting, and a same-code noise floor BEFORE any published number.
+  *(Amended 2026-07-30, owner decision: the CC BY-NC concern applies only to REPUBLISHING the dataset
+  itself, not to publishing results measured on it — LoCoMo is the field's de-facto minimum and every
+  memory vendor publishes on it. The publishing hold is LIFTED; the A/A′ noise floor executes first,
+  unchanged.)*
 - **Agentic eval: scoped, not committed.** Selection survey first (BEAM is vendor-harness/vendor-judge —
   non-comparable); adopt only an eval instrumentable to our standards. Decision at R3.1.
 - **Our own scaling benchmark** (unchanged from Phase 3): publish with negative results included.
