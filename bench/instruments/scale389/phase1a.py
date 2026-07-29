@@ -84,6 +84,10 @@ UNCENSORED_N = int(
 os.environ.setdefault("HERMES_LCM_REPO", str(PRODUCT_REPO))
 os.environ.setdefault("HERMES_MB_WORKDIR", str(WORKDIR))
 os.environ.setdefault("HERMES_MB_PROVIDER", "fastembed")
+# The engine's interval-gated FTS integrity check WRITES metadata timestamps on
+# the read path, which breaks store-freeze sha verification mid-run. Disable
+# startup checks for instrument runs (structural checks + doctor still exist).
+os.environ.setdefault("LCM_FTS_INTEGRITY_CHECK_INTERVAL_HOURS", "-1")
 os.environ.setdefault(
     "LCM_LONGMEMEVAL_FASTEMBED_CACHE",
     "/Volumes/LEXAR/hermes-work/fastembed-cache",
