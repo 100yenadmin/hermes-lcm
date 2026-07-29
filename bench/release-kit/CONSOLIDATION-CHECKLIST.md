@@ -16,7 +16,8 @@ sanity slice below, run ON the consolidated base.
    (#168 acceptance); latency curve still sub-linear and ≤ file-scan at top rung. → F34 verdict doc.
 4. ☑ **V1 sanity slice** (F35 RED → citable fix, 8-round cycle, PR #174 → F36 GREEN: fail-close 16→0, gain real +18/p=4e-05, stable across the rebuild; full-500 confirm triggered): paired ~100q (the F26 slice, known baseline 44/100) on the consolidated base under
    F32 pins — flips within the measured noise reference (≤18 discordant, |net| ≤ 6). Full 500 re-run ONLY if
-   the slice moves beyond that.
+   the slice moves beyond that. → It did; **full-500 confirm GREEN (F37): 455/500, 0 fail-closes, +11 vs
+   banked (p=0.061, reported as measured)** — release V1 number banked, kit slots filled.
 5. ☐ **Fork mono-PR review cycles**: consolidated branch → fork PR → Codex + CodeRabbit + evaOS review bot;
    iterate until a CLEAN ROUND (no new HIGH+ findings), minimum 2 rounds, cap 5 (owner suggested 4–5;
    diminishing-returns stop allowed after 2 clean).

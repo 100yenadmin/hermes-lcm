@@ -1,6 +1,6 @@
 # Hermes-LCM R2 — release notes DRAFT (candour framing, locked by owner 2026-07-29)
 
-> ⚠ DRAFT — placeholders marked ⟨TBD⟩ fill from F34 (Phase 1B) and the sanity slice before publish.
+> Final draft — all measured slots filled (F34 / F36 / F37). Locks at gate 6 after the mono-PR review rounds.
 
 ## We measured where memory systems matter — including our own limits
 
@@ -28,16 +28,21 @@ pinned, reproducible run (methods and finding docs ship in `bench/`):
   Fixed: in-product query sanitization. Re-measured: raw questions now match the sanitized form everywhere — 0% empty at all sizes, latency ratio 1.05 (F34).
 - A missing `store_id` on summary hits could cost whole answers under strict evidence validation (measured
   1.6% of questions on one run). Fixed.
+- Fixing the queries then woke a summary-retrieval arm whose hits carried no verifiable citation, and strict
+  evidence validation destroyed those answers (16% of a failure-enriched slice). Fixed: reference-strict
+  delivery — nothing is delivered that cannot be cited, with citable backfill (fork PR #174). Re-measured:
+  fail-closes 16 → 0 on the slice and 0 of 500 at full scale (F36, F37).
 
 **What we corrected in our own claims:** R1 implied an accuracy advantage; paired re-measurement found none
 (three arms, McNemar null) — the claim is withdrawn and replaced by what the data supports. The full
 correction trail (F20–F33, including three same-day self-corrections and an independent audit that refuted
 two of our own published claims) ships with this release. That trail is the product: numbers you can check.
 
-**Known limitations (published, not buried):** V1-small accuracy is a tie with our previous base by
-construction (retrieval is byte-identical on 96% of questions); the scaling recall claim is shape-only until
+**Known limitations (published, not buried):** V1-small accuracy moved +11 over our previous base
+(455 vs 444) but no full-500 pairing individually clears p<0.05 (p=0.061) — we publish the number with its
+p-value rather than claim a confirmed win; the scaling recall claim is shape-only until
 measured on the production embedding stack; the benchmark harness itself scores certain instrument failures
 as capability losses (reported upstream: LongMemEval-V2 #6, #7).
 
-Scores: LongMemEval-V1 ⟨TBD sanity-slice-confirmed⟩/500 · LongMemEval-V2 agentic 298/451 (66.1%) ·
-full provenance blocks in `bench/`.
+Scores: LongMemEval-V1 **455/500 (91.0%)** (F37; paired vs prior base +11, p=0.061, zero instrument
+fail-closes) · LongMemEval-V2 agentic 298/451 (66.1%) · full provenance blocks in `bench/`.
