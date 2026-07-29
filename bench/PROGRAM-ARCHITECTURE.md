@@ -491,3 +491,23 @@ harness's own deliberate OR-disjunction (FTS recall@10 1.0 → 0.0) — the inst
 The repo's test suite caught it; the author shipped the correct fix (an explicit allow_operators mode split,
 which is what the reviewer's finding actually described). Rule: route findings by restating the defect and its
 repro; if you prescribe a mechanism, the gate-every-caller sweep is YOURS to do first.
+
+**§6e.16 — A fix batch on a measured surface is an UNMEASURED BUILD until its gate re-runs (F42; twice-proven
+across the #171 saga).** The 20-row bot-disposition batch on PR #184 fixed every correctness item and was
+review-clean — and silently broke BOTH performance mechanisms it sat on: the residency registry key drifted
+(the mechanism went dark, no error, exact scoring quietly took over) and an ordered temp table reintroduced an
+O(N) write per query (3.17× WORSE than pre-fix). Nothing in review, tests, or CI saw either; only the
+mandatory confirmation re-run of the frozen gate did. The follow-on repair round then did it AGAIN at smaller
+scale (per-hit staleness rechecks, +334ms/query — F43), caught the same way. Rule: any change batch touching a
+gate-measured surface — however mechanical, however green — re-runs that gate before merge. "The fixes are
+correctness-only" is a prediction, not a measurement; six executions of one gate is what closing #171 actually
+cost, and every re-run earned its keep.
+
+**§6e.17 — A performance mechanism ships with ENGAGEMENT TELEMETRY, asserted as tests on the live path
+(F42/F43/F44).** Both F42 breakages were silent because the mechanism's failure mode is graceful fallback:
+when residency doesn't engage, results stay correct and only the latency claim dies. Speed-ups that degrade
+invisibly need their engagement made observable and asserted: build/hit counters on the resident registry,
+statement-count ceilings on the zero-scan hit path (the F43 repair is pinned by "hit path executes ≤K SQL
+statements"), and the gate run publishing which mechanism actually served each rung
+(`scoring=int8_quantized/float32_exact`). Telemetry written for one debugging session becomes a permanent
+regression test — that conversion, not the fix itself, is what makes the next silent regression impossible.
