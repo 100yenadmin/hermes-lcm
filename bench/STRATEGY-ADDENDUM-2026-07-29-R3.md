@@ -62,3 +62,14 @@ these systems with real frontier models"). Binding consequences:
   STRENGTHENED by the split: we publish under discipline while testing at frontier speed.
 - Official LongMemEval baselines keep their banked meaning; the FRONTIER-reader V1-medium move
   (already owner-ratified) becomes the flagship Tier-P surface going forward.
+
+### Tier-F adoption decision (2026-07-30, survey: TIER-F-AGENTIC-SURVEY.md in the 07-30 deepdive artifacts)
+Ranked by fault-finding value per integration effort: **(1) LongMemEval-V2** — the UCLA sequel to our own
+primary instrument, agent-TRAJECTORY-based (dynamic state, workflow knowledge, environment gotchas; 451
+curated questions confirmed unanswerable without working memory), Apache-2.0, adapter isomorphic to our
+Provider, and THE benchmark the owner personally flagged. **ADOPTED as the next Tier-F build** (after the
+LoCoMo config-fix replay resolves). **(2) AMA-Bench** (MIT, real tool-using agent harness, GPT-5.2 at only
+72% = headroom) — queued second. **(3) MemoryAgentBench** (test-time learning + selective forgetting — the
+only real-time-write instrument found) — watchlist. BEAM re-scored MEDIUM under Tier-F (judge unblocked,
+but dialogue-only scale-stress; no agentic axis); PersonaMem MEDIUM-LOW; GAIA LOW (no memory axis).
+τ²-Bench keeps R4 Tier-P; its memory-specific Tier-F use needs episode-chaining (noted, not funded).
