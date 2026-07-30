@@ -175,9 +175,9 @@ def temporal_trust_wire(
     normalized_certified = certified if isinstance(certified, bool) else None
     normalized_notes: list[str] = []
     for value in notes:
-        note = str(value or "").strip()
+        note = str(value or "").strip()[:_MAX_TEMPORAL_TRUST_NOTE_CHARS]
         if note and note not in normalized_notes:
-            normalized_notes.append(note[:_MAX_TEMPORAL_TRUST_NOTE_CHARS])
+            normalized_notes.append(note)
         if len(normalized_notes) >= _MAX_TEMPORAL_TRUST_NOTES:
             break
     return {

@@ -228,7 +228,7 @@ Round-3 acceptance proof:
 - Exact CI slice above: **60 passed**.
 - Batch acceptance suite above: **91 passed**.
 - Upstream-affected suite above: **166 passed**.
-- Full changed/affected-file `ruff check`: **all checks passed**.
+- Changed-file `ruff check` (the explicit command above) plus the Round-6/CI-exercised test files (`tests/test_chunk_vector_store.py`, `tests/test_trajectory_composition_policies.py`, `tests/test_trajectory_state_semantic_expansion.py`, verified separately): **all checks passed**.
 - `git diff --check`: **clean**.
 
 Delivery checkpoint: **COMPLETE** for the named local Round-3 disposition gate;
@@ -263,7 +263,7 @@ Round-4 acceptance proof:
 - Exact CI slice above: **60 passed**.
 - Batch acceptance suite above: **92 passed**.
 - Upstream-affected suite above: **167 passed**.
-- Full changed/affected-file `ruff check`: **all checks passed**.
+- Changed-file `ruff check` (the explicit command above) plus the Round-6/CI-exercised test files (`tests/test_chunk_vector_store.py`, `tests/test_trajectory_composition_policies.py`, `tests/test_trajectory_state_semantic_expansion.py`, verified separately): **all checks passed**.
 - `git diff --check`: **clean**.
 
 Delivery checkpoint: **COMPLETE** for the named local Round-4 disposition gate;
@@ -301,7 +301,7 @@ Round-5 acceptance proof:
 - Batch acceptance suite above: **94 passed**.
 - Upstream-affected suite above: **168 passed**.
 - Full `tests/test_lcm_recall.py` affected suite: **102 passed**.
-- Full changed/affected-file `ruff check`: **all checks passed**.
+- Changed-file `ruff check` (the explicit command above) plus the Round-6/CI-exercised test files (`tests/test_chunk_vector_store.py`, `tests/test_trajectory_composition_policies.py`, `tests/test_trajectory_state_semantic_expansion.py`, verified separately): **all checks passed**.
 - `git diff --check`: **clean**.
 
 Delivery checkpoint: **COMPLETE** for the named local Round-5 disposition gate;
@@ -344,7 +344,7 @@ Round-6 acceptance proof:
 - Batch acceptance suite: **99 passed**.
 - Upstream-affected suite: **169 passed**.
 - Full `tests/test_lcm_recall.py` suite: **102 passed**.
-- Full changed/affected-file `ruff check`: **all checks passed**.
+- Changed-file `ruff check` (the explicit command above) plus the Round-6/CI-exercised test files (`tests/test_chunk_vector_store.py`, `tests/test_trajectory_composition_policies.py`, `tests/test_trajectory_state_semantic_expansion.py`, verified separately): **all checks passed**.
 - `git diff --check`: **clean**.
 
 Delivery checkpoint: **COMPLETE** for the named local Round-6 final full-round
