@@ -2974,7 +2974,6 @@ class VectorStore:
                     coverage="bounded",
                     scoring="int8_quantized",
                     scanned=exc.scanned,
-                    total=self._count_embedded_vectors(identity, chunk=False),
                 )
 
         # Two-stage full-corpus path when this identity's sign-bit prescreen is a
@@ -3014,7 +3013,6 @@ class VectorStore:
                     coverage="bounded",
                     scoring=exact_scoring,
                     scanned=exc.scanned,
-                    total=self._count_embedded_vectors(identity, chunk=False),
                 )
             if binary_matrix.shape[0] == 0:
                 return KNNResult(coverage="none", scoring=exact_scoring)
@@ -3084,7 +3082,6 @@ class VectorStore:
                 coverage="bounded",
                 scoring=exact_scoring,
                 scanned=exc.scanned,
-                total=self._count_embedded_vectors(identity, chunk=False),
             )
         if not probed_ids:
             return KNNResult(coverage="none", scoring=exact_scoring)
@@ -3126,7 +3123,8 @@ class VectorStore:
                 scanned = total = None
                 if coverage == "bounded":
                     scanned = scanned_rows
-                    total = self._count_embedded_vectors(identity, chunk=False)
+                    if not stopped_early:
+                        total = self._count_embedded_vectors(identity, chunk=False)
                 return KNNResult(
                     candidates,
                     coverage=coverage,
@@ -3179,7 +3177,8 @@ class VectorStore:
         scanned = total = None
         if coverage == "bounded":
             scanned = scanned_rows
-            total = self._count_embedded_vectors(identity, chunk=False)
+            if not stopped_early:
+                total = self._count_embedded_vectors(identity, chunk=False)
         return KNNResult(
             candidates,
             coverage=coverage,
@@ -3726,7 +3725,6 @@ class VectorStore:
                     coverage="bounded",
                     scoring="int8_quantized",
                     scanned=exc.scanned,
-                    total=self._count_embedded_vectors(identity, chunk=True),
                 )
 
         # Two-stage full-corpus path when this chunk identity's sign-bit prescreen
@@ -3769,7 +3767,6 @@ class VectorStore:
                     coverage="bounded",
                     scoring=exact_scoring,
                     scanned=exc.scanned,
-                    total=self._count_embedded_vectors(identity, chunk=True),
                 )
             if binary_matrix.shape[0] == 0:
                 return KNNResult(coverage="none", scoring=exact_scoring)
@@ -3829,7 +3826,6 @@ class VectorStore:
                 coverage="bounded",
                 scoring=exact_scoring,
                 scanned=exc.scanned,
-                total=self._count_embedded_vectors(identity, chunk=True),
             )
         if not probed_ids:
             return KNNResult(coverage="none", scoring=exact_scoring)
@@ -3869,7 +3865,8 @@ class VectorStore:
                 scanned = total = None
                 if coverage == "bounded":
                     scanned = scanned_rows
-                    total = self._count_embedded_vectors(identity, chunk=True)
+                    if not stopped_early:
+                        total = self._count_embedded_vectors(identity, chunk=True)
                 return KNNResult(
                     candidates,
                     coverage=coverage,
@@ -3909,7 +3906,8 @@ class VectorStore:
         scanned = total = None
         if coverage == "bounded":
             scanned = scanned_rows
-            total = self._count_embedded_vectors(identity, chunk=True)
+            if not stopped_early:
+                total = self._count_embedded_vectors(identity, chunk=True)
         return KNNResult(
             candidates,
             coverage=coverage,

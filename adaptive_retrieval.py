@@ -1209,6 +1209,7 @@ class AdaptiveRetrievalRegistry:
                     )
                     if key in raw_trace
                 }
+            selected_refs = {item.citation for item in selected}
             manifest = {
                 "closed_slots": sorted(state.slot_refs),
                 "open_slots": [],
@@ -1219,7 +1220,10 @@ class AdaptiveRetrievalRegistry:
                     "complete": True,
                     "requirements_digest": state.identity.requirements_digest,
                     "slot_refs": {
-                        key: list(value) for key, value in sorted(state.slot_refs.items())
+                        key: [
+                            ref for ref in value if ref in selected_refs
+                        ]
+                        for key, value in sorted(state.slot_refs.items())
                     },
                     "retrieval_rounds": len(state.rounds),
                     "candidate_refs": len(state.candidates),
@@ -1240,7 +1244,12 @@ class AdaptiveRetrievalRegistry:
             return {"status": "building_elsewhere"}
         except Exception as exc:
             if token is not None:
-                self._query_views.mark_failed(token, str(exc))
+                try:
+                    self._query_views.mark_failed(token, str(exc))
+                except Exception:
+                    # Cleanup is best-effort and must never replace the build
+                    # failure that selected this response contract.
+                    pass
             return {"status": "failed", "reason": str(exc)[:500]}
 
     def finish(

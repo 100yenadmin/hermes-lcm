@@ -272,6 +272,82 @@ def test_exact_slot_closure_compute_finish_and_warm_reuse(tmp_path):
         engine.shutdown()
 
 
+def test_persisted_slot_refs_include_only_selected_evidence(tmp_path):
+    engine = _engine(tmp_path)
+    try:
+        paris_id = _append(engine, "I visited Paris.")
+        rome_id = _append(engine, "I visited Rome.")
+        started = _start(engine)
+        found = _call(
+            engine,
+            action="search",
+            retrieval_id=started["retrieval_id"],
+            missing_slot="visits",
+            tool="lcm_load_session",
+            tool_args={"session_id": "session-a", "limit": 8},
+        )
+        refs_by_store_id = {
+            item["store_id"]: item["citation"] for item in found["evidence"]
+        }
+        first_ref = refs_by_store_id[paris_id]
+        second_ref = refs_by_store_id[rome_id]
+
+        finished = _call(
+            engine,
+            action="finish",
+            retrieval_id=started["retrieval_id"],
+            resolved_slots=[{
+                "slot_id": "visits",
+                "evidence_refs": [first_ref, second_ref],
+            }],
+            selected_refs=[first_ref],
+        )
+        assert finished["query_view"]["persistence"]["status"] == "published"
+
+        warm = _start(engine)
+        assert warm["status"] == "ready"
+        assert warm["query_view"]["status"] == "hit"
+        assert [item["citation"] for item in warm["evidence"]] == [first_ref]
+    finally:
+        engine.shutdown()
+
+
+def test_query_view_cleanup_cannot_replace_the_build_failure(
+    tmp_path, monkeypatch
+):
+    engine = _engine(tmp_path)
+    try:
+        store_id = _append(engine, "I visited Paris.")
+        started = _start(engine)
+        found = _search(engine, started["retrieval_id"], store_id)
+        exact_ref = found["evidence"][0]["citation"]
+
+        def fail_publish(*args, **kwargs):
+            raise ValueError("publish failed")
+
+        def fail_cleanup(*args, **kwargs):
+            raise RuntimeError("cleanup failed")
+
+        monkeypatch.setattr(engine._query_views, "publish_ready", fail_publish)
+        monkeypatch.setattr(engine._query_views, "mark_failed", fail_cleanup)
+        finished = _call(
+            engine,
+            action="finish",
+            retrieval_id=started["retrieval_id"],
+            resolved_slots=[{
+                "slot_id": "visits",
+                "evidence_refs": [exact_ref],
+            }],
+            selected_refs=[exact_ref],
+        )
+
+        persistence = finished["query_view"]["persistence"]
+        assert persistence["status"] == "failed"
+        assert persistence["reason"] == "publish failed"
+    finally:
+        engine.shutdown()
+
+
 def test_requirements_digest_distinguishes_descriptions():
     """requirements_digest() must not collide two requirements that share
     slot_id/minimum_refs but describe different evidence -- description is

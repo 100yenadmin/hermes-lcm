@@ -13,7 +13,7 @@ from datetime import date, datetime, timedelta, timezone
 import calendar
 import math
 import re
-from typing import Any, Literal, Sequence
+from typing import Any, Literal, Mapping, Sequence
 
 from .assertion_state import query_assertion_state
 from .assertion_store import AssertionStore
@@ -82,11 +82,50 @@ _MONTHS.update({
 })
 
 
-def resolve_occurrence_time(text: Any, *, observed_at: Any, session_date: Any = None):
+def resolve_occurrence_time(
+    text: Any,
+    *,
+    observed_at: Any,
+    session_date: Any = None,
+    engine: Any = None,
+    session_id: Any = None,
+):
     """Lazy import keeps plugin bootstrap order independent of this optional parser."""
     from .occurrence_time import resolve_occurrence_time as _resolve
 
-    return _resolve(text, observed_at=observed_at, session_date=session_date)
+    caller_session_date = str(session_date or "").strip() or None
+    sidecar_dates = getattr(engine, "_session_occurrence_dates", {}) or {}
+    session_key = str(session_id or "")
+    sidecar_session_date = (
+        str(sidecar_dates.get(session_key) or "").strip() or None
+        if isinstance(sidecar_dates, Mapping) and session_key
+        else None
+    )
+    overridden = bool(
+        sidecar_session_date
+        and caller_session_date
+        and caller_session_date != sidecar_session_date
+    )
+    anchor = sidecar_session_date or caller_session_date
+    result = _resolve(text, observed_at=observed_at, session_date=anchor)
+    if sidecar_session_date:
+        result["anchor_trust"] = "engine_sidecar"
+        result["temporal_certified"] = True
+        result["session_date_overridden"] = overridden
+        if overridden:
+            result["trust_note"] = (
+                f"caller session_date {caller_session_date} overridden by "
+                f"engine sidecar {sidecar_session_date}"
+            )
+    else:
+        result["anchor_trust"] = "low_trust"
+        result["temporal_certified"] = False
+        result["session_date_overridden"] = False
+        result["trust_note"] = (
+            f"engine occurrence-date sidecar absent for session "
+            f"{session_key or '<unknown>'}; temporal result is low-trust"
+        )
+    return result
 
 
 @dataclass(frozen=True)
@@ -167,6 +206,10 @@ class GroundedEvidence:
     unresolved_conflict: bool | None
     group_active_assertion_ids: tuple[str, ...]
     group_state_truncated: bool
+    temporal_trust: Literal[
+        "not_applicable", "engine_sidecar", "low_trust"
+    ] = "not_applicable"
+    temporal_notes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -174,6 +217,11 @@ class GroundingDecision:
     status: Literal["grounded", "fallback"]
     operands: tuple[GroundedEvidence, ...] = ()
     reason: str = ""
+    temporal_trust: Literal[
+        "not_applicable", "engine_sidecar", "low_trust"
+    ] = "not_applicable"
+    temporal_certified: bool | None = None
+    notes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -375,7 +423,14 @@ def compile_evidence_plan(question: str, question_date: Any = None) -> PlanDecis
     order: Literal["ascending", "descending"] | None = None
     requires_complete = False
     interval_unit: Literal["day", "week", "month"] = "day"
-    if re.search(
+    if re.search(r"\bhow long ago\b", normalized):
+        if question_anchor is None:
+            return PlanDecision(
+                "fallback",
+                reason="question needs a valid question date for deterministic temporal planning",
+            )
+        operation, exact, minimum = "date_interval", 1, 1
+    elif re.search(
         r"\b(how long|time between|interval between|how many\s+(?:calendar\s+)?days?\s+between|since when)\b",
         normalized,
     ):
@@ -627,6 +682,7 @@ def _ground_one(
     messages: MessageStore,
     assertions: AssertionStore | None,
     as_of: float | None,
+    engine: Any = None,
 ) -> tuple[GroundedEvidence | None, str | None]:
     if not isinstance(raw, dict):
         return None, "each operand must be an object"
@@ -749,6 +805,11 @@ def _ground_one(
     evidence_day = assertion_day
 
     occurrence_day = None
+    resolved_occurrence: Mapping[str, Any] | None = None
+    temporal_trust: Literal[
+        "not_applicable", "engine_sidecar", "low_trust"
+    ] = "not_applicable"
+    temporal_notes: tuple[str, ...] = ()
     raw_occurrence = raw.get("occurrence_time")
     if raw_occurrence is not None:
         if not isinstance(raw_occurrence, dict):
@@ -761,12 +822,22 @@ def _ground_one(
                 else stored.get("timestamp")
             ),
             session_date=raw_occurrence.get("session_date"),
+            engine=engine,
+            session_id=stored.get("session_id"),
         )
+        resolved_occurrence = resolved
+        temporal_trust = str(resolved["anchor_trust"])  # type: ignore[assignment]
+        note = str(resolved.get("trust_note") or "").strip()
+        temporal_notes = (note,) if note else ()
         supplied_source = str(raw_occurrence.get("event_time_source") or "")
         if supplied_source != resolved["event_time_source"]:
             return None, "occurrence_time source is not supported by the exact quote"
         supplied_date = str(raw_occurrence.get("event_date") or "").strip()
-        if supplied_date and supplied_date != str(resolved.get("event_date") or ""):
+        if (
+            supplied_date
+            and supplied_date != str(resolved.get("event_date") or "")
+            and not resolved.get("session_date_overridden")
+        ):
             return None, "occurrence_time date is not supported by the exact quote"
         occurrence_day = _parse_day(str(resolved.get("event_date") or ""))
         evidence_day = occurrence_day or evidence_day
@@ -776,11 +847,18 @@ def _ground_one(
         claimed_day = _parse_day(raw_date)
         if claimed_day is None:
             return None, f"date {raw_date!r} is invalid or timezone-ambiguous"
-        if claimed_day not in {assertion_day, occurrence_day} and not _quote_supports_day(
-            quote, claimed_day, raw_date
-        ):
+        claimed_supported = (
+            claimed_day in {assertion_day, occurrence_day}
+            or _quote_supports_day(quote, claimed_day, raw_date)
+        )
+        occurrence_overridden = bool(
+            resolved_occurrence
+            and resolved_occurrence.get("session_date_overridden")
+        )
+        if not claimed_supported and not occurrence_overridden:
             return None, f"date {raw_date!r} is not supported by metadata or exact quote"
-        evidence_day = claimed_day
+        if not occurrence_overridden:
+            evidence_day = claimed_day
 
     if as_of is not None:
         source_observation_grounded = False
@@ -800,8 +878,10 @@ def _ground_one(
             if not math.isfinite(stored_observed_at) or stored_observed_at > as_of:
                 return None, "source was observed after the question-date boundary"
             source_observation_grounded = True
-        elif raw_occurrence is not None and raw_occurrence.get("session_date"):
-            source_observed_day = _parse_day(str(raw_occurrence.get("session_date")))
+        elif resolved_occurrence is not None and resolved_occurrence.get("session_date"):
+            source_observed_day = _parse_day(
+                str(resolved_occurrence.get("session_date"))
+            )
             if source_observed_day is None:
                 return None, "occurrence_time session_date is invalid"
             source_observed_epoch = datetime.combine(
@@ -849,6 +929,8 @@ def _ground_one(
         unresolved_conflict=conflict,
         group_active_assertion_ids=group_active_ids,
         group_state_truncated=group_truncated,
+        temporal_trust=temporal_trust,
+        temporal_notes=temporal_notes,
     ), None
 
 
@@ -858,6 +940,7 @@ def ground_evidence(
     messages: MessageStore,
     assertions: AssertionStore | None,
     as_of: float | None = None,
+    engine: Any = None,
 ) -> GroundingDecision:
     if not isinstance(raw_operands, list):
         return GroundingDecision("fallback", reason="operands must be an array")
@@ -872,11 +955,37 @@ def ground_evidence(
             messages=messages,
             assertions=assertions,
             as_of=as_of,
+            engine=engine,
         )
         if error:
             return GroundingDecision("fallback", reason=f"operands[{index}]: {error}")
         grounded.append(operand)  # type: ignore[arg-type]
-    return GroundingDecision("grounded", operands=tuple(grounded))
+    temporal = [
+        operand
+        for operand in grounded
+        if operand.temporal_trust != "not_applicable"
+    ]
+    notes = tuple(dict.fromkeys(
+        note
+        for operand in temporal
+        for note in operand.temporal_notes
+    ))
+    if any(operand.temporal_trust == "low_trust" for operand in temporal):
+        trust = "low_trust"
+        certified = False
+    elif temporal:
+        trust = "engine_sidecar"
+        certified = True
+    else:
+        trust = "not_applicable"
+        certified = None
+    return GroundingDecision(
+        "grounded",
+        operands=tuple(grounded),
+        temporal_trust=trust,
+        temporal_certified=certified,
+        notes=notes,
+    )
 
 
 def _format_number(value: float) -> str:

@@ -83,6 +83,14 @@ def test_activation_uses_only_question_language_and_fails_closed():
 
 
 def test_planner_uses_explicit_cardinality_and_interval_units():
+    how_long_ago = compile_evidence_plan(
+        "How long ago did I complete the challenge?",
+        "2023-03-20",
+    )
+    assert how_long_ago.status == "planned"
+    assert how_long_ago.plan.operation == "date_interval"
+    assert how_long_ago.plan.exact_operands == 1
+
     interval = compile_evidence_plan(
         "How many weeks had passed since I recovered when I went jogging?",
         "2024-03-20",
@@ -179,6 +187,119 @@ def test_relative_occurrence_time_grounds_without_aliasing_late_observation(evid
     )
     assert decision.status == "grounded", decision.reason
     assert decision.operands[0].evidence_date == date(2023, 3, 15)
+
+
+def test_compute_accepts_caller_anchor_only_when_it_agrees_with_sidecar(evidence_db):
+    messages, assertions = evidence_db
+    content = "I completed the plank challenge 5 days ago."
+    store_id = messages.append("session-a", {"role": "user", "content": content})
+    occurrence = {
+        "event_date": "2023-03-15",
+        "event_time_source": "relative_to_session",
+        "session_date": "2023-03-20",
+    }
+    response = json.loads(lcm_compute(
+        {
+            "question": "How long ago did I complete the plank challenge?",
+            "question_date": "2023-03-20",
+            "operands": [
+                _raw(
+                    store_id,
+                    content,
+                    content,
+                    date="2023-03-15",
+                    occurrence_time=occurrence,
+                )
+            ],
+        },
+        engine=SimpleNamespace(
+            _store=messages,
+            _assertions=assertions,
+            _session_occurrence_dates={"session-a": "2023-03-20"},
+        ),
+    ))
+
+    assert response["status"] == "computed"
+    assert response["trace"]["result_value"] == 5
+    assert response["temporal_trust"] == {
+        "status": "engine_sidecar",
+        "certified": True,
+        "notes": [],
+    }
+
+
+def test_compute_sidecar_overrides_disagreeing_caller_anchor(evidence_db):
+    messages, assertions = evidence_db
+    content = "I completed the plank challenge 5 days ago."
+    store_id = messages.append("session-a", {"role": "user", "content": content})
+    response = json.loads(lcm_compute(
+        {
+            "question": "How long ago did I complete the plank challenge?",
+            "question_date": "2023-03-20",
+            "operands": [
+                _raw(
+                    store_id,
+                    content,
+                    content,
+                    date="2023-03-16",
+                    occurrence_time={
+                        "event_date": "2023-03-16",
+                        "event_time_source": "relative_to_session",
+                        "session_date": "2023-03-21",
+                    },
+                )
+            ],
+        },
+        engine=SimpleNamespace(
+            _store=messages,
+            _assertions=assertions,
+            _session_occurrence_dates={"session-a": "2023-03-20"},
+        ),
+    ))
+
+    assert response["status"] == "computed"
+    assert response["trace"]["result_value"] == 5
+    assert response["trace"]["evidence_dates"] == ["2023-03-15"]
+    assert response["temporal_trust"]["certified"] is True
+    assert response["temporal_trust"]["notes"] == [
+        "caller session_date 2023-03-21 overridden by engine sidecar 2023-03-20"
+    ]
+
+
+def test_compute_without_sidecar_marks_temporal_result_low_trust(evidence_db):
+    messages, assertions = evidence_db
+    content = "I completed the plank challenge 5 days ago."
+    store_id = messages.append("session-a", {"role": "user", "content": content})
+    response = json.loads(lcm_compute(
+        {
+            "question": "How long ago did I complete the plank challenge?",
+            "question_date": "2023-03-20",
+            "operands": [
+                _raw(
+                    store_id,
+                    content,
+                    content,
+                    date="2023-03-15",
+                    occurrence_time={
+                        "event_date": "2023-03-15",
+                        "event_time_source": "relative_to_session",
+                        "session_date": "2023-03-20",
+                    },
+                )
+            ],
+        },
+        engine=SimpleNamespace(
+            _store=messages,
+            _assertions=assertions,
+            _session_occurrence_dates={},
+        ),
+    ))
+
+    assert response["status"] == "computed"
+    assert response["trace"]["result_value"] == 5
+    assert response["temporal_trust"]["status"] == "low_trust"
+    assert response["temporal_trust"]["certified"] is False
+    assert "sidecar absent" in response["temporal_trust"]["notes"][0]
 
 
 def test_session_sidecar_cannot_override_real_host_observation_after_as_of(evidence_db):

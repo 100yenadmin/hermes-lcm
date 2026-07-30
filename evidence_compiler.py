@@ -1234,7 +1234,7 @@ def compile_evidence(
         request["exhaustive"]
         and isinstance(expected, int)
         and expected > 0
-        and len(validated) == expected
+        and len({item["exact_ref"] for item in validated}) == expected
         and not missing
         and not rejections
     )

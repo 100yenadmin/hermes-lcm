@@ -696,6 +696,7 @@ def lcm_compute(args: Dict[str, Any], **kwargs) -> str:
             messages=engine._store,
             assertions=getattr(engine, "_assertions", None),
             as_of=as_of,
+            engine=engine,
         )
     except (TypeError, ValueError, sqlite3.Error) as exc:
         grounding = None
@@ -755,6 +756,7 @@ def lcm_compute(args: Dict[str, Any], **kwargs) -> str:
         status="validated",
         evidence_complete=bool(args.get("evidence_complete") is True),
         operand_count=len(grounding.operands),
+        temporal_certified=grounding.temporal_certified,
     )
 
     executor_started = time.perf_counter()
@@ -832,6 +834,11 @@ def lcm_compute(args: Dict[str, Any], **kwargs) -> str:
         "trace": trace.as_dict(),
         "answer": answer,
         "candidate_verification": verification_payload,
+        "temporal_trust": {
+            "status": grounding.temporal_trust,
+            "certified": grounding.temporal_certified,
+            "notes": list(grounding.notes),
+        },
         "provenance": {
             "runtime_inputs": ["question", "question_date", "exact_retrieved_evidence"],
             "stages": stages,
@@ -5548,6 +5555,8 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
                     (hydrated or {}).get("content") or hit.get("snippet") or "",
                     observed_at=source_observed_at or 0,
                     session_date=session_date,
+                    engine=engine,
+                    session_id=hit.get("session_id"),
                 )
                 occurrence["stored_at"] = source_row.get("ingested_at") or source_row.get("timestamp")
                 item["occurrence_time"] = occurrence

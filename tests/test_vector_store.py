@@ -697,6 +697,52 @@ def test_summary_int8_full_scan_uses_exact_residency(tmp_path, monkeypatch):
         dag.close()
 
 
+def test_resident_deadline_does_not_start_a_count_query(tmp_path, monkeypatch):
+    db_path = tmp_path / "resident-deadline.db"
+    dag = SummaryDAG(db_path)
+    store = VectorStore(
+        db_path,
+        config=LCMConfig(knn_resident_max_mb=1),
+        bounded_scan_rows=1,
+    )
+    try:
+        _seed_scan_corpus(
+            dag,
+            store,
+            3,
+            gold_vector=[1.0, 0.0, 0.0],
+            filler_vector=[0.0, 1.0, 0.0],
+        )
+
+        def expire(*args, **kwargs):
+            raise vector_store_module._PrescreenDeadlineExpired(1)
+
+        def count_after_deadline(*args, **kwargs):
+            raise AssertionError("deadline expiry must not start COUNT(*)")
+
+        monkeypatch.setattr(
+            store, "_resident_int8_matrix", lambda *args, **kwargs: object()
+        )
+        monkeypatch.setattr(store, "_rank_resident_int8", expire)
+        monkeypatch.setattr(
+            store, "_count_embedded_vectors", count_after_deadline
+        )
+        result = store.knn(
+            [1.0, 0.0, 0.0],
+            k=1,
+            model="scan",
+            full_scan=True,
+            deadline=vector_store_module._monotonic() + 60.0,
+        )
+
+        assert result.coverage == "bounded"
+        assert result.scanned == 1
+        assert result.total is None
+    finally:
+        store.close()
+        dag.close()
+
+
 @pytest.fixture
 def empty_resident_registry():
     registry = vector_store_module._RESIDENT_MATRIX_REGISTRY
@@ -1399,6 +1445,9 @@ def test_full_scan_budget_stops_early_and_reports_bounded(tmp_path, monkeypatch)
             now = [0.0]
             original_load = VectorStore._vectorized_batch
 
+            def count_after_deadline(*args, **kwargs):
+                raise AssertionError("deadline expiry must not start COUNT(*)")
+
             def timed_load(np, rows, dim, dtype):
                 loaded = original_load(np, rows, dim, dtype)
                 now[0] = 1.0
@@ -1410,6 +1459,9 @@ def test_full_scan_budget_stops_early_and_reports_bounded(tmp_path, monkeypatch)
             clock_patch.setattr(
                 VectorStore, "_vectorized_batch", staticmethod(timed_load)
             )
+            clock_patch.setattr(
+                store, "_count_embedded_vectors", count_after_deadline
+            )
             result = store.knn(
                 [1.0, 0.0, 0.0],
                 k=1,
@@ -1420,7 +1472,7 @@ def test_full_scan_budget_stops_early_and_reports_bounded(tmp_path, monkeypatch)
 
         assert result.coverage == "bounded"
         assert result.scanned == 2
-        assert result.total == 6
+        assert result.total is None
         assert str(gold) not in {row[0] for row in result}
     finally:
         store.close()
@@ -1513,9 +1565,15 @@ def test_full_scan_budget_includes_candidate_enumeration(tmp_path, monkeypatch):
             now[0] = 1.0
             return candidate_ids
 
+        def count_after_deadline(*args, **kwargs):
+            raise AssertionError("deadline expiry must not start COUNT(*)")
+
         monkeypatch.setattr(vector_store_module, "_monotonic", lambda: now[0])
         monkeypatch.setattr(
             VectorStore, "_bounded_candidate_ids", slow_enumeration
+        )
+        monkeypatch.setattr(
+            store, "_count_embedded_vectors", count_after_deadline
         )
 
         result = store.knn(
@@ -1528,6 +1586,7 @@ def test_full_scan_budget_includes_candidate_enumeration(tmp_path, monkeypatch):
 
         assert result.coverage == "bounded"
         assert result.scanned == 0
+        assert result.total is None
         assert result == []
     finally:
         store.close()
@@ -1553,6 +1612,9 @@ def test_full_scan_absolute_deadline_stops_between_batches(tmp_path, monkeypatch
             now = [0.0]
             original_load = VectorStore._vectorized_batch
 
+            def count_after_deadline(*args, **kwargs):
+                raise AssertionError("deadline expiry must not start COUNT(*)")
+
             def timed_load(np, rows, dim, dtype):
                 loaded = original_load(np, rows, dim, dtype)
                 now[0] = 2.0
@@ -1563,6 +1625,9 @@ def test_full_scan_absolute_deadline_stops_between_batches(tmp_path, monkeypatch
             )
             clock_patch.setattr(
                 VectorStore, "_vectorized_batch", staticmethod(timed_load)
+            )
+            clock_patch.setattr(
+                store, "_count_embedded_vectors", count_after_deadline
             )
             result = store.knn(
                 [1.0, 0.0, 0.0],
@@ -1575,7 +1640,7 @@ def test_full_scan_absolute_deadline_stops_between_batches(tmp_path, monkeypatch
 
         assert result.coverage == "bounded"
         assert result.scanned == 2
-        assert result.total == 6
+        assert result.total is None
         assert str(gold) not in {row[0] for row in result}
     finally:
         store.close()

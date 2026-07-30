@@ -12,6 +12,7 @@ import pytest
 
 from hermes_lcm.store import MessageStore
 from hermes_lcm.trajectory_store import (
+    TRAJECTORY_SCHEMA_VERSION,
     CorpusIdentity,
     CorpusIdentityError,
     ExactTrajectoryRefError,
@@ -106,6 +107,74 @@ def _source(
     )
 
 
+def _ranked_source(
+    asset_root: Path,
+    index: int,
+    *,
+    with_adjacent: bool,
+) -> TrajectorySource:
+    states = []
+    state_payloads = []
+    texts = [f"Priorityneedle ranked evidence {index:02d}."]
+    if with_adjacent:
+        texts.append(f"Adjacent context for ranked evidence {index:02d}.")
+    for state_index, text in enumerate(texts):
+        screenshot = asset_root / f"ranked-{index}-{state_index}.png"
+        screenshot.write_bytes(f"ranked-{index}-{state_index}".encode())
+        state = TrajectoryState(
+            state_index=state_index,
+            step=state_index,
+            url=f"https://example.test/ranked/{index}/{state_index}",
+            incoming_action=None if state_index == 0 else "Open details",
+            thoughts="Inspect ranked evidence.",
+            text=text,
+            screenshot_path=screenshot,
+        )
+        states.append(state)
+        state_payloads.append({
+            "state_index": state.state_index,
+            "step": state.step,
+            "url": state.url,
+            "action": state.incoming_action,
+            "thoughts": state.thoughts,
+            "text": state.text,
+            "screenshot": screenshot.name,
+        })
+    trajectory_id = f"ranked-{index:02d}"
+    return TrajectorySource(
+        trajectory_id=trajectory_id,
+        ordinal=index,
+        goal="Find ranked evidence",
+        start_url=f"https://example.test/ranked/{index}",
+        outcome="Evidence found",
+        states=tuple(states),
+        source_payload={
+            "id": trajectory_id,
+            "goal": "Find ranked evidence",
+            "outcome": "Evidence found",
+            "states": state_payloads,
+        },
+    )
+
+
+def _ranked_store(tmp_path: Path, *, adjacent_sources: int) -> TrajectoryStore:
+    db_path = tmp_path / "lcm.db"
+    asset_root = tmp_path / "assets"
+    asset_root.mkdir()
+    store = TrajectoryStore(db_path, _identity(), asset_root=asset_root)
+    trajectory_ids = []
+    for index in range(20):
+        source = _ranked_source(
+            asset_root,
+            index,
+            with_adjacent=index < adjacent_sources,
+        )
+        store.insert(source)
+        trajectory_ids.append(source.trajectory_id)
+    store.finalize(trajectory_ids)
+    return store
+
+
 @pytest.fixture
 def trajectory_db(tmp_path: Path):
     db_path = tmp_path / "lcm.db"
@@ -189,6 +258,32 @@ def test_corpus_identity_is_strict_and_read_only_open_does_not_mutate(tmp_path: 
     finally:
         readonly.close()
     assert db_path.stat().st_mtime_ns == before
+
+
+def test_newer_trajectory_schema_is_rejected_before_fts_repair(tmp_path: Path):
+    db_path = tmp_path / "lcm.db"
+    asset_root = tmp_path / "assets"
+    asset_root.mkdir()
+    store = TrajectoryStore(db_path, _identity(), asset_root=asset_root)
+    store.close()
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE lcm_trajectory_corpora SET schema_version=? WHERE singleton=1",
+            (TRAJECTORY_SCHEMA_VERSION + 1,),
+        )
+        conn.execute("DROP TABLE lcm_trajectory_states_fts")
+        conn.commit()
+
+    with pytest.raises(CorpusIdentityError):
+        TrajectoryStore(db_path, _identity(), asset_root=asset_root)
+
+    with sqlite3.connect(db_path) as conn:
+        fts = conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE name='lcm_trajectory_states_fts'"
+        ).fetchone()
+    assert fts is None
 
 
 def test_insert_is_idempotent_and_conflicting_source_fails(trajectory_db):
@@ -368,6 +463,58 @@ def test_bounded_fts_returns_stable_exact_refs_and_late_adjacent_state(trajector
 
     with pytest.raises(ExactTrajectoryRefError):
         store.resolve_exact_ref("trajectory://wrong/trajectory-a/state/1")
+
+
+def test_unused_adjacency_reserve_backfills_the_full_ranked_limit(tmp_path: Path):
+    store = _ranked_store(tmp_path, adjacent_sources=0)
+    try:
+        ranked = store.query("priorityneedle", limit=16, include_adjacent=False)
+        with_reserve = store.query(
+            "priorityneedle", limit=16, include_adjacent=True
+        )
+    finally:
+        store.close()
+
+    assert len(ranked) == 16
+    assert [hit.exact_ref for hit in with_reserve] == [
+        hit.exact_ref for hit in ranked
+    ]
+
+
+def test_partial_adjacency_reserve_backfills_in_rank_order(tmp_path: Path):
+    store = _ranked_store(tmp_path, adjacent_sources=1)
+    try:
+        ranked = store.query("priorityneedle", limit=16, include_adjacent=False)
+        with_reserve = store.query(
+            "priorityneedle", limit=16, include_adjacent=True
+        )
+    finally:
+        store.close()
+
+    non_adjacent = [
+        hit.exact_ref for hit in with_reserve if hit.match_kind != "adjacent"
+    ]
+    assert len(with_reserve) == 16
+    assert sum(hit.match_kind == "adjacent" for hit in with_reserve) == 1
+    assert non_adjacent == [hit.exact_ref for hit in ranked[:15]]
+    assert non_adjacent[-4:] == [hit.exact_ref for hit in ranked[11:15]]
+
+
+def test_full_adjacency_reserve_keeps_the_existing_composition(tmp_path: Path):
+    store = _ranked_store(tmp_path, adjacent_sources=11)
+    try:
+        ranked = store.query("priorityneedle", limit=16, include_adjacent=False)
+        with_reserve = store.query(
+            "priorityneedle", limit=16, include_adjacent=True
+        )
+    finally:
+        store.close()
+
+    assert len(with_reserve) == 16
+    assert [hit.exact_ref for hit in with_reserve[:11]] == [
+        hit.exact_ref for hit in ranked[:11]
+    ]
+    assert all(hit.match_kind == "adjacent" for hit in with_reserve[11:])
 
 
 def test_query_text_is_a_bounded_exact_excerpt_and_ref_hydrates_full_state(tmp_path: Path):

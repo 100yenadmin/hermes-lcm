@@ -264,6 +264,34 @@ def test_exact_typed_repeat_hits_promotes_and_near_miss_never_reuses(view_db):
         assert views.lookup(near_miss).status == "miss"
 
 
+def test_hit_confirmation_rechecks_generation_after_source_mutation(
+    view_db, monkeypatch
+):
+    messages, views = view_db
+    content = "I prefer tea."
+    store_id = _append(messages, content)
+    dependency = _dependency(views, store_id, content)
+    identity = _identity()
+    _publish(views, identity, [dependency])
+    original_snapshot = views.corpus_snapshot
+
+    def snapshot_then_mutate():
+        snapshot = original_snapshot()
+        messages._conn.execute(
+            "UPDATE messages SET content='I prefer coffee.' WHERE store_id=?",
+            (store_id,),
+        )
+        messages._conn.commit()
+        return snapshot
+
+    monkeypatch.setattr(views, "corpus_snapshot", snapshot_then_mutate)
+    result = views.lookup(identity)
+
+    assert result.status == "delta_required"
+    assert result.view["status"] == "stale"
+    assert result.view["hit_count"] == 0
+
+
 def test_relative_time_reanchors_while_absolute_time_reuses(view_db):
     messages, views = view_db
     content = "I traveled on 2024-03-15."

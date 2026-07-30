@@ -1020,6 +1020,7 @@ class QueryViewStore:
         if status == "failed":
             return QueryViewLookup("failed", str(row["stale_reason"] or "build failed"))
         version = int(row["current_version"])
+        generation = int(row["generation"])
         if version <= 0:
             return QueryViewLookup("miss", "view has no published evidence version")
         version_row = self._conn.execute(
@@ -1095,16 +1096,45 @@ class QueryViewStore:
             )
         if record_hit:
             with self._write_transaction():
-                self._conn.execute(
+                cur = self._conn.execute(
                     "UPDATE lcm_query_views SET hit_count=hit_count+1, "
                     "promotion_status=CASE WHEN hit_count+1 >= 2 THEN 'promoted' "
                     "ELSE promotion_status END, updated_at=? "
-                    "WHERE view_id=? AND status='ready' AND current_version=?",
-                    (current_time, view_id, version),
+                    "WHERE view_id=? AND status='ready' AND current_version=? "
+                    "AND generation=?",
+                    (current_time, view_id, version, generation),
                 )
             row = self._conn.execute(
                 "SELECT * FROM lcm_query_views WHERE view_id=?", (view_id,)
             ).fetchone()
+            confirmed = (
+                int(cur.rowcount or 0) == 1
+                and row is not None
+                and str(row["status"]) == "ready"
+                and int(row["current_version"]) == version
+                and int(row["generation"]) == generation
+            )
+            if not confirmed:
+                events, truncated = self.delta_events(
+                    covered_generation, limit=delta_limit
+                )
+                current_view = (
+                    self._shape_view(row, version_row, dependencies)
+                    if row is not None and int(row["current_version"]) == version
+                    else None
+                )
+                return QueryViewLookup(
+                    "delta_required",
+                    (
+                        str(row["stale_reason"] or "")
+                        if row is not None
+                        else ""
+                    )
+                    or "view changed during hit confirmation",
+                    current_view,
+                    events,
+                    truncated,
+                )
         return QueryViewLookup(
             "hit",
             "exact typed intent and fresh positive/negative dependencies",
