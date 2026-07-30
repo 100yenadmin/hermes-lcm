@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 
 from hermes_lcm.chunking import (
     MIN_CONVERSATIONAL_TOKENS_ENV,
@@ -32,6 +34,12 @@ class TestPolicyNormalization:
 
 
 class TestConversationalPolicy:
+    @pytest.fixture(autouse=True)
+    def _default_threshold(self, monkeypatch):
+        # Default-behavior assertions must not inherit a deployment setting
+        # from the test runner's environment.
+        monkeypatch.delenv(MIN_CONVERSATIONAL_TOKENS_ENV, raising=False)
+
     def test_skips_short_acknowledgment(self):
         assert chunk_message(1, "user", "ok thanks", policy="conversational") == []
 
