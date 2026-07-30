@@ -93,3 +93,14 @@ exclusion suspected, not embedding quality). Final ledger of the 38: 15 fusion-r
 13 chunk-eligibility class · ~10 neither-under-safe-fusion. Track B levers: (1) the 1:2 quota as
 declared run config, (2) chunk-eligibility diagnosis → possible product/config fix, before the
 declared-config re-run.
+
+## 9. FINAL MECHANISM LEDGER (CHUNK-ELIGIBILITY-DIAGNOSIS.md closes the decomposition, 2026-07-30)
+The 13 zero-eligible-chunk turns are ALL excluded by the default <40-token conversational threshold
+(chunking.py) — 12 are substantive gold turns (coverage DEFECT for short-chat content shapes), 1 a
+generic acknowledgment (by-design). Complete ledger of the 38 originally-missing gold turns:
+**15 fusion-quota recoverable (FTS:chunk 1:2, control-safe) · 12 chunk-threshold defects · 1 by-design ·
+~10 residual (measure in the re-run)**. DECLARED RE-RUN CONFIG (Track B): fixed harness (memorybench
+PR #3) + fusion quota 1:2 + lowered/configurable chunk min-token threshold for conversational stores +
+frontier answering model (Tier-F) — every knob named here with its measured justification. LoCoMo has
+now done exactly what the owner asked of it: found real faults (threshold, fusion weighting, truncation,
+captions, judge rubric) that our own harness never surfaced.
