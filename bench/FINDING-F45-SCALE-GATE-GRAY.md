@@ -58,3 +58,24 @@ Three integrity fail-closes preceded the scored run, each caught by the tools th
 lived; §6e.18 was written from the sibling PR the same night). Deviation declared by the lane:
 the shared docs checkout advanced cce92c1→0089707 (PROGRAM-ARCHITECTURE.md only) during the
 final OFF arm; instrument/tools/specs/stores byte-identical throughout.
+
+## 5. DISPOSITION (2026-07-30 morning — decided under expanded product-owner authority)
+
+The owner granted standing decision authority ("run decisions through the vision; ≥95% confidence →
+proceed; backtrack later if needed", 2026-07-30). Applying it: **the GRAY is dispositioned as
+KILL-AS-CONFIGURED.** Vision test: the program's positioning is the agent ENHANCER — fast, cheap memory
+access at scales where alternatives fail (VISION-AND-ATTRIBUTION §1c: our two measured advantages are
+delivery completeness and latency/cost at scale). An unconditional 5.7–6.1× delivered-token multiplier
+purchasing 3–6 completions per 132 questions at the top rungs contradicts that positioning under any
+reading; the cost clause landed ~4× beyond even the KILL line. Confidence: well above the 95% bar.
+
+Consequences:
+1. `session_expand_v1` stays MERGED-DORMANT (default off) — it is the measured artifact and the
+   substrate for any successor; the port to main (#188) proceeds so main equals the measured tree.
+2. The TARGETED variant (expand only on completeness-heuristic fire, per-question budget) is filed as a
+   next-train issue with its own future registration — explicitly NOT funded for R3.1.
+3. The sharper strategic read stands: at 389×, completeness loss is increasingly retrieval-REACH, not
+   amplification. The next completeness lever at scale is retrieval reach — which is where the R3
+   metric-standard + scale-curve thesis already points. No roadmap change required.
+4. Reversibility: this is a configuration/funding decision, not a code deletion — reversal costs one
+   registration and one run.
