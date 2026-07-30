@@ -30,6 +30,10 @@ _CHUNK_TARGET_TOKENS = 600
 # anything below this token estimate unconditionally, embed the rest. Stores
 # dominated by short chat turns can lower it (0 embeds everything) — at the
 # default, substantive short turns never enter the semantic arm at all.
+# INGEST-TIME ONLY, like every chunk-eligibility knob (LCM_EMBED_CONTENT_POLICY
+# included): changing it neither backfills newly-eligible turns nor archives
+# newly-ineligible chunks already in lcm_chunk_meta. A store built under one
+# value is a different corpus from one built under another — rebuild to change it.
 MIN_CONVERSATIONAL_TOKENS_ENV = "LCM_CHUNK_MIN_CONVERSATIONAL_TOKENS"
 _DEFAULT_MIN_CONVERSATIONAL_TOKENS = 40
 

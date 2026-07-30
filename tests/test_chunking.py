@@ -56,6 +56,7 @@ class TestConversationalPolicy:
 
     def test_min_tokens_env_lowers_threshold(self, monkeypatch):
         short = "I adopted a rescue dog named Biscuit yesterday."
+        monkeypatch.delenv(MIN_CONVERSATIONAL_TOKENS_ENV, raising=False)
         assert chunk_message(1, "user", short, policy="conversational") == []
         monkeypatch.setenv(MIN_CONVERSATIONAL_TOKENS_ENV, "0")
         chunks = chunk_message(1, "user", short, policy="conversational")
