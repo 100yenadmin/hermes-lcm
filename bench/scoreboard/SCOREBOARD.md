@@ -2,7 +2,7 @@
 
 Every number ships with its full run config, variance, fail-close accounting, and known dataset defects — rows that cannot meet the standard do not render.
 
-Generated from `results.jsonl` (sha256: `b026d5fb8cab03bd99af88121036c9383e8618a0a9a1e4dc8b68d8d981b32095`, rows: 5)
+Generated from `results.jsonl` (sha256: `a1b5bb647a774cb97ee47109a08eb494941282c542c64c3934b4fcf04601a188`, rows: 6)
 
 ## Summary
 
@@ -13,6 +13,7 @@ Generated from `results.jsonl` (sha256: `b026d5fb8cab03bd99af88121036c9383e8618a
 | LongMemEval-V1 (S, 500q) | accuracy | 455/500 (91.0%) | P | 2026-07-29 | [details](#longmemeval-v1-s500-accuracy-2026-07-29) |
 | LongMemEval-V1 (S, 500q) | latency_delta_s_per_q | −56.3 s/question vs vanilla (22% faster) | P | 2026-07-29 | [details](#longmemeval-v1-s500-latency-2026-07-29) |
 | LongMemEval-V2 (451q, agentic) | accuracy | 298/451 (66.1%) | P | 2026-07-27 | [details](#longmemeval-v2-451-agentic-2026-07-27) |
+| LongMemEval-V2 (451q, static) | accuracy | 123/451 (27.3%) — official static protocol, fixed weak reader | P | 2026-07-31 | [details](#longmemeval-v2-451-static-2026-07-31) |
 
 ## Row disclosures
 
@@ -247,6 +248,65 @@ single scored run; instrument-clean recount 298/444 = 67.1% excluding #166's 7 t
 **caveats:**
 - below the published 69.9 baseline for this protocol; V2 medium tier (7.4× store) never run by anyone — parked R3.2
 - paired V2 re-baseline in flight (batch/v2-rebaseline gate)
+
+### <a id="longmemeval-v2-451-static-2026-07-31"></a>longmemeval-v2-451-static-2026-07-31
+
+**id:**
+longmemeval-v2-451-static-2026-07-31
+
+**benchmark:**
+LongMemEval-V2 (451q, static)
+
+**metric:**
+accuracy
+
+**value:**
+0.2727
+
+**display:**
+123/451 (27.3%) — official static protocol, fixed weak reader
+
+**tier:**
+P
+
+**date:**
+2026-07-31
+
+**system_commit:**
+fork main @ 9d181aa (PR #190 V2 re-baseline batch: upstream delivery ports + D-ARCH-1/2/3)
+
+**harness_commit:**
+lme-v2-official @ 6bfd58a (#166 bounded-retry + instrument_failed exclusion, both arms)
+
+**judge:**
+official V2 protocol judge
+
+**reader:**
+official fixed reader (weak by design; static protocol measures retrieval+delivery, not frontier answering)
+
+**retrieval_config:**
+answer_ready delivery, full pin set (pins-treatment.yaml in run artifacts)
+
+**dataset_exposure:**
+none documented
+
+**breakdown:**
+per-question rows in run artifacts (session-notes 2026-07-30/hermes-v2-paired)
+
+**variance:**
+paired vs control (prior main @ e5acbbf) in the same run: net +3 (b=29/c=26, n=434) under a pre-registered non-inferiority gate, verdict PASS via blind adjudication; control re-measured 120/451 vs the banked R1 125/451 — single-run cross-build variance context for V2-static numbers
+
+**failclose:**
+17/451 union-dropped as instrument_failed (control 10, treatment 7), disclosed; adjusted 120/434
+
+**evidence:**
+- bench/FINDING-F47-V2-REBASELINE-GATE-PASS.md
+- bench/specs/GATE-V2-REBASELINE.yaml (frozen 41a749a7)
+- run artifacts incl. ATTRIBUTION-DARCH2.json
+
+**caveats:**
+- static-protocol numbers on V2 are low-absolute by design (fixed weak reader); the agentic protocol row (298/451) is the capability surface
+- treatment arm completed via a documented append-only continuation after a transient EINTR fail-close (AMENDMENT-2; dataset freeze byte-identical across the gap, independently verified)
 
 ### <a id="scale-curve-fastscan-2026-07-30"></a>scale-curve-fastscan-2026-07-30
 
