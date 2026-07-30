@@ -64,3 +64,11 @@ work, not instrument work.
   audit artifacts PRE-DATE the critique fetch (dated); the external material corroborates, it is not
   the trigger. The critique is ammo FOR the metric-standard thesis, never an excuse for the score:
   the two big drivers (config-class retrieval gap, genuine adversarial attribution) are real signal.
+
+## 6. Corrupted-gold cross-reference (measured, CORRUPTED-GOLD-XREF.md)
+All 99 audit-documented corrupt questions ran in arm A (unique join by conversation + exact question
+text). We were scored WRONG on 80 of them; in the deterministic 15-row failed sample, **6/15 of our
+answers match the audit-CORRECTED answer** — i.e., right against bad gold. Extrapolated (sampling
+caveats in the artifact): ~1.5–2 points of the 47% headline is corrupted-gold penalty. Known-corruption
+ceiling for our 1,986-row run: 95.02% (the audit does not cover the 446 adversarial rows). These
+denominators are now part of the seven-point disclosure (§5).
