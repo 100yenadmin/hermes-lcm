@@ -1698,7 +1698,11 @@ def _source_event_clause(quote: str, *, role: Any, unit: str | None) -> bool:
     if quote.rstrip().endswith("?"):
         return False
     normalized = " ".join(quote.casefold().split())
-    if re.search(r"\b(?:might|may|plan(?:ning)? to|want to|hope to|would|could|should|never|not)\b", normalized):
+    if re.search(
+        r"\b(?:might|may|plan(?:ning)? to|want to|hope to|would|could|should|"
+        r"never|not|no|none|zero|without|didn|don|doesn|haven|hasn)\b",
+        normalized,
+    ):
         return False
     forms = "|".join(re.escape(form) for form in _unit_forms(unit))
     return bool(
@@ -1738,6 +1742,7 @@ def _finite_enumeration(
         "time_bases": [],
         "adapter_time_used": False,
         "every_counted_event_trusted": False,
+        "every_counted_event_dated": False,
     }
     if certificate["truncated"]:
         return None, [], certificate, "finite_scan_truncated"

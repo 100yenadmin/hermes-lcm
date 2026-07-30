@@ -676,6 +676,40 @@ def test_finite_enumeration_collapses_repeated_undated_mentions(tmp_path):
     assert result["coverage_certificate"]["unknown_time_clauses"] == 2
 
 
+def test_finite_enumeration_rejects_explicitly_negated_undated_events(tmp_path):
+    """Round-6.1 P1: "I took no vacation to Bali" is a NEGATION, not an event.
+    The retention path must reject no/none/zero/without negations exactly like
+    not/never — a negated statement can never contribute to a count."""
+    engine = _engine(tmp_path)
+    observed = datetime(2025, 6, 1, tzinfo=timezone.utc).timestamp()
+    negated = _append(
+        engine,
+        "I took no vacation to Bali.",
+        session_id="negated",
+        timestamp=observed,
+    )
+    real = _append(
+        engine,
+        "I took a vacation to Kyoto.",
+        session_id="real",
+        timestamp=observed,
+    )
+    try:
+        result = _compile(
+            engine,
+            "How many vacations did I take this year?",
+            [negated, real],
+            question_as_of="2025-12-31",
+            budgets={"max_retrieval_calls": 0},
+        )
+    finally:
+        engine._store.close()
+
+    assert result["computation"] is not None, result
+    assert result["computation"]["result_value"] == 1, result
+    assert result["coverage_certificate"]["distinct_keys"] == 1
+
+
 def test_finite_enumeration_counts_available_and_excludes_postdated_event(tmp_path):
     engine = _engine(tmp_path)
     available = _append(
