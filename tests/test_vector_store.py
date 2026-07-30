@@ -1484,6 +1484,60 @@ def test_full_scan_budget_stops_early_and_reports_bounded(tmp_path, monkeypatch)
         dag.close()
 
 
+def test_full_scan_deadline_on_final_batch_reports_complete_total(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "full-scan-final-batch-deadline.db"
+    monkeypatch.setattr(vector_store_module, "_FAST_SCAN_STREAMING_MIN_ROWS", 0)
+    dag = SummaryDAG(db_path)
+    store = VectorStore(
+        db_path,
+        config=LCMConfig(knn_resident_max_mb=0),
+        bounded_scan_rows=2,
+    )
+    try:
+        _seed_scan_corpus(
+            dag,
+            store,
+            4,
+            gold_vector=[1.0, 0.0, 0.0],
+            filler_vector=[0.0, 1.0, 0.0],
+        )
+        now = [0.0]
+        loads = 0
+        original_load = VectorStore._vectorized_batch
+
+        def timed_load(np, rows, dim, dtype):
+            nonlocal loads
+            loaded = original_load(np, rows, dim, dtype)
+            loads += 1
+            if loads == 2:
+                now[0] = 2.0
+            return loaded
+
+        monkeypatch.setattr(vector_store_module, "_monotonic", lambda: now[0])
+        monkeypatch.setattr(
+            VectorStore, "_vectorized_batch", staticmethod(timed_load)
+        )
+
+        result = store.knn(
+            [1.0, 0.0, 0.0],
+            k=1,
+            model="scan",
+            full_scan=True,
+            scan_budget_s=0.0,
+            deadline=1.0,
+        )
+
+        assert loads == 2
+        assert result.coverage == "full"
+        assert result.scanned == 4
+        assert result.total == 4
+    finally:
+        store.close()
+        dag.close()
+
+
 def test_streaming_truncation_keeps_recency_order_below_host_limit(
     tmp_path, monkeypatch
 ):

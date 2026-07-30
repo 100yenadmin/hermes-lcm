@@ -627,7 +627,43 @@ def test_finite_enumeration_collapses_repeated_undated_mentions(tmp_path):
     assert result["coverage_certificate"]["unknown_time_clauses"] == 2
 
 
-def test_finite_enumeration_excludes_postdated_undated_event(tmp_path):
+def test_finite_enumeration_counts_available_and_excludes_postdated_event(tmp_path):
+    engine = _engine(tmp_path)
+    available = _append(
+        engine,
+        "I took a vacation to Kyoto.",
+        session_id="available",
+        timestamp=datetime(2025, 6, 1, tzinfo=timezone.utc).timestamp(),
+    )
+    postdated = _append(
+        engine,
+        "I took a vacation to Bali.",
+        session_id="postdated",
+        timestamp=datetime(2026, 1, 2, tzinfo=timezone.utc).timestamp(),
+    )
+    engine._session_occurrence_dates["available"] = "2025-06-01"
+    try:
+        result = _compile(
+            engine,
+            "How many vacations did I take this year?",
+            [available, postdated],
+            question_as_of="2025-12-31",
+            budgets={"max_retrieval_calls": 0},
+        )
+    finally:
+        engine._store.close()
+
+    assert result["finite_coverage"] is True
+    assert result["reason_code"] == "finite_coverage_product_verified"
+    assert result["computation"]["result_value"] == 1
+    assert result["coverage_certificate"]["unavailable_as_of_clauses"] == 1
+    assert result["coverage_certificate"]["distinct_keys"] == 1
+    assert postdated["exact_ref"] not in {
+        item["exact_ref"] for item in result["evidence"]
+    }
+
+
+def test_finite_enumeration_all_unavailable_returns_no_count(tmp_path):
     engine = _engine(tmp_path)
     postdated = _append(
         engine,
@@ -646,7 +682,7 @@ def test_finite_enumeration_excludes_postdated_undated_event(tmp_path):
         engine._store.close()
 
     assert result["computation"] is None
-    assert result["reason_code"] == "finite_source_availability_unknown"
+    assert result["reason_code"] == "finite_no_events_in_window"
     assert result["coverage_certificate"]["unavailable_as_of_clauses"] == 1
     assert result["coverage_certificate"]["distinct_keys"] == 0
 

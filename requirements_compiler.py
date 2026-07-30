@@ -1798,8 +1798,6 @@ def _finite_enumeration(
     certificate["adapter_time_used"] = "adapter_session_date" in time_bases
     if certificate["material_clauses"] == 0:
         return None, [], certificate, "finite_no_material_events"
-    if certificate["unavailable_as_of_clauses"]:
-        return None, [], certificate, "finite_source_availability_unknown"
     if certificate["ungrounded_key_clauses"]:
         return None, [], certificate, "finite_event_keys_unproven"
 

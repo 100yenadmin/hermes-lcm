@@ -102,6 +102,22 @@ ruff check adaptive_retrieval.py evidence_compiler.py query_view_store.py reason
 
 Result: **all checks passed**.
 
+## Acceptance-count chronology
+
+The acceptance suite is the same three-file command throughout this report; its
+count grew only when review rounds added regressions to those files:
+
+- Initial batch and the post-CI-fix rerun: **81 passed**.
+- Round 2: **85 passed** (**+4** Round-2 regression tests).
+- Round 3: **91 passed** (**+6** Round-3 regression tests).
+- Round 4: **92 passed** (**+1 net** acceptance test: the prior all-unavailable
+  case remains covered under its updated semantics, and a new mixed
+  available/unavailable case was added).
+
+The Round-4 final-batch deadline regression is in `tests/test_vector_store.py`,
+so it increases the upstream-affected suite from **166** to **167** without
+changing the three-file acceptance-suite count.
+
 ## PR #190 CI fix
 
 The reported CI command was reproduced locally before editing. It failed with
@@ -208,6 +224,41 @@ Round-3 acceptance proof:
 - `git diff --check`: **clean**.
 
 Delivery checkpoint: **COMPLETE** for the named local Round-3 disposition gate;
+**ADVANCE** to the orchestrator handoff. This does not claim remote exact-head
+CI for the unstaged delta, merge readiness, merge, release, or runtime proof.
+
+## Round 4 review dispositions
+
+Review mode: **address**, binding Round-4 disposition batch. Candidate identity:
+PR `#190`, branch `batch/v2-rebaseline`, local base/head before this unstaged
+batch `e5acbbf26715a1f2e721abcdf7d180c5dd1d8d32` /
+`76ba0f695f37e55ee73047a957d6814da33ff29c`. Each finding body was read through
+the requested per-comment `gh api` route before implementation. No Git mutation
+or GitHub write was performed.
+
+| Comment ID | Priority | Disposition |
+|---|---|---|
+| `3680166653` | P2 | **fixed** — `_scan_vectorized_ranked` now marks caller-deadline expiry only when the scan is genuinely truncated. A deadline that trips on the final batch leaves the scan complete; summary and chunk streaming consumers report the completed `scanned` and `total` values. Regression proves a two-batch corpus returns `coverage=full`, `scanned=4`, and `total=4` when the clock crosses the deadline during the final batch. |
+| `3680166656` | P2 | **fixed** — unavailable-as-of clauses remain excluded before event dating, but no longer abort the remaining finite enumeration. The remaining clauses are counted and certified under D-ARCH-1; `unavailable_as_of_clauses` records the separate exclusion. Regressions prove a mixed corpus counts only the available event and an all-unavailable corpus returns no computation while preserving the exclusion count. |
+| `3680154851` | Major | **fixed in this report** — the acceptance chronology now states the exact per-round progression: 81 initial/post-CI, 85 after Round 2, 91 after Round 3, and 92 after Round 4. |
+
+Round-4 focused regressions:
+
+```text
+PYTHONPATH="${AGENT_STUB_PATH}" python3 -m pytest -q tests/test_vector_store.py::test_full_scan_deadline_on_final_batch_reports_complete_total tests/test_evidence_contract.py::test_finite_enumeration_counts_available_and_excludes_postdated_event tests/test_evidence_contract.py::test_finite_enumeration_all_unavailable_returns_no_count
+```
+
+Result: **3 passed**.
+
+Round-4 acceptance proof:
+
+- Exact CI slice above: **60 passed**.
+- Batch acceptance suite above: **92 passed**.
+- Upstream-affected suite above: **167 passed**.
+- Full changed/affected-file `ruff check`: **all checks passed**.
+- `git diff --check`: **clean**.
+
+Delivery checkpoint: **COMPLETE** for the named local Round-4 disposition gate;
 **ADVANCE** to the orchestrator handoff. This does not claim remote exact-head
 CI for the unstaged delta, merge readiness, merge, release, or runtime proof.
 

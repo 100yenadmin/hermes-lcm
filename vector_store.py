@@ -336,9 +336,10 @@ class KNNResult(list[tuple[str, float, str]]):
         self.coverage = coverage
         self.scoring = scoring
         self.reason = reason
-        # Bounded-coverage provenance: how many of the corpus's live vectors were
+        # Coverage provenance: how many of the corpus's live vectors were
         # actually scored (``scanned``) out of the total live for the identity
-        # (``total``), so a caller can surface partial-archive coverage (SCAN-1).
+        # (``total``), so a caller can surface partial-archive coverage (SCAN-1)
+        # or certify a deadline-adjacent scan that nevertheless completed.
         self.scanned = scanned
         self.total = total
 
@@ -2414,22 +2415,23 @@ class VectorStore:
                 )
                 stop_expired = _prescreen_deadline_expired(deadline, scanned)
                 if budget_expired or stop_expired:
-                    deadline_expired = _caller_deadline_expired(
-                        caller_deadline,
-                        stop_deadline=deadline,
-                        stop_expired=stop_expired,
-                    )
                     stopped_early = scanned < len(candidate_ids)
                     if stopped_early:
+                        deadline_expired = _caller_deadline_expired(
+                            caller_deadline,
+                            stop_deadline=deadline,
+                            stop_expired=stop_expired,
+                        )
                         break
         except _PrescreenDeadlineExpired as exc:
             scanned = max(scanned, exc.scanned)
-            deadline_expired = _caller_deadline_expired(
-                caller_deadline,
-                stop_deadline=deadline,
-                stop_expired=True,
-            )
             stopped_early = scanned < len(candidate_ids)
+            if stopped_early:
+                deadline_expired = _caller_deadline_expired(
+                    caller_deadline,
+                    stop_deadline=deadline,
+                    stop_expired=True,
+                )
         finally:
             if batches is not None:
                 batches.close()
@@ -3179,6 +3181,9 @@ class VectorStore:
                     scanned = scanned_rows
                     if not deadline_expired:
                         total = self._count_embedded_vectors(identity, chunk=False)
+                elif scan_deadline is not None:
+                    scanned = scanned_rows
+                    total = len(scan_ids)
                 return KNNResult(
                     candidates,
                     coverage=coverage,
@@ -3933,6 +3938,9 @@ class VectorStore:
                     scanned = scanned_rows
                     if not deadline_expired:
                         total = self._count_embedded_vectors(identity, chunk=True)
+                elif scan_deadline is not None:
+                    scanned = scanned_rows
+                    total = len(scan_ids)
                 return KNNResult(
                     candidates,
                     coverage=coverage,
