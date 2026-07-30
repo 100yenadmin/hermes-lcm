@@ -2254,7 +2254,7 @@ class VectorStore:
         deadline: float | None,
         limit: int,
         score_batch: Any,
-    ) -> tuple[list[tuple[str, float, str]], int, bool]:
+    ) -> tuple[list[tuple[str, float, str]], int, bool, bool]:
         """Score every candidate in ``batch_rows`` chunks, keeping a running top-k.
 
         ``batch_rows`` bounds PEAK MEMORY (one batch of vectors resident at a
@@ -2267,7 +2267,10 @@ class VectorStore:
         absolute operation ``deadline`` can cut the scan short; when either
         does, the caller degrades to ``coverage='bounded'`` and the existing
         disclosure names the ratio.
-        Returns ``(ranked top-k, candidates scored, stopped early)``.
+        Returns ``(ranked top-k, candidates scored, stopped early,
+        deadline expired)``.  The final flag is intentionally separate from
+        ``stopped_early``: an unreadable live vector can make the scan bounded
+        without consuming the caller's latency budget.
 
         A MULTI-BATCH sweep streams past the matrix LRU (``cache=False``). The
         cache holds 4 entries, so a corpus needing more batches than that evicts
@@ -2281,6 +2284,7 @@ class VectorStore:
         best: list[tuple[int, str, float, str]] = []
         scanned = 0
         stopped_early = False
+        deadline_expired = False
         cache_batches = len(candidate_ids) <= batch_rows
         if not cache_batches:
             # Keeping the new batches OUT of the cache is only half the bound:
@@ -2292,6 +2296,7 @@ class VectorStore:
         for start in range(0, len(candidate_ids), batch_rows):
             if deadline is not None and _monotonic() >= deadline:
                 stopped_early = True
+                deadline_expired = True
                 break
             batch = candidate_ids[start:start + batch_rows]
             rowids, embedded_ids, kinds, scores = score_batch(batch, cache_batches)
@@ -2315,6 +2320,7 @@ class VectorStore:
                 )
                 if budget_expired or deadline_expired:
                     stopped_early = True
+                    deadline_expired = True
                     break
         if scanned < len(candidate_ids):
             stopped_early = True
@@ -2326,6 +2332,7 @@ class VectorStore:
             ],
             scanned,
             stopped_early,
+            deadline_expired,
         )
 
     def _scan_vectorized_ranked(
@@ -2342,12 +2349,13 @@ class VectorStore:
         deadline: float | None,
         limit: int,
         query: Any,
-    ) -> tuple[list[tuple[str, float, str]], int, bool]:
+    ) -> tuple[list[tuple[str, float, str]], int, bool, bool]:
         """Exact multi-batch R1 scan using one cursor and vectorized decode."""
         self._release_matrix_caches()
         best: list[tuple[int, str, float, str]] = []
         scanned = 0
         stopped_early = False
+        deadline_expired = False
         started = _monotonic()
         batches = None
         try:
@@ -2382,11 +2390,13 @@ class VectorStore:
                     budget_expired
                     or _prescreen_deadline_expired(deadline, scanned)
                 ):
+                    deadline_expired = True
                     stopped_early = scanned < len(candidate_ids)
                     if stopped_early:
                         break
         except _PrescreenDeadlineExpired as exc:
             scanned = max(scanned, exc.scanned)
+            deadline_expired = True
             stopped_early = scanned < len(candidate_ids)
         finally:
             if batches is not None:
@@ -2401,6 +2411,7 @@ class VectorStore:
             ],
             scanned,
             stopped_early,
+            deadline_expired,
         )
 
     def _source_allowed_ids(self, table: str, source: str) -> set[str]:
@@ -3104,7 +3115,7 @@ class VectorStore:
             ) or self._use_streaming_scan(
                 len(scan_ids), max(1, self.bounded_scan_rows)
             ):
-                candidates, scanned_rows, stopped_early = (
+                candidates, scanned_rows, stopped_early, deadline_expired = (
                     self._scan_vectorized_ranked(
                         numpy=numpy,
                         identity_hash=identity,
@@ -3123,7 +3134,7 @@ class VectorStore:
                 scanned = total = None
                 if coverage == "bounded":
                     scanned = scanned_rows
-                    if not stopped_early:
+                    if not deadline_expired:
                         total = self._count_embedded_vectors(identity, chunk=False)
                 return KNNResult(
                     candidates,
@@ -3165,7 +3176,7 @@ class VectorStore:
                     for vector in vectors
                 ]
 
-        candidates, scanned_rows, stopped_early = self._scan_ranked(
+        candidates, scanned_rows, stopped_early, deadline_expired = self._scan_ranked(
             candidate_ids=scan_ids,
             batch_rows=max(1, self.bounded_scan_rows),
             budget_s=scan_budget_s,
@@ -3177,7 +3188,7 @@ class VectorStore:
         scanned = total = None
         if coverage == "bounded":
             scanned = scanned_rows
-            if not stopped_early:
+            if not deadline_expired:
                 total = self._count_embedded_vectors(identity, chunk=False)
         return KNNResult(
             candidates,
@@ -3846,7 +3857,7 @@ class VectorStore:
             ) or self._use_streaming_scan(
                 len(scan_ids), max(1, self.bounded_scan_rows)
             ):
-                candidates, scanned_rows, stopped_early = (
+                candidates, scanned_rows, stopped_early, deadline_expired = (
                     self._scan_vectorized_ranked(
                         numpy=numpy,
                         identity_hash=identity,
@@ -3865,7 +3876,7 @@ class VectorStore:
                 scanned = total = None
                 if coverage == "bounded":
                     scanned = scanned_rows
-                    if not stopped_early:
+                    if not deadline_expired:
                         total = self._count_embedded_vectors(identity, chunk=True)
                 return KNNResult(
                     candidates,
@@ -3894,7 +3905,7 @@ class VectorStore:
                     for vector in vectors
                 ]
 
-        candidates, scanned_rows, stopped_early = self._scan_ranked(
+        candidates, scanned_rows, stopped_early, deadline_expired = self._scan_ranked(
             candidate_ids=scan_ids,
             batch_rows=max(1, self.bounded_scan_rows),
             budget_s=scan_budget_s,
@@ -3906,7 +3917,7 @@ class VectorStore:
         scanned = total = None
         if coverage == "bounded":
             scanned = scanned_rows
-            if not stopped_early:
+            if not deadline_expired:
                 total = self._count_embedded_vectors(identity, chunk=True)
         return KNNResult(
             candidates,

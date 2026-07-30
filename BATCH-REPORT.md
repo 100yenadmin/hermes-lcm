@@ -98,6 +98,47 @@ ruff check adaptive_retrieval.py evidence_compiler.py query_view_store.py reason
 
 Result: **all checks passed**.
 
+## PR #190 CI fix
+
+The reported CI command was reproduced locally before editing. It failed with
+the expected six failures: one chunk-vector coverage-total regression, four
+stale composition-policy expectations, and one stale state-semantic expansion
+expectation.
+
+- `vector_store.py`: scalar and vectorized scans now return deadline expiry
+  separately from other bounded-stop causes. Message and chunk paths skip
+  `COUNT(*)` only after actual deadline/budget expiry; an unscorable live vector
+  remains bounded while still reporting the corpus total. The existing
+  `test_exact_scan_does_not_overstate_coverage_for_unscorable_live_vector`
+  contract was not modified.
+- `tests/test_trajectory_composition_policies.py`: the default, Policy A,
+  Policy D, and hybrid tests now cite D-ARCH-2 and assert that default backfill
+  re-admits the lexical winner while each policy still promotes or protects it
+  through its own mechanism.
+- `tests/test_trajectory_state_semantic_expansion.py`: the full-pool test now
+  cites D-ARCH-2 and pins the deterministic 14-state composition: incumbent
+  rank order is preserved and the newly admitted semantic state fills the
+  unused reserve.
+
+Focused CI command:
+
+```text
+PYTHONPATH=/Volumes/LEXAR/Codex/session-notes/2026-07-29/hermes-mono-pr-rounds/artifacts/agent-stub python3 -m pytest tests/test_chunk_vector_store.py tests/test_trajectory_composition_policies.py tests/test_trajectory_state_semantic_expansion.py -q
+```
+
+Result after the fix: **60 passed**.
+
+The batch acceptance command above was rerun after the fix: **81 passed**.
+The upstream-port affected-file command above was also rerun: **166 passed**.
+
+CI-fix lint:
+
+```text
+ruff check vector_store.py tests/test_trajectory_composition_policies.py tests/test_trajectory_state_semantic_expansion.py
+```
+
+Result: **all checks passed**.
+
 ## Decision fidelity
 
 - D-ARCH-1: dated candidates dedupe by the existing event key plus resolved date; undated candidates retain the existing collapse. Counts with any undated contributor are returned with `finite_coverage=false`.
