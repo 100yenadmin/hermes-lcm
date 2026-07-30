@@ -44,3 +44,21 @@ public claims use the observational gradient.
 Live with a declared stopping rule: mechanical batch 1 pushed (a53276c); three headline architecture
 decisions in DECISIONS-R3-UPSTREAM-ARCH.md; six default-off/edge decisions tracked in fork #180; only
 delivery-path/P1 findings get in-PR fixes from here.
+
+## ★ Owner amendment 2026-07-30 — the TWO-TIER testing doctrine (frontier-first)
+The owner reframed benchmark purpose: **"whether it helps us find faults in our system... whether it
+improves real agent, real-time, real-experience results"** — and explicitly de-weighted the
+fixed-older-reader theory in favor of frontier models ("we're building for how people actually use
+these systems with real frontier models"). Binding consequences:
+- **Tier F (fault-finding):** frontier readers/judges, relaxed instrument bar, closed judges
+  acceptable, speed over purity. Purpose = surface defects our own harness cannot see and measure
+  real-experience improvement. LoCoMo lives here (it already found four instrument bugs + the
+  config-class retrieval gap + the adversarial-attribution weakness — that IS the win). LoCoMo-Plus
+  REOPENED under this tier (the closed-judge disqualifier applied a Tier-P bar to a Tier-F tool;
+  adapter delta near-zero). Newer agentic benchmarks (BEAM-class and successors) re-surveyed under
+  Tier-F criteria.
+- **Tier P (published claims):** unchanged — full pins, disclosure standard (F46 §5's seven points),
+  A/A′ noise floors, pre-registered gates. The metric-standard thesis lives at this tier and is
+  STRENGTHENED by the split: we publish under discipline while testing at frontier speed.
+- Official LongMemEval baselines keep their banked meaning; the FRONTIER-reader V1-medium move
+  (already owner-ratified) becomes the flagship Tier-P surface going forward.
