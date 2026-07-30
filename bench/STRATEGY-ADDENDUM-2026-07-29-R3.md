@@ -73,3 +73,17 @@ LoCoMo config-fix replay resolves). **(2) AMA-Bench** (MIT, real tool-using agen
 only real-time-write instrument found) — watchlist. BEAM re-scored MEDIUM under Tier-F (judge unblocked,
 but dialogue-only scale-stress; no agentic axis); PersonaMem MEDIUM-LOW; GAIA LOW (no memory axis).
 τ²-Bench keeps R4 Tier-P; its memory-specific Tier-F use needs episode-chaining (noted, not funded).
+
+### ★ CORRECTION (2026-07-30, owner caught it immediately): "LongMemEval-V2" IS our V2
+The Tier-F survey's #1 recommendation was our OWN primary instrument rediscovered under its public name —
+LongMemEval-V2 (UCLA, 451 questions, web/enterprise agent trajectories) is exactly the benchmark behind our
+banked 125/451 and 298/451, the lme-v2-official harness, our upstream harness reports #6/#7, and the paired
+re-baseline run in flight. The survey agent searched by public name; the program's shorthand ("V2") hid the
+identity; the synthesis failed to catch it. The "adopted as next Tier-F build" line is VOID.
+What survives from the survey: **AMA-Bench is the genuinely-new #1 Tier-F adoption** (trajectory memory,
+real tool-using agent harness, MIT, frontier headroom); MemoryAgentBench watchlist (test-time learning /
+selective forgetting); BEAM/PersonaMem/GAIA re-assessments stand. And the "higher-size datasets" are
+likewise already ours: V1-medium (longmemeval_m, the ratified primary move) and the V2 MEDIUM tier
+(M17 — the 7.4× store nobody has ever run, parked as Phase-3/R3.2 with its go/no-go at R3.1 close).
+Process note: name-alias drift between program shorthand and public benchmark names can make research
+lanes rediscover owned instruments — surveys must carry the program's instrument inventory with BOTH names.
