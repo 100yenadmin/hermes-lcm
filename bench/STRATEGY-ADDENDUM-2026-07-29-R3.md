@@ -87,3 +87,32 @@ likewise already ours: V1-medium (longmemeval_m, the ratified primary move) and 
 (M17 — the 7.4× store nobody has ever run, parked as Phase-3/R3.2 with its go/no-go at R3.1 close).
 Process note: name-alias drift between program shorthand and public benchmark names can make research
 lanes rediscover owned instruments — surveys must carry the program's instrument inventory with BOTH names.
+
+### Track C1 decision (2026-07-30 evening): AMB ADOPTED for Tier-F, with declared conditions
+Three-lane assessment (wf_f4e92ea1; full reports in session-notes 2026-07-30/hermes-amb-assess/
+artifacts/: AMB-HARNESS.md, AMB-COVERAGE.md, AMB-FIT.md). **ADOPT** — the owner-flagged aggregator
+(vectorize-io/agent-memory-benchmark, the Hindsight board) is worth running: one clean Python
+`MemoryProvider` ABC covers LoCoMo10/LongMemEvalS/PersonaMem/BEAM(4 tiers)/LifeBench in a single
+adapter (~200 LOC of glue; our `hermes_lcm_bridge.py` JSONL protocol reused UNMODIFIED; their own
+mastra.py precedent de-risks the subprocess shape). Conditions, all measured findings:
+1. **Comparability is NOT by-construction — it must be manufactured by us.** AMB pins nothing
+   (datasets download from `main`; its "LongMemEval" is the community-CLEANED re-release, not
+   vanilla), the README's "a Gemini model answers" contradicts the code default (Groq — their
+   issue #15), results carry no config fingerprint, there is no CI, and the board is
+   vendor-submitted with the harness owner also owning the top rows (Hindsight). Our runs pin
+   dataset sha256s + set OMB_ANSWER_LLM/judge explicitly + snapshot outputs + disclose per the
+   seven-point standard. Board rows are cited only with run-config caveats.
+2. **Legal:** the harness repo has NO code license (GitHub license=null) and redistributes ~306MB
+   of third-party datasets (incl. CC BY-NC LoCoMo) without terms. We run from a LOCAL clone with
+   our adapter file overlaid (our file, our repo, our license) — no public fork, no redistribution.
+3. **Adapter guards (from AMB-FIT):** raw_response = results-ONLY (their LoCoMo prompt-builder
+   injects raw_response into the GRADED prompt — provenance would leak into scored context);
+   our fail-closed bridge aborts a batch where reference providers silently return empty — kept,
+   as a documented conscious choice.
+4. **Tier-F instrument findings banked for the metric-standard release:** the pin/fingerprint
+   absence, the answer-LLM bug, the BEAM scoring prose/code mismatch (docs say Kendall-tau, code
+   does rubric-nugget — re-verify independently before citing), and the silent-empty retrieval
+   pattern. Primary sources only (their issues #13/#15/#26 + code paths).
+Sequencing: adapter build dispatches to the codex lane (well-spec'd, non-urgent); NO AMB runs
+while the paired V2 gate occupies the machine (5 concurrent bridge subprocesses + embedder loads
+would contend). C2 (AMA-Bench) queues behind C1's adapter; C3 (MemoryArena) assessment separate.
