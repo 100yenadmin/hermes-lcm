@@ -1737,6 +1737,7 @@ def _finite_enumeration(
         "distinct_keys": 0,
         "time_bases": [],
         "adapter_time_used": False,
+        "every_counted_event_trusted": False,
     }
     if certificate["truncated"]:
         return None, [], certificate, "finite_scan_truncated"
@@ -1837,9 +1838,13 @@ def _finite_enumeration(
         messages=engine._store,
         assertions=getattr(engine, "_assertions", None),
         as_of=question_date_as_of_epoch(contract.question_as_of),
+        engine=engine,
     )
     if grounding.status != "grounded":
         return None, operands, certificate, f"finite_grounding_failed:{grounding.reason}"
+    certificate["every_counted_event_trusted"] = (
+        grounding.temporal_certified is not False
+    )
     computed_operands = tuple(
         replace(grounded, key=str(candidate["dedupe_key"]))
         for grounded, candidate in zip(grounding.operands, operands, strict=True)
@@ -1857,7 +1862,10 @@ def _finite_enumeration(
     certificate["certificate_sha256"] = _digest(certificate)
     reason = (
         "finite_coverage_product_verified"
-        if certificate["every_counted_event_dated"]
+        if (
+            certificate["every_counted_event_dated"]
+            and certificate["every_counted_event_trusted"]
+        )
         else "finite_count_uncertified_undated_events"
     )
     return computed.trace.as_dict(), operands, certificate, reason
@@ -1899,8 +1907,8 @@ def _render_computation(
     if uncertified:
         lines.append(
             "- certification: UNCERTIFIED because at least one counted event has "
-            "no occurrence date; this count is not certified as exhaustive for "
-            "the requested time window."
+            "no trusted occurrence date; this count is not certified as exhaustive "
+            "for the requested time window."
         )
     lines.extend(
         [
@@ -2204,6 +2212,7 @@ def compile_preanswer_evidence(
             result["finite_coverage"] = bool(
                 coverage_certificate
                 and coverage_certificate.get("every_counted_event_dated")
+                and coverage_certificate.get("every_counted_event_trusted")
             )
 
     result["metrics"].update(

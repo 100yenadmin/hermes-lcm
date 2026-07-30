@@ -35,6 +35,9 @@ _MAX_OPERANDS = 50
 _MAX_QUESTION_CHARS = 4_000
 _MAX_QUOTE_CHARS = 24_000
 _MAX_LABEL_CHARS = 300
+_MAX_CALLER_SESSION_DATE_NOTE_CHARS = 64
+_MAX_TEMPORAL_TRUST_NOTES = 8
+_MAX_TEMPORAL_TRUST_NOTE_CHARS = 512
 _NUMBER_RE = re.compile(r"-?\d[\d,]*(?:\.\d+)?")
 _COMPUTATION_TRIGGER_RE = re.compile(
     r"\b(how many|how much|count|total|sum|difference|more than|less than|ago|"
@@ -106,6 +109,15 @@ def resolve_occurrence_time_with_trust(
         and caller_session_date
         and caller_session_date != sidecar_session_date
     )
+    caller_session_date_note = caller_session_date
+    if (
+        caller_session_date_note
+        and len(caller_session_date_note) > _MAX_CALLER_SESSION_DATE_NOTE_CHARS
+    ):
+        caller_session_date_note = (
+            caller_session_date_note[:_MAX_CALLER_SESSION_DATE_NOTE_CHARS - 3]
+            + "..."
+        )
     anchor = sidecar_session_date or caller_session_date
     result = _resolve(text, observed_at=observed_at, session_date=anchor)
     source = str(result.get("event_time_source") or "unknown")
@@ -125,7 +137,7 @@ def resolve_occurrence_time_with_trust(
         trust["session_date_overridden"] = overridden
         if overridden:
             trust["trust_note"] = (
-                f"caller session_date {caller_session_date} overridden by "
+                f"caller session_date {caller_session_date_note} overridden by "
                 f"engine sidecar {sidecar_session_date}"
             )
     elif (
@@ -145,6 +157,34 @@ def resolve_occurrence_time_with_trust(
                 f"{session_key or '<unknown>'}; temporal result is low-trust"
             )
     return result, trust
+
+
+def temporal_trust_wire(
+    status: Any,
+    certified: Any,
+    notes: Sequence[Any] = (),
+) -> dict[str, Any]:
+    """Return the one bounded temporal-trust shape used on public tool wires."""
+    normalized_status = str(status or "not_applicable")
+    if normalized_status not in {
+        "not_applicable",
+        "engine_sidecar",
+        "low_trust",
+    }:
+        normalized_status = "low_trust"
+    normalized_certified = certified if isinstance(certified, bool) else None
+    normalized_notes: list[str] = []
+    for value in notes:
+        note = str(value or "").strip()
+        if note and note not in normalized_notes:
+            normalized_notes.append(note[:_MAX_TEMPORAL_TRUST_NOTE_CHARS])
+        if len(normalized_notes) >= _MAX_TEMPORAL_TRUST_NOTES:
+            break
+    return {
+        "status": normalized_status,
+        "certified": normalized_certified,
+        "notes": normalized_notes,
+    }
 
 
 def resolve_occurrence_time(
@@ -473,7 +513,7 @@ def compile_evidence_plan(question: str, question_date: Any = None) -> PlanDecis
                 reason="question needs a valid question date for deterministic temporal planning",
             )
         requested_interval_unit = re.search(
-            r"\bin\s+(days?|weeks?|months?|years?)\b",
+            r"\bin\s+(?:calendar\s+)?(days?|weeks?|months?|years?)\b",
             normalized,
         )
         interval_unit = (
@@ -1315,22 +1355,34 @@ def execute_plan(
                 f"Absolute interval from {selected[0].evidence_date.isoformat()} "
                 f"to {selected[1].evidence_date.isoformat()} is {days} days"  # type: ignore[union-attr]
             )
-        if len(selected) == 1:
-            first_day, second_day = selected[0].evidence_date, plan.question_anchor
-        else:
-            first_day, second_day = selected[0].evidence_date, selected[1].evidence_date
-        assert first_day is not None and second_day is not None
-        earlier, later = sorted((first_day, second_day))
-        complete_months = (
-            (later.year - earlier.year) * 12 + later.month - earlier.month
-        )
-        if later.day < earlier.day:
-            complete_months -= 1
-        complete_years = later.year - earlier.year
-        if (later.month, later.day) < (earlier.month, earlier.day):
-            complete_years -= 1
-
         interval_unit = plan.interval_unit
+        complete_months = complete_years = 0
+        if interval_unit in {"auto", "month", "year"}:
+            if len(selected) == 1:
+                first_day, second_day = (
+                    selected[0].evidence_date,
+                    plan.question_anchor,
+                )
+            else:
+                first_day, second_day = (
+                    selected[0].evidence_date,
+                    selected[1].evidence_date,
+                )
+            if first_day is None or second_day is None:
+                return ComputationDecision(
+                    "fallback",
+                    reason="calendar date_interval requires two grounded dates",
+                )
+            earlier, later = sorted((first_day, second_day))
+            complete_months = (
+                (later.year - earlier.year) * 12 + later.month - earlier.month
+            )
+            if later.day < earlier.day:
+                complete_months -= 1
+            complete_years = later.year - earlier.year
+            if (later.month, later.day) < (earlier.month, earlier.day):
+                complete_years -= 1
+
         if interval_unit == "auto":
             if complete_years > 0:
                 interval_unit = "year"

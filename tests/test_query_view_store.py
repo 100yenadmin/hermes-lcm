@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import replace
 import sqlite3
 import threading
@@ -275,24 +276,38 @@ def test_hit_confirmation_rechecks_generation_after_source_mutation(
     _publish(views, identity, [dependency])
     published_snapshot = views.corpus_snapshot()
     original_snapshot = views.corpus_snapshot
-    mutated = False
+    original_write_transaction = views._write_transaction
+    snapshot_calls = 0
+    hit_confirmation_hook_reached = False
 
-    def mutate_then_snapshot():
-        nonlocal mutated
-        if not mutated:
-            _append(messages, "I prefer coffee.")
-            mutated = True
+    def tracked_snapshot():
+        nonlocal snapshot_calls
+        snapshot_calls += 1
         return original_snapshot()
 
-    # Positive-dependency validation has completed when lookup asks for this
-    # snapshot. Advance the real corpus generation at that exact seam so the
-    # stale-generation branch, not the happy-path hit CAS, is exercised.
-    monkeypatch.setattr(views, "corpus_snapshot", mutate_then_snapshot)
+    @contextmanager
+    def mutate_during_hit_confirmation():
+        nonlocal hit_confirmation_hook_reached
+        # The initial negative-space snapshot completed and found the view
+        # current. Mutate only as the hit-confirmation transaction begins.
+        assert snapshot_calls == 1
+        hit_confirmation_hook_reached = True
+        _append(messages, "I prefer coffee.")
+        with original_write_transaction():
+            yield
+
+    monkeypatch.setattr(views, "corpus_snapshot", tracked_snapshot)
+    monkeypatch.setattr(
+        views,
+        "_write_transaction",
+        mutate_during_hit_confirmation,
+    )
     result = views.lookup(identity)
 
-    assert mutated is True
+    assert hit_confirmation_hook_reached is True
+    assert snapshot_calls == 2
     assert result.status == "delta_required"
-    assert result.reason == "corpus advanced beyond the negative-space watermark"
+    assert result.reason == "corpus advanced during hit confirmation"
     assert result.view["status"] == "stale"
     assert result.view["corpus_generation"] == published_snapshot.generation
     assert result.view["hit_count"] == 0

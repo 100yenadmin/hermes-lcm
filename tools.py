@@ -52,6 +52,7 @@ from .reasoning import (
     execute_plan,
     ground_evidence,
     question_date_as_of_epoch,
+    temporal_trust_wire,
     validate_selector_alignment,
     verify_final_answer,
     resolve_occurrence_time_with_trust,
@@ -837,11 +838,11 @@ def lcm_compute(args: Dict[str, Any], **kwargs) -> str:
         "trace": trace.as_dict(),
         "answer": answer,
         "candidate_verification": verification_payload,
-        "temporal_trust": {
-            "status": grounding.temporal_trust,
-            "certified": grounding.temporal_certified,
-            "notes": list(grounding.notes),
-        },
+        "temporal_trust": temporal_trust_wire(
+            grounding.temporal_trust,
+            grounding.temporal_certified,
+            grounding.notes,
+        ),
         "provenance": {
             "runtime_inputs": ["question", "question_date", "exact_retrieved_evidence"],
             "stages": stages,
@@ -5554,7 +5555,7 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
                         ).date().isoformat()
                     except (TypeError, ValueError, OverflowError, OSError):
                         session_date = None
-                occurrence, temporal_trust = resolve_occurrence_time_with_trust(
+                occurrence, resolved_trust = resolve_occurrence_time_with_trust(
                     (hydrated or {}).get("content") or hit.get("snippet") or "",
                     observed_at=source_observed_at or 0,
                     session_date=session_date,
@@ -5563,7 +5564,12 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
                 )
                 occurrence["stored_at"] = source_row.get("ingested_at") or source_row.get("timestamp")
                 item["occurrence_time"] = occurrence
-                item["temporal_trust"] = temporal_trust
+                trust_note = str(resolved_trust.get("trust_note") or "").strip()
+                item["temporal_trust"] = temporal_trust_wire(
+                    resolved_trust.get("anchor_trust"),
+                    resolved_trust.get("temporal_certified"),
+                    (trust_note,) if trust_note else (),
+                )
                 item["observation_time"] = {
                     "observed_at": occurrence.get("observed_at") or None,
                     "ingested_at": source_row.get("ingested_at") or source_row.get("timestamp"),

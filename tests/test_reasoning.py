@@ -263,16 +263,19 @@ def test_compute_accepts_caller_anchor_only_when_it_agrees_with_sidecar(evidence
 
 
 @pytest.mark.parametrize(
-    ("unit", "expected_value"),
+    ("unit_phrase", "expected_value", "expected_unit"),
     [
-        ("days", 794),
-        ("weeks", 113),
-        ("months", 26),
-        ("years", 2),
+        ("days", 794, "day"),
+        ("weeks", 113, "week"),
+        ("months", 26, "month"),
+        ("years", 2, "year"),
+        ("calendar days", 794, "day"),
+        ("calendar weeks", 113, "week"),
+        ("calendar months", 26, "month"),
     ],
 )
 def test_how_long_ago_answer_honors_explicit_unit(
-    evidence_db, unit, expected_value
+    evidence_db, unit_phrase, expected_value, expected_unit
 ):
     messages, assertions = evidence_db
     content = "I completed the plank challenge on January 15, 2021."
@@ -283,7 +286,7 @@ def test_how_long_ago_answer_honors_explicit_unit(
     response = json.loads(lcm_compute(
         {
             "question": (
-                f"How long ago, in {unit}, did I complete the plank challenge?"
+                f"How long ago, in {unit_phrase}, did I complete the plank challenge?"
             ),
             "question_date": "2023-03-20",
             "operands": [
@@ -295,7 +298,7 @@ def test_how_long_ago_answer_honors_explicit_unit(
 
     assert response["status"] == "computed"
     assert response["trace"]["result_value"] == expected_value
-    assert response["trace"]["unit"] == unit.rstrip("s")
+    assert response["trace"]["unit"] == expected_unit
 
 
 def test_how_long_ago_answer_without_unit_uses_coarsest_fit(evidence_db):
@@ -357,6 +360,30 @@ def test_compute_sidecar_overrides_disagreeing_caller_anchor(evidence_db):
     assert response["temporal_trust"]["notes"] == [
         "caller session_date 2023-03-21 overridden by engine sidecar 2023-03-20"
     ]
+
+
+def test_caller_session_date_is_bounded_in_schema_and_trust_note():
+    from hermes_lcm.schemas import LCM_COMPUTE
+
+    caller_session_date = "caller-" + ("x" * 500)
+    _, trust = resolve_occurrence_time_with_trust(
+        "I completed the plank challenge 5 days ago.",
+        observed_at=_epoch("2023-03-20"),
+        session_date=caller_session_date,
+        engine=SimpleNamespace(
+            _session_occurrence_dates={"session-a": "2023-03-20"},
+        ),
+        session_id="session-a",
+    )
+
+    note = trust["trust_note"]
+    assert caller_session_date not in note
+    assert ("caller-" + ("x" * 54) + "...") in note
+    session_date_schema = (
+        LCM_COMPUTE["parameters"]["properties"]["operands"]["items"]
+        ["properties"]["occurrence_time"]["properties"]["session_date"]
+    )
+    assert session_date_schema["maxLength"] == 64
 
 
 def test_compute_without_sidecar_marks_temporal_result_low_trust(evidence_db):

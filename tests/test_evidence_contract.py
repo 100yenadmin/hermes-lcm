@@ -521,6 +521,37 @@ def test_complete_finite_enumeration_counts_distinct_adapter_dated_events(tmp_pa
     assert result["coverage_certificate"]["adapter_time_used"] is True
 
 
+def test_relative_finite_event_without_sidecar_is_counted_but_uncertified(
+    tmp_path,
+):
+    engine = _engine(tmp_path)
+    observed_at = datetime(2025, 6, 2, tzinfo=timezone.utc).timestamp()
+    source = _append(
+        engine,
+        "I took a vacation to Kyoto yesterday.",
+        session_id="kyoto",
+        timestamp=observed_at,
+    )
+    try:
+        result = _compile(
+            engine,
+            "How many vacations did I take this year?",
+            [source],
+            question_as_of="2025-12-31",
+            budgets={"max_retrieval_calls": 0},
+        )
+    finally:
+        engine._store.close()
+
+    assert result["state"] == "computation_sufficient"
+    assert result["computation"]["result_value"] == 1
+    assert result["finite_coverage"] is False
+    assert result["reason_code"] == "finite_count_uncertified_undated_events"
+    assert result["coverage_certificate"]["every_counted_event_dated"] is True
+    assert result["coverage_certificate"]["every_counted_event_trusted"] is False
+    assert "UNCERTIFIED" in result["context"]
+
+
 def test_finite_enumeration_distinguishes_same_entity_events_by_date(tmp_path):
     engine = _engine(tmp_path)
     first = _append(engine, "I took a vacation to Bali.", session_id="first")

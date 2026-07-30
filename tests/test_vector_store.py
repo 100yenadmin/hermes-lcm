@@ -1520,6 +1520,17 @@ def test_full_scan_deadline_on_final_batch_reports_complete_total(
             VectorStore, "_vectorized_batch", staticmethod(timed_load)
         )
 
+        def count_should_not_run(*args, **kwargs):
+            raise AssertionError(
+                "completed final-batch scan must not run COUNT(*)"
+            )
+
+        monkeypatch.setattr(
+            store,
+            "_count_embedded_vectors",
+            count_should_not_run,
+        )
+
         result = store.knn(
             [1.0, 0.0, 0.0],
             k=1,
@@ -1574,6 +1585,17 @@ def test_full_scan_deadline_on_final_batch_without_numpy_reports_complete_total(
         monkeypatch.setattr(vector_store_module, "_load_numpy", unavailable)
         monkeypatch.setattr(vector_store_module, "_monotonic", lambda: now[0])
         monkeypatch.setattr(store, "_load_vectors_for_ids", timed_load)
+
+        def count_should_not_run(*args, **kwargs):
+            raise AssertionError(
+                "completed final-batch scan must not run COUNT(*)"
+            )
+
+        monkeypatch.setattr(
+            store,
+            "_count_embedded_vectors",
+            count_should_not_run,
+        )
 
         result = store.knn(
             [1.0, 0.0, 0.0],

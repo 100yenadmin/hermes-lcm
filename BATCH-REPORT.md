@@ -23,15 +23,15 @@ Each upstream hunk was checked against the current `fork/main` baseline before e
 ## Unit results
 
 All commands below use repository-relative test paths and run from the repository
-root. `AGENT_STUB_PATH` is operator-local for standalone checkouts that need the
-`hermes_lcm` package shim; an installed checkout may omit the `PYTHONPATH` prefix.
+root. `PYTHONPATH=.` makes the commands portable in a clean checkout without
+operator-local environment variables.
 
 ### Unit 1: six upstream follow-up fixes
 
 Command:
 
 ```text
-PYTHONPATH="${AGENT_STUB_PATH}" python3 -m pytest -q tests/test_adaptive_retrieval.py::test_persisted_slot_refs_include_only_selected_evidence tests/test_adaptive_retrieval.py::test_query_view_cleanup_cannot_replace_the_build_failure tests/test_evidence_compiler.py::test_duplicate_grounded_ref_cannot_certify_finite_coverage tests/test_query_view_store.py::test_hit_confirmation_rechecks_generation_after_source_mutation tests/test_trajectory_store.py::test_newer_trajectory_schema_is_rejected_before_fts_repair tests/test_vector_store.py::test_full_scan_budget_stops_early_and_reports_bounded tests/test_vector_store.py::test_full_scan_budget_includes_candidate_enumeration tests/test_vector_store.py::test_full_scan_absolute_deadline_stops_between_batches tests/test_vector_store.py::test_resident_deadline_does_not_start_a_count_query tests/test_prescreen_flip_blackout.py::test_deadline_bounds_a_synced_binary_summary_prescreen tests/test_int8_two_stage_knn.py::test_chunk_deadline_bounds_a_synced_binary_prescreen
+PYTHONPATH=. python3 -m pytest -q tests/test_adaptive_retrieval.py::test_persisted_slot_refs_include_only_selected_evidence tests/test_adaptive_retrieval.py::test_query_view_cleanup_cannot_replace_the_build_failure tests/test_evidence_compiler.py::test_duplicate_grounded_ref_cannot_certify_finite_coverage tests/test_query_view_store.py::test_hit_confirmation_rechecks_generation_after_source_mutation tests/test_trajectory_store.py::test_newer_trajectory_schema_is_rejected_before_fts_repair tests/test_vector_store.py::test_full_scan_budget_stops_early_and_reports_bounded tests/test_vector_store.py::test_full_scan_budget_includes_candidate_enumeration tests/test_vector_store.py::test_full_scan_absolute_deadline_stops_between_batches tests/test_vector_store.py::test_resident_deadline_does_not_start_a_count_query tests/test_prescreen_flip_blackout.py::test_deadline_bounds_a_synced_binary_summary_prescreen tests/test_int8_two_stage_knn.py::test_chunk_deadline_bounds_a_synced_binary_prescreen
 ```
 
 Result: **11 passed**.
@@ -41,7 +41,7 @@ Result: **11 passed**.
 Command:
 
 ```text
-PYTHONPATH="${AGENT_STUB_PATH}" python3 -m pytest -q tests/test_evidence_contract.py::test_finite_enumeration_distinguishes_same_entity_events_by_date tests/test_evidence_contract.py::test_finite_enumeration_returns_dated_and_undated_count_uncertified tests/test_evidence_contract.py::test_finite_enumeration_collapses_repeated_undated_mentions
+PYTHONPATH=. python3 -m pytest -q tests/test_evidence_contract.py::test_finite_enumeration_distinguishes_same_entity_events_by_date tests/test_evidence_contract.py::test_finite_enumeration_returns_dated_and_undated_count_uncertified tests/test_evidence_contract.py::test_finite_enumeration_collapses_repeated_undated_mentions
 ```
 
 Result: **3 passed**.
@@ -51,7 +51,7 @@ Result: **3 passed**.
 Command:
 
 ```text
-PYTHONPATH="${AGENT_STUB_PATH}" python3 -m pytest -q tests/test_trajectory_store.py::test_unused_adjacency_reserve_backfills_the_full_ranked_limit tests/test_trajectory_store.py::test_partial_adjacency_reserve_backfills_in_rank_order tests/test_trajectory_store.py::test_full_adjacency_reserve_keeps_the_existing_composition
+PYTHONPATH=. python3 -m pytest -q tests/test_trajectory_store.py::test_unused_adjacency_reserve_backfills_the_full_ranked_limit tests/test_trajectory_store.py::test_partial_adjacency_reserve_backfills_in_rank_order tests/test_trajectory_store.py::test_full_adjacency_reserve_keeps_the_existing_composition
 ```
 
 Result: **3 passed**.
@@ -61,7 +61,7 @@ Result: **3 passed**.
 Command:
 
 ```text
-PYTHONPATH="${AGENT_STUB_PATH}" python3 -m pytest -q tests/test_reasoning.py::test_compute_accepts_caller_anchor_only_when_it_agrees_with_sidecar tests/test_reasoning.py::test_compute_sidecar_overrides_disagreeing_caller_anchor tests/test_reasoning.py::test_compute_without_sidecar_marks_temporal_result_low_trust
+PYTHONPATH=. python3 -m pytest -q tests/test_reasoning.py::test_compute_accepts_caller_anchor_only_when_it_agrees_with_sidecar tests/test_reasoning.py::test_compute_sidecar_overrides_disagreeing_caller_anchor tests/test_reasoning.py::test_compute_without_sidecar_marks_temporal_result_low_trust
 ```
 
 Result: **3 passed**.
@@ -71,7 +71,7 @@ Result: **3 passed**.
 Command:
 
 ```text
-PYTHONPATH="${AGENT_STUB_PATH}" python3 -m pytest -q tests/test_reasoning.py::test_planner_uses_explicit_cardinality_and_interval_units
+PYTHONPATH=. python3 -m pytest -q tests/test_reasoning.py::test_planner_uses_explicit_cardinality_and_interval_units
 ```
 
 Result: **1 passed**. The regression proves that `how long ago` plans one evidence-date operand plus the question-date anchor.
@@ -81,7 +81,7 @@ Result: **1 passed**. The regression proves that `how long ago` plans one eviden
 Spec acceptance files:
 
 ```text
-PYTHONPATH="${AGENT_STUB_PATH}" python3 -m pytest -q tests/test_trajectory_store.py tests/test_evidence_contract.py tests/test_reasoning.py
+PYTHONPATH=. python3 -m pytest -q tests/test_trajectory_store.py tests/test_evidence_contract.py tests/test_reasoning.py
 ```
 
 Result: **81 passed**.
@@ -89,7 +89,7 @@ Result: **81 passed**.
 Upstream-port affected test files:
 
 ```text
-PYTHONPATH="${AGENT_STUB_PATH}" python3 -m pytest -q tests/test_adaptive_retrieval.py tests/test_evidence_compiler.py tests/test_query_view_store.py tests/test_vector_store.py tests/test_prescreen_flip_blackout.py tests/test_int8_two_stage_knn.py
+PYTHONPATH=. python3 -m pytest -q tests/test_adaptive_retrieval.py tests/test_evidence_compiler.py tests/test_query_view_store.py tests/test_vector_store.py tests/test_prescreen_flip_blackout.py tests/test_int8_two_stage_knn.py
 ```
 
 Result: **166 passed**.
@@ -116,6 +116,9 @@ count grew only when review rounds added regressions to those files:
 - Round 5: **94 passed** (**+2** acceptance tests: explicit-date certification
   without a sidecar and collision resistance for distinct overlong same-date
   event keys).
+- Round 6: **99 passed** (**+5** acceptance cases: one low-trust finite-count
+  certification regression, three `calendar` unit variants, and one bounded
+  caller-session-date schema/note regression).
 
 The Round-4 final-batch deadline regression is in `tests/test_vector_store.py`,
 so it increases the upstream-affected suite from **166** to **167** without
@@ -148,7 +151,7 @@ expectation.
 Focused CI command:
 
 ```text
-PYTHONPATH="${AGENT_STUB_PATH}" python3 -m pytest tests/test_chunk_vector_store.py tests/test_trajectory_composition_policies.py tests/test_trajectory_state_semantic_expansion.py -q
+PYTHONPATH=. python3 -m pytest tests/test_chunk_vector_store.py tests/test_trajectory_composition_policies.py tests/test_trajectory_state_semantic_expansion.py -q
 ```
 
 Result after the fix: **60 passed**.
@@ -180,7 +183,7 @@ was performed.
 | `3679976780` | P2 | **fixed** — `_finite_event_key` reserves the 300-character budget for the date suffix. Regression proves an over-300-character base yields distinct keys for two dates and preserves both suffixes. |
 | `3679976783` | P2 | **fixed** — temporal certification now requires the sidecar anchor to parse successfully. A malformed sidecar uses D-ARCH-3's absent/unusable-sidecar cell: `anchor_trust=low_trust`, `temporal_certified=false`; it does not retain `engine_sidecar` trust. |
 | `3679973895` | P3 | **documented only** — comments at both certification sites name caller-evidence `exact_ref` uniqueness and engine finite-scan `dedupe_key` uniqueness and state that the surfaces intentionally differ. |
-| `3680021253` | Minor | **fixed in this report** — machine-local `PYTHONPATH` values were replaced by the operator-local `AGENT_STUB_PATH` convention while all test targets remain repository-relative. |
+| `3680021253` | Minor | **superseded by the Round-6 portability fix** — all commands now use repository-relative `PYTHONPATH=.` and require no operator-local environment variable. |
 
 Round-2 proof:
 
@@ -215,7 +218,7 @@ or GitHub write was performed.
 Round-3 focused regressions:
 
 ```text
-PYTHONPATH="${AGENT_STUB_PATH}" python3 -m pytest -q tests/test_evidence_contract.py::test_finite_enumeration_distinguishes_same_entity_events_by_date tests/test_evidence_contract.py::test_finite_enumeration_returns_dated_and_undated_count_uncertified tests/test_trajectory_store.py::test_adjacency_reserve_backfill_preserves_diversity_cap tests/test_reasoning.py::test_how_long_ago_answer_honors_explicit_unit tests/test_reasoning.py::test_how_long_ago_answer_without_unit_uses_coarsest_fit tests/test_reasoning.py::test_public_compute_tool_reports_stages_and_discards_mutated_candidate tests/test_vector_store.py::test_full_scan_budget_stops_early_and_reports_bounded tests/test_vector_store.py::test_full_scan_budget_includes_candidate_enumeration
+PYTHONPATH=. python3 -m pytest -q tests/test_evidence_contract.py::test_finite_enumeration_distinguishes_same_entity_events_by_date tests/test_evidence_contract.py::test_finite_enumeration_returns_dated_and_undated_count_uncertified tests/test_trajectory_store.py::test_adjacency_reserve_backfill_preserves_diversity_cap tests/test_reasoning.py::test_how_long_ago_answer_honors_explicit_unit tests/test_reasoning.py::test_how_long_ago_answer_without_unit_uses_coarsest_fit tests/test_reasoning.py::test_public_compute_tool_reports_stages_and_discards_mutated_candidate tests/test_vector_store.py::test_full_scan_budget_stops_early_and_reports_bounded tests/test_vector_store.py::test_full_scan_budget_includes_candidate_enumeration
 ```
 
 Result: **11 passed**.
@@ -250,7 +253,7 @@ or GitHub write was performed.
 Round-4 focused regressions:
 
 ```text
-PYTHONPATH="${AGENT_STUB_PATH}" python3 -m pytest -q tests/test_vector_store.py::test_full_scan_deadline_on_final_batch_reports_complete_total tests/test_evidence_contract.py::test_finite_enumeration_counts_available_and_excludes_postdated_event tests/test_evidence_contract.py::test_finite_enumeration_all_unavailable_returns_no_count
+PYTHONPATH=. python3 -m pytest -q tests/test_vector_store.py::test_full_scan_deadline_on_final_batch_reports_complete_total tests/test_evidence_contract.py::test_finite_enumeration_counts_available_and_excludes_postdated_event tests/test_evidence_contract.py::test_finite_enumeration_all_unavailable_returns_no_count
 ```
 
 Result: **3 passed**.
@@ -287,7 +290,7 @@ push, PR write, or other Git/GitHub mutation was performed.
 Round-5 focused regressions:
 
 ```text
-PYTHONPATH="${AGENT_STUB_PATH}" python3 -m pytest -q tests/test_lcm_recall.py::test_recalled_occurrence_round_trips_as_unchanged_compute_operand tests/test_reasoning.py::test_explicit_occurrence_without_sidecar_is_certified tests/test_reasoning.py::test_compute_without_sidecar_marks_temporal_result_low_trust tests/test_reasoning.py::test_malformed_sidecar_date_is_low_trust_and_uncertified tests/test_vector_store.py::test_full_scan_deadline_on_final_batch_without_numpy_reports_complete_total tests/test_query_view_store.py::test_hit_confirmation_rechecks_generation_after_source_mutation tests/test_evidence_contract.py::test_finite_event_key_hashes_distinct_overlong_bases_on_same_date
+PYTHONPATH=. python3 -m pytest -q tests/test_lcm_recall.py::test_recalled_occurrence_round_trips_as_unchanged_compute_operand tests/test_reasoning.py::test_explicit_occurrence_without_sidecar_is_certified tests/test_reasoning.py::test_compute_without_sidecar_marks_temporal_result_low_trust tests/test_reasoning.py::test_malformed_sidecar_date_is_low_trust_and_uncertified tests/test_vector_store.py::test_full_scan_deadline_on_final_batch_without_numpy_reports_complete_total tests/test_query_view_store.py::test_hit_confirmation_rechecks_generation_after_source_mutation tests/test_evidence_contract.py::test_finite_event_key_hashes_distinct_overlong_bases_on_same_date
 ```
 
 Result: **7 passed**.
@@ -305,11 +308,55 @@ Delivery checkpoint: **COMPLETE** for the named local Round-5 disposition gate;
 **ADVANCE** to the orchestrator handoff. This does not claim remote exact-head
 CI for the unstaged delta, merge readiness, merge, release, or runtime proof.
 
+## Round 6 final full-round dispositions
+
+Review mode: **address**, binding Round-6 final full-round disposition batch.
+Candidate identity: PR `#190`, branch `batch/v2-rebaseline`, local/remote head
+before this unstaged batch `849a26be61119e105515bba27c944a75df7f8c41`.
+Every finding body was read through the requested per-comment `gh api` route.
+No commit, push, PR write, review reply/resolution, or other Git/GitHub mutation
+was performed.
+
+| Comment ID | Priority | Disposition |
+|---|---|---|
+| `3680255017` | P1 | **fixed** — finite enumeration now passes the engine trust sidecar into grounding and requires both a dated and non-low-trust operand set for certification. A relative event resolved only from host `observed_at` remains counted but sets `every_counted_event_trusted=false`, `finite_coverage=false`, and the existing uncertified reason/disclosure. |
+| `3680255014` | P2 | **fixed** — `how long ago, in calendar days/weeks/months` preserves the explicitly requested unit. The answer-level parameterization covers all three calendar forms. |
+| `3680255021` | P2 | **fixed** — persisted computation traces allow and store the bounded `temporal_trust` sibling. The low-trust compute → publish → warm-replay regression proves the cached view exposes the same `{status, certified, notes}` block as the fresh compute. |
+| `3680255026` | P2 | **fixed** — caller `occurrence_time.session_date` text is truncated to 64 characters before inclusion in a trust note, and the compute schema now declares `maxLength: 64`. |
+| `3680273764` | Minor | **fixed in this report** — every replay command uses repository-relative `PYTHONPATH=.` and no operator environment variable. |
+| `3680273767` | Major | **fixed** — all six message/chunk scan result sites now use one `_scanned_knn_result` helper for deadline-aware `scanned`/`total` gating; the existing bounded/full/deadline suites plus the new chunk mirror preserve behavior. |
+| `3680378478`, `3680438106` | P2 + Major | **fixed** — lookup now takes a fresh corpus snapshot inside the hit-confirmation write transaction before incrementing the hit. The regression mutates only after the initial negative-space snapshot, asserts a branch-entry marker, reaches the second snapshot, and receives the branch-specific `corpus advanced during hit confirmation` result with a stale view and zero hits. |
+| `3680378485` | P2 | **fixed** — the unconditional bare assert is gone. Calendar endpoint validation is an explicit fallback scoped to `auto`, `month`, and `year`; day/week execution retains the prior narrow path and is safe under `python -O`. |
+| `3680378489` | P3 | **fixed** — one `temporal_trust_wire` helper emits the same bounded `{status, certified, notes}` shape for `lcm_compute`, `lcm_recall`, and persisted replay. The recall-to-compute wire test compares the two public blocks directly. |
+| `3680438117` | Trivial | **fixed** — both summary final-batch regressions use an explicit `AssertionError`-raising COUNT stub, and the mirrored `knn_chunks` regression proves a completed two-batch deadline crossing reports `full`, `scanned=4`, `total=4` without calling COUNT. |
+
+Round-6 focused regressions:
+
+```text
+PYTHONPATH=. python3 -m pytest -q tests/test_evidence_contract.py::test_relative_finite_event_without_sidecar_is_counted_but_uncertified tests/test_reasoning.py::test_how_long_ago_answer_honors_explicit_unit tests/test_reasoning.py::test_caller_session_date_is_bounded_in_schema_and_trust_note tests/test_adaptive_retrieval.py::test_low_trust_computation_persists_and_replays_temporal_trust tests/test_lcm_recall.py::test_recalled_occurrence_round_trips_as_unchanged_compute_operand tests/test_query_view_store.py::test_hit_confirmation_rechecks_generation_after_source_mutation tests/test_vector_store.py::test_full_scan_deadline_on_final_batch_reports_complete_total tests/test_vector_store.py::test_full_scan_deadline_on_final_batch_without_numpy_reports_complete_total tests/test_chunk_vector_store.py::test_chunk_deadline_on_final_batch_reports_total_without_count
+```
+
+Result: **15 passed**.
+
+Round-6 acceptance proof:
+
+- Exact CI slice: **61 passed**.
+- Batch acceptance suite: **99 passed**.
+- Upstream-affected suite: **169 passed**.
+- Full `tests/test_lcm_recall.py` suite: **102 passed**.
+- Full changed/affected-file `ruff check`: **all checks passed**.
+- `git diff --check`: **clean**.
+
+Delivery checkpoint: **COMPLETE** for the named local Round-6 final full-round
+disposition gate; **ADVANCE** to the orchestrator handoff. All ten deduplicated
+findings are fixed locally. This does not claim remote exact-head CI for the
+unstaged delta, merge readiness, merge, release, deployment, or runtime proof.
+
 ## Decision fidelity
 
 - D-ARCH-1: dated candidates dedupe by the existing event key plus resolved date; undated candidates retain the existing collapse. Counts with any undated contributor are returned with `finite_coverage=false`.
 - D-ARCH-2: adjacency remains first priority for its reserve; unused slots return to ranked candidates in rank order.
-- D-ARCH-3: explicit dates are self-anchoring and certified without a sidecar; relative occurrences use the engine occurrence-date sidecar as the trusted anchor, disagreement overrides the caller and is noted, and absence or invalidity returns a low-trust, uncertified result. Trust metadata is a sibling of the operand-shaped `occurrence_time` object.
+- D-ARCH-3: explicit dates are self-anchoring and certified without a sidecar; relative occurrences use the engine occurrence-date sidecar as the trusted anchor, disagreement overrides the caller and is noted, and absence or invalidity returns a low-trust, uncertified result. Finite counts still include low-trust relative events but cannot certify them. Trust metadata is a sibling of the operand-shaped `occurrence_time` object and has the same public wire shape on compute, recall, and replay.
 - Batch-2: `how long ago` uses one evidence-date operand and the question-date anchor.
 - Deviations from the binding D-ARCH text: **none**.
 

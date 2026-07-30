@@ -1453,9 +1453,9 @@ def test_recalled_occurrence_round_trips_as_unchanged_compute_operand(
         "support",
     }
     assert hit["temporal_trust"] == {
-        "anchor_trust": "engine_sidecar",
-        "temporal_certified": True,
-        "session_date_overridden": False,
+        "status": "engine_sidecar",
+        "certified": True,
+        "notes": [],
     }
 
     assertions = AssertionStore(recall_engine._store.db_path)
@@ -1489,6 +1489,7 @@ def test_recalled_occurrence_round_trips_as_unchanged_compute_operand(
 
     assert computed["status"] == "computed"
     assert computed["trace"]["result_value"] == 5
+    assert computed["temporal_trust"] == hit["temporal_trust"]
     assert occurrence == occurrence_before_compute
 
 

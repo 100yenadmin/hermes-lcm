@@ -1416,6 +1416,35 @@ class VectorStore:
             return None
         return int(row[0]) if row is not None else None
 
+    def _scanned_knn_result(
+        self,
+        rows: Sequence[tuple[str, float, str]] = (),
+        *,
+        coverage: str,
+        scoring: str,
+        scanned_rows: int,
+        deadline_expired: bool,
+        identity_hash: str,
+        chunk: bool,
+        complete_total: int | None = None,
+    ) -> KNNResult:
+        """Build one scan result with the shared deadline-aware total policy."""
+        scanned = total = None
+        if coverage == "bounded":
+            scanned = scanned_rows
+            if not deadline_expired:
+                total = self._count_embedded_vectors(identity_hash, chunk=chunk)
+        elif complete_total is not None:
+            scanned = scanned_rows
+            total = complete_total
+        return KNNResult(
+            rows,
+            coverage=coverage,
+            scoring=scoring,
+            scanned=scanned,
+            total=total,
+        )
+
     def _data_version(self, identity_hash: str) -> int:
         row = self._conn.execute(
             "SELECT data_version FROM lcm_embedding_profile WHERE identity_hash = ?",
@@ -3128,15 +3157,13 @@ class VectorStore:
                 stop_deadline=scan_deadline,
                 stop_expired=True,
             )
-            return KNNResult(
+            return self._scanned_knn_result(
                 coverage="bounded",
                 scoring=exact_scoring,
-                scanned=exc.scanned,
-                total=(
-                    None
-                    if deadline_expired
-                    else self._count_embedded_vectors(identity, chunk=False)
-                ),
+                scanned_rows=exc.scanned,
+                deadline_expired=deadline_expired,
+                identity_hash=identity,
+                chunk=False,
             )
         if not probed_ids:
             return KNNResult(coverage="none", scoring=exact_scoring)
@@ -3176,20 +3203,15 @@ class VectorStore:
                     )
                 )
                 coverage = "bounded" if stopped_early else candidate_coverage
-                scanned = total = None
-                if coverage == "bounded":
-                    scanned = scanned_rows
-                    if not deadline_expired:
-                        total = self._count_embedded_vectors(identity, chunk=False)
-                elif scan_deadline is not None:
-                    scanned = scanned_rows
-                    total = len(scan_ids)
-                return KNNResult(
+                return self._scanned_knn_result(
                     candidates,
                     coverage=coverage,
                     scoring=exact_scoring,
-                    scanned=scanned,
-                    total=total,
+                    scanned_rows=scanned_rows,
+                    deadline_expired=deadline_expired,
+                    identity_hash=identity,
+                    chunk=False,
+                    complete_total=(len(scan_ids) if scan_deadline is not None else None),
                 )
 
             def score_batch(
@@ -3234,20 +3256,15 @@ class VectorStore:
             score_batch=score_batch,
         )
         coverage = "bounded" if stopped_early else candidate_coverage
-        scanned = total = None
-        if coverage == "bounded":
-            scanned = scanned_rows
-            if not deadline_expired:
-                total = self._count_embedded_vectors(identity, chunk=False)
-        elif scan_deadline is not None:
-            scanned = scanned_rows
-            total = len(scan_ids)
-        return KNNResult(
+        return self._scanned_knn_result(
             candidates,
             coverage=coverage,
             scoring=exact_scoring,
-            scanned=scanned,
-            total=total,
+            scanned_rows=scanned_rows,
+            deadline_expired=deadline_expired,
+            identity_hash=identity,
+            chunk=False,
+            complete_total=(len(scan_ids) if scan_deadline is not None else None),
         )
 
     def _scan_limits(
@@ -3890,15 +3907,13 @@ class VectorStore:
                 stop_deadline=scan_deadline,
                 stop_expired=True,
             )
-            return KNNResult(
+            return self._scanned_knn_result(
                 coverage="bounded",
                 scoring=exact_scoring,
-                scanned=exc.scanned,
-                total=(
-                    None
-                    if deadline_expired
-                    else self._count_embedded_vectors(identity, chunk=True)
-                ),
+                scanned_rows=exc.scanned,
+                deadline_expired=deadline_expired,
+                identity_hash=identity,
+                chunk=True,
             )
         if not probed_ids:
             return KNNResult(coverage="none", scoring=exact_scoring)
@@ -3936,20 +3951,15 @@ class VectorStore:
                     )
                 )
                 coverage = "bounded" if stopped_early else candidate_coverage
-                scanned = total = None
-                if coverage == "bounded":
-                    scanned = scanned_rows
-                    if not deadline_expired:
-                        total = self._count_embedded_vectors(identity, chunk=True)
-                elif scan_deadline is not None:
-                    scanned = scanned_rows
-                    total = len(scan_ids)
-                return KNNResult(
+                return self._scanned_knn_result(
                     candidates,
                     coverage=coverage,
                     scoring=exact_scoring,
-                    scanned=scanned,
-                    total=total,
+                    scanned_rows=scanned_rows,
+                    deadline_expired=deadline_expired,
+                    identity_hash=identity,
+                    chunk=True,
+                    complete_total=(len(scan_ids) if scan_deadline is not None else None),
                 )
 
             def score_batch(
@@ -3981,20 +3991,15 @@ class VectorStore:
             score_batch=score_batch,
         )
         coverage = "bounded" if stopped_early else candidate_coverage
-        scanned = total = None
-        if coverage == "bounded":
-            scanned = scanned_rows
-            if not deadline_expired:
-                total = self._count_embedded_vectors(identity, chunk=True)
-        elif scan_deadline is not None:
-            scanned = scanned_rows
-            total = len(scan_ids)
-        return KNNResult(
+        return self._scanned_knn_result(
             candidates,
             coverage=coverage,
             scoring=exact_scoring,
-            scanned=scanned,
-            total=total,
+            scanned_rows=scanned_rows,
+            deadline_expired=deadline_expired,
+            identity_hash=identity,
+            chunk=True,
+            complete_total=(len(scan_ids) if scan_deadline is not None else None),
         )
 
     def _current_chunk_profile(self) -> sqlite3.Row | None:
