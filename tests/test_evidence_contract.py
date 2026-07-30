@@ -8,7 +8,10 @@ from types import SimpleNamespace
 
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.evidence_compiler import compile_preanswer_evidence
-from hermes_lcm.requirements_compiler import _finite_event_key
+from hermes_lcm.requirements_compiler import (
+    _finite_event_key,
+    _source_event_clause,
+)
 from hermes_lcm.store import MessageStore
 from hermes_lcm.tools import lcm_compile_evidence
 from hermes_lcm.schemas import LCM_COMPILE_EVIDENCE
@@ -182,6 +185,9 @@ def test_open_cardinality_returns_one_event_count_uncertified(tmp_path):
     assert result["finite_coverage"] is False
     assert result["computation"]["result_value"] == 1
     assert result["reason_code"] == "finite_count_uncertified_undated_events"
+    assert result["coverage_certificate"]["every_counted_event_dated"] is False
+    assert result["coverage_certificate"]["every_counted_event_trusted"] is True
+    assert "UNCERTIFIED" in result["context"]
 
 
 def test_targeted_retrieval_admits_only_positive_slot_coverage(tmp_path):
@@ -552,6 +558,40 @@ def test_relative_finite_event_without_sidecar_is_counted_but_uncertified(
     assert "UNCERTIFIED" in result["context"]
 
 
+def test_relative_finite_event_without_observed_at_is_counted_but_uncertified(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "hermes_lcm.store.time.time",
+        lambda: datetime(2025, 6, 1, tzinfo=timezone.utc).timestamp(),
+    )
+    engine = _engine(tmp_path)
+    source = _append(
+        engine,
+        "I took a vacation to Kyoto yesterday.",
+        session_id="kyoto",
+    )
+    try:
+        result = _compile(
+            engine,
+            "How many vacations did I take this year?",
+            [source],
+            question_as_of="2025-12-31",
+            budgets={"max_retrieval_calls": 0},
+        )
+    finally:
+        engine._store.close()
+
+    assert result["state"] == "computation_sufficient", result
+    assert result["computation"]["result_value"] == 1
+    assert result["finite_coverage"] is False
+    assert result["reason_code"] == "finite_count_uncertified_undated_events"
+    assert result["coverage_certificate"]["every_counted_event_dated"] is False
+    assert result["coverage_certificate"]["every_counted_event_trusted"] is False
+    assert "UNCERTIFIED" in result["context"]
+
+
 def test_finite_enumeration_distinguishes_same_entity_events_by_date(tmp_path):
     engine = _engine(tmp_path)
     first = _append(engine, "I took a vacation to Bali.", session_id="first")
@@ -710,6 +750,44 @@ def test_finite_enumeration_rejects_explicitly_negated_undated_events(tmp_path):
     assert result["coverage_certificate"]["distinct_keys"] == 1
 
 
+def test_source_event_negation_binds_to_event_action_or_counted_unit():
+    rejected = (
+        "I took no vacation to Bali.",
+        "I took zero vacations this year.",
+        "I took none of my vacations with family.",
+        "I went without taking a vacation this year.",
+        "I never visited Bali on vacation.",
+        "I did not take a vacation to Bali.",
+        "I didn't take a vacation to Bali.",
+        "I didn t take a vacation to Bali.",
+        "We don't take vacations to Bali.",
+        "We don t take vacations to Bali.",
+        "I doesn't take a vacation to Bali.",
+        "I doesn t take a vacation to Bali.",
+        "We haven't taken a vacation to Bali.",
+        "We haven t taken a vacation to Bali.",
+        "I hasn't taken a vacation to Bali.",
+        "I hasn t taken a vacation to Bali.",
+    )
+    admitted = (
+        "I took a vacation with Don.",
+        "I took a vacation with no checked bags.",
+        "I took a vacation without my family.",
+        "I took a vacation with no vacations planned afterward.",
+        "I took a vacation to Havre.",
+        "I took a vacation to Haven.",
+    )
+
+    assert all(
+        not _source_event_clause(quote, role="user", unit="vacation")
+        for quote in rejected
+    )
+    assert all(
+        _source_event_clause(quote, role="user", unit="vacation")
+        for quote in admitted
+    )
+
+
 def test_finite_enumeration_counts_available_and_excludes_postdated_event(tmp_path):
     engine = _engine(tmp_path)
     available = _append(
@@ -741,6 +819,46 @@ def test_finite_enumeration_counts_available_and_excludes_postdated_event(tmp_pa
     assert result["computation"]["result_value"] == 1
     assert result["coverage_certificate"]["unavailable_as_of_clauses"] == 1
     assert result["coverage_certificate"]["distinct_keys"] == 1
+    assert postdated["exact_ref"] not in {
+        item["exact_ref"] for item in result["evidence"]
+    }
+
+
+def test_finite_enumeration_excludes_future_event_with_available_observed_at(
+    tmp_path,
+):
+    engine = _engine(tmp_path)
+    observed = datetime(2025, 6, 1, tzinfo=timezone.utc).timestamp()
+    available = _append(
+        engine,
+        "I took a vacation to Kyoto.",
+        session_id="available",
+        timestamp=observed,
+    )
+    postdated = _append(
+        engine,
+        "I took a vacation to Bali.",
+        session_id="postdated",
+        timestamp=observed,
+    )
+    engine._session_occurrence_dates.update(
+        {"available": "2025-06-01", "postdated": "2026-01-02"}
+    )
+    try:
+        result = _compile(
+            engine,
+            "How many vacations did I take this year?",
+            [available, postdated],
+            question_as_of="2025-12-31",
+            budgets={"max_retrieval_calls": 0},
+        )
+    finally:
+        engine._store.close()
+
+    assert result["finite_coverage"] is True
+    assert result["reason_code"] == "finite_coverage_product_verified"
+    assert result["computation"]["result_value"] == 1
+    assert result["coverage_certificate"]["unavailable_as_of_clauses"] == 1
     assert postdated["exact_ref"] not in {
         item["exact_ref"] for item in result["evidence"]
     }

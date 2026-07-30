@@ -1380,7 +1380,11 @@ def execute_plan(
             if later.day < earlier.day:
                 complete_months -= 1
             complete_years = later.year - earlier.year
-            if (later.month, later.day) < (earlier.month, earlier.day):
+            anniversary_day = min(
+                earlier.day,
+                calendar.monthrange(later.year, earlier.month)[1],
+            )
+            if (later.month, later.day) < (earlier.month, anniversary_day):
                 complete_years -= 1
 
         if interval_unit == "auto":

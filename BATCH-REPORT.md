@@ -119,6 +119,12 @@ count grew only when review rounds added regressions to those files:
 - Round 6: **99 passed** (**+5** acceptance cases: one low-trust finite-count
   certification regression, three `calendar` unit variants, and one bounded
   caller-session-date schema/note regression).
+- Round 6.2 pre-Round-7 head: **100 passed** (**+1** explicitly negated
+  finite-event regression).
+- Round 7: **105 passed** (**+5** cases: missing-`observed_at` fallback,
+  event-bound negation, observed-available/future-event exclusion, and two
+  leap-day anniversary dates; the open-cardinality disclosure test was
+  strengthened without adding a case).
 
 The Round-4 final-batch deadline regression is in `tests/test_vector_store.py`,
 so it increases the upstream-affected suite from **166** to **167** without
@@ -350,6 +356,49 @@ Round-6 acceptance proof:
 Delivery checkpoint: **COMPLETE** for the named local Round-6 final full-round
 disposition gate; **ADVANCE** to the orchestrator handoff. All ten deduplicated
 findings are fixed locally. This does not claim remote exact-head CI for the
+unstaged delta, merge readiness, merge, release, deployment, or runtime proof.
+
+## Round 7 review dispositions
+
+Review mode: **address**, binding Round-7 disposition batch. Candidate identity:
+PR `#190`, branch `batch/v2-rebaseline`, local/remote head before this unstaged
+batch `cbdd4cc2b158c099407e5737c9011e7e11ecb574`. Every finding body was read
+through the requested per-comment `gh api` route. No commit, push, PR write,
+review reply/resolution, checkout, or other Git/GitHub mutation was performed.
+
+| Comment ID | Priority | Disposition |
+|---|---|---|
+| `3680940804`, `3680911089`, `3680911881` | P1 + Major + P2 | **fixed together** — negation is scoped to the counted event assertion. `no`/`none`/`zero`/`without` reject only when bound to the requested unit or its event action; `not`/`never` and the full `didn't`/`don't`/`doesn't`/`haven't`/`hasn't` forms (including curly apostrophes and apostrophe-stripped `didn t`-style forms) reject only when directly attached to an event action. Bare `don`/`haven`/other stems are gone. Regressions preserve rejection of the Round-6.2 negated event and admit `Don`, unrelated `no`/`without` details, `Havre`, and `Haven`. |
+| `3680911885` | P3 | **fixed** — a relative event with neither `observed_at` nor a benchmark session date now falls through the pre-Round-2 availability semantics. It remains counted under D-ARCH-1 and is explicitly uncertified; a present future `observed_at` still excludes through the epoch path. |
+| `3680911888` | P3 | **fixed** — the resolved `event_day` future-date guard now runs before every availability-signal path can return. A regression gives a future event an already-available `observed_at` and proves the event is excluded. |
+| `3680911886` | P3 | **fixed in the test** — the open-cardinality regression now asserts the uncertified reason, both certificate trust/date flags, `finite_coverage=false`, and the Round-3 `UNCERTIFIED` injected-context disclosure. |
+| `3680940808` | P2 | **fixed** — completed-year comparison clamps the anniversary day to the last valid day of the target February. `2020-02-29` to both `2021-02-28` and `2021-03-01` returns one completed year. |
+
+Round-7 focused regressions:
+
+```text
+PYTHONPATH=. python3 -m pytest -q tests/test_evidence_contract.py::test_open_cardinality_returns_one_event_count_uncertified tests/test_evidence_contract.py::test_relative_finite_event_without_observed_at_is_counted_but_uncertified tests/test_evidence_contract.py::test_source_event_negation_binds_to_event_action_or_counted_unit tests/test_evidence_contract.py::test_finite_enumeration_excludes_future_event_with_available_observed_at tests/test_evidence_contract.py::test_finite_enumeration_rejects_explicitly_negated_undated_events tests/test_evidence_contract.py::test_finite_enumeration_counts_available_and_excludes_postdated_event tests/test_reasoning.py::test_how_long_ago_years_clamps_leap_day_anniversary
+```
+
+Result: **8 passed**.
+
+Round-7 acceptance proof:
+
+- Exact CI slice: **61 passed**.
+- Batch acceptance suite: **105 passed**.
+- Upstream-affected suite: **169 passed** with the isolated checkout's
+  `/Volumes/LEXAR/hermes-work/ci-stub` added to `PYTHONPATH`; the literal
+  `PYTHONPATH=.` command could not collect `test_adaptive_retrieval.py` or
+  `test_query_view_store.py` because this checkout has no sibling `agent`
+  package. No symlink or other harness file was created.
+- Full `tests/test_lcm_recall.py` suite under the same CI-stub import
+  prerequisite: **102 passed**.
+- Changed/acceptance/CI-file `ruff check`: **all checks passed**.
+- `git diff --check`: **clean**.
+
+Delivery checkpoint: **COMPLETE** for the named local Round-7 disposition gate;
+**ADVANCE** to the orchestrator handoff. All seven comment IDs have the binding
+local fix or test disposition. This does not claim remote exact-head CI for the
 unstaged delta, merge readiness, merge, release, deployment, or runtime proof.
 
 ## Decision fidelity

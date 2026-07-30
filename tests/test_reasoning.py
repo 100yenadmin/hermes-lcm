@@ -301,6 +301,34 @@ def test_how_long_ago_answer_honors_explicit_unit(
     assert response["trace"]["unit"] == expected_unit
 
 
+@pytest.mark.parametrize("question_date", ["2021-02-28", "2021-03-01"])
+def test_how_long_ago_years_clamps_leap_day_anniversary(
+    evidence_db, question_date
+):
+    messages, assertions = evidence_db
+    content = "I completed the plank challenge on February 29, 2020."
+    store_id = messages.append(
+        "session-a",
+        {"role": "user", "content": content, "timestamp": _epoch("2020-02-29")},
+    )
+    response = json.loads(lcm_compute(
+        {
+            "question": (
+                "How long ago, in years, did I complete the plank challenge?"
+            ),
+            "question_date": question_date,
+            "operands": [
+                _raw(store_id, content, content, date="2020-02-29")
+            ],
+        },
+        engine=SimpleNamespace(_store=messages, _assertions=assertions),
+    ))
+
+    assert response["status"] == "computed"
+    assert response["trace"]["result_value"] == 1
+    assert response["trace"]["unit"] == "year"
+
+
 def test_how_long_ago_answer_without_unit_uses_coarsest_fit(evidence_db):
     messages, assertions = evidence_db
     content = "I completed the plank challenge on January 15, 2021."

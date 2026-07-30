@@ -947,15 +947,18 @@ def _candidate_event_day(candidate: Mapping[str, Any]) -> tuple[date | None, str
 def _available_as_of(candidate: Mapping[str, Any], contract: AnswerContract) -> bool:
     if not contract.question_as_of:
         return True
+    boundary = question_date_as_of_epoch(contract.question_as_of)
+    if boundary is None:
+        return False
+    event_day, _ = _candidate_event_day(candidate)
+    if event_day is not None and event_day > date.fromisoformat(contract.question_as_of):
+        return False
     if (
         contract.temporal_window is None
         and contract.operation
         not in {"latest", "previous", "date_filter", "date_interval", "order"}
     ):
         return True
-    boundary = question_date_as_of_epoch(contract.question_as_of)
-    if boundary is None:
-        return False
     observed = candidate.get("observed_at")
     if observed is not None:
         try:
@@ -973,10 +976,7 @@ def _available_as_of(candidate: Mapping[str, Any], contract: AnswerContract) -> 
         except ValueError:
             return False
     else:
-        return False
-    event_day, _ = _candidate_event_day(candidate)
-    if event_day is not None and event_day > date.fromisoformat(contract.question_as_of):
-        return False
+        return True
     return available <= boundary
 
 
@@ -1699,12 +1699,38 @@ def _source_event_clause(quote: str, *, role: Any, unit: str | None) -> bool:
         return False
     normalized = " ".join(quote.casefold().split())
     if re.search(
-        r"\b(?:might|may|plan(?:ning)? to|want to|hope to|would|could|should|"
-        r"never|not|no|none|zero|without|didn|don|doesn|haven|hasn)\b",
+        r"\b(?:might|may|plan(?:ning)? to|want to|hope to|would|could|should)\b",
         normalized,
     ):
         return False
     forms = "|".join(re.escape(form) for form in _unit_forms(unit))
+    actions = (
+        r"attend(?:ed)?|visit(?:ed)?|go(?:ne)? to|went to|take|took|taken|"
+        r"view(?:ed)?|add(?:ed)?|buy|bought|return(?:ed)? from|"
+        r"participat(?:e|ed) in|complet(?:e|ed)|join(?:ed)?|"
+        r"travel(?:led|ed)? to"
+    )
+    contraction = r"(?:didn|don|doesn|haven|hasn)(?:['’]|\s+)t"
+    if re.search(
+        rf"\b(?:i|we)\s+(?:(?:did|do|does|have|has)\s+not|"
+        rf"{contraction}|never)\s+(?:{actions})\b",
+        normalized,
+    ):
+        return False
+    if re.search(
+        rf"\b(?:i|we)\s+(?:{actions})\s+(?:no|zero)\s+(?:{forms})\b|"
+        rf"\b(?:i|we)\s+(?:{actions})\s+none\s+of\s+"
+        rf"(?:(?:my|our|the)\s+)?(?:{forms})\b|"
+        rf"\b(?:i|we)\s+(?:went|returned|travelled|traveled)\s+without\s+"
+        rf"(?:(?:a|an|any|the)\s+)?(?:{forms})\b|"
+        rf"\b(?:i|we)\s+(?:went|returned|travelled|traveled)\s+without\s+"
+        rf"(?:attending|visiting|going to|taking|viewing|adding|"
+        rf"buying|returning from|participating in|completing|joining|"
+        rf"travelling to|traveling to)\s+(?:(?:a|an|any|the)\s+)?"
+        rf"(?:{forms})\b",
+        normalized,
+    ):
+        return False
     return bool(
         re.search(
             r"\b(?:i|we)\s+(?:attended|visited|went to|took|viewed|added|bought|"
