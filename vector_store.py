@@ -57,6 +57,18 @@ def _prescreen_deadline_expired(deadline: float | None, scanned_rows: int) -> bo
     return deadline is not None and _monotonic() >= deadline
 
 
+def _caller_deadline_expired(
+    caller_deadline: float | None,
+    *,
+    stop_deadline: float | None,
+    stop_expired: bool,
+) -> bool:
+    """Classify an effective stop as the caller's absolute deadline only."""
+    if caller_deadline is None or not stop_expired:
+        return False
+    return stop_deadline == caller_deadline or _monotonic() >= caller_deadline
+
+
 # Vectors are float32 in native little-endian order by default. These are
 # recorded as part of the canonical profile identity so a dtype/byteorder change
 # is detectable rather than silently reinterpreting stored bytes.
@@ -2252,6 +2264,7 @@ class VectorStore:
         batch_rows: int,
         budget_s: float,
         deadline: float | None,
+        caller_deadline: float | None,
         limit: int,
         score_batch: Any,
     ) -> tuple[list[tuple[str, float, str]], int, bool, bool]:
@@ -2266,11 +2279,14 @@ class VectorStore:
         ``budget_s`` (0 = no relative early stop, the default) and the caller's
         absolute operation ``deadline`` can cut the scan short; when either
         does, the caller degrades to ``coverage='bounded'`` and the existing
-        disclosure names the ratio.
+        disclosure names the ratio. ``deadline`` is the effective stop deadline,
+        which may include the relative budget; ``caller_deadline`` is only the
+        caller's absolute deadline.
         Returns ``(ranked top-k, candidates scored, stopped early,
-        deadline expired)``.  The final flag is intentionally separate from
-        ``stopped_early``: an unreadable live vector can make the scan bounded
-        without consuming the caller's latency budget.
+        deadline expired)``. The final flag reports only caller-deadline expiry
+        and is intentionally separate from ``stopped_early``: a relative budget
+        or unreadable live vector can make the scan bounded without expiring the
+        caller's absolute deadline.
 
         A MULTI-BATCH sweep streams past the matrix LRU (``cache=False``). The
         cache holds 4 entries, so a corpus needing more batches than that evicts
@@ -2294,9 +2310,14 @@ class VectorStore:
             self._release_matrix_caches()
         started = _monotonic()
         for start in range(0, len(candidate_ids), batch_rows):
-            if deadline is not None and _monotonic() >= deadline:
+            stop_expired = deadline is not None and _monotonic() >= deadline
+            if stop_expired:
                 stopped_early = True
-                deadline_expired = True
+                deadline_expired = _caller_deadline_expired(
+                    caller_deadline,
+                    stop_deadline=deadline,
+                    stop_expired=stop_expired,
+                )
                 break
             batch = candidate_ids[start:start + batch_rows]
             rowids, embedded_ids, kinds, scores = score_batch(batch, cache_batches)
@@ -2315,12 +2336,16 @@ class VectorStore:
                 budget_expired = (
                     budget_s > 0 and (_monotonic() - started) >= budget_s
                 )
-                deadline_expired = (
+                stop_expired = (
                     deadline is not None and _monotonic() >= deadline
                 )
-                if budget_expired or deadline_expired:
+                if budget_expired or stop_expired:
                     stopped_early = True
-                    deadline_expired = True
+                    deadline_expired = _caller_deadline_expired(
+                        caller_deadline,
+                        stop_deadline=deadline,
+                        stop_expired=stop_expired,
+                    )
                     break
         if scanned < len(candidate_ids):
             stopped_early = True
@@ -2347,6 +2372,7 @@ class VectorStore:
         batch_rows: int,
         budget_s: float,
         deadline: float | None,
+        caller_deadline: float | None,
         limit: int,
         query: Any,
     ) -> tuple[list[tuple[str, float, str]], int, bool, bool]:
@@ -2386,17 +2412,23 @@ class VectorStore:
                 budget_expired = (
                     budget_s > 0 and (_monotonic() - started) >= budget_s
                 )
-                if (
-                    budget_expired
-                    or _prescreen_deadline_expired(deadline, scanned)
-                ):
-                    deadline_expired = True
+                stop_expired = _prescreen_deadline_expired(deadline, scanned)
+                if budget_expired or stop_expired:
+                    deadline_expired = _caller_deadline_expired(
+                        caller_deadline,
+                        stop_deadline=deadline,
+                        stop_expired=stop_expired,
+                    )
                     stopped_early = scanned < len(candidate_ids)
                     if stopped_early:
                         break
         except _PrescreenDeadlineExpired as exc:
             scanned = max(scanned, exc.scanned)
-            deadline_expired = True
+            deadline_expired = _caller_deadline_expired(
+                caller_deadline,
+                stop_deadline=deadline,
+                stop_expired=True,
+            )
             stopped_early = scanned < len(candidate_ids)
         finally:
             if batches is not None:
@@ -3089,10 +3121,20 @@ class VectorStore:
                 reason="unverifiable_provenance",
             )
         except _PrescreenDeadlineExpired as exc:
+            deadline_expired = _caller_deadline_expired(
+                deadline,
+                stop_deadline=scan_deadline,
+                stop_expired=True,
+            )
             return KNNResult(
                 coverage="bounded",
                 scoring=exact_scoring,
                 scanned=exc.scanned,
+                total=(
+                    None
+                    if deadline_expired
+                    else self._count_embedded_vectors(identity, chunk=False)
+                ),
             )
         if not probed_ids:
             return KNNResult(coverage="none", scoring=exact_scoring)
@@ -3126,6 +3168,7 @@ class VectorStore:
                         batch_rows=max(1, self.bounded_scan_rows),
                         budget_s=scan_budget_s,
                         deadline=scan_deadline,
+                        caller_deadline=deadline,
                         limit=k,
                         query=query_array,
                     )
@@ -3181,6 +3224,7 @@ class VectorStore:
             batch_rows=max(1, self.bounded_scan_rows),
             budget_s=scan_budget_s,
             deadline=scan_deadline,
+            caller_deadline=deadline,
             limit=k,
             score_batch=score_batch,
         )
@@ -3833,10 +3877,20 @@ class VectorStore:
                 scan_deadline,
             )
         except _PrescreenDeadlineExpired as exc:
+            deadline_expired = _caller_deadline_expired(
+                deadline,
+                stop_deadline=scan_deadline,
+                stop_expired=True,
+            )
             return KNNResult(
                 coverage="bounded",
                 scoring=exact_scoring,
                 scanned=exc.scanned,
+                total=(
+                    None
+                    if deadline_expired
+                    else self._count_embedded_vectors(identity, chunk=True)
+                ),
             )
         if not probed_ids:
             return KNNResult(coverage="none", scoring=exact_scoring)
@@ -3868,6 +3922,7 @@ class VectorStore:
                         batch_rows=max(1, self.bounded_scan_rows),
                         budget_s=scan_budget_s,
                         deadline=scan_deadline,
+                        caller_deadline=deadline,
                         limit=k,
                         query=query_array,
                     )
@@ -3910,6 +3965,7 @@ class VectorStore:
             batch_rows=max(1, self.bounded_scan_rows),
             budget_s=scan_budget_s,
             deadline=scan_deadline,
+            caller_deadline=deadline,
             limit=k,
             score_batch=score_batch,
         )

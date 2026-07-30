@@ -521,6 +521,70 @@ def test_partial_adjacency_reserve_backfills_in_rank_order(tmp_path: Path):
     assert non_adjacent[-4:] == [hit.exact_ref for hit in ranked[11:15]]
 
 
+def test_adjacency_reserve_backfill_preserves_diversity_cap(tmp_path: Path):
+    db_path = tmp_path / "lcm.db"
+    asset_root = tmp_path / "assets"
+    asset_root.mkdir()
+    store = TrajectoryStore(db_path, _identity(), asset_root=asset_root)
+    target = _ranked_source(asset_root, 0, with_adjacent=True)
+    tail_screenshot = asset_root / "ranked-0-2.png"
+    tail_screenshot.write_bytes(b"ranked-0-2")
+    tail = TrajectoryState(
+        state_index=2,
+        step=2,
+        url="https://example.test/ranked/0/2",
+        incoming_action="Open final details",
+        thoughts="Inspect lower-ranked evidence.",
+        text=f"Priorityneedle {'background ' * 200}",
+        screenshot_path=tail_screenshot,
+    )
+    target_payload = dict(target.source_payload)
+    target_payload["states"] = [
+        *target_payload["states"],
+        {
+            "state_index": tail.state_index,
+            "step": tail.step,
+            "url": tail.url,
+            "action": tail.incoming_action,
+            "thoughts": tail.thoughts,
+            "text": tail.text,
+            "screenshot": tail_screenshot.name,
+        },
+    ]
+    target = TrajectorySource(
+        trajectory_id=target.trajectory_id,
+        ordinal=target.ordinal,
+        goal=target.goal,
+        start_url=target.start_url,
+        outcome=target.outcome,
+        states=(*target.states, tail),
+        source_payload=target_payload,
+    )
+    try:
+        store.insert(target)
+        trajectory_ids = [target.trajectory_id]
+        for index in range(1, 4):
+            source = _ranked_source(asset_root, index, with_adjacent=False)
+            store.insert(source)
+            trajectory_ids.append(source.trajectory_id)
+        store.finalize(trajectory_ids)
+
+        hits = store.query(
+            "priorityneedle",
+            limit=6,
+            include_adjacent=True,
+            diversity_cap=2,
+        )
+    finally:
+        store.close()
+
+    assert sum(hit.trajectory_id == target.trajectory_id for hit in hits) == 2
+    assert any(
+        hit.trajectory_id == target.trajectory_id and hit.match_kind == "adjacent"
+        for hit in hits
+    )
+
+
 def test_full_adjacency_reserve_keeps_the_existing_composition(tmp_path: Path):
     store = _ranked_store(tmp_path, adjacent_sources=11)
     try:

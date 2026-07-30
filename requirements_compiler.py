@@ -1881,18 +1881,34 @@ def _render_fact(candidate: Mapping[str, Any], contract: AnswerContract) -> str:
     )
 
 
-def _render_computation(computation: Mapping[str, Any]) -> str:
+def _render_computation(
+    computation: Mapping[str, Any], *, uncertified: bool = False
+) -> str:
     refs = [str(item) for item in computation.get("citations") or []]
-    return "\n".join(
+    lines = [
+        f'<lcm-answer-brief version="{REQUIREMENTS_COMPILER_VERSION}">',
+        "Product-validated canonical computation:",
+        f"- result: {computation.get('result')}",
+        f"- exact operands: {', '.join(refs)}",
+    ]
+    if uncertified:
+        lines.append(
+            "- certification: UNCERTIFIED because at least one counted event has "
+            "no occurrence date; this count is not certified as exhaustive for "
+            "the requested time window."
+        )
+    lines.extend(
         [
-            f'<lcm-answer-brief version="{REQUIREMENTS_COMPILER_VERSION}">',
-            "Product-validated canonical computation:",
-            f"- result: {computation.get('result')}",
-            f"- exact operands: {', '.join(refs)}",
-            "Use the canonical result unchanged; do not add or alter operands.",
+            (
+                "Use the canonical result unchanged; preserve the UNCERTIFIED "
+                "disclosure and do not add or alter operands."
+                if uncertified
+                else "Use the canonical result unchanged; do not add or alter operands."
+            ),
             "</lcm-answer-brief>",
         ]
     )
+    return "\n".join(lines)
 
 
 def _deliver(
@@ -2213,7 +2229,13 @@ def compile_preanswer_evidence(
             result,
             state="computation_sufficient",
             reason_code=reason,
-            context=_render_computation(computation),
+            context=_render_computation(
+                computation,
+                uncertified=(
+                    coverage_certificate is not None
+                    and not result["finite_coverage"]
+                ),
+            ),
             evidence=selected_items,
             novel_refs=novel_selected,
             computation=computation,

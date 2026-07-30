@@ -156,7 +156,7 @@ class EvidencePlan:
     exact_operands: int | None = None
     temporal_window: TemporalWindow | None = None
     question_anchor: date | None = None
-    interval_unit: Literal["day", "week", "month"] = "day"
+    interval_unit: Literal["auto", "day", "week", "month", "year"] = "day"
     difference_direction: Literal[
         "absolute", "first_minus_second", "second_minus_first"
     ] | None = None
@@ -428,13 +428,22 @@ def compile_evidence_plan(question: str, question_date: Any = None) -> PlanDecis
     ] | None = None
     order: Literal["ascending", "descending"] | None = None
     requires_complete = False
-    interval_unit: Literal["day", "week", "month"] = "day"
+    interval_unit: Literal["auto", "day", "week", "month", "year"] = "day"
     if re.search(r"\bhow long ago\b", normalized):
         if question_anchor is None:
             return PlanDecision(
                 "fallback",
                 reason="question needs a valid question date for deterministic temporal planning",
             )
+        requested_interval_unit = re.search(
+            r"\bin\s+(days?|weeks?|months?|years?)\b",
+            normalized,
+        )
+        interval_unit = (
+            requested_interval_unit.group(1).rstrip("s")
+            if requested_interval_unit
+            else "auto"
+        )  # type: ignore[assignment]
         operation, exact, minimum = "date_interval", 1, 1
     elif re.search(
         r"\b(how long|time between|interval between|how many\s+(?:calendar\s+)?days?\s+between|since when)\b",
@@ -1257,28 +1266,48 @@ def execute_plan(
                 f"Absolute interval from {selected[0].evidence_date.isoformat()} "
                 f"to {selected[1].evidence_date.isoformat()} is {days} days"  # type: ignore[union-attr]
             )
-        if plan.interval_unit == "week":
-            result_value = days // 7
-        elif plan.interval_unit == "month":
-            if len(selected) == 1:
-                first_day, second_day = selected[0].evidence_date, plan.question_anchor
+        if len(selected) == 1:
+            first_day, second_day = selected[0].evidence_date, plan.question_anchor
+        else:
+            first_day, second_day = selected[0].evidence_date, selected[1].evidence_date
+        assert first_day is not None and second_day is not None
+        earlier, later = sorted((first_day, second_day))
+        complete_months = (
+            (later.year - earlier.year) * 12 + later.month - earlier.month
+        )
+        if later.day < earlier.day:
+            complete_months -= 1
+        complete_years = later.year - earlier.year
+        if (later.month, later.day) < (earlier.month, earlier.day):
+            complete_years -= 1
+
+        interval_unit = plan.interval_unit
+        if interval_unit == "auto":
+            if complete_years > 0:
+                interval_unit = "year"
+            elif complete_months > 0:
+                interval_unit = "month"
+            elif days >= 7:
+                interval_unit = "week"
             else:
-                first_day, second_day = selected[0].evidence_date, selected[1].evidence_date
-            assert first_day is not None and second_day is not None
-            earlier, later = sorted((first_day, second_day))
-            result_value = (later.year - earlier.year) * 12 + later.month - earlier.month
-            if later.day < earlier.day:
-                result_value -= 1
+                interval_unit = "day"
+
+        if interval_unit == "week":
+            result_value = days // 7
+        elif interval_unit == "month":
+            result_value = complete_months
+        elif interval_unit == "year":
+            result_value = complete_years
         else:
             result_value = days
-        result = _format_quantity(float(result_value), plan.interval_unit)
+        result = _format_quantity(float(result_value), interval_unit)
         return _trace(
             plan,
             selected,
             result=result,
             result_value=result_value,
-            unit=plan.interval_unit,
-            steps=[interval_step, f"Reported interval in {plan.interval_unit}s"],
+            unit=interval_unit,
+            steps=[interval_step, f"Reported interval in {interval_unit}s"],
         )
 
     if plan.operation == "date_filter":

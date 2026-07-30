@@ -229,6 +229,65 @@ def test_compute_accepts_caller_anchor_only_when_it_agrees_with_sidecar(evidence
     }
 
 
+@pytest.mark.parametrize(
+    ("unit", "expected_value"),
+    [
+        ("days", 794),
+        ("weeks", 113),
+        ("months", 26),
+        ("years", 2),
+    ],
+)
+def test_how_long_ago_answer_honors_explicit_unit(
+    evidence_db, unit, expected_value
+):
+    messages, assertions = evidence_db
+    content = "I completed the plank challenge on January 15, 2021."
+    store_id = messages.append(
+        "session-a",
+        {"role": "user", "content": content, "timestamp": _epoch("2021-01-15")},
+    )
+    response = json.loads(lcm_compute(
+        {
+            "question": (
+                f"How long ago, in {unit}, did I complete the plank challenge?"
+            ),
+            "question_date": "2023-03-20",
+            "operands": [
+                _raw(store_id, content, content, date="2021-01-15")
+            ],
+        },
+        engine=SimpleNamespace(_store=messages, _assertions=assertions),
+    ))
+
+    assert response["status"] == "computed"
+    assert response["trace"]["result_value"] == expected_value
+    assert response["trace"]["unit"] == unit.rstrip("s")
+
+
+def test_how_long_ago_answer_without_unit_uses_coarsest_fit(evidence_db):
+    messages, assertions = evidence_db
+    content = "I completed the plank challenge on January 15, 2021."
+    store_id = messages.append(
+        "session-a",
+        {"role": "user", "content": content, "timestamp": _epoch("2021-01-15")},
+    )
+    response = json.loads(lcm_compute(
+        {
+            "question": "How long ago did I complete the plank challenge?",
+            "question_date": "2023-03-20",
+            "operands": [
+                _raw(store_id, content, content, date="2021-01-15")
+            ],
+        },
+        engine=SimpleNamespace(_store=messages, _assertions=assertions),
+    ))
+
+    assert response["status"] == "computed"
+    assert response["trace"]["result"] == "2 years"
+    assert response["trace"]["unit"] == "year"
+
+
 def test_compute_sidecar_overrides_disagreeing_caller_anchor(evidence_db):
     messages, assertions = evidence_db
     content = "I completed the plank challenge 5 days ago."
@@ -635,6 +694,11 @@ def test_public_compute_tool_reports_stages_and_discards_mutated_candidate(evide
     assert computed["provenance"]["stages"]["selector"]["provider"] == (
         "unknown_to_plugin"
     )
+    assert (
+        computed["provenance"]["stages"]["selector"]["temporal_certified"]
+        is None
+    )
+    assert computed["temporal_trust"]["certified"] is None
 
     cited = " ".join(f"[{value}]" for value in computed["trace"]["citations"])
     mutated = json.loads(lcm_compute(

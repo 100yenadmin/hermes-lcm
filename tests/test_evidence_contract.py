@@ -543,6 +543,7 @@ def test_finite_enumeration_distinguishes_same_entity_events_by_date(tmp_path):
     assert result["computation"]["result_value"] == 2
     assert result["coverage_certificate"]["distinct_keys"] == 2
     assert result["coverage_certificate"]["every_counted_event_dated"] is True
+    assert "UNCERTIFIED" not in result["context"]
 
 
 def test_finite_event_key_preserves_date_suffix_for_overlong_base():
@@ -589,6 +590,7 @@ def test_finite_enumeration_returns_dated_and_undated_count_uncertified(tmp_path
     assert result["computation"]["result_value"] == 2
     assert result["coverage_certificate"]["unknown_time_clauses"] == 1
     assert result["coverage_certificate"]["every_counted_event_dated"] is False
+    assert "UNCERTIFIED" in result["context"]
 
 
 def test_finite_enumeration_collapses_repeated_undated_mentions(tmp_path):

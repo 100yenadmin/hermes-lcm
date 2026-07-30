@@ -174,6 +174,43 @@ Delivery checkpoint: **COMPLETE** for the named local Round-2 disposition gate;
 **ADVANCE** to the orchestrator handoff. This does not claim remote exact-head
 CI, merge readiness, merge, release, or runtime proof for the unstaged delta.
 
+## Round 3 review dispositions
+
+Review mode: **address**, binding Round-3 disposition batch. Candidate identity:
+PR `#190`, branch `batch/v2-rebaseline`, local base/head before this unstaged
+batch `e5acbbf26715a1f2e721abcdf7d180c5dd1d8d32` /
+`0c8bea9a19e032b3b1261a8ff3d4931458228d92`. Each finding body was read through
+the requested per-comment `gh api` route before implementation. No Git mutation
+or GitHub write was performed.
+
+| Comment ID | Priority | Disposition |
+|---|---|---|
+| `3680071381` | P1 | **fixed** — an uncertified finite count now injects an explicit `UNCERTIFIED` disclosure that says an undated contributor prevents exhaustive certification for the requested window and instructs the answerer to preserve that disclosure. Regression proves a dated+undated mix carries the warning while a fully dated set does not. |
+| `3680071370` | P2 | **fixed** — adjacency-reserve backfill now consults and updates the same per-trajectory count used by nucleus and adjacency selection. Regression creates a backfill candidate that would become the third hit under `diversity_cap=2` and proves it is not admitted. |
+| `3680071376` | P2 | **fixed** — `how long ago` planning extracts explicitly requested days, weeks, months, or years; execution supports complete years; and a question with no unit uses the coarsest non-zero complete unit. Answer-level regressions cover all four explicit units and the no-unit path. |
+| `3680077589` | P2 | **fixed** — the effective scan stop remains bounded by `budget_s`, but `deadline_expired` now identifies only the caller's absolute deadline. Summary and chunk scan paths preserve `total` after budget-only scan or enumeration expiry, while absolute-deadline paths still avoid `COUNT(*)`. The F44 change is limited to stop-cause classification and the two mirrored consumers. |
+| `3679973901` | P3 | **documented and verified** — the selector-stage write site now names the `None` = not applicable, `False` = uncertified, `True` = certified contract and forbids bool coercion. Repo-wide consumer grep found only direct JSON serialization; no dashboard or serializer coerces the value. Regression proves the non-temporal selector stage serializes `None` as JSON `null`, distinct from the existing uncertified `false` coverage. |
+
+Round-3 focused regressions:
+
+```text
+PYTHONPATH="${AGENT_STUB_PATH}" python3 -m pytest -q tests/test_evidence_contract.py::test_finite_enumeration_distinguishes_same_entity_events_by_date tests/test_evidence_contract.py::test_finite_enumeration_returns_dated_and_undated_count_uncertified tests/test_trajectory_store.py::test_adjacency_reserve_backfill_preserves_diversity_cap tests/test_reasoning.py::test_how_long_ago_answer_honors_explicit_unit tests/test_reasoning.py::test_how_long_ago_answer_without_unit_uses_coarsest_fit tests/test_reasoning.py::test_public_compute_tool_reports_stages_and_discards_mutated_candidate tests/test_vector_store.py::test_full_scan_budget_stops_early_and_reports_bounded tests/test_vector_store.py::test_full_scan_budget_includes_candidate_enumeration
+```
+
+Result: **11 passed**.
+
+Round-3 acceptance proof:
+
+- Exact CI slice above: **60 passed**.
+- Batch acceptance suite above: **91 passed**.
+- Upstream-affected suite above: **166 passed**.
+- Full changed/affected-file `ruff check`: **all checks passed**.
+- `git diff --check`: **clean**.
+
+Delivery checkpoint: **COMPLETE** for the named local Round-3 disposition gate;
+**ADVANCE** to the orchestrator handoff. This does not claim remote exact-head
+CI for the unstaged delta, merge readiness, merge, release, or runtime proof.
+
 ## Decision fidelity
 
 - D-ARCH-1: dated candidates dedupe by the existing event key plus resolved date; undated candidates retain the existing collapse. Counts with any undated contributor are returned with `finite_coverage=false`.

@@ -3762,15 +3762,15 @@ class TrajectoryStore:
             int(row["state_id"]): candidate_score[int(row["state_id"])]
             for row in selected
         }
+        selected_per_trajectory: dict[str, int] = {}
+        for row in selected:
+            trajectory_id = str(row["trajectory_id"])
+            selected_per_trajectory[trajectory_id] = (
+                selected_per_trajectory.get(trajectory_id, 0) + 1
+            )
 
         if include_adjacent and selected and len(selected) < limit:
             nucleus_rows = list(selected)
-            selected_per_trajectory: dict[str, int] = {}
-            for row in selected:
-                trajectory_id = str(row["trajectory_id"])
-                selected_per_trajectory[trajectory_id] = (
-                    selected_per_trajectory.get(trajectory_id, 0) + 1
-                )
             adjacent_by_nucleus: list[list[sqlite3.Row]] = []
             for nucleus in nucleus_rows:
                 adjacent_rows = self._conn.execute(
@@ -3829,8 +3829,18 @@ class TrajectoryStore:
                 state_id = int(row["state_id"])
                 if state_id in selected_ids:
                     continue
+                trajectory_id = str(row["trajectory_id"])
+                if (
+                    diversity_cap > 0
+                    and selected_per_trajectory.get(trajectory_id, 0)
+                    >= diversity_cap
+                ):
+                    continue
                 selected.append(row)
                 selected_ids.add(state_id)
+                selected_per_trajectory[trajectory_id] = (
+                    selected_per_trajectory.get(trajectory_id, 0) + 1
+                )
                 match_kind_by_id[state_id] = candidate_kind.get(state_id, "fts")
                 score_by_id[state_id] = candidate_score[state_id]
 

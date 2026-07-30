@@ -748,6 +748,9 @@ def lcm_compute(args: Dict[str, Any], **kwargs) -> str:
                 )
             },
         })
+    # Tri-state contract: None means temporal certification is not applicable,
+    # False means temporal evidence is uncertified, and True means certified.
+    # Preserve those values through JSON as null/false/true; never bool-coerce.
     stages["selector"] = _compute_stage(
         "host_tool_arguments",
         selector_started,
