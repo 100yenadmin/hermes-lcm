@@ -46,3 +46,21 @@ work, not instrument work.
    code changed; our LongMemEval numbers flow through a different harness entirely.
 4. Portfolio question (LoCoMo-Plus + the community critique of LoCoMo/LongMemEval flaws) under
    research (wf_8d68b003); the scored-run decision follows that + the fixed-harness A/A′.
+
+## 5. Portfolio disposition (research workflow wf_8d68b003, decided 2026-07-30 under product-owner authority)
+- **LoCoMo-Plus: REJECTED** on the program's instrument bar — its contribution (defeating string-match
+  bias) is inseparable from closed vendor judges (validated only against Gemini-2.5-Flash/GPT-4o, no
+  self-hostable fallback preserving its 0.81 human agreement); no license; zero adoption; repo stale.
+  τ²-Bench keeps the R4 slot (one-instrument-at-a-time). Reopen only on open license + self-hostable
+  judge + an open slot.
+- **LoCoMo sidecar: CONTINUES on the fixed harness** (memorybench PR #3) with the SEVEN-POINT DISCLOSURE
+  required on any published number: fix-state/commit; judge identity + full prompt (the community audit
+  measured the STOCK judge accepting 62.81% of intentionally-wrong-vague answers — ours errs strict);
+  corrupted-gold exposure (99/1,540 documented golden-answer errors → ~93.6% ceiling; cross-reference
+  vs our rows IN FLIGHT); retrieval/embedder config named; per-category breakdown; run count/variance;
+  the A/A′ noise floor alongside the point estimate.
+- **Citation discipline:** cite primary evidence only (snap-research/locomo#27, EverMind-AI/EverOS#73,
+  mem0ai/mem0#3944) — the Reddit thread carries a vendor COI and a confirmed citation error. Our own
+  audit artifacts PRE-DATE the critique fetch (dated); the external material corroborates, it is not
+  the trigger. The critique is ammo FOR the metric-standard thesis, never an excuse for the score:
+  the two big drivers (config-class retrieval gap, genuine adversarial attribution) are real signal.
