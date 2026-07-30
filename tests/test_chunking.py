@@ -2,6 +2,7 @@ from __future__ import annotations
 
 
 from hermes_lcm.chunking import (
+    MIN_CONVERSATIONAL_TOKENS_ENV,
     chunk_message,
     group_by_store_id,
     iter_message_chunks,
@@ -52,6 +53,27 @@ class TestConversationalPolicy:
     def test_skips_empty_content(self):
         assert chunk_message(1, "user", "   ", policy="conversational") == []
         assert chunk_message(1, "assistant", None, policy="conversational") == []
+
+    def test_min_tokens_env_lowers_threshold(self, monkeypatch):
+        short = "I adopted a rescue dog named Biscuit yesterday."
+        assert chunk_message(1, "user", short, policy="conversational") == []
+        monkeypatch.setenv(MIN_CONVERSATIONAL_TOKENS_ENV, "0")
+        chunks = chunk_message(1, "user", short, policy="conversational")
+        assert len(chunks) == 1
+        assert chunks[0].char_end == len(short)
+        # heads shares the conversational-role threshold
+        assert chunk_message(1, "user", short, policy="heads") != []
+
+    def test_min_tokens_env_invalid_or_negative_uses_default(self, monkeypatch):
+        short = "ok thanks"
+        for raw in ("bogus", "-5", ""):
+            monkeypatch.setenv(MIN_CONVERSATIONAL_TOKENS_ENV, raw)
+            assert chunk_message(1, "user", short, policy="conversational") == []
+
+    def test_min_tokens_env_never_embeds_non_conversational_roles(self, monkeypatch):
+        monkeypatch.setenv(MIN_CONVERSATIONAL_TOKENS_ENV, "0")
+        assert chunk_message(1, "tool", "short tool note", policy="conversational") == []
+        assert chunk_message(1, "system", "short system note", policy="conversational") == []
 
 
 class TestTurnAlignmentAndSpans:
