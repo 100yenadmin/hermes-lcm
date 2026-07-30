@@ -116,3 +116,31 @@ mastra.py precedent de-risks the subprocess shape). Conditions, all measured fin
 Sequencing: adapter build dispatches to the codex lane (well-spec'd, non-urgent); NO AMB runs
 while the paired V2 gate occupies the machine (5 concurrent bridge subprocesses + embedder loads
 would contend). C2 (AMA-Bench) queues behind C1's adapter; C3 (MemoryArena) assessment separate.
+
+### Track C2/C3 decisions (2026-07-30 late; assessments wf_bf8be389 → hermes-c2c3-assess artifacts)
+- **C2 AMA-Bench: BUILD** (AMA-BENCH-FIT.md). High fit: memory_construction/memory_retrieve maps
+  1:1 onto the bridge JSONL contract; ~300-380 LOC glue, zero bridge changes, registration via
+  their register_method() = zero upstream diff. Declared mitigations, all measured findings:
+  (1) `--subset openend` ONLY — mcq_set.jsonl does not exist in the public dataset despite
+  README/CLI documenting it; (2) pin by SHA (repo ddfd319e, HF dataset a5777378 — no tags exist
+  anywhere); (3) their judge FAILS OPEN (unparseable yes/no → silent token-F1 substitute) and
+  their model client FAILS OPEN on context overflow (truncate+retry) — both patched to fail
+  closed at run prep; (4) trajectory re-split uses a STRICT parser of their deterministic
+  step format (raise on any non-matching line — upstream drift fails loud, no fork taken).
+  Cost profile: construction near-zero LLM (deterministic summaries + local embed);
+  208 episodes / 2,496 QA; the gaia tail (max 1.03M raw tokens) needs a timing pilot first.
+- **C3 MemoryArena (arXiv 2602.16313 — disambiguated from WorldMemArena and an unaffiliated
+  repo): DEFER, written reasons.** It fills a REAL cell nothing else covers (causally-necessary
+  cross-session memory inside tool-executing envs, graded on task success; models saturated on
+  LoCoMo/LME drop to 40-60%) — but: ONE commit ever (created 2026-06-01), no code license,
+  HIGH multi-service self-host burden (per-domain env servers, external data pulls, memory
+  microservice, up to 3 extra paid keys, two LLM cost centers), and its overlap with queued
+  AMA-Bench is unresolved. REVISIT after AMA-Bench runs: the marginal value then is task-success
+  grading of tool EXECUTION — adopt only if that cell still matters and the harness matures.
+  Dataset itself is CC-BY-4.0 (clean). It is the MemoryAgentBench authors' successor project.
+- **MemoryAgentBench: KEEP-WATCHLIST** (refresh in MEMORYAGENTBENCH-REFRESH.md). Uniqueness
+  holds (only standalone Test-Time-Learning + Selective-Forgetting/Conflict-Resolution splits —
+  the real-time-write fault class), and a STANDALONE TTL+CR pilot is genuinely cheap (<1000
+  judge-free deterministic QA; exclude the 1.48M-token Recsys outlier). But upstream is dead
+  (zero commits ~10 weeks, maintainer graduated, a community adapter PR closed unmerged in
+  2 minutes) — any adoption is a private-fork port (~100-150 LOC), on demand, not a dependency.
