@@ -1,0 +1,48 @@
+# F46 — LoCoMo arm-A (47%) decomposed: instrument bugs + a config-class retrieval gap; capability not indicted (2026-07-30)
+
+**Provenance:** arm A of the pre-registered A/A′ noise-floor pair (1,986 questions, full pin discipline,
+MemScore 47%, per-category 49.2/43.8/29.1/52.9/45.5). Two-stage analysis: a 12-agent read-only
+decomposition workflow (wf_8ec9895c; report `hermes-locomo-deepdive/artifacts/LOCOMO-ARM-A-DEEPDIVE.md`)
+plus a zero-LLM retrieval-replay root-cause run (`RETRIEVAL-GAP-ROOTCAUSE.md`, sha 7051208b…). Owner
+hypothesis going in: ~80% instrument/format bug. Verdict: partly — and the biggest driver is CONFIG.
+
+## 1. Confirmed instrument bugs (fixed in memorybench PR #3, both-arms by construction)
+1. **blip_caption never ingested** — 55/1,986 gold answers exist only in image captions; 42 scored wrong.
+2. **Adapter truncation lying** — 5.7% of delivered results hard-cut to 300 chars mid-sentence with
+   `content_truncated=false`; cap lifted to the product's 2,400-char answer-ready bound, metadata truthful.
+3. **Abstention judge rubric** — zero-credited correct false-premise corrections (bounded, ~2–20 rows).
+4. **groundTruth="undefined"** on adversarial rows (scoring-inert; hygiene). Plus stale retry errors.
+Quantified ceiling from these alone: ~+3 points. The owner's "long answers penalized" hypothesis was
+checked and is NOT supported (0/24 sampled judge explanations cite length).
+
+## 2. The dominant driver: candidate-generation recall, CONFIG-CLASS (retrieval replay, 25-row fixed sample)
+- 22/25 (88%) `ingested_never_ranked`: gold verbatim in SQLite, absent from the diagnostic UNCAPPED
+  top-50. The raw natural-language FTS arm finds **0/41** missing gold turns in its top-200; the
+  configured fastembed (bge-small) chunk arm finds 7/41. Failure is BEFORE fusion, before any reader.
+- 2/25 ranked just below the top-25 cap (ranks 26, 36); 1/25 truncated-out (the 300-char bug).
+- 0 ingestion losses, 0 query-rewrite losses; replays reproduced arm A's ordered results exactly.
+**Reading:** the FTS zero is the known conjunctive-AND death on conversational prose queries — the
+precise class #183 (fts_prose_mode) was built to fix — and arm A ran the R2-era product build
+(543e9ea, pre-#183) with prose mode nonexistent, a small embedder, and a top-25 cap. This is the same
+lesson LongMemEval taught (F31 §3); LoCoMo's 47% vs V1's 91% divergence is pipeline configuration,
+not a capability contradiction.
+
+## 3. What IS genuine (not config): adversarial attribution
+243/446 adversarial rows wrong with the correct fact retrieved 78.6% of the time — the model
+misattributes the speaker instead of flagging the false premise. Real answer-layer weakness; product
+work, not instrument work.
+
+## 4. Disposition (product-owner authority)
+1. Arm A′ CANCELLED mid-ingest (documented in the run dir) — the noise-floor pair re-runs on the fixed
+   harness with a DECLARED run config; continuing on the buggy harness spent paid phases on a
+   measurement that no longer fed a decision.
+2. The scored re-run config is an ENGINEERING declaration, disclosed in full lineage (this finding):
+   current product main (includes #183), fts_prose_mode enabled for the conversational adapter,
+   embedder choice re-evaluated, cap per the product's answer-ready contract. Config chosen after
+   diagnosis is legitimate system-building; the disclosure is what keeps it honest. No score
+   projections until measured (§6e.8 discipline — the 47–50% band from the deep dive assumed the gap
+   might be capability; F46 §2 reclassifies it config-class, ceiling unknown until run).
+3. LongMemEval interference: NONE — all fixes are LoCoMo-lane harness/adapter surfaces; zero product
+   code changed; our LongMemEval numbers flow through a different harness entirely.
+4. Portfolio question (LoCoMo-Plus + the community critique of LoCoMo/LongMemEval flaws) under
+   research (wf_8d68b003); the scored-run decision follows that + the fixed-harness A/A′.
