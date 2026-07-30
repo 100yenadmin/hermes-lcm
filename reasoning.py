@@ -108,7 +108,7 @@ def resolve_occurrence_time(
     )
     anchor = sidecar_session_date or caller_session_date
     result = _resolve(text, observed_at=observed_at, session_date=anchor)
-    if sidecar_session_date:
+    if sidecar_session_date and result.get("session_date"):
         result["anchor_trust"] = "engine_sidecar"
         result["temporal_certified"] = True
         result["session_date_overridden"] = overridden
@@ -121,10 +121,16 @@ def resolve_occurrence_time(
         result["anchor_trust"] = "low_trust"
         result["temporal_certified"] = False
         result["session_date_overridden"] = False
-        result["trust_note"] = (
-            f"engine occurrence-date sidecar absent for session "
-            f"{session_key or '<unknown>'}; temporal result is low-trust"
-        )
+        if sidecar_session_date:
+            result["trust_note"] = (
+                f"engine occurrence-date sidecar invalid for session "
+                f"{session_key or '<unknown>'}; temporal result is low-trust"
+            )
+        else:
+            result["trust_note"] = (
+                f"engine occurrence-date sidecar absent for session "
+                f"{session_key or '<unknown>'}; temporal result is low-trust"
+            )
     return result
 
 

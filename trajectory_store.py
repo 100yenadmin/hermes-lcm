@@ -627,13 +627,16 @@ class TrajectoryStore:
         return conn
 
     def _validate_existing_schema_version(self) -> None:
-        try:
-            row = self._conn.execute(
-                "SELECT schema_version FROM lcm_trajectory_corpora "
-                "WHERE singleton = 1"
-            ).fetchone()
-        except sqlite3.OperationalError:
+        exists = self._conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'lcm_trajectory_corpora'"
+        ).fetchone()
+        if exists is None:
             return
+        row = self._conn.execute(
+            "SELECT schema_version FROM lcm_trajectory_corpora "
+            "WHERE singleton = 1"
+        ).fetchone()
         if row is not None and int(row["schema_version"]) != TRAJECTORY_SCHEMA_VERSION:
             raise CorpusIdentityError(
                 "trajectory database corpus identity does not match requested identity"

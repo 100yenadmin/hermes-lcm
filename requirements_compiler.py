@@ -956,7 +956,15 @@ def _available_as_of(candidate: Mapping[str, Any], contract: AnswerContract) -> 
     boundary = question_date_as_of_epoch(contract.question_as_of)
     if boundary is None:
         return False
-    if candidate.get("session_date_source") == "benchmark_session_date":
+    observed = candidate.get("observed_at")
+    if observed is not None:
+        try:
+            available = float(observed)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if not math.isfinite(available):
+            return False
+    elif candidate.get("session_date_source") == "benchmark_session_date":
         raw = str(candidate.get("session_date") or "")
         try:
             available = datetime.combine(
@@ -965,13 +973,7 @@ def _available_as_of(candidate: Mapping[str, Any], contract: AnswerContract) -> 
         except ValueError:
             return False
     else:
-        observed = candidate.get("observed_at")
-        try:
-            available = float(observed)
-        except (TypeError, ValueError, OverflowError):
-            return False
-        if not math.isfinite(available):
-            return False
+        return False
     event_day, _ = _candidate_event_day(candidate)
     if event_day is not None and event_day > date.fromisoformat(contract.question_as_of):
         return False
@@ -1677,7 +1679,8 @@ def _finite_event_key(
             return None
         base = f"{unit.replace('_', ' ')} {explicit.group(0).casefold()}"
     if resolved_date:
-        return f"{base} @ {resolved_date}"[:300]
+        suffix = f" @ {resolved_date}"
+        return f"{base[: 300 - len(suffix)]}{suffix}"
     return base[:300]
 
 
@@ -1754,14 +1757,14 @@ def _finite_enumeration(
             if hydrated is None:
                 certificate["ungrounded_key_clauses"] += 1
                 continue
+            if not _available_as_of(hydrated, contract):
+                certificate["unavailable_as_of_clauses"] += 1
+                continue
             event_day, basis = _candidate_event_day(hydrated)
             if event_day is None:
                 certificate["unknown_time_clauses"] += 1
                 resolved_date = None
             else:
-                if not _available_as_of(hydrated, contract):
-                    certificate["unavailable_as_of_clauses"] += 1
-                    continue
                 time_bases.add(basis)
                 if not (
                     contract.temporal_window.start
@@ -1800,6 +1803,8 @@ def _finite_enumeration(
     if certificate["ungrounded_key_clauses"]:
         return None, [], certificate, "finite_event_keys_unproven"
 
+    # Engine finite-scan certification uses dedupe_key uniqueness; caller-evidence
+    # certification uses exact_ref uniqueness. These are intentionally different surfaces.
     by_key: dict[str, dict[str, Any]] = {}
     for candidate in candidates:
         by_key.setdefault(str(candidate["dedupe_key"]), candidate)
@@ -1826,17 +1831,13 @@ def _finite_enumeration(
         raw_operands,
         messages=engine._store,
         assertions=getattr(engine, "_assertions", None),
-        as_of=(
-            question_date_as_of_epoch(contract.question_as_of)
-            if certificate["every_counted_event_dated"]
-            else None
-        ),
+        as_of=question_date_as_of_epoch(contract.question_as_of),
     )
     if grounding.status != "grounded":
         return None, operands, certificate, f"finite_grounding_failed:{grounding.reason}"
     computed_operands = tuple(
         replace(grounded, key=str(candidate["dedupe_key"]))
-        for grounded, candidate in zip(grounding.operands, operands)
+        for grounded, candidate in zip(grounding.operands, operands, strict=True)
     )
     plan = EvidencePlan(
         operation="count_distinct",

@@ -22,12 +22,16 @@ Each upstream hunk was checked against the current `fork/main` baseline before e
 
 ## Unit results
 
+All commands below use repository-relative test paths and run from the repository
+root. `AGENT_STUB_PATH` is operator-local for standalone checkouts that need the
+`hermes_lcm` package shim; an installed checkout may omit the `PYTHONPATH` prefix.
+
 ### Unit 1: six upstream follow-up fixes
 
 Command:
 
 ```text
-PYTHONPATH=/Volumes/LEXAR/Codex/session-notes/2026-07-29/hermes-mono-pr-rounds/artifacts/agent-stub python3 -m pytest -q tests/test_adaptive_retrieval.py::test_persisted_slot_refs_include_only_selected_evidence tests/test_adaptive_retrieval.py::test_query_view_cleanup_cannot_replace_the_build_failure tests/test_evidence_compiler.py::test_duplicate_grounded_ref_cannot_certify_finite_coverage tests/test_query_view_store.py::test_hit_confirmation_rechecks_generation_after_source_mutation tests/test_trajectory_store.py::test_newer_trajectory_schema_is_rejected_before_fts_repair tests/test_vector_store.py::test_full_scan_budget_stops_early_and_reports_bounded tests/test_vector_store.py::test_full_scan_budget_includes_candidate_enumeration tests/test_vector_store.py::test_full_scan_absolute_deadline_stops_between_batches tests/test_vector_store.py::test_resident_deadline_does_not_start_a_count_query tests/test_prescreen_flip_blackout.py::test_deadline_bounds_a_synced_binary_summary_prescreen tests/test_int8_two_stage_knn.py::test_chunk_deadline_bounds_a_synced_binary_prescreen
+PYTHONPATH="${AGENT_STUB_PATH}" python3 -m pytest -q tests/test_adaptive_retrieval.py::test_persisted_slot_refs_include_only_selected_evidence tests/test_adaptive_retrieval.py::test_query_view_cleanup_cannot_replace_the_build_failure tests/test_evidence_compiler.py::test_duplicate_grounded_ref_cannot_certify_finite_coverage tests/test_query_view_store.py::test_hit_confirmation_rechecks_generation_after_source_mutation tests/test_trajectory_store.py::test_newer_trajectory_schema_is_rejected_before_fts_repair tests/test_vector_store.py::test_full_scan_budget_stops_early_and_reports_bounded tests/test_vector_store.py::test_full_scan_budget_includes_candidate_enumeration tests/test_vector_store.py::test_full_scan_absolute_deadline_stops_between_batches tests/test_vector_store.py::test_resident_deadline_does_not_start_a_count_query tests/test_prescreen_flip_blackout.py::test_deadline_bounds_a_synced_binary_summary_prescreen tests/test_int8_two_stage_knn.py::test_chunk_deadline_bounds_a_synced_binary_prescreen
 ```
 
 Result: **11 passed**.
@@ -37,7 +41,7 @@ Result: **11 passed**.
 Command:
 
 ```text
-PYTHONPATH=/Volumes/LEXAR/Codex/session-notes/2026-07-29/hermes-mono-pr-rounds/artifacts/agent-stub python3 -m pytest -q tests/test_evidence_contract.py::test_finite_enumeration_distinguishes_same_entity_events_by_date tests/test_evidence_contract.py::test_finite_enumeration_returns_dated_and_undated_count_uncertified tests/test_evidence_contract.py::test_finite_enumeration_collapses_repeated_undated_mentions
+PYTHONPATH="${AGENT_STUB_PATH}" python3 -m pytest -q tests/test_evidence_contract.py::test_finite_enumeration_distinguishes_same_entity_events_by_date tests/test_evidence_contract.py::test_finite_enumeration_returns_dated_and_undated_count_uncertified tests/test_evidence_contract.py::test_finite_enumeration_collapses_repeated_undated_mentions
 ```
 
 Result: **3 passed**.
@@ -47,7 +51,7 @@ Result: **3 passed**.
 Command:
 
 ```text
-PYTHONPATH=/Volumes/LEXAR/Codex/session-notes/2026-07-29/hermes-mono-pr-rounds/artifacts/agent-stub python3 -m pytest -q tests/test_trajectory_store.py::test_unused_adjacency_reserve_backfills_the_full_ranked_limit tests/test_trajectory_store.py::test_partial_adjacency_reserve_backfills_in_rank_order tests/test_trajectory_store.py::test_full_adjacency_reserve_keeps_the_existing_composition
+PYTHONPATH="${AGENT_STUB_PATH}" python3 -m pytest -q tests/test_trajectory_store.py::test_unused_adjacency_reserve_backfills_the_full_ranked_limit tests/test_trajectory_store.py::test_partial_adjacency_reserve_backfills_in_rank_order tests/test_trajectory_store.py::test_full_adjacency_reserve_keeps_the_existing_composition
 ```
 
 Result: **3 passed**.
@@ -57,7 +61,7 @@ Result: **3 passed**.
 Command:
 
 ```text
-PYTHONPATH=/Volumes/LEXAR/Codex/session-notes/2026-07-29/hermes-mono-pr-rounds/artifacts/agent-stub python3 -m pytest -q tests/test_reasoning.py::test_compute_accepts_caller_anchor_only_when_it_agrees_with_sidecar tests/test_reasoning.py::test_compute_sidecar_overrides_disagreeing_caller_anchor tests/test_reasoning.py::test_compute_without_sidecar_marks_temporal_result_low_trust
+PYTHONPATH="${AGENT_STUB_PATH}" python3 -m pytest -q tests/test_reasoning.py::test_compute_accepts_caller_anchor_only_when_it_agrees_with_sidecar tests/test_reasoning.py::test_compute_sidecar_overrides_disagreeing_caller_anchor tests/test_reasoning.py::test_compute_without_sidecar_marks_temporal_result_low_trust
 ```
 
 Result: **3 passed**.
@@ -67,7 +71,7 @@ Result: **3 passed**.
 Command:
 
 ```text
-PYTHONPATH=/Volumes/LEXAR/Codex/session-notes/2026-07-29/hermes-mono-pr-rounds/artifacts/agent-stub python3 -m pytest -q tests/test_reasoning.py::test_planner_uses_explicit_cardinality_and_interval_units
+PYTHONPATH="${AGENT_STUB_PATH}" python3 -m pytest -q tests/test_reasoning.py::test_planner_uses_explicit_cardinality_and_interval_units
 ```
 
 Result: **1 passed**. The regression proves that `how long ago` plans one evidence-date operand plus the question-date anchor.
@@ -77,7 +81,7 @@ Result: **1 passed**. The regression proves that `how long ago` plans one eviden
 Spec acceptance files:
 
 ```text
-PYTHONPATH=/Volumes/LEXAR/Codex/session-notes/2026-07-29/hermes-mono-pr-rounds/artifacts/agent-stub python3 -m pytest -q tests/test_trajectory_store.py tests/test_evidence_contract.py tests/test_reasoning.py
+PYTHONPATH="${AGENT_STUB_PATH}" python3 -m pytest -q tests/test_trajectory_store.py tests/test_evidence_contract.py tests/test_reasoning.py
 ```
 
 Result: **81 passed**.
@@ -85,7 +89,7 @@ Result: **81 passed**.
 Upstream-port affected test files:
 
 ```text
-PYTHONPATH=/Volumes/LEXAR/Codex/session-notes/2026-07-29/hermes-mono-pr-rounds/artifacts/agent-stub python3 -m pytest -q tests/test_adaptive_retrieval.py tests/test_evidence_compiler.py tests/test_query_view_store.py tests/test_vector_store.py tests/test_prescreen_flip_blackout.py tests/test_int8_two_stage_knn.py
+PYTHONPATH="${AGENT_STUB_PATH}" python3 -m pytest -q tests/test_adaptive_retrieval.py tests/test_evidence_compiler.py tests/test_query_view_store.py tests/test_vector_store.py tests/test_prescreen_flip_blackout.py tests/test_int8_two_stage_knn.py
 ```
 
 Result: **166 passed**.
@@ -123,7 +127,7 @@ expectation.
 Focused CI command:
 
 ```text
-PYTHONPATH=/Volumes/LEXAR/Codex/session-notes/2026-07-29/hermes-mono-pr-rounds/artifacts/agent-stub python3 -m pytest tests/test_chunk_vector_store.py tests/test_trajectory_composition_policies.py tests/test_trajectory_state_semantic_expansion.py -q
+PYTHONPATH="${AGENT_STUB_PATH}" python3 -m pytest tests/test_chunk_vector_store.py tests/test_trajectory_composition_policies.py tests/test_trajectory_state_semantic_expansion.py -q
 ```
 
 Result after the fix: **60 passed**.
@@ -138,6 +142,37 @@ ruff check vector_store.py tests/test_trajectory_composition_policies.py tests/t
 ```
 
 Result: **all checks passed**.
+
+## Round 2 review dispositions
+
+Review mode: **address**, Round 2 delta only. Candidate identity:
+PR `#190`, branch `batch/v2-rebaseline`, local base/head before this unstaged
+batch `e5acbbf26715a1f2e721abcdf7d180c5dd1d8d32` /
+`cdc95c13e688cfa1b7af714c4d3a9661a65cf0a4`. No Git mutation or GitHub write
+was performed.
+
+| Comment ID | Priority | Disposition |
+|---|---|---|
+| `3679976787` | P1 | **fixed** — finite-scan candidates are availability-checked before event-date handling, real host `observed_at` takes precedence over a sidecar as the availability boundary, and grounding always receives the historical `as_of` when present. Regression: an undated event observed after the question date is excluded and cannot produce a count. |
+| `3680021268` | Major | **fixed** — `_validate_existing_schema_version` returns only when `lcm_trajectory_corpora` is absent; malformed existing tables propagate `sqlite3.OperationalError`. Regression proves a missing `schema_version` column raises before any FTS rebuild. |
+| `3679973891` | P2 | **fixed** — the grounding/operand pairing now uses `zip(..., strict=True)`, so cardinality drift fails instead of truncating silently. |
+| `3679976780` | P2 | **fixed** — `_finite_event_key` reserves the 300-character budget for the date suffix. Regression proves an over-300-character base yields distinct keys for two dates and preserves both suffixes. |
+| `3679976783` | P2 | **fixed** — temporal certification now requires the sidecar anchor to parse successfully. A malformed sidecar uses D-ARCH-3's absent/unusable-sidecar cell: `anchor_trust=low_trust`, `temporal_certified=false`; it does not retain `engine_sidecar` trust. |
+| `3679973895` | P3 | **documented only** — comments at both certification sites name caller-evidence `exact_ref` uniqueness and engine finite-scan `dedupe_key` uniqueness and state that the surfaces intentionally differ. |
+| `3680021253` | Minor | **fixed in this report** — machine-local `PYTHONPATH` values were replaced by the operator-local `AGENT_STUB_PATH` convention while all test targets remain repository-relative. |
+
+Round-2 proof:
+
+- Focused Round-2 regressions: **8 passed**.
+- Exact CI slice: **60 passed**.
+- Batch acceptance suite: **85 passed**.
+- Upstream-affected suite: **166 passed**.
+- Changed-file `ruff check`: **all checks passed**.
+- `git diff --check`: **clean**.
+
+Delivery checkpoint: **COMPLETE** for the named local Round-2 disposition gate;
+**ADVANCE** to the orchestrator handoff. This does not claim remote exact-head
+CI, merge readiness, merge, release, or runtime proof for the unstaged delta.
 
 ## Decision fidelity
 

@@ -19,6 +19,7 @@ from hermes_lcm.reasoning import (
     execute_plan,
     ground_evidence,
     question_date_as_of_epoch,
+    resolve_occurrence_time,
     resolve_temporal_window,
     validate_selector_alignment,
     verify_final_answer,
@@ -300,6 +301,23 @@ def test_compute_without_sidecar_marks_temporal_result_low_trust(evidence_db):
     assert response["temporal_trust"]["status"] == "low_trust"
     assert response["temporal_trust"]["certified"] is False
     assert "sidecar absent" in response["temporal_trust"]["notes"][0]
+
+
+def test_malformed_sidecar_date_is_low_trust_and_uncertified():
+    result = resolve_occurrence_time(
+        "I completed the plank challenge 5 days ago.",
+        observed_at=_epoch("2023-03-20"),
+        session_date="2023-03-20",
+        engine=SimpleNamespace(
+            _session_occurrence_dates={"session-a": "not-a-date"},
+        ),
+        session_id="session-a",
+    )
+
+    assert result["session_date"] is None
+    assert result["anchor_trust"] == "low_trust"
+    assert result["temporal_certified"] is False
+    assert "sidecar invalid" in result["trust_note"]
 
 
 def test_session_sidecar_cannot_override_real_host_observation_after_as_of(evidence_db):

@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.evidence_compiler import compile_preanswer_evidence
+from hermes_lcm.requirements_compiler import _finite_event_key
 from hermes_lcm.store import MessageStore
 from hermes_lcm.tools import lcm_compile_evidence
 from hermes_lcm.schemas import LCM_COMPILE_EVIDENCE
@@ -161,7 +162,11 @@ def test_instead_of_difference_uses_question_direction(tmp_path):
 
 def test_open_cardinality_returns_one_event_count_uncertified(tmp_path):
     engine = _engine(tmp_path)
-    source = _append(engine, "I visited Lisbon during my spring vacation.")
+    source = _append(
+        engine,
+        "I visited Lisbon during my spring vacation.",
+        timestamp=datetime(2025, 6, 1, tzinfo=timezone.utc).timestamp(),
+    )
     try:
         result = _compile(
             engine,
@@ -540,10 +545,32 @@ def test_finite_enumeration_distinguishes_same_entity_events_by_date(tmp_path):
     assert result["coverage_certificate"]["every_counted_event_dated"] is True
 
 
+def test_finite_event_key_preserves_date_suffix_for_overlong_base():
+    names = " ".join(
+        f"Place{chr(65 + index // 26)}{chr(65 + index % 26)}"
+        for index in range(80)
+    )
+    quote = f"I took a vacation to {names}."
+
+    first = _finite_event_key(quote, "vacation", "2025-02-01")
+    second = _finite_event_key(quote, "vacation", "2025-06-01")
+
+    assert first is not None and second is not None
+    assert len(first) == len(second) == 300
+    assert first.endswith(" @ 2025-02-01")
+    assert second.endswith(" @ 2025-06-01")
+    assert first != second
+
+
 def test_finite_enumeration_returns_dated_and_undated_count_uncertified(tmp_path):
     engine = _engine(tmp_path)
     known = _append(engine, "I took a vacation to Bali.", session_id="known")
-    unknown = _append(engine, "I took a vacation to Kyoto.", session_id="unknown")
+    unknown = _append(
+        engine,
+        "I took a vacation to Kyoto.",
+        session_id="unknown",
+        timestamp=datetime(2025, 6, 1, tzinfo=timezone.utc).timestamp(),
+    )
     engine._session_occurrence_dates["known"] = "2025-02-01"
     try:
         result = _compile(
@@ -566,8 +593,19 @@ def test_finite_enumeration_returns_dated_and_undated_count_uncertified(tmp_path
 
 def test_finite_enumeration_collapses_repeated_undated_mentions(tmp_path):
     engine = _engine(tmp_path)
-    first = _append(engine, "I took a vacation to Bali.", session_id="first")
-    second = _append(engine, "I took a vacation to Bali.", session_id="second")
+    observed = datetime(2025, 6, 1, tzinfo=timezone.utc).timestamp()
+    first = _append(
+        engine,
+        "I took a vacation to Bali.",
+        session_id="first",
+        timestamp=observed,
+    )
+    second = _append(
+        engine,
+        "I took a vacation to Bali.",
+        session_id="second",
+        timestamp=observed,
+    )
     try:
         result = _compile(
             engine,
@@ -585,6 +623,30 @@ def test_finite_enumeration_collapses_repeated_undated_mentions(tmp_path):
     assert result["computation"]["result_value"] == 1
     assert result["coverage_certificate"]["distinct_keys"] == 1
     assert result["coverage_certificate"]["unknown_time_clauses"] == 2
+
+
+def test_finite_enumeration_excludes_postdated_undated_event(tmp_path):
+    engine = _engine(tmp_path)
+    postdated = _append(
+        engine,
+        "I took a vacation to Bali.",
+        timestamp=datetime(2026, 1, 2, tzinfo=timezone.utc).timestamp(),
+    )
+    try:
+        result = _compile(
+            engine,
+            "How many vacations did I take this year?",
+            [postdated],
+            question_as_of="2025-12-31",
+            budgets={"max_retrieval_calls": 0},
+        )
+    finally:
+        engine._store.close()
+
+    assert result["computation"] is None
+    assert result["reason_code"] == "finite_source_availability_unknown"
+    assert result["coverage_certificate"]["unavailable_as_of_clauses"] == 1
+    assert result["coverage_certificate"]["distinct_keys"] == 0
 
 
 def test_finite_enumeration_rejects_truncated_raw_scan(tmp_path):
@@ -895,7 +957,12 @@ def test_finite_scan_ignores_generic_advice_and_uncertifies_unknown_source_event
         session_id="advice",
         role="assistant",
     )
-    unknown = _append(engine, "I attended Casey's wedding.", session_id="unknown")
+    unknown = _append(
+        engine,
+        "I attended Casey's wedding.",
+        session_id="unknown",
+        timestamp=datetime(2025, 6, 1, tzinfo=timezone.utc).timestamp(),
+    )
     engine._session_occurrence_dates["known"] = "2025-02-01"
     try:
         result = _compile(

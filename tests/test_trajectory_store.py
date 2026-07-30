@@ -286,6 +286,27 @@ def test_newer_trajectory_schema_is_rejected_before_fts_repair(tmp_path: Path):
     assert fts is None
 
 
+def test_malformed_trajectory_schema_raises_before_fts_repair(tmp_path: Path):
+    db_path = tmp_path / "lcm.db"
+    asset_root = tmp_path / "assets"
+    asset_root.mkdir()
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "CREATE TABLE lcm_trajectory_corpora "
+            "(singleton INTEGER PRIMARY KEY CHECK (singleton = 1))"
+        )
+
+    with pytest.raises(sqlite3.OperationalError, match="no such column: schema_version"):
+        TrajectoryStore(db_path, _identity(), asset_root=asset_root)
+
+    with sqlite3.connect(db_path) as conn:
+        fts = conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE name='lcm_trajectory_states_fts'"
+        ).fetchone()
+    assert fts is None
+
+
 def test_insert_is_idempotent_and_conflicting_source_fails(trajectory_db):
     _db_path, asset_root, _messages, store = trajectory_db
     source = _source(asset_root)
