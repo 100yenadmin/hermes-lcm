@@ -54,7 +54,7 @@ from .reasoning import (
     question_date_as_of_epoch,
     validate_selector_alignment,
     verify_final_answer,
-    resolve_occurrence_time,
+    resolve_occurrence_time_with_trust,
 )
 from .presets import preset_status_payload
 from .rollup_periods import (
@@ -5554,7 +5554,7 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
                         ).date().isoformat()
                     except (TypeError, ValueError, OverflowError, OSError):
                         session_date = None
-                occurrence = resolve_occurrence_time(
+                occurrence, temporal_trust = resolve_occurrence_time_with_trust(
                     (hydrated or {}).get("content") or hit.get("snippet") or "",
                     observed_at=source_observed_at or 0,
                     session_date=session_date,
@@ -5563,6 +5563,7 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
                 )
                 occurrence["stored_at"] = source_row.get("ingested_at") or source_row.get("timestamp")
                 item["occurrence_time"] = occurrence
+                item["temporal_trust"] = temporal_trust
                 item["observation_time"] = {
                     "observed_at": occurrence.get("observed_at") or None,
                     "ingested_at": source_row.get("ingested_at") or source_row.get("timestamp"),

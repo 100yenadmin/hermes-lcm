@@ -563,6 +563,24 @@ def test_finite_event_key_preserves_date_suffix_for_overlong_base():
     assert first != second
 
 
+def test_finite_event_key_hashes_distinct_overlong_bases_on_same_date():
+    common_names = " ".join(
+        f"Place{chr(65 + index // 26)}{chr(65 + index % 26)}"
+        for index in range(80)
+    )
+    first_quote = f"I took a vacation to {common_names} DestinationAlpha."
+    second_quote = f"I took a vacation to {common_names} DestinationBeta."
+
+    first = _finite_event_key(first_quote, "vacation", "2025-02-01")
+    second = _finite_event_key(second_quote, "vacation", "2025-02-01")
+
+    assert first is not None and second is not None
+    assert len(first) == len(second) == 300
+    assert first.endswith(" @ 2025-02-01")
+    assert second.endswith(" @ 2025-02-01")
+    assert first != second
+
+
 def test_finite_enumeration_returns_dated_and_undated_count_uncertified(tmp_path):
     engine = _engine(tmp_path)
     known = _append(engine, "I took a vacation to Bali.", session_id="known")

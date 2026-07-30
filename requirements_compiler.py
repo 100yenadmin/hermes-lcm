@@ -1678,10 +1678,17 @@ def _finite_event_key(
         if explicit is None:
             return None
         base = f"{unit.replace('_', ' ')} {explicit.group(0).casefold()}"
+    def bounded_key(value: str, limit: int) -> str:
+        if len(value) <= limit:
+            return value
+        digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+        marker = f" #{digest}"
+        return f"{value[:limit - len(marker)]}{marker}"
+
     if resolved_date:
         suffix = f" @ {resolved_date}"
-        return f"{base[: 300 - len(suffix)]}{suffix}"
-    return base[:300]
+        return f"{bounded_key(base, 300 - len(suffix))}{suffix}"
+    return bounded_key(base, 300)
 
 
 def _source_event_clause(quote: str, *, role: Any, unit: str | None) -> bool:

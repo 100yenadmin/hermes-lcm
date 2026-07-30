@@ -3239,6 +3239,9 @@ class VectorStore:
             scanned = scanned_rows
             if not deadline_expired:
                 total = self._count_embedded_vectors(identity, chunk=False)
+        elif scan_deadline is not None:
+            scanned = scanned_rows
+            total = len(scan_ids)
         return KNNResult(
             candidates,
             coverage=coverage,
@@ -3983,6 +3986,9 @@ class VectorStore:
             scanned = scanned_rows
             if not deadline_expired:
                 total = self._count_embedded_vectors(identity, chunk=True)
+        elif scan_deadline is not None:
+            scanned = scanned_rows
+            total = len(scan_ids)
         return KNNResult(
             candidates,
             coverage=coverage,

@@ -113,10 +113,15 @@ count grew only when review rounds added regressions to those files:
 - Round 4: **92 passed** (**+1 net** acceptance test: the prior all-unavailable
   case remains covered under its updated semantics, and a new mixed
   available/unavailable case was added).
+- Round 5: **94 passed** (**+2** acceptance tests: explicit-date certification
+  without a sidecar and collision resistance for distinct overlong same-date
+  event keys).
 
 The Round-4 final-batch deadline regression is in `tests/test_vector_store.py`,
 so it increases the upstream-affected suite from **166** to **167** without
-changing the three-file acceptance-suite count.
+changing the three-file acceptance-suite count. The Round-5 no-NumPy
+final-batch regression and corrected query-view stale-branch regression increase
+that suite to **168**.
 
 ## PR #190 CI fix
 
@@ -262,11 +267,49 @@ Delivery checkpoint: **COMPLETE** for the named local Round-4 disposition gate;
 **ADVANCE** to the orchestrator handoff. This does not claim remote exact-head
 CI for the unstaged delta, merge readiness, merge, release, or runtime proof.
 
+## Round 5 review dispositions
+
+Review mode: **address**, binding Round-5 disposition batch. Candidate identity:
+PR `#190`, branch `batch/v2-rebaseline`, local base/head before this unstaged
+batch `e5acbbf26715a1f2e721abcdf7d180c5dd1d8d32` /
+`430a48df17acfa27436d3a4e7b4c001c0e51f7ae`. Each finding body was read through
+the requested per-comment `gh api` route before implementation. No commit,
+push, PR write, or other Git/GitHub mutation was performed.
+
+| Comment ID | Priority | Disposition |
+|---|---|---|
+| `3680300339` | P1 | **fixed** — answer-ready recall leaves `occurrence_time` in the exact pre-batch compute-operand shape and publishes `anchor_trust`, `temporal_certified`, `session_date_overridden`, and any `trust_note` in a sibling `temporal_trust` block. The wire regression passes that exact recalled occurrence object into `lcm_compute`, proves a computed result, and proves the object is unchanged across the seam. |
+| `3680300336` | P2 | **fixed** — trust classification now follows the resolved occurrence type. Explicit dates are certified without a sidecar; relative resolutions use the D-ARCH-3 valid, absent, and invalid sidecar cells; an unrelated/unknown occurrence is not certified merely because a sidecar exists. Regressions cover explicit-date/no-sidecar certification and relative/no-sidecar low trust. |
+| `3680300341` | P2 | **fixed** — the scalar no-NumPy summary and chunk scan consumers now mirror the vectorized completed-scan provenance: when the deadline crosses during the final scored batch, coverage remains `full` with `scanned` and `total`. The forced-no-NumPy regression proves `full`, `4/4`. |
+| `3680283571` | P2 | **fixed in the test** — the query-view regression now advances corpus generation through `MessageStore.append` after positive-dependency validation and immediately before the confirmation snapshot. It asserts the exact negative-space watermark stale reason, `delta_required`, stale view state, unchanged published generation, and zero hits. |
+| `3680283573` | P3 | **fixed** — overlong finite-event key bases retain a bounded readable prefix plus a SHA-256 prefix before the date suffix. Distinct long-named events on the same date no longer collide; the 300-character key and date suffix contracts remain intact. |
+
+Round-5 focused regressions:
+
+```text
+PYTHONPATH="${AGENT_STUB_PATH}" python3 -m pytest -q tests/test_lcm_recall.py::test_recalled_occurrence_round_trips_as_unchanged_compute_operand tests/test_reasoning.py::test_explicit_occurrence_without_sidecar_is_certified tests/test_reasoning.py::test_compute_without_sidecar_marks_temporal_result_low_trust tests/test_reasoning.py::test_malformed_sidecar_date_is_low_trust_and_uncertified tests/test_vector_store.py::test_full_scan_deadline_on_final_batch_without_numpy_reports_complete_total tests/test_query_view_store.py::test_hit_confirmation_rechecks_generation_after_source_mutation tests/test_evidence_contract.py::test_finite_event_key_hashes_distinct_overlong_bases_on_same_date
+```
+
+Result: **7 passed**.
+
+Round-5 acceptance proof:
+
+- Exact CI slice above: **60 passed**.
+- Batch acceptance suite above: **94 passed**.
+- Upstream-affected suite above: **168 passed**.
+- Full `tests/test_lcm_recall.py` affected suite: **102 passed**.
+- Full changed/affected-file `ruff check`: **all checks passed**.
+- `git diff --check`: **clean**.
+
+Delivery checkpoint: **COMPLETE** for the named local Round-5 disposition gate;
+**ADVANCE** to the orchestrator handoff. This does not claim remote exact-head
+CI for the unstaged delta, merge readiness, merge, release, or runtime proof.
+
 ## Decision fidelity
 
 - D-ARCH-1: dated candidates dedupe by the existing event key plus resolved date; undated candidates retain the existing collapse. Counts with any undated contributor are returned with `finite_coverage=false`.
 - D-ARCH-2: adjacency remains first priority for its reserve; unused slots return to ranked candidates in rank order.
-- D-ARCH-3: the engine occurrence-date sidecar is the trusted anchor; disagreement overrides the caller and is noted; absence returns a low-trust, uncertified temporal result.
+- D-ARCH-3: explicit dates are self-anchoring and certified without a sidecar; relative occurrences use the engine occurrence-date sidecar as the trusted anchor, disagreement overrides the caller and is noted, and absence or invalidity returns a low-trust, uncertified result. Trust metadata is a sibling of the operand-shaped `occurrence_time` object.
 - Batch-2: `how long ago` uses one evidence-date operand and the question-date anchor.
 - Deviations from the binding D-ARCH text: **none**.
 

@@ -82,14 +82,14 @@ _MONTHS.update({
 })
 
 
-def resolve_occurrence_time(
+def resolve_occurrence_time_with_trust(
     text: Any,
     *,
     observed_at: Any,
     session_date: Any = None,
     engine: Any = None,
     session_id: Any = None,
-):
+) -> tuple[dict[str, Any], dict[str, Any]]:
     """Lazy import keeps plugin bootstrap order independent of this optional parser."""
     from .occurrence_time import resolve_occurrence_time as _resolve
 
@@ -108,30 +108,66 @@ def resolve_occurrence_time(
     )
     anchor = sidecar_session_date or caller_session_date
     result = _resolve(text, observed_at=observed_at, session_date=anchor)
-    if sidecar_session_date and result.get("session_date"):
-        result["anchor_trust"] = "engine_sidecar"
-        result["temporal_certified"] = True
-        result["session_date_overridden"] = overridden
+    source = str(result.get("event_time_source") or "unknown")
+    reason = str(result.get("reason") or "")
+    trust: dict[str, Any] = {
+        "anchor_trust": "not_applicable",
+        "temporal_certified": None,
+        "session_date_overridden": False,
+    }
+    if source == "explicit":
+        # An explicit date is self-anchoring. Sidecar availability or validity
+        # cannot change its certification.
+        trust["temporal_certified"] = True
+    elif source == "relative_to_session" and sidecar_session_date:
+        trust["anchor_trust"] = "engine_sidecar"
+        trust["temporal_certified"] = True
+        trust["session_date_overridden"] = overridden
         if overridden:
-            result["trust_note"] = (
+            trust["trust_note"] = (
                 f"caller session_date {caller_session_date} overridden by "
                 f"engine sidecar {sidecar_session_date}"
             )
-    else:
-        result["anchor_trust"] = "low_trust"
-        result["temporal_certified"] = False
-        result["session_date_overridden"] = False
+    elif (
+        source == "relative_to_session"
+        or reason == "relative_expression_without_session_date"
+    ):
+        trust["anchor_trust"] = "low_trust"
+        trust["temporal_certified"] = False
         if sidecar_session_date:
-            result["trust_note"] = (
+            trust["trust_note"] = (
                 f"engine occurrence-date sidecar invalid for session "
                 f"{session_key or '<unknown>'}; temporal result is low-trust"
             )
         else:
-            result["trust_note"] = (
+            trust["trust_note"] = (
                 f"engine occurrence-date sidecar absent for session "
                 f"{session_key or '<unknown>'}; temporal result is low-trust"
             )
-    return result
+    return result, trust
+
+
+def resolve_occurrence_time(
+    text: Any,
+    *,
+    observed_at: Any,
+    session_date: Any = None,
+    engine: Any = None,
+    session_id: Any = None,
+) -> dict[str, Any]:
+    """Return only the operand-shaped occurrence object.
+
+    Trust metadata is deliberately kept out of this object so an answer-ready
+    recall hit can pass it to ``lcm_compute`` without changing wire shape.
+    """
+    occurrence, _trust = resolve_occurrence_time_with_trust(
+        text,
+        observed_at=observed_at,
+        session_date=session_date,
+        engine=engine,
+        session_id=session_id,
+    )
+    return occurrence
 
 
 @dataclass(frozen=True)
@@ -215,6 +251,7 @@ class GroundedEvidence:
     temporal_trust: Literal[
         "not_applicable", "engine_sidecar", "low_trust"
     ] = "not_applicable"
+    temporal_certified: bool | None = None
     temporal_notes: tuple[str, ...] = ()
 
 
@@ -824,12 +861,13 @@ def _ground_one(
     temporal_trust: Literal[
         "not_applicable", "engine_sidecar", "low_trust"
     ] = "not_applicable"
+    temporal_certified: bool | None = None
     temporal_notes: tuple[str, ...] = ()
     raw_occurrence = raw.get("occurrence_time")
     if raw_occurrence is not None:
         if not isinstance(raw_occurrence, dict):
             return None, "occurrence_time must be an object"
-        resolved = resolve_occurrence_time(
+        resolved, resolved_trust = resolve_occurrence_time_with_trust(
             quote,
             observed_at=(
                 stored.get("observed_at")
@@ -841,8 +879,11 @@ def _ground_one(
             session_id=stored.get("session_id"),
         )
         resolved_occurrence = resolved
-        temporal_trust = str(resolved["anchor_trust"])  # type: ignore[assignment]
-        note = str(resolved.get("trust_note") or "").strip()
+        temporal_trust = str(  # type: ignore[assignment]
+            resolved_trust["anchor_trust"]
+        )
+        temporal_certified = resolved_trust["temporal_certified"]
+        note = str(resolved_trust.get("trust_note") or "").strip()
         temporal_notes = (note,) if note else ()
         supplied_source = str(raw_occurrence.get("event_time_source") or "")
         if supplied_source != resolved["event_time_source"]:
@@ -851,7 +892,7 @@ def _ground_one(
         if (
             supplied_date
             and supplied_date != str(resolved.get("event_date") or "")
-            and not resolved.get("session_date_overridden")
+            and not resolved_trust.get("session_date_overridden")
         ):
             return None, "occurrence_time date is not supported by the exact quote"
         occurrence_day = _parse_day(str(resolved.get("event_date") or ""))
@@ -868,7 +909,7 @@ def _ground_one(
         )
         occurrence_overridden = bool(
             resolved_occurrence
-            and resolved_occurrence.get("session_date_overridden")
+            and resolved_trust.get("session_date_overridden")
         )
         if not claimed_supported and not occurrence_overridden:
             return None, f"date {raw_date!r} is not supported by metadata or exact quote"
@@ -945,6 +986,7 @@ def _ground_one(
         group_active_assertion_ids=group_active_ids,
         group_state_truncated=group_truncated,
         temporal_trust=temporal_trust,
+        temporal_certified=temporal_certified,
         temporal_notes=temporal_notes,
     ), None
 
@@ -978,18 +1020,25 @@ def ground_evidence(
     temporal = [
         operand
         for operand in grounded
-        if operand.temporal_trust != "not_applicable"
+        if operand.temporal_certified is not None
     ]
     notes = tuple(dict.fromkeys(
         note
         for operand in temporal
         for note in operand.temporal_notes
     ))
-    if any(operand.temporal_trust == "low_trust" for operand in temporal):
+    if any(operand.temporal_certified is False for operand in temporal):
         trust = "low_trust"
         certified = False
     elif temporal:
-        trust = "engine_sidecar"
+        trust = (
+            "engine_sidecar"
+            if any(
+                operand.temporal_trust == "engine_sidecar"
+                for operand in temporal
+            )
+            else "not_applicable"
+        )
         certified = True
     else:
         trust = "not_applicable"

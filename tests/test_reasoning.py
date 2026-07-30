@@ -19,7 +19,7 @@ from hermes_lcm.reasoning import (
     execute_plan,
     ground_evidence,
     question_date_as_of_epoch,
-    resolve_occurrence_time,
+    resolve_occurrence_time_with_trust,
     resolve_temporal_window,
     validate_selector_alignment,
     verify_final_answer,
@@ -188,6 +188,39 @@ def test_relative_occurrence_time_grounds_without_aliasing_late_observation(evid
     )
     assert decision.status == "grounded", decision.reason
     assert decision.operands[0].evidence_date == date(2023, 3, 15)
+
+
+def test_explicit_occurrence_without_sidecar_is_certified(evidence_db):
+    messages, assertions = evidence_db
+    content = "I completed the plank challenge on 2023-03-15."
+    store_id = messages.append("session-a", {"role": "user", "content": content})
+    occurrence = {
+        "event_at": _epoch("2023-03-15"),
+        "event_date": "2023-03-15",
+        "event_time_source": "explicit",
+        "precision": "day",
+        "policy_version": "occurrence-time-v1",
+    }
+
+    decision = ground_evidence(
+        [
+            _raw(
+                store_id,
+                content,
+                content,
+                date="2023-03-15",
+                occurrence_time=occurrence,
+            )
+        ],
+        messages=messages,
+        assertions=assertions,
+        engine=SimpleNamespace(_session_occurrence_dates={}),
+    )
+
+    assert decision.status == "grounded", decision.reason
+    assert decision.temporal_trust == "not_applicable"
+    assert decision.temporal_certified is True
+    assert decision.notes == ()
 
 
 def test_compute_accepts_caller_anchor_only_when_it_agrees_with_sidecar(evidence_db):
@@ -363,7 +396,7 @@ def test_compute_without_sidecar_marks_temporal_result_low_trust(evidence_db):
 
 
 def test_malformed_sidecar_date_is_low_trust_and_uncertified():
-    result = resolve_occurrence_time(
+    result, trust = resolve_occurrence_time_with_trust(
         "I completed the plank challenge 5 days ago.",
         observed_at=_epoch("2023-03-20"),
         session_date="2023-03-20",
@@ -374,9 +407,15 @@ def test_malformed_sidecar_date_is_low_trust_and_uncertified():
     )
 
     assert result["session_date"] is None
-    assert result["anchor_trust"] == "low_trust"
-    assert result["temporal_certified"] is False
-    assert "sidecar invalid" in result["trust_note"]
+    assert not {
+        "anchor_trust",
+        "temporal_certified",
+        "session_date_overridden",
+        "trust_note",
+    }.intersection(result)
+    assert trust["anchor_trust"] == "low_trust"
+    assert trust["temporal_certified"] is False
+    assert "sidecar invalid" in trust["trust_note"]
 
 
 def test_session_sidecar_cannot_override_real_host_observation_after_as_of(evidence_db):

@@ -273,22 +273,28 @@ def test_hit_confirmation_rechecks_generation_after_source_mutation(
     dependency = _dependency(views, store_id, content)
     identity = _identity()
     _publish(views, identity, [dependency])
+    published_snapshot = views.corpus_snapshot()
     original_snapshot = views.corpus_snapshot
+    mutated = False
 
-    def snapshot_then_mutate():
-        snapshot = original_snapshot()
-        messages._conn.execute(
-            "UPDATE messages SET content='I prefer coffee.' WHERE store_id=?",
-            (store_id,),
-        )
-        messages._conn.commit()
-        return snapshot
+    def mutate_then_snapshot():
+        nonlocal mutated
+        if not mutated:
+            _append(messages, "I prefer coffee.")
+            mutated = True
+        return original_snapshot()
 
-    monkeypatch.setattr(views, "corpus_snapshot", snapshot_then_mutate)
+    # Positive-dependency validation has completed when lookup asks for this
+    # snapshot. Advance the real corpus generation at that exact seam so the
+    # stale-generation branch, not the happy-path hit CAS, is exercised.
+    monkeypatch.setattr(views, "corpus_snapshot", mutate_then_snapshot)
     result = views.lookup(identity)
 
+    assert mutated is True
     assert result.status == "delta_required"
+    assert result.reason == "corpus advanced beyond the negative-space watermark"
     assert result.view["status"] == "stale"
+    assert result.view["corpus_generation"] == published_snapshot.generation
     assert result.view["hit_count"] == 0
 
 
