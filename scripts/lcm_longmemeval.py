@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """LongMemEval retrieval-quality harness CLI for hermes-lcm.
 
-Two subcommands:
+Three subcommands:
 
     fetch   Download the pinned LongMemEval_S dataset file once (operator step).
+    prepare Stream a corpus into checksum-verified per-question files.
     run     Ingest histories into fresh temp LCM stores and score the arms.
 
 Offline by default: `run` never downloads. Deterministic with `--provider stub`;
@@ -25,13 +26,18 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from benchmarking.longmemeval import (  # noqa: E402
+    DATASET_COORDS,
     DATASET_FILENAME,
     DATASET_REPO_ID,
     DATASET_REVISION,
     PROVIDERS,
     load_questions,
+    load_prepared_dataset,
+    prepare_dataset,
     render_markdown,
     run_harness,
+    sha256_file,
+    validate_dataset_path_label,
 )
 
 
@@ -42,8 +48,26 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     fetch = sub.add_parser("fetch", help="Download the pinned LongMemEval_S dataset file.")
     fetch.add_argument("--output", required=True, help="Directory to write the dataset file into.")
 
+    prepare = sub.add_parser(
+        "prepare", help="Stream a dataset into per-question JSON files plus a manifest."
+    )
+    prepare.add_argument("--dataset", required=True, help="Path to the LongMemEval corpus.")
+    prepare.add_argument("--prepared-dir", required=True, help="Empty output directory.")
+    prepare.add_argument(
+        "--dataset-label", default="s", choices=DATASET_COORDS,
+        help="Dataset tier label used to validate and stamp provenance (default: s).",
+    )
+
     run = sub.add_parser("run", help="Run the retrieval harness over the dataset.")
-    run.add_argument("--dataset", required=True, help="Path to the downloaded longmemeval_s file.")
+    source = run.add_mutually_exclusive_group(required=True)
+    source.add_argument("--dataset", help="Path to the downloaded LongMemEval corpus.")
+    source.add_argument(
+        "--prepared-dir", help="Path to a checksum-verified prepared dataset directory."
+    )
+    run.add_argument(
+        "--dataset-label", default="s", choices=DATASET_COORDS,
+        help="Dataset tier label used to validate and stamp provenance (default: s).",
+    )
     run.add_argument("--output", required=True, help="Output directory for metrics JSON + markdown.")
     run.add_argument(
         "--provider",
@@ -107,20 +131,53 @@ def _cmd_fetch(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_prepare(args: argparse.Namespace) -> int:
+    try:
+        manifest = prepare_dataset(
+            Path(args.dataset), Path(args.prepared_dir), dataset_label=args.dataset_label
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise SystemExit(str(exc)) from exc
+    print(json.dumps(manifest, indent=2, sort_keys=True))
+    return 0
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
     if args.provider != "stub" and not args.model:
         raise SystemExit(f"--model is required for --provider {args.provider}")
     if args.limit is not None and args.limit <= 0:
         raise SystemExit("--limit must be a positive integer")
-    dataset_path = Path(args.dataset)
-    if not dataset_path.is_file():
-        raise SystemExit(f"dataset file not found: {dataset_path}. Run `fetch` first.")
     output_dir = _validate_output_path(Path(args.output), allow_external=args.allow_external_output)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    questions = load_questions(dataset_path, limit=args.limit)
+    try:
+        if args.dataset is not None:
+            dataset_path = Path(args.dataset)
+            if not dataset_path.is_file():
+                raise SystemExit(
+                    f"dataset file not found: {dataset_path}. Run `fetch` first."
+                )
+            validate_dataset_path_label(dataset_path, args.dataset_label)
+            source_sha256 = sha256_file(dataset_path)
+            manifest_sha256 = None
+            questions = load_questions(dataset_path, limit=args.limit)
+            question_count = len(questions)
+        else:
+            prepared = load_prepared_dataset(
+                Path(args.prepared_dir), dataset_label=args.dataset_label
+            )
+            source_sha256 = prepared.source_sha256
+            manifest_sha256 = prepared.manifest_sha256
+            question_count = (
+                prepared.question_count
+                if args.limit is None
+                else min(prepared.question_count, args.limit)
+            )
+            questions = prepared.iter_questions(limit=args.limit)
+    except (OSError, ValueError) as exc:
+        raise SystemExit(str(exc)) from exc
 
-    with tempfile.TemporaryDirectory(prefix="lcm-longmemeval-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="lcm-longmemeval-", dir=output_dir) as tmp:
         tmp_dir = Path(tmp)
         os.environ.setdefault("HERMES_HOME", str(tmp_dir / "hermes-home"))
         report = run_harness(
@@ -130,6 +187,10 @@ def _cmd_run(args: argparse.Namespace) -> int:
             tmp_dir=tmp_dir,
             use_rerank=args.rerank,
             reuse_db_template=args.reuse_db_template,
+            question_count=question_count,
+            dataset_label=args.dataset_label,
+            source_sha256=source_sha256,
+            manifest_sha256=manifest_sha256,
         )
 
     metrics_path = output_dir / "longmemeval_metrics.json"
@@ -149,6 +210,8 @@ def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv if argv is not None else sys.argv[1:])
     if args.command == "fetch":
         return _cmd_fetch(args)
+    if args.command == "prepare":
+        return _cmd_prepare(args)
     if args.command == "run":
         return _cmd_run(args)
     raise SystemExit(f"unknown command: {args.command}")

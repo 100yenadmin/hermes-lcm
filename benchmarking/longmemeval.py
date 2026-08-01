@@ -9,10 +9,11 @@ arm against the dataset's labeled evidence sessions.
 It is retrieval-only: LongMemEval labels the evidence session(s) per question,
 so recall@k / NDCG@k are computable offline without an LLM judge.
 
-Dataset: LongMemEval_S (Wu et al., ICLR 2025), canonical Hugging Face dataset
-``xiaowu0162/longmemeval``, file ``longmemeval_s``, pinned to a fixed revision
-(see :data:`DATASET_REPO_ID` / :data:`DATASET_REVISION`). The dataset is
-downloaded once by an explicit operator command and never during a run.
+Dataset: LongMemEval (Wu et al., ICLR 2025), canonical Hugging Face dataset
+``xiaowu0162/longmemeval``. The small default (``longmemeval_s``) and medium
+tier (``longmemeval_m``) share one pinned revision (see :data:`DATASET_COORDS`).
+The dataset is downloaded once by an explicit operator command and never during
+a run.
 
 Export hygiene mirrors ``scripts/lcm_benchmark.py``: output is aggregate-only.
 It contains no transcript content, session ids, or local paths.
@@ -24,6 +25,7 @@ import hashlib
 import importlib.util
 import json
 import math
+import os
 import re
 import shutil
 import sys
@@ -31,7 +33,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Iterator, Sequence
 
 from .standalone import ensure_agent_context_engine_importable
 
@@ -53,6 +55,22 @@ EMBED_BATCH_SIZE = 64
 DATASET_REPO_ID = "xiaowu0162/longmemeval"
 DATASET_REVISION = "2ec2a557f339b6c0369619b1ed5793734cc87533"
 DATASET_FILENAME = "longmemeval_s"
+DATASET_COORDS = {
+    "s": {
+        "name": "LongMemEval_S",
+        "repo_id": DATASET_REPO_ID,
+        "revision": DATASET_REVISION,
+        "file": DATASET_FILENAME,
+    },
+    "m": {
+        "name": "LongMemEval_M",
+        "repo_id": DATASET_REPO_ID,
+        "revision": DATASET_REVISION,
+        "file": "longmemeval_m",
+    },
+}
+PREPARED_MANIFEST_SCHEMA_VERSION = 1
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 PROVIDERS = ("stub", "fastembed", "voyage", "ollama")
 # ``chunk_vectors`` scores the raw-chunk KNN corpus; ``hybrid_rrf3`` fuses it as a
@@ -242,6 +260,236 @@ def load_questions(path: str | Path, *, limit: int | None = None) -> list[Questi
             raise ValueError("--limit must be a positive integer")
         questions = questions[:limit]
     return questions
+
+
+def sha256_file(path: str | Path) -> str:
+    """Return the SHA-256 of ``path`` without loading it into memory."""
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def dataset_coordinates(dataset_label: str) -> dict[str, str]:
+    """Return a copy of the pinned coordinates for a supported dataset label."""
+    try:
+        return dict(DATASET_COORDS[dataset_label])
+    except KeyError as exc:
+        raise ValueError(f"unsupported dataset label: {dataset_label!r}") from exc
+
+
+def validate_dataset_path_label(path: str | Path, dataset_label: str) -> None:
+    """Fail closed when a direct dataset filename does not match its label."""
+    expected = dataset_coordinates(dataset_label)["file"]
+    actual = Path(path).name
+    if actual != expected:
+        raise ValueError(
+            f"dataset label {dataset_label!r} requires filename {expected!r}; got {actual!r}"
+        )
+
+
+class _HashingReader:
+    """Minimal binary reader that hashes the same bytes consumed by ``ijson``."""
+
+    def __init__(self, source):
+        self._source = source
+        self._digest = hashlib.sha256()
+
+    def read(self, size: int = -1) -> bytes:
+        chunk = self._source.read(size)
+        self._digest.update(chunk)
+        return chunk
+
+    @property
+    def hexdigest(self) -> str:
+        return self._digest.hexdigest()
+
+
+def _iter_dataset_rows(source) -> Iterator[dict[str, Any]]:
+    """Incrementally yield top-level array items from a LongMemEval corpus."""
+    try:
+        import ijson
+    except ImportError as exc:
+        raise RuntimeError(
+            "ijson is required for `prepare`; install it for that command only"
+        ) from exc
+    for row in ijson.items(source, "item", use_float=True):
+        if not isinstance(row, dict):
+            raise ValueError("LongMemEval dataset entries must be JSON objects")
+        yield row
+
+
+def _question_filename(question_id: str) -> str:
+    if (
+        not question_id
+        or question_id in {".", "..", "manifest"}
+        or "/" in question_id
+        or "\\" in question_id
+    ):
+        raise ValueError(f"unsafe question_id for prepared output: {question_id!r}")
+    return f"{question_id}.json"
+
+
+def _canonical_json_bytes(value: Any) -> bytes:
+    return (
+        json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n"
+    ).encode("utf-8")
+
+
+def prepare_dataset(
+    source_path: str | Path,
+    prepared_dir: str | Path,
+    *,
+    dataset_label: str,
+) -> dict[str, Any]:
+    """Stream a corpus into checksum-addressed, per-question prepared files."""
+    source_path = Path(source_path)
+    validate_dataset_path_label(source_path, dataset_label)
+    if not source_path.is_file():
+        raise ValueError(f"dataset file not found: {source_path}")
+
+    prepared_dir = Path(prepared_dir)
+    prepared_dir.mkdir(parents=True, exist_ok=True)
+    if any(prepared_dir.iterdir()):
+        raise ValueError(f"prepared directory must be empty: {prepared_dir}")
+
+    questions: list[dict[str, str]] = []
+    seen_ids: set[str] = set()
+    with source_path.open("rb") as raw_source:
+        source = _HashingReader(raw_source)
+        for row in _iter_dataset_rows(source):
+            question_id = str(row.get("question_id", ""))
+            if question_id in seen_ids:
+                raise ValueError(f"duplicate question_id in dataset: {question_id!r}")
+            filename = _question_filename(question_id)
+            payload = _canonical_json_bytes(row)
+            (prepared_dir / filename).write_bytes(payload)
+            questions.append(
+                {
+                    "question_id": question_id,
+                    "file": filename,
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                }
+            )
+            seen_ids.add(question_id)
+
+        manifest = {
+            "schema_version": PREPARED_MANIFEST_SCHEMA_VERSION,
+            "dataset_label": dataset_label,
+            "source_file": source_path.name,
+            "source_sha256": source.hexdigest,
+            "question_count": len(questions),
+            "questions": questions,
+        }
+    (prepared_dir / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    return manifest
+
+
+@dataclass(frozen=True)
+class PreparedDataset:
+    directory: Path
+    dataset_label: str
+    source_sha256: str
+    manifest_sha256: str
+    question_count: int
+    questions: tuple[dict[str, str], ...]
+
+    def iter_questions(self, *, limit: int | None = None) -> Iterator[Question]:
+        if limit is not None and limit <= 0:
+            raise ValueError("--limit must be a positive integer")
+        entries = self.questions if limit is None else self.questions[:limit]
+        for entry in entries:
+            path = self.directory / entry["file"]
+            payload = path.read_bytes()
+            actual_sha = hashlib.sha256(payload).hexdigest()
+            if actual_sha != entry["sha256"]:
+                raise ValueError(f"prepared question checksum mismatch: {entry['file']}")
+            raw = json.loads(payload)
+            if str(raw.get("question_id", "")) != entry["question_id"]:
+                raise ValueError(f"prepared question id mismatch: {entry['file']}")
+            yield parse_question(raw)
+
+
+def load_prepared_dataset(
+    prepared_dir: str | Path, *, dataset_label: str
+) -> PreparedDataset:
+    """Validate an entire prepared manifest/file set before returning a lazy reader."""
+    prepared_dir = Path(prepared_dir)
+    manifest_path = prepared_dir / "manifest.json"
+    if not manifest_path.is_file():
+        raise ValueError(f"prepared manifest not found: {manifest_path}")
+    manifest_bytes = manifest_path.read_bytes()
+    try:
+        manifest = json.loads(manifest_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid prepared manifest: {manifest_path}") from exc
+    if not isinstance(manifest, dict):
+        raise ValueError("prepared manifest must be a JSON object")
+    if manifest.get("schema_version") != PREPARED_MANIFEST_SCHEMA_VERSION:
+        raise ValueError("unsupported prepared manifest schema_version")
+    if manifest.get("dataset_label") != dataset_label:
+        raise ValueError(
+            f"dataset label mismatch: requested {dataset_label!r}, "
+            f"manifest has {manifest.get('dataset_label')!r}"
+        )
+    source_sha256 = str(manifest.get("source_sha256", ""))
+    if not _SHA256_RE.fullmatch(source_sha256):
+        raise ValueError("prepared manifest source_sha256 is invalid")
+    expected_source_file = dataset_coordinates(dataset_label)["file"]
+    if manifest.get("source_file") != expected_source_file:
+        raise ValueError(
+            f"prepared manifest source_file does not match label {dataset_label!r}"
+        )
+
+    raw_questions = manifest.get("questions")
+    if not isinstance(raw_questions, list):
+        raise ValueError("prepared manifest questions must be a list")
+    if manifest.get("question_count") != len(raw_questions):
+        raise ValueError("prepared manifest question_count mismatch")
+
+    questions: list[dict[str, str]] = []
+    seen_ids: set[str] = set()
+    seen_files: set[str] = set()
+    for raw_entry in raw_questions:
+        if not isinstance(raw_entry, dict):
+            raise ValueError("prepared manifest question entries must be objects")
+        question_id = str(raw_entry.get("question_id", ""))
+        filename = str(raw_entry.get("file", ""))
+        expected_filename = _question_filename(question_id)
+        checksum = str(raw_entry.get("sha256", ""))
+        if filename != expected_filename:
+            raise ValueError(f"prepared filename mismatch for question {question_id!r}")
+        if question_id in seen_ids or filename in seen_files:
+            raise ValueError(f"duplicate prepared question entry: {question_id!r}")
+        if not _SHA256_RE.fullmatch(checksum):
+            raise ValueError(f"invalid prepared question checksum: {filename}")
+        path = prepared_dir / filename
+        if not path.is_file():
+            raise ValueError(f"prepared question file not found: {path}")
+        if sha256_file(path) != checksum:
+            raise ValueError(f"prepared question checksum mismatch: {filename}")
+        questions.append(
+            {"question_id": question_id, "file": filename, "sha256": checksum}
+        )
+        seen_ids.add(question_id)
+        seen_files.add(filename)
+
+    actual_files = {path.name for path in prepared_dir.glob("*.json")}
+    expected_files = seen_files | {"manifest.json"}
+    if actual_files != expected_files:
+        raise ValueError("prepared directory JSON file set does not match manifest")
+
+    return PreparedDataset(
+        directory=prepared_dir,
+        dataset_label=dataset_label,
+        source_sha256=source_sha256,
+        manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
+        question_count=len(questions),
+        questions=tuple(questions),
+    )
 
 
 def evidence_sessions(question: Question) -> set[str]:
@@ -1042,16 +1290,39 @@ def evaluate_question(
         store.close()
 
 
-def _embed_in_batches(embedder, texts: Sequence[str], batch_size: int = EMBED_BATCH_SIZE) -> list:
+def _embedding_batch_size() -> int:
+    raw = os.environ.get("LCM_EMBEDDING_MAX_BATCH_ITEMS")
+    if raw is None:
+        return EMBED_BATCH_SIZE
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError("LCM_EMBEDDING_MAX_BATCH_ITEMS must be an integer") from exc
+    if value <= 0:
+        raise ValueError("LCM_EMBEDDING_MAX_BATCH_ITEMS must be positive")
+    return value
+
+
+def _embed_in_batches(embedder, texts: Sequence[str], batch_size: int | None = None) -> list:
     """Embed ``texts`` in ``batch_size`` sub-batches, concatenating the results.
 
     One ``embed_documents`` call per sub-batch (F7 amortization) while each call
     stays inside the provider's per-call deadline. Per-text vectors are identical to
     embedding one text at a time for the deterministic/independent providers used here.
     """
+    if batch_size is None:
+        batch_size = _embedding_batch_size()
+    if batch_size <= 0:
+        raise ValueError("embedding batch size must be positive")
     vectors: list = []
     for start in range(0, len(texts), max(1, batch_size)):
-        vectors.extend(embedder.embed_documents(list(texts[start:start + batch_size])))
+        batch = list(texts[start:start + batch_size])
+        embedded = list(embedder.embed_documents(batch))
+        if len(embedded) != len(batch):
+            raise ValueError(
+                f"embedding provider returned {len(embedded)} vectors for {len(batch)} texts"
+            )
+        vectors.extend(embedded)
     return vectors
 
 
@@ -1101,7 +1372,7 @@ def _aggregate_rerank_mode(mode_counts: dict[str, int]) -> dict[str, Any]:
 
 
 def run_harness(
-    questions: Sequence[Question],
+    questions: Iterable[Question],
     *,
     provider_name: str,
     model: str,
@@ -1109,8 +1380,21 @@ def run_harness(
     embeddings_enabled: bool | None = None,
     use_rerank: bool = False,
     reuse_db_template: bool = True,
+    question_count: int | None = None,
+    dataset_label: str = "s",
+    source_sha256: str | None = None,
+    manifest_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Run every arm over every question and return an aggregate-only report."""
+    dataset_report: dict[str, Any] = dataset_coordinates(dataset_label)
+    if source_sha256 is not None:
+        if not _SHA256_RE.fullmatch(source_sha256):
+            raise ValueError("source_sha256 must be a lowercase SHA-256 hex digest")
+        dataset_report["source_sha256"] = source_sha256
+    if manifest_sha256 is not None:
+        if not _SHA256_RE.fullmatch(manifest_sha256):
+            raise ValueError("manifest_sha256 must be a lowercase SHA-256 hex digest")
+        dataset_report["manifest_sha256"] = manifest_sha256
     if embeddings_enabled is None:
         embeddings_enabled = provider_name != "none"
     embedder = resolve_harness_provider(provider_name, model)
@@ -1139,8 +1423,10 @@ def run_harness(
     # Track per-question rerank modes so the run-level label is an aggregate, not
     # whatever the final question happened to use (FIX-2).
     rerank_mode_counts: dict[str, int] = {}
+    consumed_count = 0
 
     for question in questions:
+        consumed_count += 1
         if question.is_abstention:
             abstention_count += 1
             continue
@@ -1176,21 +1462,21 @@ def run_harness(
                 bucket[arm].session_granularity = True
                 overall[arm].session_granularity = True
 
+    if question_count is not None and consumed_count != question_count:
+        raise ValueError(
+            f"question count mismatch: expected {question_count}, consumed {consumed_count}"
+        )
+
     return {
         "schema_version": SCHEMA_VERSION,
         "benchmark_version": BENCHMARK_VERSION,
         "generated_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "transcript_contents_included": False,
-        "dataset": {
-            "name": "LongMemEval_S",
-            "repo_id": DATASET_REPO_ID,
-            "revision": DATASET_REVISION,
-            "file": DATASET_FILENAME,
-        },
+        "dataset": dataset_report,
         "provider": provider_name,
         "model": model,
         "embeddings_enabled": embeddings_enabled,
-        "question_count": len(questions),
+        "question_count": consumed_count,
         "scored_count": scored_count,
         "abstention_excluded": abstention_count,
         "rerank": {
@@ -1242,7 +1528,7 @@ def render_markdown(report: dict[str, Any]) -> str:
     ingest = report.get("ingest", {})
     per_q = ingest.get("per_question_ms", {})
     lines = [
-        f"# LongMemEval_S retrieval — provider={report['provider']} "
+        f"# {report['dataset']['name']} retrieval — provider={report['provider']} "
         f"model={report['model'] or 'n/a'}",
         "",
         f"scored={report['scored_count']} abstention_excluded={report['abstention_excluded']} "
