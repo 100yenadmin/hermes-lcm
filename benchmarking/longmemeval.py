@@ -250,9 +250,8 @@ def parse_question(raw: dict[str, Any]) -> Question:
     )
 
 
-def load_questions(path: str | Path, *, limit: int | None = None) -> list[Question]:
-    """Load LongMemEval questions from the downloaded JSON file."""
-    data = json.loads(Path(path).read_text(encoding="utf-8"))
+def _questions_from_bytes(payload: bytes, *, limit: int | None = None) -> list[Question]:
+    data = json.loads(payload)
     if not isinstance(data, list):
         raise ValueError("LongMemEval dataset must be a JSON array of questions")
     questions = [parse_question(row) for row in data]
@@ -261,6 +260,19 @@ def load_questions(path: str | Path, *, limit: int | None = None) -> list[Questi
             raise ValueError("--limit must be a positive integer")
         questions = questions[:limit]
     return questions
+
+
+def load_questions(path: str | Path, *, limit: int | None = None) -> list[Question]:
+    """Load LongMemEval questions from the downloaded JSON file."""
+    return _questions_from_bytes(Path(path).read_bytes(), limit=limit)
+
+
+def load_questions_with_sha256(
+    path: str | Path, *, limit: int | None = None
+) -> tuple[list[Question], str]:
+    """Parse and hash one immutable byte read of a direct dataset file."""
+    payload = Path(path).read_bytes()
+    return _questions_from_bytes(payload, limit=limit), hashlib.sha256(payload).hexdigest()
 
 
 def sha256_file(path: str | Path) -> str:
@@ -1079,6 +1091,7 @@ def evaluate_question(
     top_k: int = 10,
     use_rerank: bool = False,
     db_template: Path | None = None,
+    embedding_batch_size: int | None = None,
 ) -> dict[str, Any]:
     """Ingest one question into a fresh store and score every retrieval arm.
 
@@ -1182,7 +1195,9 @@ def evaluate_question(
 
         if embeddings_enabled and summary_specs:
             summary_vectors = _embed_in_batches(
-                provider_embedder, [text for _session, _node, text in summary_specs]
+                provider_embedder,
+                [text for _session, _node, text in summary_specs],
+                batch_size=embedding_batch_size,
             )
             for (session_id, node_id, _text), vector in zip(summary_specs, summary_vectors):
                 vector_store.record_embedding(
@@ -1416,6 +1431,9 @@ def run_harness(
         dataset_report["manifest_sha256"] = manifest_sha256
     if embeddings_enabled is None:
         embeddings_enabled = provider_name != "none"
+    effective_embedding_batch_size = (
+        _embedding_batch_size() if embeddings_enabled else None
+    )
     embedder = resolve_harness_provider(provider_name, model)
 
     db_template: Path | None = None
@@ -1457,6 +1475,7 @@ def run_harness(
             embeddings_enabled=embeddings_enabled,
             use_rerank=use_rerank,
             db_template=db_template,
+            embedding_batch_size=effective_embedding_batch_size,
         )
         scored_count += 1
         ingest_samples.append(scored.pop("ingest_ms", 0.0))
@@ -1486,6 +1505,14 @@ def run_harness(
             f"question count mismatch: expected {question_count}, consumed {consumed_count}"
         )
 
+    ingest_report: dict[str, Any] = {
+        "batched_embeddings": embeddings_enabled,
+        "reuse_db_template": reuse_db_template,
+        "per_question_ms": percentiles(ingest_samples),
+    }
+    if dataset_label == "m" or manifest_sha256 is not None:
+        ingest_report["embedding_batch_size"] = effective_embedding_batch_size
+
     return {
         "schema_version": SCHEMA_VERSION,
         "benchmark_version": BENCHMARK_VERSION,
@@ -1503,11 +1530,7 @@ def run_harness(
             "candidate_window": RERANK_CANDIDATE_WINDOW,
             "timeout_s": RERANK_TIMEOUT_S,
         },
-        "ingest": {
-            "batched_embeddings": embeddings_enabled,
-            "reuse_db_template": reuse_db_template,
-            "per_question_ms": percentiles(ingest_samples),
-        },
+        "ingest": ingest_report,
         "arms": {
             arm: _arm_report(overall[arm]) for arm in ARMS
         },
