@@ -57,6 +57,7 @@ def _write_dataset(directory: Path, label: str = "m", count: int = 3) -> tuple[P
 
 
 def test_prepare_streams_and_writes_checksum_manifest(tmp_path, monkeypatch):
+    pytest.importorskip("ijson", reason="prepare path requires ijson; the run env installs it explicitly")
     source, rows = _write_dataset(tmp_path)
     prepared_dir = tmp_path / "prepared"
 
@@ -79,6 +80,7 @@ def test_prepare_streams_and_writes_checksum_manifest(tmp_path, monkeypatch):
 
 
 def test_prepared_manifest_fails_closed_on_label_count_and_content_mismatch(tmp_path):
+    pytest.importorskip("ijson", reason="prepare path requires ijson; the run env installs it explicitly")
     source, _rows = _write_dataset(tmp_path)
     prepared_dir = tmp_path / "prepared"
     lme.prepare_dataset(source, prepared_dir, dataset_label="m")
@@ -135,6 +137,7 @@ def _zero_timing(monkeypatch):
 
 
 def test_prepared_and_dataset_runs_have_identical_metrics(tmp_path, monkeypatch):
+    pytest.importorskip("ijson", reason="prepared-run equivalence requires the prepare path (ijson); run env installs it explicitly")
     monkeypatch.delenv("LCM_EMBEDDING_MAX_BATCH_ITEMS", raising=False)
     _zero_timing(monkeypatch)
     source, _rows = _write_dataset(tmp_path)
