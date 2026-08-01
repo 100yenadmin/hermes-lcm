@@ -6,13 +6,23 @@ import hashlib
 import importlib.util
 import json
 import sqlite3
+import sys
+import tempfile
+from contextlib import closing
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 import benchmarking.longmemeval as lme
 
 _SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "lcm_longmemeval.py"
+_BANKED_METRICS = (
+    Path(__file__).resolve().parents[1]
+    / "benchmarks"
+    / "results"
+    / "longmemeval-v3-500q-fastembed-metrics.json"
+)
 
 
 def _load_cli():
@@ -78,42 +88,36 @@ def test_prepare_streams_and_writes_checksum_manifest(tmp_path, monkeypatch):
         assert payload == lme._canonical_json_bytes(row)
     assert (prepared_dir / "manifest.json").is_file()
 
-
-def test_prepare_rejects_malformed_json_without_publishing_partial_output(tmp_path):
-    pytest.importorskip("ijson", reason="prepare path requires ijson; the run env installs it explicitly")
-    source = tmp_path / lme.DATASET_COORDS["m"]["file"]
-    source.write_text(json.dumps([_raw_question(0)])[:-1], encoding="utf-8")
-    prepared_dir = tmp_path / "prepared"
-
+    malformed_root = tmp_path / "malformed"
+    malformed_root.mkdir()
+    malformed_source = malformed_root / lme.DATASET_COORDS["m"]["file"]
+    malformed_source.write_text(json.dumps([_raw_question(0)])[:-1], encoding="utf-8")
+    malformed_output = malformed_root / "prepared"
     with pytest.raises(ValueError, match="invalid LongMemEval dataset JSON"):
-        lme.prepare_dataset(source, prepared_dir, dataset_label="m")
+        lme.prepare_dataset(malformed_source, malformed_output, dataset_label="m")
+    assert not malformed_output.exists()
+    assert not list(malformed_root.glob(".prepared.prepare-*"))
 
-    assert not prepared_dir.exists()
-    assert not list(tmp_path.glob(".prepared.prepare-*"))
-
-
-def test_prepare_rejects_casefolded_reserved_question_id_atomically(tmp_path):
-    pytest.importorskip("ijson", reason="prepare path requires ijson; the run env installs it explicitly")
-    source, rows = _write_dataset(tmp_path, count=2)
-    rows[1]["question_id"] = "Manifest"
-    source.write_text(json.dumps(rows) + "\n", encoding="utf-8")
-    prepared_dir = tmp_path / "prepared"
-
+    reserved_root = tmp_path / "reserved"
+    reserved_root.mkdir()
+    reserved_source, reserved_rows = _write_dataset(reserved_root, count=2)
+    reserved_rows[1]["question_id"] = "Manifest"
+    reserved_source.write_text(json.dumps(reserved_rows) + "\n", encoding="utf-8")
+    reserved_output = reserved_root / "prepared"
     with pytest.raises(ValueError, match="unsafe question_id"):
-        lme.prepare_dataset(source, prepared_dir, dataset_label="m")
+        lme.prepare_dataset(reserved_source, reserved_output, dataset_label="m")
+    assert not reserved_output.exists()
 
-    assert not prepared_dir.exists()
-
-
-def test_prepare_atomically_replaces_an_existing_empty_directory(tmp_path):
-    pytest.importorskip("ijson", reason="prepare path requires ijson; the run env installs it explicitly")
-    source, _rows = _write_dataset(tmp_path, count=1)
-    prepared_dir = tmp_path / "prepared"
-    prepared_dir.mkdir()
-
-    lme.prepare_dataset(source, prepared_dir, dataset_label="m")
-
-    assert sorted(path.name for path in prepared_dir.iterdir()) == ["manifest.json", "q0.json"]
+    existing_root = tmp_path / "existing-empty"
+    existing_root.mkdir()
+    existing_source, _rows = _write_dataset(existing_root, count=1)
+    existing_output = existing_root / "prepared"
+    existing_output.mkdir()
+    lme.prepare_dataset(existing_source, existing_output, dataset_label="m")
+    assert sorted(path.name for path in existing_output.iterdir()) == [
+        "manifest.json",
+        "q0.json",
+    ]
 
 
 def test_prepared_manifest_fails_closed_on_label_count_and_content_mismatch(tmp_path):
@@ -137,6 +141,45 @@ def test_prepared_manifest_fails_closed_on_label_count_and_content_mismatch(tmp_
     (prepared_dir / "q1.json").write_text("{}", encoding="utf-8")
     with pytest.raises(ValueError, match="checksum mismatch"):
         lme.load_prepared_dataset(prepared_dir, dataset_label="m")
+
+    guard_cases = [
+        ("schema_version", "schema_version"),
+        ("source_file", "source_file"),
+        ("source_sha256", "source_sha256 is invalid"),
+        ("question_sha256", "invalid prepared question checksum"),
+        ("extra_file", "file set does not match manifest"),
+        ("missing_file", "question file not found"),
+        ("duplicate", "duplicate prepared question entry"),
+    ]
+    for case, message in guard_cases:
+        case_root = tmp_path / f"guard-{case}"
+        case_root.mkdir()
+        case_source, _rows = _write_dataset(case_root, count=2)
+        case_prepared = case_root / "prepared"
+        lme.prepare_dataset(case_source, case_prepared, dataset_label="m")
+        case_manifest_path = case_prepared / "manifest.json"
+        case_manifest = json.loads(case_manifest_path.read_text(encoding="utf-8"))
+
+        if case == "schema_version":
+            case_manifest["schema_version"] += 1
+        elif case == "source_file":
+            case_manifest["source_file"] = "longmemeval_s"
+        elif case == "source_sha256":
+            case_manifest["source_sha256"] = "not-a-digest"
+        elif case == "question_sha256":
+            case_manifest["questions"][0]["sha256"] = "ABC"
+        elif case == "extra_file":
+            (case_prepared / "extra.json").write_text("{}", encoding="utf-8")
+        elif case == "missing_file":
+            (case_prepared / case_manifest["questions"][0]["file"]).unlink()
+        elif case == "duplicate":
+            case_manifest["questions"].append(dict(case_manifest["questions"][0]))
+            case_manifest["question_count"] += 1
+
+        if case not in {"extra_file", "missing_file"}:
+            case_manifest_path.write_text(json.dumps(case_manifest), encoding="utf-8")
+        with pytest.raises(ValueError, match=message):
+            lme.load_prepared_dataset(case_prepared, dataset_label="m")
 
 
 def test_direct_dataset_label_must_match_filename(tmp_path):
@@ -165,6 +208,92 @@ def test_cli_requires_exactly_one_run_source_and_exposes_prepare():
                 "--output", "out",
             ]
         )
+
+
+def test_fetch_routes_the_selected_dataset_label(tmp_path, monkeypatch):
+    cli = _load_cli()
+    captured = {}
+
+    def _fake_download(**kwargs):
+        captured.update(kwargs)
+        return str(tmp_path / kwargs["filename"])
+
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        SimpleNamespace(hf_hub_download=_fake_download),
+    )
+    args = cli._parse_args(
+        ["fetch", "--dataset-label", "m", "--output", str(tmp_path / "download")]
+    )
+
+    assert cli._cmd_fetch(args) == 0
+    assert captured["filename"] == lme.DATASET_COORDS["m"]["file"]
+    assert captured["repo_id"] == lme.DATASET_COORDS["m"]["repo_id"]
+    assert captured["revision"] == lme.DATASET_COORDS["m"]["revision"]
+
+
+def test_prepare_requires_opt_in_for_external_output(tmp_path, monkeypatch):
+    cli = _load_cli()
+    source = tmp_path / "longmemeval_m"
+    prepared_dir = tmp_path / "prepared"
+    argv = [
+        "prepare",
+        "--dataset", str(source),
+        "--prepared-dir", str(prepared_dir),
+        "--dataset-label", "m",
+    ]
+
+    with pytest.raises(SystemExit, match="Refusing output outside repo"):
+        cli._cmd_prepare(cli._parse_args(argv))
+
+    captured = {}
+
+    def _fake_prepare(dataset, output, *, dataset_label):
+        captured.update(dataset=dataset, output=output, dataset_label=dataset_label)
+        return {"prepared": True}
+
+    monkeypatch.setattr(cli, "prepare_dataset", _fake_prepare)
+    assert cli._cmd_prepare(cli._parse_args([*argv, "--allow-external-output"])) == 0
+    assert captured == {
+        "dataset": source,
+        "output": prepared_dir.resolve(),
+        "dataset_label": "m",
+    }
+
+
+def test_run_rejects_direct_medium_dataset(tmp_path):
+    cli = _load_cli()
+    source, _rows = _write_dataset(tmp_path)
+    args = cli._parse_args(
+        [
+            "run", "--dataset", str(source), "--dataset-label", "m",
+            "--output", str(tmp_path / "output"), "--allow-external-output",
+        ]
+    )
+
+    with pytest.raises(SystemExit, match="prepare.*--prepared-dir"):
+        cli._cmd_run(args)
+
+
+def test_direct_dataset_hashes_the_same_single_read_it_parses(tmp_path, monkeypatch):
+    source, rows = _write_dataset(tmp_path, label="s", count=1)
+    expected_bytes = source.read_bytes()
+    original_read_bytes = Path.read_bytes
+    read_count = 0
+
+    def _counted_read(path):
+        nonlocal read_count
+        if path == source:
+            read_count += 1
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", _counted_read)
+    questions, digest = lme.load_questions_with_sha256(source)
+
+    assert read_count == 1
+    assert questions == [lme.parse_question(rows[0])]
+    assert digest == hashlib.sha256(expected_bytes).hexdigest()
 
 
 def _zero_timing(monkeypatch):
@@ -206,7 +335,57 @@ def test_prepared_and_dataset_runs_have_identical_metrics(tmp_path, monkeypatch)
     )
 
     assert from_prepared["dataset"].pop("manifest_sha256") == prepared.manifest_sha256
+    assert from_prepared["ingest"]["embedding_batch_size"] == lme.EMBED_BATCH_SIZE
     assert json.dumps(from_prepared, sort_keys=True) == json.dumps(direct, sort_keys=True)
+
+
+def test_medium_report_records_inherited_embedding_batch_size(tmp_path, monkeypatch):
+    monkeypatch.setenv("LCM_EMBEDDING_MAX_BATCH_ITEMS", "2")
+    report = lme.run_harness(
+        [],
+        provider_name="stub",
+        model="",
+        tmp_dir=tmp_path,
+        reuse_db_template=False,
+        question_count=0,
+        dataset_label="m",
+    )
+
+    assert report["ingest"]["embedding_batch_size"] == 2
+
+
+def test_run_harness_rejects_count_and_digest_mismatches(tmp_path):
+    question = lme.parse_question(_raw_question(0))
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    with pytest.raises(ValueError, match="question count mismatch"):
+        lme.run_harness(
+            [question],
+            provider_name="stub",
+            model="",
+            tmp_dir=run_dir,
+            reuse_db_template=False,
+            question_count=2,
+            dataset_label="m",
+        )
+    with pytest.raises(ValueError, match="source_sha256"):
+        lme.run_harness(
+            [],
+            provider_name="stub",
+            model="",
+            tmp_dir=run_dir,
+            reuse_db_template=False,
+            source_sha256="invalid",
+        )
+    with pytest.raises(ValueError, match="manifest_sha256"):
+        lme.run_harness(
+            [],
+            provider_name="stub",
+            model="",
+            tmp_dir=run_dir,
+            reuse_db_template=False,
+            manifest_sha256="invalid",
+        )
 
 
 class _RecordingStub(lme.StubEmbedder):
@@ -232,6 +411,22 @@ def test_batched_embedding_preserves_order_and_single_call_values(monkeypatch):
     assert actual == expected
 
 
+@pytest.mark.parametrize(("value", "message"), [("abc", "integer"), ("0", "positive")])
+def test_embedding_batch_size_rejects_invalid_environment_values(monkeypatch, value, message):
+    monkeypatch.setenv("LCM_EMBEDDING_MAX_BATCH_ITEMS", value)
+    with pytest.raises(ValueError, match=message):
+        lme._embedding_batch_size()
+
+
+def test_embedding_batches_reject_provider_vector_count_mismatch():
+    class _DroppingStub(lme.StubEmbedder):
+        def embed_documents(self, texts):
+            return super().embed_documents(texts)[:-1]
+
+    with pytest.raises(ValueError, match="returned 1 vectors for 2 texts"):
+        lme._embed_in_batches(_DroppingStub(), ["alpha", "bravo"], batch_size=2)
+
+
 def test_evaluate_question_keeps_session_insertion_order_when_summary_embedding_is_batched(
     tmp_path, monkeypatch
 ):
@@ -252,32 +447,54 @@ def test_evaluate_question_keeps_session_insertion_order_when_summary_embedding_
         lme.deterministic_session_summary(session) for session in raw["haystack_sessions"]
     ]
     assert recorder.calls[-2:] == [expected_summaries[:2], expected_summaries[2:]]
-    with sqlite3.connect(tmp_path / "q7.db") as conn:
-        inserted = conn.execute(
-            "SELECT session_id, created_at FROM summary_nodes ORDER BY node_id"
-        ).fetchall()
+    with closing(sqlite3.connect(tmp_path / "q7.db")) as conn:
+        with conn:
+            inserted = conn.execute(
+                "SELECT session_id, created_at FROM summary_nodes ORDER BY node_id"
+            ).fetchall()
     assert inserted == list(zip(raw["haystack_session_ids"], [1.0, 2.0, 3.0]))
 
 
-def test_small_default_report_is_byte_identical_to_golden(tmp_path, monkeypatch):
-    """Freeze the complete deterministic default report used by banked small runs."""
+# Deliberately do not round floats here: byte identity is the compatibility anchor
+# for the single-platform banked run. Cross-platform libm last-bit drift is a known
+# caveat, but rounding the emitted metrics would itself change the banked schema.
+def test_small_default_cli_report_is_byte_identical_to_golden(tmp_path, monkeypatch):
+    """Freeze CLI-emitted bytes; regenerate only from the pinned banked platform."""
+    cli = _load_cli()
     monkeypatch.delenv("LCM_EMBEDDING_MAX_BATCH_ITEMS", raising=False)
     _zero_timing(monkeypatch)
-    run_dir = tmp_path / "run"
-    run_dir.mkdir()
-    report = lme.run_harness(
-        [lme.parse_question(_raw_question(0))],
-        provider_name="stub",
-        model="",
-        tmp_dir=run_dir,
+    source, _rows = _write_dataset(tmp_path, label="s", count=1)
+    output_dir = tmp_path / "output"
+    temp_root = tmp_path / "tmp-root"
+    temp_root.mkdir()
+    monkeypatch.setenv("TMPDIR", str(temp_root))
+    monkeypatch.setenv("HERMES_HOME", str(temp_root / "hermes-home"))
+    monkeypatch.setattr(tempfile, "tempdir", None)
+    captured_tmp_dir = None
+    original_run_harness = cli.run_harness
+
+    def _capture_tmp_dir(*args, **kwargs):
+        nonlocal captured_tmp_dir
+        captured_tmp_dir = Path(kwargs["tmp_dir"])
+        return original_run_harness(*args, **kwargs)
+
+    monkeypatch.setattr(cli, "run_harness", _capture_tmp_dir)
+    assert cli.main(
+        [
+            "run", "--dataset", str(source), "--provider", "stub",
+            "--output", str(output_dir), "--allow-external-output", "--json",
+        ]
+    ) == 0
+
+    report_bytes = (output_dir / "longmemeval_metrics.json").read_bytes()
+    report = json.loads(report_bytes)
+    banked_report = json.loads(_BANKED_METRICS.read_bytes())
+    assert captured_tmp_dir is not None
+    assert captured_tmp_dir.parent == temp_root
+    assert report["dataset"] == banked_report["dataset"]
+    assert "source_sha256" not in report["dataset"]
+    assert "manifest_sha256" not in report["dataset"]
+    assert "embedding_batch_size" not in report["ingest"]
+    assert hashlib.sha256(report_bytes).hexdigest() == (
+        "b8952714d53f1ae819770c513d42421cdf6396bced2dc03f2aa8ca8b2209bc07"
     )
-    payload = json.dumps(report, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    assert hashlib.sha256(payload).hexdigest() == (
-        "01a62d4e045ed608d102c128a67e6cbfb5929f0427104507323a5d2099202f7e"
-    )
-    assert report["dataset"] == {
-        "name": "LongMemEval_S",
-        "repo_id": lme.DATASET_REPO_ID,
-        "revision": lme.DATASET_REVISION,
-        "file": lme.DATASET_FILENAME,
-    }
