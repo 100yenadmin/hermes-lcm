@@ -144,3 +144,18 @@ would contend). C2 (AMA-Bench) queues behind C1's adapter; C3 (MemoryArena) asse
   judge-free deterministic QA; exclude the 1.48M-token Recsys outlier). But upstream is dead
   (zero commits ~10 weeks, maintainer graduated, a community adapter PR closed unmerged in
   2 minutes) — any adoption is a private-fork port (~100-150 LOC), on demand, not a dependency.
+
+### Owner steer 2026-07-31 — AMB judge/answerer policy (supersedes the C1 stock-judge condition)
+Owner declined Gemini-anchored config ("nobody uses Gemini" — dead-model experience isn't the
+program's story; consistent with the frontier-first two-tier doctrine). REVISED CONFIG OF RECORD:
+- **Answerer = frontier stack we actually ship against:** sol (GPT-5.6) first; a Claude-answerer
+  row queued later (strategic: the Claude Memory north star). Gemini-matched answerer DROPPED.
+- **Judge = Claude (cross-family), not Gemini, not GPT:** the hygiene requirement was always
+  cross-FAMILY judging (no family grades its own homework — same principle as Codex↔Claude code
+  review), never Gemini per se. AMB's model client supports Anthropic natively (C1 assessment);
+  judge identity + full prompts published per the seven-point standard. No GEMINI_API_KEY needed.
+- **Board comparability:** already caveat-only per the C1 decision (their pins/judge/COI issues
+  are documented); a different-but-disclosed judge adds one line to an existing caveat. OPTIONAL
+  parked item: a one-time dual-judged slice (stock vs ours on identical outputs) to measure the
+  judge delta as a bridge coefficient, if a head-to-head number is ever wanted.
+- Luna (GPT-5.6 cheap tier): exploratory Tier-F sweep ANSWERER on volume lanes; never a judge.
