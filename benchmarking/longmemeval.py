@@ -29,6 +29,7 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -301,6 +302,11 @@ class _HashingReader:
         self._digest.update(chunk)
         return chunk
 
+    def drain(self) -> None:
+        """Hash any bytes the streaming parser left after the top-level array."""
+        for chunk in iter(lambda: self.read(1024 * 1024), b""):
+            pass
+
     @property
     def hexdigest(self) -> str:
         return self._digest.hexdigest()
@@ -314,16 +320,19 @@ def _iter_dataset_rows(source) -> Iterator[dict[str, Any]]:
         raise RuntimeError(
             "ijson is required for `prepare`; install it for that command only"
         ) from exc
-    for row in ijson.items(source, "item", use_float=True):
-        if not isinstance(row, dict):
-            raise ValueError("LongMemEval dataset entries must be JSON objects")
-        yield row
+    try:
+        for row in ijson.items(source, "item", use_float=True):
+            if not isinstance(row, dict):
+                raise ValueError("LongMemEval dataset entries must be JSON objects")
+            yield row
+    except ijson.JSONError as exc:
+        raise ValueError("invalid LongMemEval dataset JSON") from exc
 
 
 def _question_filename(question_id: str) -> str:
     if (
         not question_id
-        or question_id in {".", "..", "manifest"}
+        or question_id.casefold() in {".", "..", "manifest"}
         or "/" in question_id
         or "\\" in question_id
     ):
@@ -350,42 +359,52 @@ def prepare_dataset(
         raise ValueError(f"dataset file not found: {source_path}")
 
     prepared_dir = Path(prepared_dir)
-    prepared_dir.mkdir(parents=True, exist_ok=True)
-    if any(prepared_dir.iterdir()):
-        raise ValueError(f"prepared directory must be empty: {prepared_dir}")
+    prepared_dir.parent.mkdir(parents=True, exist_ok=True)
+    if prepared_dir.exists():
+        if not prepared_dir.is_dir() or any(prepared_dir.iterdir()):
+            raise ValueError(f"prepared directory must be empty: {prepared_dir}")
 
-    questions: list[dict[str, str]] = []
-    seen_ids: set[str] = set()
-    with source_path.open("rb") as raw_source:
-        source = _HashingReader(raw_source)
-        for row in _iter_dataset_rows(source):
-            question_id = str(row.get("question_id", ""))
-            if question_id in seen_ids:
-                raise ValueError(f"duplicate question_id in dataset: {question_id!r}")
-            filename = _question_filename(question_id)
-            payload = _canonical_json_bytes(row)
-            (prepared_dir / filename).write_bytes(payload)
-            questions.append(
-                {
-                    "question_id": question_id,
-                    "file": filename,
-                    "sha256": hashlib.sha256(payload).hexdigest(),
-                }
-            )
-            seen_ids.add(question_id)
-
-        manifest = {
-            "schema_version": PREPARED_MANIFEST_SCHEMA_VERSION,
-            "dataset_label": dataset_label,
-            "source_file": source_path.name,
-            "source_sha256": source.hexdigest,
-            "question_count": len(questions),
-            "questions": questions,
-        }
-    (prepared_dir / "manifest.json").write_text(
-        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    staging_dir = Path(
+        tempfile.mkdtemp(prefix=f".{prepared_dir.name}.prepare-", dir=prepared_dir.parent)
     )
-    return manifest
+    try:
+        questions: list[dict[str, str]] = []
+        seen_ids: set[str] = set()
+        with source_path.open("rb") as raw_source:
+            source = _HashingReader(raw_source)
+            for row in _iter_dataset_rows(source):
+                question_id = str(row.get("question_id", ""))
+                if question_id in seen_ids:
+                    raise ValueError(f"duplicate question_id in dataset: {question_id!r}")
+                filename = _question_filename(question_id)
+                payload = _canonical_json_bytes(row)
+                (staging_dir / filename).write_bytes(payload)
+                questions.append(
+                    {
+                        "question_id": question_id,
+                        "file": filename,
+                        "sha256": hashlib.sha256(payload).hexdigest(),
+                    }
+                )
+                seen_ids.add(question_id)
+            source.drain()
+
+            manifest = {
+                "schema_version": PREPARED_MANIFEST_SCHEMA_VERSION,
+                "dataset_label": dataset_label,
+                "source_file": source_path.name,
+                "source_sha256": source.hexdigest,
+                "question_count": len(questions),
+                "questions": questions,
+            }
+        (staging_dir / "manifest.json").write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        os.replace(staging_dir, prepared_dir)
+        return manifest
+    finally:
+        if staging_dir.exists():
+            shutil.rmtree(staging_dir)
 
 
 @dataclass(frozen=True)

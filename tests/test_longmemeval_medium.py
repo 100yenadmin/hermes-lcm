@@ -52,7 +52,7 @@ def _raw_question(index: int) -> dict:
 def _write_dataset(directory: Path, label: str = "m", count: int = 3) -> tuple[Path, list[dict]]:
     rows = [_raw_question(index) for index in range(count)]
     path = directory / lme.DATASET_COORDS[label]["file"]
-    path.write_text(json.dumps(rows), encoding="utf-8")
+    path.write_text(json.dumps(rows) + "\n", encoding="utf-8")
     return path, rows
 
 
@@ -77,6 +77,43 @@ def test_prepare_streams_and_writes_checksum_manifest(tmp_path, monkeypatch):
         assert hashlib.sha256(payload).hexdigest() == entry["sha256"]
         assert payload == lme._canonical_json_bytes(row)
     assert (prepared_dir / "manifest.json").is_file()
+
+
+def test_prepare_rejects_malformed_json_without_publishing_partial_output(tmp_path):
+    pytest.importorskip("ijson", reason="prepare path requires ijson; the run env installs it explicitly")
+    source = tmp_path / lme.DATASET_COORDS["m"]["file"]
+    source.write_text(json.dumps([_raw_question(0)])[:-1], encoding="utf-8")
+    prepared_dir = tmp_path / "prepared"
+
+    with pytest.raises(ValueError, match="invalid LongMemEval dataset JSON"):
+        lme.prepare_dataset(source, prepared_dir, dataset_label="m")
+
+    assert not prepared_dir.exists()
+    assert not list(tmp_path.glob(".prepared.prepare-*"))
+
+
+def test_prepare_rejects_casefolded_reserved_question_id_atomically(tmp_path):
+    pytest.importorskip("ijson", reason="prepare path requires ijson; the run env installs it explicitly")
+    source, rows = _write_dataset(tmp_path, count=2)
+    rows[1]["question_id"] = "Manifest"
+    source.write_text(json.dumps(rows) + "\n", encoding="utf-8")
+    prepared_dir = tmp_path / "prepared"
+
+    with pytest.raises(ValueError, match="unsafe question_id"):
+        lme.prepare_dataset(source, prepared_dir, dataset_label="m")
+
+    assert not prepared_dir.exists()
+
+
+def test_prepare_atomically_replaces_an_existing_empty_directory(tmp_path):
+    pytest.importorskip("ijson", reason="prepare path requires ijson; the run env installs it explicitly")
+    source, _rows = _write_dataset(tmp_path, count=1)
+    prepared_dir = tmp_path / "prepared"
+    prepared_dir.mkdir()
+
+    lme.prepare_dataset(source, prepared_dir, dataset_label="m")
+
+    assert sorted(path.name for path in prepared_dir.iterdir()) == ["manifest.json", "q0.json"]
 
 
 def test_prepared_manifest_fails_closed_on_label_count_and_content_mismatch(tmp_path):
