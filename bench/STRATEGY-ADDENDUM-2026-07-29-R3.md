@@ -159,3 +159,16 @@ program's story; consistent with the frontier-first two-tier doctrine). REVISED 
   parked item: a one-time dual-judged slice (stock vs ours on identical outputs) to measure the
   judge delta as a bridge coefficient, if a head-to-head number is ever wanted.
 - Luna (GPT-5.6 cheap tier): exploratory Tier-F sweep ANSWERER on volume lanes; never a judge.
+
+### Owner steer 2026-08-02 — frontier embeddings + run-log discipline + parallelization unlocked
+1. **Voyage/frontier embeddings across the board for FUTURE declared configs** (V1-medium, AMA,
+   AMB, any new LoCoMo variant): quality frontier stack end-to-end — "we're testing and making
+   for frontier models and quality frontier embeddings." The IN-FLIGHT LoCoMo A/A′ stays
+   fastembed (arm A already ran; changing an instrument mid-pair voids the noise floor).
+   Side benefit: API embeddings eliminate the local-embedder contention class entirely
+   (the 07-31 hang was concurrent LOCAL onnx loads).
+2. **Run log:** bench/RUN-LOG.md is the append-only registry of record — every run (id, date,
+   config summary, artifacts path, status/result pointer) ties back to the runbook. The fork
+   docs branch is the program home; a dedicated public repo rides on the scoreboard-naming call.
+3. **Parallelization/memory: no longer a constraint** (owner). Lanes overlap freely; the one
+   surviving rule is instrument-integrity (no config changes mid-pair; pins per lane).
