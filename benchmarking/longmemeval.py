@@ -456,6 +456,7 @@ def _question_filename(question_id: str) -> str:
     if (
         not question_id
         or question_id.casefold() in {".", "..", "manifest", "_template"}
+        or question_id.startswith(".")
         or stem in windows_reserved
         or "/" in question_id
         or "\\" in question_id

@@ -140,6 +140,14 @@ def test_question_filename_reserves_template():
         lme._question_filename("_TEMPLATE")
 
 
+@pytest.mark.parametrize("question_id", [".hidden", "...", ".q1"])
+def test_question_filename_rejects_leading_dot_ids(question_id):
+    # glob("*.json") skips dotfiles on POSIX, so a hidden prepared file would
+    # spuriously fail the manifest file-set check at load — reject at prepare.
+    with pytest.raises(ValueError, match="unsafe question_id"):
+        lme._question_filename(question_id)
+
+
 @pytest.mark.parametrize(
     "question_id",
     [
