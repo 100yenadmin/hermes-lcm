@@ -369,12 +369,14 @@ def _peek_dataset_root(source_path: Path) -> None:
     try:
         with source_path.open("rb") as source:
             first = next(ijson.parse(source, use_float=True), None)
-    except TypeError as exc:
-        raise RuntimeError(
-            "ijson >= 3.2 is required for `prepare`; "
-            "upgrade it for that command only"
-        ) from exc
-    except ijson.JSONError as exc:
+    except (ijson.JSONError, TypeError) as exc:
+        # A TypeError from the call signature means an ijson too old for
+        # ``use_float``; any other TypeError is a backend data error.
+        if isinstance(exc, TypeError) and "use_float" in str(exc):
+            raise RuntimeError(
+                "ijson >= 3.2 is required for `prepare`; "
+                "upgrade it for that command only"
+            ) from exc
         detail = str(exc).strip()
         message = "invalid LongMemEval dataset JSON"
         if detail:
@@ -397,12 +399,15 @@ def _iter_dataset_rows(source) -> Iterator[dict[str, Any]]:
             if not isinstance(row, dict):
                 raise ValueError("LongMemEval dataset entries must be JSON objects")
             yield row
-    except TypeError as exc:
-        raise RuntimeError(
-            "ijson >= 3.2 is required for `prepare`; "
-            "upgrade it for that command only"
-        ) from exc
-    except (ijson.JSONError, ValueError, KeyError) as exc:
+    except (ijson.JSONError, ValueError, KeyError, TypeError) as exc:
+        # A TypeError from the call signature means an ijson too old for
+        # ``use_float``; any other TypeError is a backend data error and maps
+        # to the standard invalid-dataset ValueError below.
+        if isinstance(exc, TypeError) and "use_float" in str(exc):
+            raise RuntimeError(
+                "ijson >= 3.2 is required for `prepare`; "
+                "upgrade it for that command only"
+            ) from exc
         detail = str(exc).strip()
         offset = next(
             (
