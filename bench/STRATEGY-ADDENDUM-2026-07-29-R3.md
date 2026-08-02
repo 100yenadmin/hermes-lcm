@@ -172,3 +172,24 @@ program's story; consistent with the frontier-first two-tier doctrine). REVISED 
    docs branch is the program home; a dedicated public repo rides on the scoreboard-naming call.
 3. **Parallelization/memory: no longer a constraint** (owner). Lanes overlap freely; the one
    surviving rule is instrument-integrity (no config changes mid-pair; pins per lane).
+
+## 2026-08-02 — SOTA-MODELS POLICY (owner directive; config of record for all NEW registrations)
+Owner: "moving forward we're using SOTA models — I don't care about the harnesses or adapters."
+Applied with verified OpenRouter pricing (2026-08-02): luna $0.10/$0.60 per M (1.05M ctx) ·
+sol $5/$30 · claude-sonnet-5 $2/$10 (1M ctx) · gpt-5.2 $1.75/$14 (retired as answerer — dominated).
+- **Reader/answerer default: `gpt-5.6-luna` @ medium effort** — SOTA family, largest context on
+  the board, and the cheapest serious model (undercuts even qwen3.5-9b effectively). Effort
+  low for high-volume simple extraction; high only on observed long-context misses.
+- **Judge default: `claude-sonnet-5`** — preserves the ratified cross-family rule (no family
+  judges its own answers on scored runs; luna+sol are both GPT-5.6) AND is 2.5× cheaper than
+  sol on input. `sol @ low/medium` judges only where the answerer is NOT GPT-family (e.g. a
+  future Claude-answerer row) — that is where the owner's sol-judge suggestion slots.
+- **Already-registered instruments run AS REGISTERED** (LoCoMo C1 keeps sol/sol from F48 for
+  comparability — same-family caveat stays disclosed; judge migration is a C2+ re-registration
+  question). The in-flight #436 slice finishes on its frozen paired config.
+- **Per-benchmark:** V2 SOTA row = NEW declared config (luna reader + sonnet-5 judge; official
+  qwen rows stay visible; at luna pricing the 451q re-run ≈ single-digit dollars). V1-M
+  retrieval row unchanged (no LLM). V1-M reader row + AMB + AMA = luna + sonnet-5. AMA pilot
+  spec updated pre-run (never executed under gpt-5.2).
+- Every switch = new declared config with own registration + A/A′; no silent retunes; old rows
+  remain visible (append-only scoreboard discipline unchanged).
