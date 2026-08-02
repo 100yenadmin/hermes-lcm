@@ -2,12 +2,13 @@
 
 Every number ships with its full run config, variance, fail-close accounting, and known dataset defects — rows that cannot meet the standard do not render.
 
-Generated from `results.jsonl` (sha256: `5f191eef205881b8e6e97a9948c0c12b49d193d07e23fbe93e73e3c9de76a93c`, rows: 7)
+Generated from `results.jsonl` (sha256: `1b9f6ab91f6afef9375d961f08c2b9f8e74268e1da45ad9d596ac677f1f412b7`, rows: 8)
 
 ## Summary
 
 | Benchmark | Metric | Result | Tier | Date | Details |
 |---|---|---|---|---|---|
+| AMA-Bench (open-ended, 208 episodes) | strict judged accuracy, fail-closed denominator | 1180/2496 = 47.3% (scored-only 1180/2460 = 48.0%) | F | 2026-08-02 | [details](#ama208-full-2026-08-02) |
 | Internal scale instrument (389×, 19,829 sessions / 199,641 messages) | p50_ms | 263.6 ms @ 19,829 sessions (24× vs pre-fix; 125 ms @ 8k) | P | 2026-07-30 | [details](#scale-curve-fastscan-2026-07-30) |
 | LoCoMo (locomo10, 1,986q) | accuracy | 54.6% (1,085/1,986 MemScore) | F | 2026-08-02 | [details](#locomo10-1986-declared-2026-08-02) |
 | ~~LoCoMo (locomo10, 1,986q)~~ | ~~accuracy~~ | ~~47.0% (MemScore)~~ | ~~F~~ | ~~2026-07-30~~ | ~~[details](#locomo10-1986-arm-a-2026-07-30)~~ → [successor](#locomo10-1986-declared-2026-08-02) |
@@ -17,6 +18,66 @@ Generated from `results.jsonl` (sha256: `5f191eef205881b8e6e97a9948c0c12b49d193d
 | LongMemEval-V2 (451q, static) | accuracy | 123/451 (27.3%) — official static protocol, fixed weak reader | P | 2026-07-31 | [details](#longmemeval-v2-451-static-2026-07-31) |
 
 ## Row disclosures
+
+### <a id="ama208-full-2026-08-02"></a>ama208-full-2026-08-02
+
+**id:**
+ama208-full-2026-08-02
+
+**benchmark:**
+AMA-Bench (open-ended, 208 episodes)
+
+**metric:**
+strict judged accuracy, fail-closed denominator
+
+**value:**
+0.4728
+
+**display:**
+1180/2496 = 47.3% (scored-only 1180/2460 = 48.0%)
+
+**tier:**
+F
+
+**date:**
+2026-08-02
+
+**system_commit:**
+hermes-lcm product via wt-ama-adapter c06d6a5; clone ddfd319e + 2 disclosed patches
+
+**harness_commit:**
+AMA-bench ddfd319e0be33424288c13806f1eafc63e625b59
+
+**judge:**
+anthropic/claude-sonnet-5 (cross-family; judge-fail-closed patch applied, 0 unparsed)
+
+**reader:**
+openai/gpt-5.6-luna (default effort; harness exposes no effort surface — disclosed)
+
+**retrieval_config:**
+hermes_lcm method overlay, per-episode ingest, fastembed local
+
+**dataset_exposure:**
+dataset sha256 45c36052e...; no training/tuning on it
+
+**breakdown:**
+tiers: small<100k 1026/2172=47.2%, mid 134/252=53.2%, large>800k 20/36=55.6% \| worst tasks: alfworld 18.4%, swebench 43.8%, webarena 47.3% \| best: candy_crush 75.0%, crafter 66.7%, gaia_level3 65.0%
+
+**variance:**
+A/A' 30-episode fixed-seed subset pending (registered policy; runs next)
+
+**failclose:**
+3/208 episodes failed (luna empty-content completions x3 retries; AttributeError in harness model_client.py:109) — 36 questions counted in denominator, never dropped
+
+**evidence:**
+- bench/specs/RUN-SHEET-AMA-208.md
+- bench/FINDING-F51-AMA-208-FIRST-FULL.md
+- session-notes 2026-08-02 hermes-ama-full208 (per-episode results, timing, telemetry)
+
+**caveats:**
+- First full-208 disclosed number; GOALS target >=72.26% NOT met (gap -24.9pt); funnel decomposition queued
+- Accuracy RISES with episode size (large>800k tier 55.6% vs small 47.2%) — no context-scale degradation
+- Reader effort = model default (AMA custom-provider path exposes no effort surface)
 
 ### <a id="locomo10-1986-arm-a-2026-07-30"></a>locomo10-1986-arm-a-2026-07-30
 
