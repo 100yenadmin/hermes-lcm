@@ -54,3 +54,22 @@ wire-as-you-go / gate-every-caller; the pins pinned the code, nobody pinned the 
   copied sample store); replay (pending): `fts-prose-replay/`.
 - Code refs: wt-locomo-product `config.py:388,688`, `store.py:1147`, `tools.py:2387,2513-2544,
   4702-4737`, `search_query.py:158-200`; bridge `hermes_lcm_bridge.py:134-198`.
+
+## 7. Replay results (2026-08-02, zero-spend — §4 reqs 1+2 SATISFIED)
+Real code path (`should_use_fts_prose_mode` + `build_fts5_match_query` + `MessageStore.search()`
+imported from the product), read-only store copies, zero LLM calls. Artifacts:
+session-notes 2026-08-02 `fts-prose-replay/` (scripts, per-row CSVs, SUMMARY.json).
+- **Gold recovery on the F46 41-miss list (raw FTS arm, top-200): 0/41 as-run → 22/41 (54%)
+  with prose mode on.** By category: single-hop 0→10/25, multi-hop 0→7/8, world 0→5/8.
+- **Candidate volume (100q uniform sample, seed 20260802): conjunctive median 0 / p90 0
+  (1/100 questions returned any hit); prose median 155 / p90 200 (cap). Prose-eligible: 99/100.**
+- **Precision guard: clean** — the classifier-negative sample question produced identical
+  query + identical results under both modes; 0 violations.
+- Nuance for exact-match tooling: new-run ingestion appends `[shared image: …]` captions, so
+  gold text is a prefix of stored content on 12/41 rows (normalized-substring match used).
+- Scope note: F46 §7's 0/22 FUSED recovery measured the fused output of a run where prose mode
+  was (per this finding) never active; this replay measures the raw FTS arm with the feature
+  genuinely on. Different stages, different config states — not in conflict.
+- **Remaining prereq before registration: §4 req 3 (fusion-ratio re-derivation)** — the sim must
+  be CATEGORY-BALANCED this time (the F46-era sim's imbalance is a documented
+  gate-proxy-calibration echo) and uses the part2 candidate-volume data as its input.
