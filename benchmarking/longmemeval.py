@@ -318,9 +318,16 @@ class _HashingReader:
         return chunk
 
     def drain(self) -> None:
-        """Hash any bytes the streaming parser left after the top-level array."""
+        """Hash bytes after the top-level array; reject non-whitespace trailers.
+
+        Trailing garbage (e.g. a concatenated second array) would otherwise be
+        hashed into source_sha256 while its content silently never prepares.
+        """
         for chunk in iter(lambda: self.read(1024 * 1024), b""):
-            pass
+            if chunk.strip():
+                raise ValueError(
+                    "invalid LongMemEval dataset JSON: trailing content after the top-level array"
+                )
 
     @property
     def hexdigest(self) -> str:
@@ -661,6 +668,7 @@ def load_prepared_dataset(
     questions: list[dict[str, str]] = []
     seen_ids: set[str] = set()
     seen_files: set[str] = set()
+    seen_files_folded: set[str] = set()
     for raw_entry in raw_questions:
         if not isinstance(raw_entry, dict):
             raise ValueError("prepared manifest question entries must be objects")
@@ -670,8 +678,11 @@ def load_prepared_dataset(
         checksum = str(raw_entry.get("sha256", ""))
         if filename != expected_filename:
             raise ValueError(f"prepared filename mismatch for question {question_id!r}")
-        if question_id in seen_ids or filename in seen_files:
-            raise ValueError(f"duplicate prepared question entry: {question_id!r}")
+        if question_id.casefold() in seen_ids or filename.casefold() in seen_files_folded:
+            raise ValueError(
+                f"duplicate prepared question entry: {question_id!r} "
+                "(ids and filenames are compared case-insensitively, mirroring prepare)"
+            )
         if not _SHA256_RE.fullmatch(checksum):
             raise ValueError(f"invalid prepared question checksum: {filename}")
         path = prepared_dir / filename
@@ -680,8 +691,9 @@ def load_prepared_dataset(
         questions.append(
             {"question_id": question_id, "file": filename, "sha256": checksum}
         )
-        seen_ids.add(question_id)
+        seen_ids.add(question_id.casefold())
         seen_files.add(filename)
+        seen_files_folded.add(filename.casefold())
 
     actual_files = {path.name for path in prepared_dir.glob("*.json")}
     expected_files = seen_files | {"manifest.json"}

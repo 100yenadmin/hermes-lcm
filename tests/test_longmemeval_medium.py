@@ -148,6 +148,18 @@ def test_prepare_rejects_non_list_collection_fields_before_publish(tmp_path):
     assert not prepared_dir.exists()
 
 
+def test_prepare_rejects_trailing_content_after_array(tmp_path):
+    pytest.importorskip("ijson", reason="prepare path requires ijson; the run env installs it explicitly")
+    source, rows = _write_dataset(tmp_path, count=1)
+    source.write_text(json.dumps(rows) + json.dumps([_raw_question(1)]), encoding="utf-8")
+    prepared_dir = tmp_path / "prepared"
+
+    with pytest.raises(ValueError, match="trailing content after the top-level array"):
+        lme.prepare_dataset(source, prepared_dir, dataset_label="m")
+
+    assert not prepared_dir.exists()
+
+
 def test_prepare_rejects_null_haystack_session_before_publish(tmp_path):
     pytest.importorskip("ijson", reason="prepare path requires ijson; the run env installs it explicitly")
     source, rows = _write_dataset(tmp_path, count=1)
