@@ -44,3 +44,30 @@ rubric and adversarial gold BETWEEN runs (disclosed below); the F46 decompositio
   confirmed, feeds a category-aware fusion refinement (own registration, not a silent retune).
 - B3 (adversarial premise-check product work) unchanged as the roadmapped product fix.
 - Voyage-embedding variant (owner steer) = a FUTURE declared config with its own A/A′.
+
+## §3-CORRECTION (2026-08-02, hours after publication — caught by the decomposition agent's premise check)
+§3's table was WRONG: it propagated a category-label scramble from F46's per-category tuple
+("49.2/43.8/29.1/52.9/45.5" was labeled single/multi/temporal/world/adv; ground-truth mapping —
+verified 0/1,986 mismatches against locomo10.json categories — is multi=49.2, temporal=43.8,
+single=29.1). The rescore-both-sides failure class, caught by instruments. CORRECTED table:
+
+| category | old | declared | Δ | corrected reading |
+|---|---|---|---|---|
+| single-hop | 29.1 | 37.2 | **+8.1** | GAIN, not the −12 "regression" §3 claimed. No quota fault here. |
+| multi-hop | 49.2 | 64.8 | +15.6 | fusion/threshold recoveries (as before, smaller Δ) |
+| temporal | 43.8 | 41.7 | −2.1 | small; n=96 (2 questions); within churn range |
+| world-knowledge | 52.9 | 69.7 | +16.8 | unchanged from §3 |
+| adversarial | 45.5 | 32.7 | −12.8 | unchanged from §3 (measured-honest, B3 pending) |
+
+**The decomposition's REAL findings (all per-row evidence in session-notes 2026-08-02
+hermes-singlehop-decomp):**
+1. ★ **FTS is near-inert in DELIVERY on LoCoMo in BOTH configs: 3/49,650 delivered hits new,
+   2/49,650 old** — despite #183 prose mode being live in the new build. The quota isn't capping
+   a healthy FTS arm; the arm barely surfaces at all on this dataset's conversational queries.
+   NEW system-level finding → next-train investigation (why does the prose-mode arm lose every
+   fused slot: scoring scale? candidate depth? quota floor=0 semantics?).
+2. Single-hop churn under the config change: 24 lost vs 47 gained (net +23). Of the 24: 12
+   retrieval-lost to chunk-ranking reshuffle, 12 answer-variance (same evidence, different
+   generated answer), 0 judge-delta.
+3. §5's "category-aware fusion refinement" item is WITHDRAWN (premise was the mislabeled
+   regression). The FTS-inertness investigation replaces it.

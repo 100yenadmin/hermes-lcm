@@ -2,7 +2,7 @@
 
 Every number ships with its full run config, variance, fail-close accounting, and known dataset defects — rows that cannot meet the standard do not render.
 
-Generated from `results.jsonl` (sha256: `f19312de95c819fa5ef36a749cddb8add01d9d93af923affc2926389dbd16d36`, rows: 7)
+Generated from `results.jsonl` (sha256: `5f191eef205881b8e6e97a9948c0c12b49d193d07e23fbe93e73e3c9de76a93c`, rows: 7)
 
 ## Summary
 
@@ -60,7 +60,7 @@ fastembed bge-small, top-25 cap, RRF fusion (pre-quota); every defect class meas
 99/1,540 documented corrupted-gold questions all ran; we scored wrong on 80; 6/15 sampled failures match the audit-CORRECTED answer; known-corruption ceiling 95.02% for this slice
 
 **breakdown:**
-per-category 49.2 / 43.8 / 29.1 / 52.9 / 45.5 (single-hop / multi-hop / temporal / world-knowledge / adversarial)
+per-category (ground-truth labels, corrected 2026-08-02): single-hop 29.1 / multi-hop 49.2 / temporal 43.8 / world 52.9 / adversarial 45.5 — an earlier published tuple scrambled the first three labels (F46 CORRECTION)
 
 **variance:**
 arm A of a pre-registered A/A' pair; A' cancelled when harness bugs were found mid-pair (documented in run dir) — noise floor re-runs on the fixed harness
@@ -121,7 +121,7 @@ fastembed bge-small; fusion quota fts:chunk=1:2 (measured selection, FUSION-EMBE
 99 documented corrupted-gold rows all ran, scored as-is; known-corruption ceiling ≈95% (unchanged from F46 §6)
 
 **breakdown:**
-single-hop 37.2 / multi-hop 64.8 / temporal 41.7 / world 69.7 / adversarial 32.7 (F48 §3 with old-config deltas and attributions)
+single-hop 37.2 (+8.1) / multi-hop 64.8 (+15.6) / temporal 41.7 (−2.1) / world 69.7 (+16.8) / adversarial 32.7 (−12.8) — corrected table in F48 §3-CORRECTION
 
 **variance:**
 pre-registered A/A′ pair on fresh stores: 69/1,986 discordant (3.47%), aggregate spread 0.76 pts; arm A is the scored read per the run sheet
@@ -135,9 +135,9 @@ pre-registered A/A′ pair on fresh stores: 69/1,986 discordant (3.47%), aggrega
 - session-notes 2026-07-31 hermes-locomo-declared artifacts
 
 **caveats:**
-- +7.6 vs the superseded row is NOT pure retrieval: the judge rubric and adversarial gold changed between configs (both disclosed); corrupted gold unchanged
-- single-hop fell 12 pts — suspected fusion-quota side effect flagged AS A FINDING (decomposition in progress); adversarial 32.7 is the measured-honest number against canonical abstention gold with the known B3 product weakness unfixed
-- Tier-F: fault-finding config; Voyage-embedding variant queues as its own declared config
+- +7.6 vs the superseded row is NOT pure retrieval: the judge rubric and adversarial gold changed between configs (both disclosed); corrupted gold unchanged (ceiling ≈95%)
+- initial publication claimed a single-hop regression from a label-scramble — corrected within hours (F48 §3-CORRECTION); the REAL new finding: the FTS arm is near-inert in delivery on this dataset in BOTH configs (3/49,650 vs 2/49,650) despite prose mode — under investigation
+- adversarial 32.7 is the measured-honest number against canonical abstention gold with the known B3 product weakness unfixed; Tier-F config; Voyage variant queues separately
 
 ### <a id="longmemeval-v1-s500-accuracy-2026-07-29"></a>longmemeval-v1-s500-accuracy-2026-07-29
 

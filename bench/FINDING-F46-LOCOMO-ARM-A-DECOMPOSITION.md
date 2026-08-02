@@ -104,3 +104,10 @@ PR #3) + fusion quota 1:2 + lowered/configurable chunk min-token threshold for c
 frontier answering model (Tier-F) — every knob named here with its measured justification. LoCoMo has
 now done exactly what the owner asked of it: found real faults (threshold, fusion weighting, truncation,
 captions, judge rubric) that our own harness never surfaced.
+
+## CORRECTION (2026-08-02): the §intro per-category tuple's labels were scrambled
+"49.2/43.8/29.1/52.9/45.5" was published as single/multi/temporal/world/adversarial; ground-truth
+category mapping gives **multi-hop 49.2, temporal 43.8, single-hop 29.1** (world/adversarial were
+correct). Propagated into F48 §3 before being caught by a premise-checking decomposition agent
+(see F48 §3-CORRECTION). All F46 mechanism analyses operated on qid-level data and are unaffected;
+only this summary tuple's labeling was wrong.
