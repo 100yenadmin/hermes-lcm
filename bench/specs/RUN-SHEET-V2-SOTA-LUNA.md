@@ -39,3 +39,12 @@ Pre-launch: check OpenRouter remaining ≥ $12 (rough ceiling: 451q × ~60k in a
 $2.7 reader-in + outputs + judge legs + A′ subset ≈ $6-10). If remaining < $12 after the AMA
 pilot, park and surface — never start a scored run that can 402 mid-flight (the slice-freeze
 lesson).
+
+## AMENDMENT 1 (2026-08-02, pre-launch — probe-measured budget guard)
+3-question probe EXECUTED (probe-run-4): 3/3 scored, 0 instrument failures, sonnet-5 evaluator
+parsed via chat-completions transport, luna reader clean. Variant runner
+(official_unit_runner_sota.py: models swapped + the frozen 60-batch count assertions relaxed —
+both patches documented in-file; the frozen original untouched). Probe-measured cost projects
+the full 451 at ≈$5–8. §4's guard is amended BEFORE launch from the pre-probe "remaining ≥ $12"
+to **remaining ≥ measured-projection + 30% ≈ $10.40**. Same intent (no mid-run 402), better
+arithmetic. Launch decision applies the amended guard at the post-AMA credits reading.
