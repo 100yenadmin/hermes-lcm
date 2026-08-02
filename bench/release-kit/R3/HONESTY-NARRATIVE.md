@@ -29,7 +29,23 @@ naming two missing pieces of evidence we then had to produce as instruments, and
 detected and discarded verdict-shaped text that leaked into its context. The PASS that merged the
 batch is auditable end to end, and the fail-close event is disclosed on the resulting number.
 
-The pattern across all three: pre-registration before spend, fail-closed instruments, author≠judge,
-and negative results published at the same resolution as positive ones. This is what we mean when
-we say the market's numbers are unanchored — not that they are dishonest, but that nothing in how
-they were produced would have CAUGHT any of the failures above.
+## 4. We published a wrong table, and our own instrument caught it in hours (F46→F48)
+F48's per-category table shipped with a label scramble inherited from a summary tuple written days
+earlier in F46: three category axes were misassigned, so the finding claimed a "single-hop −12
+regression, suspected quota fault" — with a remediation workstream planned — when single-hop had
+actually GAINED +8.1. The error was caught the same day by a decomposition agent whose first step
+was to premise-check the claim against ground truth (0/1,986 category mismatches on re-derivation)
+instead of trusting the published table. The correction was append-only on every surface that
+carried the error — finding docs, scoreboard rows, the tracker — with the wrong table left visible
+under its correction. The planned workstream built on the phantom regression was withdrawn in the
+same commit, and what replaced it was the REAL finding the recomputation surfaced: an entire
+retrieval arm near-inert in delivery (3/49,650 hits), which no one had been looking for. Rule
+extracted and now binding: at every claim boundary, headline numbers are recomputed from the
+rawest source on disk — especially when the summary being trusted is one we wrote ourselves.
+
+The pattern across all four: pre-registration before spend, fail-closed instruments, author≠judge,
+negative results published at the same resolution as positive ones — and corrections treated as
+first-class findings, same-day and append-only, because a scoreboard you can trust is one whose
+errors are visible. This is what we mean when we say the market's numbers are unanchored — not
+that they are dishonest, but that nothing in how they were produced would have CAUGHT any of the
+failures above.
