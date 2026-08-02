@@ -403,6 +403,11 @@ def _iter_dataset_rows(source) -> Iterator[dict[str, Any]]:
                 raise ValueError("LongMemEval dataset entries must be JSON objects")
             yield row
     except (ijson.JSONError, ValueError, KeyError, TypeError) as exc:
+        # Our own row-shape error is already specific — pass it through unwrapped.
+        if isinstance(exc, ValueError) and str(exc).startswith(
+            "LongMemEval dataset entries must be JSON objects"
+        ):
+            raise
         # A TypeError from the call signature means an ijson too old for
         # ``use_float``; any other TypeError is a backend data error and maps
         # to the standard invalid-dataset ValueError below.
@@ -1505,7 +1510,7 @@ def _embed_in_batches(embedder, texts: Sequence[str], batch_size: int | None = N
     if batch_size <= 0:
         raise ValueError("embedding batch size must be positive")
     vectors: list = []
-    for start in range(0, len(texts), max(1, batch_size)):
+    for start in range(0, len(texts), batch_size):
         batch = list(texts[start:start + batch_size])
         embedded = list(embedder.embed_documents(batch))
         if len(embedded) != len(batch):
