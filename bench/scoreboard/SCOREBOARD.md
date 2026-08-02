@@ -2,7 +2,7 @@
 
 Every number ships with its full run config, variance, fail-close accounting, and known dataset defects — rows that cannot meet the standard do not render.
 
-Generated from `results.jsonl` (sha256: `9a61109a62be3fbeef2c50b142473ce088133e4d88af7e76414e4c04bc3ed2da`, rows: 9)
+Generated from `results.jsonl` (sha256: `2991ffb564a1820c62724eecccbe8f6f0793bca21dad0916f1559e9c65aa8843`, rows: 9)
 
 ## Summary
 
@@ -536,7 +536,7 @@ same frozen static-451 set as F47; no tuning on it
 web 97/240=40.4%, enterprise 46/211=21.8%
 
 **variance:**
-A/A' 100q fixed-seed subset (seed 20260802) queued per run sheet — no delta narratives before it banks
+A/A' 100q fixed-seed subset (seed 20260802) EXECUTED: 11/100 discordant (11.0%), aggregate spread 1.0pt (A-subset 32.0% vs A' 33.0%), 0 instrument failures — question-level churn high (sampling), aggregate stable; the +4.4pt cross-config delta is ~4x the subset spread
 
 **failclose:**
 0/451 instrument failures both domains
