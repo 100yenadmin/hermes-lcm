@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import sys
@@ -83,14 +84,40 @@ def _scored(question_id: str) -> dict:
 
 
 def _run_with_checkpoint(tmp_path, questions, checkpoint, **kwargs):
+    provider_name = kwargs.pop("provider_name", "stub")
+    model = kwargs.pop("model", "")
     return lme.run_harness(
         questions,
-        provider_name="stub",
-        model="",
+        provider_name=provider_name,
+        model=model,
         tmp_dir=tmp_path,
         reuse_db_template=False,
         checkpoint_path=checkpoint,
         **kwargs,
+    )
+
+
+def _header_record(**overrides):
+    bindings = {
+        "provider": "stub",
+        "model": "",
+        "rerank": False,
+        "embeddings_enabled": True,
+        "dataset_label": "s",
+        "manifest_sha256": None,
+        "embedding_batch_size": lme.EMBED_BATCH_SIZE,
+    }
+    bindings.update(overrides)
+    return lme._checkpoint_header(**bindings)
+
+
+def _write_checkpoint(checkpoint, *records):
+    checkpoint.write_text(
+        "".join(
+            json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
+            for record in records
+        ),
+        encoding="utf-8",
     )
 
 
@@ -236,9 +263,12 @@ def test_run_harness_cleans_question_db_when_evaluation_raises(tmp_path, monkeyp
     assert cleanup_calls == [(tmp_path, "q0")]
 
 
-def test_checkpoint_is_flushed_after_each_completed_question(tmp_path, monkeypatch):
+def test_checkpoint_is_fsynced_after_header_and_each_completed_question(
+    tmp_path, monkeypatch
+):
     questions = [_question(f"q{index}") for index in range(3)]
     checkpoint = tmp_path / lme.PER_QUESTION_CHECKPOINT_FILENAME
+    fsync_calls = []
 
     def _evaluate(question, *_args, **_kwargs):
         if question.question_id == "q2":
@@ -246,12 +276,35 @@ def test_checkpoint_is_flushed_after_each_completed_question(tmp_path, monkeypat
         return _scored(question.question_id)
 
     monkeypatch.setattr(lme, "evaluate_question", _evaluate)
+    monkeypatch.setattr(lme.os, "fsync", lambda fileno: fsync_calls.append(fileno))
     with pytest.raises(RuntimeError, match="simulated crash"):
-        _run_with_checkpoint(tmp_path, questions, checkpoint)
+        _run_with_checkpoint(
+            tmp_path,
+            questions,
+            checkpoint,
+            dataset_label="m",
+            manifest_sha256="1" * 64,
+            use_rerank=True,
+        )
 
     records = [json.loads(line) for line in checkpoint.read_text().splitlines()]
-    assert [record["question_id"] for record in records] == ["q0", "q1"]
-    assert records[0]["arms"]["fts"]["recall@1"] == 1.0
+    assert records[0] == _header_record(
+        rerank=True, dataset_label="m", manifest_sha256="1" * 64
+    )
+    assert [record["question_id"] for record in records[1:]] == ["q0", "q1"]
+    assert records[1]["arms"]["fts"]["recall@1"] == 1.0
+    assert len(fsync_calls) == 3
+
+
+def test_question_checkpoint_record_does_not_mutate_scored_input():
+    scored = _scored("q0")
+    original = copy.deepcopy(scored)
+
+    record = lme._question_checkpoint_record(_question("q0"), scored)
+
+    assert scored == original
+    assert "ingest_ms" not in record["arms"]
+    assert "rerank_mode" not in record["arms"]["hybrid_rerank"]
 
 
 def test_resume_report_is_identical_to_uninterrupted_report(tmp_path, monkeypatch):
@@ -290,9 +343,17 @@ def test_resume_report_is_identical_to_uninterrupted_report(tmp_path, monkeypatc
 
     assert evaluated == ["q2"]
     assert resumed == uninterrupted
-    assert json.dumps(resumed, indent=2, sort_keys=True).encode() == json.dumps(
-        uninterrupted, indent=2, sort_keys=True
-    ).encode()
+    uninterrupted_report = tmp_path / "uninterrupted" / "longmemeval_metrics.json"
+    resumed_report = tmp_path / "resumed" / "longmemeval_metrics.json"
+    uninterrupted_report.parent.mkdir()
+    resumed_report.parent.mkdir()
+    uninterrupted_report.write_text(
+        json.dumps(uninterrupted, indent=2, sort_keys=True), encoding="utf-8"
+    )
+    resumed_report.write_text(
+        json.dumps(resumed, indent=2, sort_keys=True), encoding="utf-8"
+    )
+    assert resumed_report.read_bytes() == uninterrupted_report.read_bytes()
 
 
 def test_resume_drops_torn_final_line_and_reruns_that_question(
@@ -327,19 +388,148 @@ def test_resume_drops_torn_final_line_and_reruns_that_question(
     assert report["question_count"] == 2
     assert "dropping torn final checkpoint line" in caplog.text
     assert [
-        json.loads(line)["question_id"] for line in checkpoint.read_text().splitlines()
+        json.loads(line)["question_id"]
+        for line in checkpoint.read_text().splitlines()[1:]
     ] == ["q0", "q1"]
 
 
 def test_resume_rejects_checkpoint_from_wrong_question_selection(tmp_path, monkeypatch):
     checkpoint = tmp_path / lme.PER_QUESTION_CHECKPOINT_FILENAME
-    checkpoint.write_text('{"question_id":"q-other"}\n', encoding="utf-8")
+    _write_checkpoint(
+        checkpoint,
+        _header_record(),
+        {"question_id": "q-other"},
+    )
 
     def _unexpected_evaluation(*_args, **_kwargs):
         raise AssertionError("wrong-directory checkpoint must fail before scoring")
 
     monkeypatch.setattr(lme, "evaluate_question", _unexpected_evaluation)
     with pytest.raises(ValueError, match="wrong output directory"):
+        _run_with_checkpoint(
+            tmp_path,
+            [_question("q0")],
+            checkpoint,
+            resume=True,
+            selected_question_ids=["q0"],
+        )
+
+
+def test_resume_with_changed_model_fails_closed_naming_field(tmp_path, monkeypatch):
+    checkpoint = tmp_path / lme.PER_QUESTION_CHECKPOINT_FILENAME
+    monkeypatch.setattr(
+        lme, "evaluate_question", lambda question, *_args, **_kwargs: _scored(question.question_id)
+    )
+    _run_with_checkpoint(tmp_path, [_question("q0")], checkpoint)
+
+    with pytest.raises(ValueError, match=r"configuration mismatch.*model"):
+        _run_with_checkpoint(
+            tmp_path,
+            [_question("q0")],
+            checkpoint,
+            model="changed-model",
+            resume=True,
+            selected_question_ids=["q0"],
+        )
+
+
+def test_resume_rejects_headerless_checkpoint(tmp_path, monkeypatch):
+    checkpoint = tmp_path / lme.PER_QUESTION_CHECKPOINT_FILENAME
+    _write_checkpoint(
+        checkpoint,
+        lme._question_checkpoint_record(_question("q0"), _scored("q0")),
+    )
+    monkeypatch.setattr(
+        lme,
+        "evaluate_question",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not score")),
+    )
+
+    with pytest.raises(ValueError, match=r"missing required __checkpoint_header__.*old-format"):
+        _run_with_checkpoint(
+            tmp_path,
+            [_question("q0")],
+            checkpoint,
+            resume=True,
+            selected_question_ids=["q0"],
+        )
+
+
+def test_resume_rejects_newline_terminated_corrupt_final_line(tmp_path, monkeypatch):
+    checkpoint = tmp_path / lme.PER_QUESTION_CHECKPOINT_FILENAME
+    _write_checkpoint(checkpoint, _header_record())
+    with checkpoint.open("ab") as checkpoint_file:
+        checkpoint_file.write(b'{"question_id":"q0"\n')
+    monkeypatch.setattr(
+        lme,
+        "evaluate_question",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not score")),
+    )
+
+    with pytest.raises(ValueError, match=r"invalid checkpoint JSON at line 2"):
+        _run_with_checkpoint(
+            tmp_path,
+            [_question("q0")],
+            checkpoint,
+            resume=True,
+            selected_question_ids=["q0"],
+        )
+
+
+def test_existing_checkpoint_without_resume_fails_closed(tmp_path, monkeypatch):
+    checkpoint = tmp_path / lme.PER_QUESTION_CHECKPOINT_FILENAME
+    _write_checkpoint(checkpoint, _header_record())
+    original = checkpoint.read_bytes()
+    monkeypatch.setattr(
+        lme,
+        "evaluate_question",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not score")),
+    )
+
+    with pytest.raises(ValueError, match=r"checkpoint exists from a previous run; pass --resume"):
+        _run_with_checkpoint(tmp_path, [_question("q0")], checkpoint)
+
+    assert checkpoint.read_bytes() == original
+
+
+def test_resume_rejects_mid_file_corruption(tmp_path, monkeypatch):
+    checkpoint = tmp_path / lme.PER_QUESTION_CHECKPOINT_FILENAME
+    valid_record = lme._question_checkpoint_record(_question("q0"), _scored("q0"))
+    checkpoint.write_bytes(
+        (
+            json.dumps(_header_record(), sort_keys=True, separators=(",", ":"))
+            + "\n{not-json}\n"
+            + json.dumps(valid_record, sort_keys=True, separators=(",", ":"))
+            + "\n"
+        ).encode()
+    )
+    monkeypatch.setattr(
+        lme,
+        "evaluate_question",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not score")),
+    )
+
+    with pytest.raises(ValueError, match=r"invalid checkpoint JSON at line 2"):
+        _run_with_checkpoint(
+            tmp_path,
+            [_question("q0")],
+            checkpoint,
+            resume=True,
+            selected_question_ids=["q0"],
+        )
+
+
+def test_resume_rejects_duplicate_question_id(tmp_path, monkeypatch):
+    checkpoint = tmp_path / lme.PER_QUESTION_CHECKPOINT_FILENAME
+    record = lme._question_checkpoint_record(_question("q0"), _scored("q0"))
+    _write_checkpoint(checkpoint, _header_record(), record, record)
+    monkeypatch.setattr(
+        lme,
+        "evaluate_question",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not score")),
+    )
+
+    with pytest.raises(ValueError, match=r"duplicate checkpoint question_id 'q0'"):
         _run_with_checkpoint(
             tmp_path,
             [_question("q0")],

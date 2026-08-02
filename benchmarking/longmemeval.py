@@ -21,6 +21,7 @@ It contains no transcript content, session ids, or local paths.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import importlib.util
 import json
@@ -74,6 +75,7 @@ DATASET_COORDS = {
 }
 PREPARED_MANIFEST_SCHEMA_VERSION = 1
 PER_QUESTION_CHECKPOINT_FILENAME = "per_question_checkpoint.jsonl"
+_CHECKPOINT_HEADER_KEY = "__checkpoint_header__"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _IJSON_MIN_VERSION = (3, 2)
 
@@ -1617,8 +1619,60 @@ def _aggregate_rerank_mode(mode_counts: dict[str, int]) -> dict[str, Any]:
     }
 
 
+def _checkpoint_header(
+    *,
+    provider: str,
+    model: str,
+    rerank: bool,
+    embeddings_enabled: bool,
+    dataset_label: str,
+    manifest_sha256: str | None,
+    embedding_batch_size: int | None,
+) -> dict[str, Any]:
+    bindings: dict[str, Any] = {
+        "provider": provider,
+        "model": model,
+        "rerank": rerank,
+        "embeddings_enabled": embeddings_enabled,
+        "dataset_label": dataset_label,
+        "embedding_batch_size": embedding_batch_size,
+    }
+    if manifest_sha256 is not None:
+        bindings["manifest_sha256"] = manifest_sha256
+    return {_CHECKPOINT_HEADER_KEY: bindings}
+
+
+def _validate_checkpoint_header(
+    record: Any, *, expected_header: dict[str, Any], path: Path
+) -> None:
+    if not isinstance(record, dict) or _CHECKPOINT_HEADER_KEY not in record:
+        raise ValueError(
+            f"checkpoint is missing required {_CHECKPOINT_HEADER_KEY}; "
+            f"old-format checkpoints cannot be resumed: {path}"
+        )
+    if set(record) != {_CHECKPOINT_HEADER_KEY} or not isinstance(
+        record[_CHECKPOINT_HEADER_KEY], dict
+    ):
+        raise ValueError(f"invalid checkpoint header record: {path}")
+
+    actual = record[_CHECKPOINT_HEADER_KEY]
+    expected = expected_header[_CHECKPOINT_HEADER_KEY]
+    mismatches = [
+        f"{field}: checkpoint={actual.get(field)!r}, current={expected.get(field)!r}"
+        for field in sorted(set(actual) | set(expected))
+        if field not in actual or field not in expected or actual[field] != expected[field]
+    ]
+    if mismatches:
+        raise ValueError(
+            f"checkpoint configuration mismatch for {path}: " + "; ".join(mismatches)
+        )
+
+
 def _load_question_checkpoint(
-    path: Path, *, selected_question_ids: set[str]
+    path: Path,
+    *,
+    selected_question_ids: set[str],
+    expected_header: dict[str, Any],
 ) -> list[dict[str, Any]]:
     """Load a checkpoint, truncating only a malformed final crash-torn line."""
     payload = path.read_bytes()
@@ -1627,11 +1681,12 @@ def _load_question_checkpoint(
     seen: set[str] = set()
     offset = 0
     dropped_torn_line = False
+    header_seen = False
     for index, raw_line in enumerate(lines):
         try:
             record = json.loads(raw_line)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            if index != len(lines) - 1:
+            if index != len(lines) - 1 or raw_line.endswith(b"\n"):
                 raise ValueError(
                     f"invalid checkpoint JSON at line {index + 1}: {path}"
                 ) from exc
@@ -1642,8 +1697,15 @@ def _load_question_checkpoint(
             )
             with path.open("r+b") as checkpoint_file:
                 checkpoint_file.truncate(offset)
+                checkpoint_file.flush()
+                os.fsync(checkpoint_file.fileno())
             dropped_torn_line = True
             break
+        if index == 0:
+            _validate_checkpoint_header(record, expected_header=expected_header, path=path)
+            header_seen = True
+            offset += len(raw_line)
+            continue
         if not isinstance(record, dict):
             raise ValueError(f"checkpoint line {index + 1} must be a JSON object: {path}")
         question_id = record.get("question_id")
@@ -1659,12 +1721,27 @@ def _load_question_checkpoint(
         seen.add(question_id)
         records.append(record)
         offset += len(raw_line)
+    if not header_seen:
+        raise ValueError(
+            f"checkpoint is missing required {_CHECKPOINT_HEADER_KEY}; "
+            f"cannot resume: {path}"
+        )
     if payload and not dropped_torn_line and not payload.endswith(b"\n"):
         # A crash may land after the JSON object but before its newline. Preserve
         # the valid record and restore the separator before later appends.
         with path.open("ab") as checkpoint_file:
             checkpoint_file.write(b"\n")
+            checkpoint_file.flush()
+            os.fsync(checkpoint_file.fileno())
     return records
+
+
+def _write_checkpoint_record(checkpoint_file, record: dict[str, Any]) -> None:
+    checkpoint_file.write(
+        json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
+    )
+    checkpoint_file.flush()
+    os.fsync(checkpoint_file.fileno())
 
 
 def _question_checkpoint_record(
@@ -1679,8 +1756,9 @@ def _question_checkpoint_record(
             "ingest_ms": 0.0,
             "arms": {},
         }
-    ingest_ms = scored.pop("ingest_ms", 0.0)
-    rerank_mode = scored["hybrid_rerank"].pop(
+    checkpoint_scored = copy.deepcopy(scored)
+    ingest_ms = checkpoint_scored.pop("ingest_ms", 0.0)
+    rerank_mode = checkpoint_scored["hybrid_rerank"].pop(
         "rerank_mode", RERANK_MODE_PLACEHOLDER
     )
     return {
@@ -1689,7 +1767,7 @@ def _question_checkpoint_record(
         "abstention": False,
         "rerank_mode": rerank_mode,
         "ingest_ms": ingest_ms,
-        "arms": scored,
+        "arms": checkpoint_scored,
     }
 
 
@@ -1788,20 +1866,44 @@ def run_harness(
     if resume and len(selected_ids) != len(selected_id_sequence):
         raise ValueError("selected question ids must be unique when resuming")
 
-    checkpoint_records: list[dict[str, Any]] = []
-    if checkpoint_path is not None:
-        checkpoint_path = Path(checkpoint_path)
-        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-        if resume and checkpoint_path.exists():
-            checkpoint_records = _load_question_checkpoint(
-                checkpoint_path, selected_question_ids=selected_ids
-            )
-
     if embeddings_enabled is None:
         embeddings_enabled = provider_name != "none"
     effective_embedding_batch_size = (
         _embedding_batch_size() if embeddings_enabled else None
     )
+    expected_checkpoint_header = _checkpoint_header(
+        provider=provider_name,
+        model=model,
+        rerank=use_rerank,
+        embeddings_enabled=embeddings_enabled,
+        dataset_label=dataset_label,
+        manifest_sha256=manifest_sha256,
+        embedding_batch_size=effective_embedding_batch_size,
+    )
+
+    checkpoint_records: list[dict[str, Any]] = []
+    if checkpoint_path is not None:
+        checkpoint_path = Path(checkpoint_path)
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        checkpoint_exists = checkpoint_path.exists()
+        checkpoint_nonempty = checkpoint_exists and checkpoint_path.stat().st_size > 0
+        if not resume and checkpoint_nonempty:
+            raise ValueError(
+                "checkpoint exists from a previous run; pass --resume to continue it "
+                "or use a fresh --output"
+            )
+        if resume:
+            if not checkpoint_nonempty:
+                raise ValueError(
+                    f"cannot resume without a non-empty checkpoint containing "
+                    f"{_CHECKPOINT_HEADER_KEY}: {checkpoint_path}"
+                )
+            checkpoint_records = _load_question_checkpoint(
+                checkpoint_path,
+                selected_question_ids=selected_ids,
+                expected_header=expected_checkpoint_header,
+            )
+
     embedder = resolve_harness_provider(provider_name, model)
 
     db_template: Path | None = None
@@ -1847,6 +1949,8 @@ def run_harness(
     checkpoint_file = None
     if checkpoint_path is not None:
         checkpoint_file = checkpoint_path.open("a" if resume else "w", encoding="utf-8")
+        if not resume:
+            _write_checkpoint_record(checkpoint_file, expected_checkpoint_header)
 
     observed_question_ids: set[str] = set()
     try:
@@ -1883,10 +1987,7 @@ def run_harness(
                 scored_count += scored_delta
                 abstention_count += abstention_delta
                 if checkpoint_file is not None:
-                    checkpoint_file.write(
-                        json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
-                    )
-                    checkpoint_file.flush()
+                    _write_checkpoint_record(checkpoint_file, record)
             finally:
                 _cleanup_question_db(tmp_dir, question.question_id)
     finally:
