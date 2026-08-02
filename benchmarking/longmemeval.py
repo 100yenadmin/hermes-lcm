@@ -488,11 +488,6 @@ def prepare_dataset(
             "prepared staging parent is not writable: "
             f"{prepared_dir.parent} (check --prepared-dir {prepared_dir})"
         ) from exc
-    if not os.access(prepared_dir.parent, os.W_OK):
-        raise OSError(
-            "prepared staging parent is not writable: "
-            f"{prepared_dir.parent} (check --prepared-dir {prepared_dir})"
-        )
     if prepared_dir.exists():
         if not prepared_dir.is_dir() or any(prepared_dir.iterdir()):
             raise ValueError(f"prepared directory must be empty: {prepared_dir}")
@@ -1279,6 +1274,12 @@ def evaluate_question(
     from hermes_lcm.vector_store import EmbeddingIdentity, VectorStore
 
     db_path = tmp_dir / f"{_safe(question.question_id)}.db"
+    if db_path.name == "_template.db":
+        # The prepared path rejects this id at prepare time; guard the direct
+        # --dataset path too, or the question DB would clobber the seeded template.
+        raise ValueError(
+            f"question_id {question.question_id!r} collides with the template database"
+        )
     model = provider_embedder.model_id
     dim = int(provider_embedder.dim)
     config = LCMConfig(
