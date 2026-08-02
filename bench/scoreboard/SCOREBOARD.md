@@ -2,14 +2,15 @@
 
 Every number ships with its full run config, variance, fail-close accounting, and known dataset defects — rows that cannot meet the standard do not render.
 
-Generated from `results.jsonl` (sha256: `a1b5bb647a774cb97ee47109a08eb494941282c542c64c3934b4fcf04601a188`, rows: 6)
+Generated from `results.jsonl` (sha256: `f19312de95c819fa5ef36a749cddb8add01d9d93af923affc2926389dbd16d36`, rows: 7)
 
 ## Summary
 
 | Benchmark | Metric | Result | Tier | Date | Details |
 |---|---|---|---|---|---|
 | Internal scale instrument (389×, 19,829 sessions / 199,641 messages) | p50_ms | 263.6 ms @ 19,829 sessions (24× vs pre-fix; 125 ms @ 8k) | P | 2026-07-30 | [details](#scale-curve-fastscan-2026-07-30) |
-| LoCoMo (locomo10, 1,986q) | accuracy | 47.0% (MemScore) | F | 2026-07-30 | [details](#locomo10-1986-arm-a-2026-07-30) |
+| LoCoMo (locomo10, 1,986q) | accuracy | 54.6% (1,085/1,986 MemScore) | F | 2026-08-02 | [details](#locomo10-1986-declared-2026-08-02) |
+| ~~LoCoMo (locomo10, 1,986q)~~ | ~~accuracy~~ | ~~47.0% (MemScore)~~ | ~~F~~ | ~~2026-07-30~~ | ~~[details](#locomo10-1986-arm-a-2026-07-30)~~ → [successor](#locomo10-1986-declared-2026-08-02) |
 | LongMemEval-V1 (S, 500q) | accuracy | 455/500 (91.0%) | P | 2026-07-29 | [details](#longmemeval-v1-s500-accuracy-2026-07-29) |
 | LongMemEval-V1 (S, 500q) | latency_delta_s_per_q | −56.3 s/question vs vanilla (22% faster) | P | 2026-07-29 | [details](#longmemeval-v1-s500-latency-2026-07-29) |
 | LongMemEval-V2 (451q, agentic) | accuracy | 298/451 (66.1%) | P | 2026-07-27 | [details](#longmemeval-v2-451-agentic-2026-07-27) |
@@ -74,6 +75,69 @@ pin discipline PASS; truncation bug meant 5.7% of delivered results were silentl
 **caveats:**
 - published AS THE FAULT-FINDING RESULT IT IS: decomposition attributes the gap to instrument bugs (~+3pts ceiling), corrupted gold (~1.5-2pts), a config-class retrieval gap (fusion quota + chunk threshold, both since landed), and one genuine answer-layer weakness (adversarial speaker attribution — fact retrieved on 78.6% of wrong rows); declared-config re-run pending
 - this row is the disclosure standard demonstrated on our own worst number
+
+**superseded_by:**
+locomo10-1986-declared-2026-08-02
+
+### <a id="locomo10-1986-declared-2026-08-02"></a>locomo10-1986-declared-2026-08-02
+
+**id:**
+locomo10-1986-declared-2026-08-02
+
+**benchmark:**
+LoCoMo (locomo10, 1,986q)
+
+**metric:**
+accuracy
+
+**value:**
+0.5463
+
+**display:**
+54.6% (1,085/1,986 MemScore)
+
+**tier:**
+F
+
+**date:**
+2026-08-02
+
+**system_commit:**
+hermes-lcm fork main @ 9d181aa (post-#190/#197)
+
+**harness_commit:**
+memorybench feat/locomo-hermes-prep @ f55eba3 (+2c36f98 run-prep); all F46 §1 instrument fixes live
+
+**judge:**
+gpt-5.6-sol @ low; full prompts pinned (defaults.ts 7662f6…); narrowed abstention rubric (credits verifiable premise-rejection only) — stricter than the stock LoCoMo judge
+
+**reader:**
+gpt-5.6-sol @ medium (frontier answerer per two-tier doctrine)
+
+**retrieval_config:**
+fastembed bge-small; fusion quota fts:chunk=1:2 (measured selection, FUSION-EMBEDDER-DIAGNOSIS); conversational chunk threshold 10 (measured, CHUNK-ELIGIBILITY); answer-ready 2,400 chars; full pins in run artifacts
+
+**dataset_exposure:**
+99 documented corrupted-gold rows all ran, scored as-is; known-corruption ceiling ≈95% (unchanged from F46 §6)
+
+**breakdown:**
+single-hop 37.2 / multi-hop 64.8 / temporal 41.7 / world 69.7 / adversarial 32.7 (F48 §3 with old-config deltas and attributions)
+
+**variance:**
+pre-registered A/A′ pair on fresh stores: 69/1,986 discordant (3.47%), aggregate spread 0.76 pts; arm A is the scored read per the run sheet
+
+**failclose:**
+0/1,986 both arms; union-drop 0; pins signed pre+post both arms
+
+**evidence:**
+- bench/FINDING-F48-LOCOMO-DECLARED-CONFIG.md
+- bench/specs/RUN-SHEET-LOCOMO-DECLARED-CONFIG.md
+- session-notes 2026-07-31 hermes-locomo-declared artifacts
+
+**caveats:**
+- +7.6 vs the superseded row is NOT pure retrieval: the judge rubric and adversarial gold changed between configs (both disclosed); corrupted gold unchanged
+- single-hop fell 12 pts — suspected fusion-quota side effect flagged AS A FINDING (decomposition in progress); adversarial 32.7 is the measured-honest number against canonical abstention gold with the known B3 product weakness unfixed
+- Tier-F: fault-finding config; Voyage-embedding variant queues as its own declared config
 
 ### <a id="longmemeval-v1-s500-accuracy-2026-07-29"></a>longmemeval-v1-s500-accuracy-2026-07-29
 
