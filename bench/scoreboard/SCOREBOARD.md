@@ -2,7 +2,7 @@
 
 Every number ships with its full run config, variance, fail-close accounting, and known dataset defects — rows that cannot meet the standard do not render.
 
-Generated from `results.jsonl` (sha256: `2991ffb564a1820c62724eecccbe8f6f0793bca21dad0916f1559e9c65aa8843`, rows: 9)
+Generated from `results.jsonl` (sha256: `cb1983d74d0c6a149f43a64c894e0257499bcc65eea8d32c11f430401369df4f`, rows: 9)
 
 ## Summary
 
@@ -65,7 +65,7 @@ dataset sha256 45c36052e...; no training/tuning on it
 tiers: small<100k 1026/2172=47.2%, mid 134/252=53.2%, large>800k 20/36=55.6% \| worst tasks: alfworld 18.4%, swebench 43.8%, webarena 47.3% \| best: candy_crush 75.0%, crafter 66.7%, gaia_level3 65.0%
 
 **variance:**
-A/A' 30-episode fixed-seed subset pending (registered policy; runs next)
+A/A' 30-episode fixed-seed subset (seed 20260802) EXECUTED: 27/30 pairs compared (3 skipped where either arm had a failed episode, disclosed), 324 questions, 31/324 discordant (9.6%), aggregate spread 1.54pt (A-subset 45.4% vs A' 46.9%) — question-level churn ~10%, aggregate stable
 
 **failclose:**
 3/208 episodes failed (luna empty-content completions x3 retries; AttributeError in harness model_client.py:109) — 36 questions counted in denominator, never dropped
