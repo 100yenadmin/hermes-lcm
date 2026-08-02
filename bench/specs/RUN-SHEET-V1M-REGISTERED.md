@@ -29,7 +29,7 @@ Registered BEFORE launch; this sheet is the registration. G0 channel: coverage r
   continuation pattern applies.
 
 ## 3. Pins (finalized at launch — every value from a command, none hand-typed)
-- Instrument: #198 merge sha (pending final CI + bot pass at 4a3f290). Product: engine sha at
+- Instrument: #198 MERGED at 9f29d4b2 (squash, 2026-08-02T04:14:53Z; 11 bot passes, 45 threads resolved). Product: engine sha at
   merge. Dataset: prepared-dir manifest sha. Env: FULL `_EnvFieldSpec`-inventory diff per F49 §5
   (every flag explicit or listed default — first run under the new standing rule).
 - Provider: voyage / voyage-context-3, batched embedding path (#198), key from Keychain at
