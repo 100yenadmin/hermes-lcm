@@ -73,3 +73,17 @@ session-notes 2026-08-02 `fts-prose-replay/` (scripts, per-row CSVs, SUMMARY.jso
 - **Remaining prereq before registration: §4 req 3 (fusion-ratio re-derivation)** — the sim must
   be CATEGORY-BALANCED this time (the F46-era sim's imbalance is a documented
   gate-proxy-calibration echo) and uses the part2 candidate-volume data as its input.
+
+## 8. Fusion-ratio re-derivation result (2026-08-02 — §4 req 3 SATISFIED; all C1 prereqs closed)
+SPEC-FUSION-RESIM executed: 100q category-balanced (20×5, seed 20260802), real bridge
+`quota_merge` imported verbatim (3-case self-test passed), chunk arm replayed offline from
+retained embeddings + cached fastembed model, delivered limit 25 confirmed from source
+(search.ts:60). **Selected by the a-priori rule: `fts:chunk = 1:1`** — aggregate gold-turn
+delivery 53.66% vs 50.24% (prose@1:2); tie with 2:1 broken on fewer displaced gold-chunk hits
+(5 vs 8) + smaller config delta. 1:3 rejected on the category-loss constraint. Headline
+recomputed from the raw per-question CSV by the orchestrator (110/205, exact match).
+Context: the AS-RUN banked config had a dark FTS arm ≈ the chunk-only control (40.00%), so C1's
+predicted delivery delta vs the banked run is ≈ +13.7pt. Disclosed deviation: 4/2,815 dataset
+evidence entries pack multiple dia_ids in one string; split via pattern, documented in resim.py.
+→ Registration: `specs/RUN-SHEET-LOCOMO-C1-FTS-ON.md` (bands pre-declared; launch gated on the
+machine slot per its §5).
