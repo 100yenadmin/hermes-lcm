@@ -198,6 +198,8 @@ class ContentHashEmbeddingCache:
             raise ValueError("embedding cache provider id must not be empty")
         if not self._model_id:
             raise ValueError("embedding cache model id must not be empty")
+        self.hits = 0
+        self.misses = 0
         self._initialize()
 
     @property
@@ -219,6 +221,7 @@ class ContentHashEmbeddingCache:
         return connection
 
     def _initialize(self) -> None:
+        cache_existed = self.cache_path.exists()
         with self._connect() as connection:
             mode = str(connection.execute("PRAGMA journal_mode=WAL").fetchone()[0])
             if mode.casefold() != "wal":
@@ -238,6 +241,8 @@ class ContentHashEmbeddingCache:
                 ) WITHOUT ROWID
                 """
             )
+        if not cache_existed:
+            _fsync_parent_directory(self.cache_path)
 
     @staticmethod
     def _encode_vector(vector: Sequence[float]) -> tuple[int, bytes]:
@@ -281,6 +286,8 @@ class ContentHashEmbeddingCache:
             return []
         digests = [self.content_sha256(text) for text in documents]
         cached = self._lookup(digests)
+        self.hits += sum(digest in cached for digest in digests)
+        self.misses += sum(digest not in cached for digest in digests)
         missing_by_digest: dict[str, str] = {}
         for digest, text in zip(digests, documents):
             if digest not in cached:
@@ -2003,7 +2010,9 @@ def _checkpoint_header(
     rerank: bool,
     embeddings_enabled: bool,
     dataset_label: str,
+    direct_source_sha256: str | None,
     manifest_sha256: str | None,
+    reuse_db_template: bool,
     embedding_batch_size: int | None,
 ) -> dict[str, Any]:
     bindings: dict[str, Any] = {
@@ -2012,8 +2021,11 @@ def _checkpoint_header(
         "rerank": rerank,
         "embeddings_enabled": embeddings_enabled,
         "dataset_label": dataset_label,
+        "reuse_db_template": reuse_db_template,
         "embedding_batch_size": embedding_batch_size,
     }
+    if direct_source_sha256 is not None:
+        bindings["source_sha256"] = direct_source_sha256
     if manifest_sha256 is not None:
         bindings["manifest_sha256"] = manifest_sha256
     return {_CHECKPOINT_HEADER_KEY: bindings}
@@ -2095,6 +2107,7 @@ def _load_question_checkpoint(
             )
         if question_id in seen:
             raise ValueError(f"duplicate checkpoint question_id {question_id!r}: {path}")
+        _validate_restored_checkpoint_metrics(record, line_number=index + 1, path=path)
         seen.add(question_id)
         records.append(record)
         offset += len(raw_line)
@@ -2119,6 +2132,65 @@ def _write_checkpoint_record(checkpoint_file, record: dict[str, Any]) -> None:
     )
     checkpoint_file.flush()
     os.fsync(checkpoint_file.fileno())
+
+
+def _fsync_parent_directory(path: Path) -> None:
+    """Durably publish a new file entry where directory fsync is supported."""
+    dir_fd: int | None = None
+    try:
+        dir_fd = os.open(str(Path(path).parent), os.O_RDONLY)
+        os.fsync(dir_fd)
+    except (OSError, NotImplementedError):
+        # Windows and some filesystems cannot open/fsync directory handles.
+        return
+    finally:
+        if dir_fd is not None:
+            os.close(dir_fd)
+
+
+def _validate_restored_checkpoint_metrics(
+    record: dict[str, Any], *, line_number: int, path: Path
+) -> None:
+    """Validate every aggregate input restored from a scored checkpoint row."""
+    if record.get("abstention") is True:
+        return
+
+    def require_real(field: str, value: Any) -> None:
+        if (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(float(value))
+        ):
+            raise ValueError(
+                f"checkpoint line {line_number} field {field} must be a finite real number: {path}"
+            )
+
+    require_real("ingest_ms", record.get("ingest_ms"))
+    arms = record.get("arms")
+    if not isinstance(arms, dict):
+        raise ValueError(f"checkpoint line {line_number} field arms must be an object: {path}")
+    for arm in ARMS:
+        metrics = arms.get(arm)
+        arm_field = f"arms.{arm}"
+        if not isinstance(metrics, dict):
+            raise ValueError(
+                f"checkpoint line {line_number} field {arm_field} must be an object: {path}"
+            )
+        for metric in ("recall@1", "recall@5", "recall@10", "ndcg@10", "latency_ms"):
+            require_real(f"{arm_field}.{metric}", metrics.get(metric))
+        turn = metrics.get("turn")
+        turn_field = f"{arm_field}.turn"
+        if not isinstance(turn, dict):
+            raise ValueError(
+                f"checkpoint line {line_number} field {turn_field} must be an object: {path}"
+            )
+        for metric in ("recall@1", "recall@5", "recall@10", "ndcg@10"):
+            require_real(f"{turn_field}.{metric}", turn.get(metric))
+        if not isinstance(turn.get("session_granularity"), bool):
+            raise ValueError(
+                f"checkpoint line {line_number} field {turn_field}.session_granularity "
+                f"must be a boolean: {path}"
+            )
 
 
 def _question_checkpoint_record(
@@ -2216,6 +2288,7 @@ def run_harness(
     question_count: int | None = None,
     dataset_label: str = "s",
     source_sha256: str | None = None,
+    direct_source_sha256: str | None = None,
     manifest_sha256: str | None = None,
     checkpoint_path: Path | None = None,
     resume: bool = False,
@@ -2227,6 +2300,10 @@ def run_harness(
         if not _SHA256_RE.fullmatch(source_sha256):
             raise ValueError("source_sha256 must be a lowercase SHA-256 hex digest")
         dataset_report["source_sha256"] = source_sha256
+    if direct_source_sha256 is not None and not _SHA256_RE.fullmatch(
+        direct_source_sha256
+    ):
+        raise ValueError("direct_source_sha256 must be a lowercase SHA-256 hex digest")
     if manifest_sha256 is not None:
         if not _SHA256_RE.fullmatch(manifest_sha256):
             raise ValueError("manifest_sha256 must be a lowercase SHA-256 hex digest")
@@ -2254,7 +2331,9 @@ def run_harness(
         rerank=use_rerank,
         embeddings_enabled=embeddings_enabled,
         dataset_label=dataset_label,
+        direct_source_sha256=direct_source_sha256,
         manifest_sha256=manifest_sha256,
+        reuse_db_template=reuse_db_template,
         embedding_batch_size=effective_embedding_batch_size,
     )
 
@@ -2283,24 +2362,6 @@ def run_harness(
                 expected_header=expected_checkpoint_header,
             )
 
-    embedder = resolve_harness_provider(provider_name, model)
-
-    db_template: Path | None = None
-    if reuse_db_template:
-        _ensure_hermes_lcm_package()
-        from hermes_lcm.config import LCMConfig
-
-        db_template = Path(tmp_dir) / "_template.db"
-        _bootstrap_db_template(
-            db_template,
-            LCMConfig(
-                database_path=str(db_template),
-                embeddings_enabled=embeddings_enabled,
-                embedding_provider=provider_name,
-                embedding_model=embedder.model_id,
-            ),
-        )
-
     by_category: dict[str, dict[str, ArmSamples]] = {}
     overall = _new_arm_samples()
     scored_count = 0
@@ -2325,22 +2386,45 @@ def run_harness(
         scored_count += scored_delta
         abstention_count += abstention_delta
 
+    fully_completed_resume = resume and completed_question_ids == selected_ids
+    embed_cache_path = os.environ.get(EMBED_CACHE_ENV)
+    if embed_cache_path is not None and not embed_cache_path.strip():
+        raise ValueError(f"{EMBED_CACHE_ENV} must be a non-empty SQLite path")
+
+    embedder = None
+    db_template: Path | None = None
+    if not fully_completed_resume:
+        embedder = resolve_harness_provider(provider_name, model)
+        if reuse_db_template:
+            _ensure_hermes_lcm_package()
+            from hermes_lcm.config import LCMConfig
+
+            db_template = Path(tmp_dir) / "_template.db"
+            _bootstrap_db_template(
+                db_template,
+                LCMConfig(
+                    database_path=str(db_template),
+                    embeddings_enabled=embeddings_enabled,
+                    embedding_provider=provider_name,
+                    embedding_model=embedder.model_id,
+                ),
+            )
+
     checkpoint_file = None
-    if checkpoint_path is not None:
+    if checkpoint_path is not None and not fully_completed_resume:
         checkpoint_file = checkpoint_path.open("a" if resume else "w", encoding="utf-8")
         if not resume:
             _write_checkpoint_record(checkpoint_file, expected_checkpoint_header)
             # Make the directory ENTRY durable too — record fsyncs alone don't
             # survive a crash that predates the dirent reaching disk.
-            dir_fd = os.open(str(checkpoint_path.parent), os.O_RDONLY)
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
+            _fsync_parent_directory(checkpoint_path)
 
     observed_question_ids: set[str] = set()
+    if fully_completed_resume:
+        observed_question_ids.update(selected_ids)
+        consumed_count = len(selected_id_sequence)
     try:
-        for question in questions:
+        for question in (() if fully_completed_resume else questions):
             consumed_count += 1
             observed_question_ids.add(question.question_id)
             if resume and question.question_id not in selected_ids:
@@ -2399,6 +2483,11 @@ def run_harness(
     }
     if dataset_label == "m" or manifest_sha256 is not None:
         ingest_report["embedding_batch_size"] = effective_embedding_batch_size
+    if embed_cache_path is not None:
+        ingest_report["embed_cache"] = {
+            "hits": int(getattr(embedder, "hits", 0)),
+            "misses": int(getattr(embedder, "misses", 0)),
+        }
 
     return {
         "schema_version": SCHEMA_VERSION,

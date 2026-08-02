@@ -104,7 +104,9 @@ def _header_record(**overrides):
         "rerank": False,
         "embeddings_enabled": True,
         "dataset_label": "s",
+        "direct_source_sha256": None,
         "manifest_sha256": None,
+        "reuse_db_template": False,
         "embedding_batch_size": lme.EMBED_BATCH_SIZE,
     }
     bindings.update(overrides)
@@ -297,6 +299,14 @@ def test_checkpoint_is_fsynced_after_header_and_each_completed_question(
     assert len(fsync_calls) == 4
 
 
+def test_directory_fsync_skips_unsupported_platform(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        lme.os, "open", lambda *_args, **_kwargs: (_ for _ in ()).throw(NotImplementedError())
+    )
+
+    lme._fsync_parent_directory(tmp_path / "checkpoint.jsonl")
+
+
 def test_question_checkpoint_record_does_not_mutate_scored_input():
     scored = _scored("q0")
     original = copy.deepcopy(scored)
@@ -472,6 +482,90 @@ def test_resume_with_changed_model_fails_closed_naming_field(tmp_path, monkeypat
             [_question("q0")],
             checkpoint,
             model="changed-model",
+            resume=True,
+            selected_question_ids=["q0"],
+        )
+
+
+def test_resume_with_changed_dataset_digest_fails_closed_naming_field(tmp_path, monkeypatch):
+    checkpoint = tmp_path / lme.PER_QUESTION_CHECKPOINT_FILENAME
+    monkeypatch.setattr(
+        lme, "evaluate_question", lambda question, *_args, **_kwargs: _scored(question.question_id)
+    )
+    _run_with_checkpoint(
+        tmp_path, [_question("q0")], checkpoint, direct_source_sha256="1" * 64
+    )
+
+    with pytest.raises(ValueError, match=r"configuration mismatch.*source_sha256"):
+        _run_with_checkpoint(
+            tmp_path,
+            [_question("q0")],
+            checkpoint,
+            direct_source_sha256="2" * 64,
+            resume=True,
+            selected_question_ids=["q0"],
+        )
+
+
+def test_resume_with_changed_template_mode_fails_closed_naming_field(tmp_path, monkeypatch):
+    checkpoint = tmp_path / lme.PER_QUESTION_CHECKPOINT_FILENAME
+    monkeypatch.setattr(
+        lme, "evaluate_question", lambda question, *_args, **_kwargs: _scored(question.question_id)
+    )
+    _run_with_checkpoint(tmp_path, [_question("q0")], checkpoint)
+
+    with pytest.raises(ValueError, match=r"configuration mismatch.*reuse_db_template"):
+        lme.run_harness(
+            [_question("q0")],
+            provider_name="stub",
+            model="",
+            tmp_dir=tmp_path,
+            reuse_db_template=True,
+            checkpoint_path=checkpoint,
+            resume=True,
+            selected_question_ids=["q0"],
+        )
+
+
+def test_fully_completed_resume_skips_provider_initialization(tmp_path, monkeypatch):
+    checkpoint = tmp_path / lme.PER_QUESTION_CHECKPOINT_FILENAME
+    monkeypatch.setattr(
+        lme, "evaluate_question", lambda question, *_args, **_kwargs: _scored(question.question_id)
+    )
+    expected = _run_with_checkpoint(tmp_path, [_question("q0")], checkpoint)
+    monkeypatch.setattr(
+        lme,
+        "resolve_harness_provider",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("provider initialized")),
+    )
+
+    actual = _run_with_checkpoint(
+        tmp_path,
+        [_question("q0")],
+        checkpoint,
+        resume=True,
+        selected_question_ids=["q0"],
+    )
+
+    assert actual == expected
+
+
+def test_resume_rejects_null_metric_with_line_and_field(tmp_path, monkeypatch):
+    checkpoint = tmp_path / lme.PER_QUESTION_CHECKPOINT_FILENAME
+    record = lme._question_checkpoint_record(_question("q0"), _scored("q0"))
+    record["arms"]["fts"]["recall@1"] = None
+    _write_checkpoint(checkpoint, _header_record(), record)
+    monkeypatch.setattr(
+        lme,
+        "resolve_harness_provider",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("provider initialized")),
+    )
+
+    with pytest.raises(ValueError, match=r"line 2 field arms\.fts\.recall@1"):
+        _run_with_checkpoint(
+            tmp_path,
+            [_question("q0")],
+            checkpoint,
             resume=True,
             selected_question_ids=["q0"],
         )

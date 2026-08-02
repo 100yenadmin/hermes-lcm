@@ -235,6 +235,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
             # dataset block. The digest still covers the exact bytes parsed above,
             # but provenance hashes are emitted only for prepared/medium runs.
             source_sha256 = parsed_sha256 if args.dataset_label != "s" else None
+            direct_source_sha256 = parsed_sha256
             manifest_sha256 = None
             question_count = len(questions)
             selected_question_ids = tuple(question.question_id for question in questions)
@@ -243,6 +244,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 Path(args.prepared_dir), dataset_label=args.dataset_label
             )
             source_sha256 = prepared.source_sha256
+            direct_source_sha256 = None
             manifest_sha256 = prepared.manifest_sha256
             question_count = (
                 prepared.question_count
@@ -274,6 +276,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 question_count=question_count,
                 dataset_label=args.dataset_label,
                 source_sha256=source_sha256,
+                direct_source_sha256=direct_source_sha256,
                 manifest_sha256=manifest_sha256,
                 checkpoint_path=output_dir / PER_QUESTION_CHECKPOINT_FILENAME,
                 resume=args.resume,
@@ -311,7 +314,10 @@ def _cmd_prewarm_cache(args: argparse.Namespace) -> int:
     try:
         questions = _prepared_shard_questions(args)
         provider = resolve_harness_provider(
-            args.provider, args.model, timeout=args.timeout, warmup=False
+            args.provider,
+            args.model,
+            timeout=args.timeout,
+            warmup=args.provider == "fastembed",
         )
         report = prewarm_embedding_cache(
             questions,

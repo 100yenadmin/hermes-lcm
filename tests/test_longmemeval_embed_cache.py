@@ -45,6 +45,8 @@ class TestCacheHit:
 
         assert actual == expected
         assert raw.calls == 1
+        assert cached.hits == 1
+        assert cached.misses == 1
 
 
 class TestCacheMiss:
@@ -190,3 +192,82 @@ def test_empty_cache_env_fails_closed(tmp_path, monkeypatch):
 
     with pytest.raises(ValueError, match="non-empty SQLite path"):
         lme._maybe_cache_harness_provider(_CountingProvider(), provider_name="voyage")
+
+
+def test_cache_database_creation_syncs_parent_directory(tmp_path, monkeypatch):
+    synced = []
+    monkeypatch.setattr(lme, "_fsync_parent_directory", synced.append)
+    path = tmp_path / "embeddings.db"
+
+    lme.ContentHashEmbeddingCache(_CountingProvider(), path)
+
+    assert synced == [path]
+
+
+def test_report_discloses_cache_stats_only_when_env_is_set(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        lme, "evaluate_question", lambda question, *_args, **_kwargs: {
+            **{
+                arm: {
+                    "recall@1": 1.0,
+                    "recall@5": 1.0,
+                    "recall@10": 1.0,
+                    "ndcg@10": 1.0,
+                    "latency_ms": 1.0,
+                    "turn": {
+                        "recall@1": 1.0,
+                        "recall@5": 1.0,
+                        "recall@10": 1.0,
+                        "ndcg@10": 1.0,
+                        "session_granularity": False,
+                    },
+                }
+                for arm in lme.ARMS
+            },
+            "ingest_ms": 1.0,
+        },
+    )
+    monkeypatch.delenv(lme.EMBED_CACHE_ENV, raising=False)
+    without_cache = lme.run_harness(
+        [_question()], provider_name="stub", model="", tmp_dir=tmp_path, reuse_db_template=False
+    )
+    assert "embed_cache" not in without_cache["ingest"]
+
+    monkeypatch.setenv(lme.EMBED_CACHE_ENV, str(tmp_path / "cache.db"))
+    with_cache = lme.run_harness(
+        [_question()], provider_name="stub", model="", tmp_dir=tmp_path, reuse_db_template=False
+    )
+    assert with_cache["ingest"]["embed_cache"] == {"hits": 0, "misses": 0}
+
+
+def test_fastembed_prewarm_resolves_with_run_path_warmup(tmp_path, monkeypatch):
+    cli = _load_cli()
+    monkeypatch.setenv(lme.EMBED_CACHE_ENV, str(tmp_path / "cache.db"))
+    monkeypatch.setattr(cli, "_prepared_shard_questions", lambda _args: [])
+    calls = []
+
+    class _Provider:
+        pass
+
+    def _resolve(*args, **kwargs):
+        calls.append((args, kwargs))
+        return _Provider()
+
+    monkeypatch.setattr(cli, "resolve_harness_provider", _resolve)
+    monkeypatch.setattr(cli, "prewarm_embedding_cache", lambda *_args, **_kwargs: {})
+    args = cli._parse_args(
+        [
+            "prewarm-cache",
+            "--prepared-dir",
+            "prepared",
+            "--shards-manifest",
+            "shards",
+            "--provider",
+            "fastembed",
+            "--model",
+            "local-model",
+        ]
+    )
+
+    assert cli._cmd_prewarm_cache(args) == 0
+    assert calls == [(("fastembed", "local-model"), {"timeout": 300.0, "warmup": True})]
