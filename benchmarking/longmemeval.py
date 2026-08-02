@@ -28,15 +28,18 @@ import json
 import logging
 import math
 import os
+import random
 import re
 import shutil
+import sqlite3
+import struct
 import sys
 import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Iterable, Iterator, Sequence
+from typing import Any, Callable, Iterable, Iterator, Sequence
 
 from .standalone import ensure_agent_context_engine_importable
 
@@ -110,6 +113,7 @@ CATEGORY_LABELS = {
 _WHITESPACE_RE = re.compile(r"\s+")
 _STUB_MODEL = "stub-hash-64"
 _STUB_DIM = 64
+EMBED_CACHE_ENV = "LCM_LONGMEMEVAL_EMBED_CACHE"
 
 
 def _ensure_hermes_lcm_package() -> None:
@@ -164,6 +168,182 @@ class StubEmbedder:
         return self._embed(text)
 
 
+class ContentHashEmbeddingCache:
+    """Per-document embedding cache keyed by exact provider input text.
+
+    ``embed_documents`` is the cache boundary because Voyage treats each string
+    in its outer request list as one independently returned document vector.
+    Query embeddings and provider-specific methods are delegated unchanged.
+    """
+
+    provider_id: str
+
+    def __init__(
+        self,
+        provider,
+        cache_path: str | Path,
+        *,
+        provider_id: str | None = None,
+        model_id: str | None = None,
+    ) -> None:
+        self._provider = provider
+        self.cache_path = Path(cache_path)
+        self.provider_id = str(
+            provider_id or getattr(provider, "provider_id", "")
+        ).strip()
+        self._model_id = str(
+            model_id or getattr(provider, "model_id", "")
+        ).strip()
+        if not self.provider_id:
+            raise ValueError("embedding cache provider id must not be empty")
+        if not self._model_id:
+            raise ValueError("embedding cache model id must not be empty")
+        self._initialize()
+
+    @property
+    def model_id(self) -> str:
+        return self._model_id
+
+    @property
+    def dim(self) -> int:
+        return int(getattr(self._provider, "dim", 0))
+
+    @staticmethod
+    def content_sha256(text: str) -> str:
+        """Hash the exact UTF-8 string passed as one provider document."""
+        return hashlib.sha256(str(text).encode("utf-8")).hexdigest()
+
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.cache_path, timeout=30.0)
+        connection.execute("PRAGMA busy_timeout=30000")
+        return connection
+
+    def _initialize(self) -> None:
+        with self._connect() as connection:
+            mode = str(connection.execute("PRAGMA journal_mode=WAL").fetchone()[0])
+            if mode.casefold() != "wal":
+                raise RuntimeError(
+                    f"embedding cache requires SQLite WAL mode, got {mode!r}"
+                )
+            connection.execute("PRAGMA synchronous=NORMAL")
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS embedding_cache (
+                    provider TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    content_sha256 TEXT NOT NULL CHECK(length(content_sha256) = 64),
+                    vector_dim INTEGER NOT NULL CHECK(vector_dim > 0),
+                    vector_f64_le BLOB NOT NULL,
+                    PRIMARY KEY (provider, model, content_sha256)
+                ) WITHOUT ROWID
+                """
+            )
+
+    @staticmethod
+    def _encode_vector(vector: Sequence[float]) -> tuple[int, bytes]:
+        values = [float(value) for value in vector]
+        if not values:
+            raise ValueError("embedding provider returned an empty vector")
+        return len(values), struct.pack(f"<{len(values)}d", *values)
+
+    @staticmethod
+    def _decode_vector(dimension: int, payload: bytes) -> list[float]:
+        expected = int(dimension) * 8
+        if int(dimension) <= 0 or len(payload) != expected:
+            raise ValueError("embedding cache vector payload is corrupt")
+        return list(struct.unpack(f"<{int(dimension)}d", payload))
+
+    def _lookup(self, digests: Sequence[str]) -> dict[str, list[float]]:
+        if not digests:
+            return {}
+        found: dict[str, list[float]] = {}
+        with self._connect() as connection:
+            for digest in dict.fromkeys(digests):
+                row = connection.execute(
+                    """
+                    SELECT vector_dim, vector_f64_le
+                    FROM embedding_cache
+                    WHERE provider = ? AND model = ? AND content_sha256 = ?
+                    """,
+                    (self.provider_id, self.model_id, digest),
+                ).fetchone()
+                if row is not None:
+                    found[digest] = self._decode_vector(int(row[0]), bytes(row[1]))
+        return found
+
+    def cached_count(self, texts: Sequence[str]) -> int:
+        digests = [self.content_sha256(str(text)) for text in texts]
+        return len(self._lookup(digests))
+
+    def embed_documents(self, texts: Sequence[str]) -> list[list[float]]:
+        documents = [str(text) for text in texts]
+        if not documents:
+            return []
+        digests = [self.content_sha256(text) for text in documents]
+        cached = self._lookup(digests)
+        missing_by_digest: dict[str, str] = {}
+        for digest, text in zip(digests, documents):
+            if digest not in cached:
+                missing_by_digest.setdefault(digest, text)
+
+        if missing_by_digest:
+            missing_digests = list(missing_by_digest)
+            missing_texts = [missing_by_digest[digest] for digest in missing_digests]
+            vectors = list(self._provider.embed_documents(missing_texts))
+            if len(vectors) != len(missing_texts):
+                raise ValueError(
+                    "embedding provider returned "
+                    f"{len(vectors)} vectors for {len(missing_texts)} texts"
+                )
+            encoded = [self._encode_vector(vector) for vector in vectors]
+            with self._connect() as connection:
+                connection.executemany(
+                    """
+                    INSERT OR IGNORE INTO embedding_cache (
+                        provider, model, content_sha256, vector_dim, vector_f64_le
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            self.provider_id,
+                            self.model_id,
+                            digest,
+                            dimension,
+                            sqlite3.Binary(payload),
+                        )
+                        for digest, (dimension, payload) in zip(missing_digests, encoded)
+                    ],
+                )
+            # Another shard may have won INSERT OR IGNORE. Re-read so every
+            # caller observes the first vector set durably stored for the key.
+            cached.update(self._lookup(missing_digests))
+
+        try:
+            return [list(cached[digest]) for digest in digests]
+        except KeyError as exc:  # pragma: no cover - defensive storage failure
+            raise RuntimeError("embedding cache did not retain a populated key") from exc
+
+    def embed_query(self, text: str) -> list[float]:
+        return self._provider.embed_query(text)
+
+    def __getattr__(self, name: str):
+        return getattr(self._provider, name)
+
+
+def _maybe_cache_harness_provider(provider, *, provider_name: str):
+    cache_path = os.environ.get(EMBED_CACHE_ENV)
+    if cache_path is None:
+        return provider
+    if not cache_path.strip():
+        raise ValueError(f"{EMBED_CACHE_ENV} must be a non-empty SQLite path")
+    return ContentHashEmbeddingCache(
+        provider,
+        cache_path,
+        provider_id=provider_name,
+        model_id=str(getattr(provider, "model_id", "")),
+    )
+
+
 def _fastembed_cache_dir() -> str | None:
     """Cache dir for FastEmbed models, honoring an env override.
 
@@ -178,17 +358,26 @@ def _fastembed_cache_dir() -> str | None:
     return override or None
 
 
-def resolve_harness_provider(provider: str, model: str, *, timeout: float = 300.0):
+def resolve_harness_provider(
+    provider: str,
+    model: str,
+    *,
+    timeout: float = 300.0,
+    use_embed_cache: bool = True,
+    warmup: bool = True,
+):
     """Return a WARMED embedder for ``provider``. ``stub`` stays fully offline.
 
     Non-stub providers are warmed up once here so ``.dim`` is populated (FastEmbed
     reports dim only after the first embed) and any model download happens before
     the scoring loop rather than inside a per-question deadline.
     """
+    resolved = None
     if provider == "stub":
-        return StubEmbedder()
-    _ensure_hermes_lcm_package()
-    if not model:
+        resolved = StubEmbedder()
+    else:
+        _ensure_hermes_lcm_package()
+    if provider != "stub" and not model:
         raise ValueError(f"--model is required for --provider {provider}")
     if provider in {"fastembed", "fast-embed"}:
         from hermes_lcm.embedding_provider import EmbeddingSpendGuard, FastembedProvider
@@ -196,28 +385,31 @@ def resolve_harness_provider(provider: str, model: str, *, timeout: float = 300.
         # max_calls=0 disables the per-minute call-rate guard, matching the
         # bulk-backfill contract (resolve_provider(for_backfill=True)); the
         # harness embeds thousands of summaries in one pass.
-        embedder = FastembedProvider(
+        resolved = FastembedProvider(
             model,
             cache_dir=_fastembed_cache_dir(),
             timeout=timeout,
             spend_guard=EmbeddingSpendGuard(max_calls=0),
         )
-        embedder.warmup()
-        return embedder
-    from hermes_lcm.config import LCMConfig
-    from hermes_lcm.embedding_provider import resolve_provider
+        if warmup:
+            resolved.warmup()
+    elif provider != "stub":
+        from hermes_lcm.config import LCMConfig
+        from hermes_lcm.embedding_provider import resolve_provider
 
-    config = LCMConfig(
-        embedding_provider=provider,
-        embedding_model=model,
-        embedding_backfill_timeout_s=timeout,
-    )
-    resolved = resolve_provider(config, for_backfill=True)
+        config = LCMConfig(
+            embedding_provider=provider,
+            embedding_model=model,
+            embedding_backfill_timeout_s=timeout,
+        )
+        resolved = resolve_provider(config, for_backfill=True)
     if resolved is None:
         raise ValueError(f"could not resolve embedding provider {provider!r}")
-    if int(getattr(resolved, "dim", 0)) == 0:
+    if warmup and provider != "stub" and int(getattr(resolved, "dim", 0)) == 0:
         resolved.embed_query("warmup")
-    return resolved
+    if not use_embed_cache:
+        return resolved
+    return _maybe_cache_harness_provider(resolved, provider_name=provider)
 
 
 # --------------------------------------------------------------------------- #
@@ -635,6 +827,17 @@ class PreparedDataset:
         for entry in self._selected_entries(limit):
             yield parse_question(self._read_entry(entry))
 
+    def iter_question_ids(self, question_ids: Sequence[str]) -> Iterator[Question]:
+        """Yield an explicit manifest-selected subset in caller order."""
+        by_id = {entry["question_id"]: entry for entry in self.questions}
+        for question_id in question_ids:
+            entry = by_id.get(str(question_id))
+            if entry is None:
+                raise ValueError(
+                    f"shard question id is absent from prepared dataset: {question_id!r}"
+                )
+            yield parse_question(self._read_entry(entry))
+
 
 def load_prepared_dataset(
     prepared_dir: str | Path, *, dataset_label: str
@@ -760,6 +963,180 @@ def deterministic_session_summary(turns: Sequence[dict[str, Any]], *, max_chars:
         # session gets a deterministic non-empty placeholder instead.
         return "(empty session)"
     return condensed[:max_chars]
+
+
+def iter_ingest_embedding_request_units(question: Question) -> Iterator[str]:
+    """Yield every exact document string embedded during one question's ingest.
+
+    Raw conversational chunks are sent one document at a time; deterministic
+    session summaries are sent as a batch, but each batch item remains one
+    independently keyed Voyage document request unit.
+    """
+    _ensure_hermes_lcm_package()
+    from hermes_lcm.chunking import iter_message_chunks
+
+    next_store_id = 1
+    for session in question.haystack_sessions:
+        messages = [
+            {
+                "role": str(turn.get("role", "user")) if isinstance(turn, dict) else "user",
+                "content": turn.get("content", "") if isinstance(turn, dict) else str(turn),
+            }
+            for turn in session
+        ]
+        if messages:
+            rows = [
+                {
+                    "store_id": store_id,
+                    "role": message["role"],
+                    "content": message["content"],
+                }
+                for store_id, message in zip(
+                    range(next_store_id, next_store_id + len(messages)), messages
+                )
+            ]
+            next_store_id += len(messages)
+            for chunk in iter_message_chunks(rows, policy="conversational"):
+                yield str(chunk.text)
+        yield deterministic_session_summary(session)
+
+
+def load_shard_question_ids(shards_manifest: str | Path) -> tuple[str, ...]:
+    """Load ordered qids from one shard manifest or a directory of shard manifests."""
+    path = Path(shards_manifest)
+    if path.is_dir():
+        manifest_paths = sorted(path.glob("shard-*/manifest.json"))
+        if not manifest_paths and (path / "manifest.json").is_file():
+            manifest_paths = [path / "manifest.json"]
+    elif path.is_file():
+        manifest_paths = [path]
+    else:
+        raise ValueError(f"shards manifest not found: {path}")
+    if not manifest_paths:
+        raise ValueError(f"no shard manifests found under: {path}")
+
+    question_ids: list[str] = []
+    seen: set[str] = set()
+    for manifest_path in manifest_paths:
+        try:
+            manifest = json.loads(manifest_path.read_bytes())
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"invalid shard manifest: {manifest_path}") from exc
+        raw_questions = manifest.get("questions") if isinstance(manifest, dict) else None
+        if not isinstance(raw_questions, list):
+            raise ValueError(f"shard manifest questions must be a list: {manifest_path}")
+        for entry in raw_questions:
+            question_id = str(entry.get("question_id", "")) if isinstance(entry, dict) else ""
+            if not question_id:
+                raise ValueError(f"invalid shard question entry: {manifest_path}")
+            if question_id in seen:
+                raise ValueError(f"duplicate question id across shard manifests: {question_id!r}")
+            seen.add(question_id)
+            question_ids.append(question_id)
+    return tuple(question_ids)
+
+
+def prewarm_embedding_cache(
+    questions: Iterable[Question],
+    provider: ContentHashEmbeddingCache,
+    *,
+    progress_every: int = 100,
+    progress: Callable[[int], None] | None = None,
+) -> dict[str, Any]:
+    """Populate all unique ingest document units, skipping already-cached keys."""
+    if not isinstance(provider, ContentHashEmbeddingCache):
+        raise ValueError(f"{EMBED_CACHE_ENV} must be set for prewarm-cache")
+    if progress_every <= 0:
+        raise ValueError("progress_every must be positive")
+
+    seen: set[str] = set()
+    batch: list[str] = []
+    already_cached = 0
+    processed = 0
+
+    def flush_batch() -> None:
+        nonlocal already_cached, processed
+        if not batch:
+            return
+        already_cached += provider.cached_count(batch)
+        provider.embed_documents(batch)
+        processed += len(batch)
+        if progress is not None:
+            progress(processed)
+        batch.clear()
+
+    for question in questions:
+        for text in iter_ingest_embedding_request_units(question):
+            digest = provider.content_sha256(text)
+            if digest in seen:
+                continue
+            seen.add(digest)
+            batch.append(text)
+            if len(batch) == progress_every:
+                flush_batch()
+    flush_batch()
+    return {
+        "provider": provider.provider_id,
+        "model": provider.model_id,
+        "cache_path": str(provider.cache_path),
+        "unique_request_units": len(seen),
+        "already_cached": already_cached,
+        "populated": len(seen) - already_cached,
+    }
+
+
+def embedding_determinism_report(
+    questions: Iterable[Question],
+    provider,
+    *,
+    sample_size: int = 20,
+    seed: int = 0,
+) -> dict[str, Any]:
+    """Embed random unique session summaries twice and compare float bits."""
+    if sample_size <= 0:
+        raise ValueError("sample_size must be positive")
+    unique: dict[str, str] = {}
+    for question in questions:
+        for session in question.haystack_sessions:
+            text = deterministic_session_summary(session)
+            digest = ContentHashEmbeddingCache.content_sha256(text)
+            unique.setdefault(digest, text)
+    if len(unique) < sample_size:
+        raise ValueError(
+            f"determinism probe needs {sample_size} unique sessions; found {len(unique)}"
+        )
+
+    sampled_digests = random.Random(seed).sample(list(unique), sample_size)
+    sampled_texts = [unique[digest] for digest in sampled_digests]
+    first = _embed_in_batches(provider, sampled_texts)
+    second = _embed_in_batches(provider, sampled_texts)
+    if len(first) != sample_size or len(second) != sample_size:
+        raise ValueError("determinism probe provider returned the wrong vector count")
+
+    identical = 0
+    max_abs_diff = 0.0
+    for left, right in zip(first, second):
+        if len(left) != len(right):
+            raise ValueError("determinism probe vector dimensions changed")
+        left_bits = struct.pack(f"<{len(left)}d", *(float(value) for value in left))
+        right_bits = struct.pack(f"<{len(right)}d", *(float(value) for value in right))
+        if left_bits == right_bits:
+            identical += 1
+        for left_value, right_value in zip(left, right):
+            difference = abs(float(left_value) - float(right_value))
+            if not math.isfinite(difference):
+                raise ValueError("determinism probe received a non-finite vector value")
+            max_abs_diff = max(max_abs_diff, difference)
+    return {
+        "provider": str(getattr(provider, "provider_id", "")),
+        "model": str(getattr(provider, "model_id", "")),
+        "sample_size": sample_size,
+        "seed": seed,
+        "sample_content_sha256": sampled_digests,
+        "bitwise_identical_count": identical,
+        "non_identical_count": sample_size - identical,
+        "max_abs_diff": max_abs_diff,
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -1881,6 +2258,8 @@ def run_harness(
         embedding_batch_size=effective_embedding_batch_size,
     )
 
+    if resume and checkpoint_path is None:
+        raise ValueError("resume=True requires a checkpoint_path")
     checkpoint_records: list[dict[str, Any]] = []
     if checkpoint_path is not None:
         checkpoint_path = Path(checkpoint_path)
@@ -1951,6 +2330,13 @@ def run_harness(
         checkpoint_file = checkpoint_path.open("a" if resume else "w", encoding="utf-8")
         if not resume:
             _write_checkpoint_record(checkpoint_file, expected_checkpoint_header)
+            # Make the directory ENTRY durable too — record fsyncs alone don't
+            # survive a crash that predates the dirent reaching disk.
+            dir_fd = os.open(str(checkpoint_path.parent), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
 
     observed_question_ids: set[str] = set()
     try:

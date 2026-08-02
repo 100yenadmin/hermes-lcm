@@ -293,7 +293,8 @@ def test_checkpoint_is_fsynced_after_header_and_each_completed_question(
     )
     assert [record["question_id"] for record in records[1:]] == ["q0", "q1"]
     assert records[1]["arms"]["fts"]["recall@1"] == 1.0
-    assert len(fsync_calls) == 3
+    # Header file + newly-created directory entry + two completed questions.
+    assert len(fsync_calls) == 4
 
 
 def test_question_checkpoint_record_does_not_mutate_scored_input():
@@ -354,6 +355,49 @@ def test_resume_report_is_identical_to_uninterrupted_report(tmp_path, monkeypatc
         json.dumps(resumed, indent=2, sort_keys=True), encoding="utf-8"
     )
     assert resumed_report.read_bytes() == uninterrupted_report.read_bytes()
+
+
+def test_resume_with_abstention_question_reproduces_report(tmp_path, monkeypatch):
+    # The abstention branch (scored is None -> abstention record, arms {}) must
+    # checkpoint and reseed exactly like scored questions.
+    questions = [_question("q0"), _question("q1_abs"), _question("q2")]
+    full_checkpoint = tmp_path / "full.jsonl"
+    resumed_checkpoint = tmp_path / "resumed.jsonl"
+    monkeypatch.setattr(lme.time, "strftime", lambda *_args, **_kwargs: "fixed-time")
+    monkeypatch.setattr(
+        lme, "evaluate_question", lambda question, *_args, **_kwargs: _scored(question.question_id)
+    )
+    uninterrupted = _run_with_checkpoint(tmp_path, questions, full_checkpoint)
+
+    def _crash_on_q2(question, *_args, **_kwargs):
+        if question.question_id == "q2":
+            raise RuntimeError("simulated crash")
+        return _scored(question.question_id)
+
+    monkeypatch.setattr(lme, "evaluate_question", _crash_on_q2)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        _run_with_checkpoint(tmp_path, questions, resumed_checkpoint)
+
+    abstention_lines = [
+        json.loads(line)
+        for line in resumed_checkpoint.read_text(encoding="utf-8").splitlines()
+        if '"q1_abs"' in line
+    ]
+    assert len(abstention_lines) == 1
+    assert abstention_lines[0]["abstention"] is True
+    assert abstention_lines[0]["arms"] == {}
+
+    monkeypatch.setattr(
+        lme, "evaluate_question", lambda question, *_args, **_kwargs: _scored(question.question_id)
+    )
+    resumed = _run_with_checkpoint(
+        tmp_path,
+        questions,
+        resumed_checkpoint,
+        resume=True,
+        selected_question_ids=[question.question_id for question in questions],
+    )
+    assert resumed == uninterrupted
 
 
 def test_resume_drops_torn_final_line_and_reruns_that_question(
