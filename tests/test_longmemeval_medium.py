@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import platform
 import sqlite3
 import sys
 import tempfile
@@ -22,6 +23,13 @@ _BANKED_METRICS = (
     / "benchmarks"
     / "results"
     / "longmemeval-v3-500q-fastembed-metrics.json"
+)
+
+# The banked golden SHA below was recorded on Darwin arm64.
+_GOLDEN_PLATFORM = ("darwin", "arm64")
+_GOLDEN_REGEN_COMMAND = (
+    "uv run --with pytest --with ijson python3 -m pytest "
+    "tests/test_longmemeval_medium.py::test_small_default_cli_report_is_byte_identical_to_golden"
 )
 
 
@@ -460,6 +468,12 @@ def test_evaluate_question_keeps_session_insertion_order_when_summary_embedding_
 # caveat, but rounding the emitted metrics would itself change the banked schema.
 def test_small_default_cli_report_is_byte_identical_to_golden(tmp_path, monkeypatch):
     """Freeze CLI-emitted bytes; regenerate only from the pinned banked platform."""
+    current_platform = (sys.platform, platform.machine())
+    if current_platform != _GOLDEN_PLATFORM:
+        pytest.skip(
+            f"golden bytes were recorded on Darwin arm64; regenerate with: "
+            f"{_GOLDEN_REGEN_COMMAND}"
+        )
     cli = _load_cli()
     monkeypatch.delenv("LCM_EMBEDDING_MAX_BATCH_ITEMS", raising=False)
     _zero_timing(monkeypatch)

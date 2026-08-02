@@ -378,13 +378,15 @@ python scripts/lcm_longmemeval.py fetch --output /path/to/longmemeval-data
 
 The medium tier uses the streaming prepared format so the multi-gigabyte corpus
 is never fully materialized in memory. Fetch, prepare, then run it as three
-explicit operator steps:
+explicit operator steps. The prepare step requires `ijson`; the command below
+supplies it with `uv run --with ijson`, or you can first run
+`python -m pip install ijson` and invoke the script with `python` instead:
 
 ```bash
 python scripts/lcm_longmemeval.py fetch \
   --dataset-label m \
   --output /path/to/longmemeval-data
-python scripts/lcm_longmemeval.py prepare \
+uv run --with ijson python scripts/lcm_longmemeval.py prepare \
   --dataset /path/to/longmemeval-data/longmemeval_m \
   --dataset-label m \
   --prepared-dir /path/to/longmemeval-prepared \

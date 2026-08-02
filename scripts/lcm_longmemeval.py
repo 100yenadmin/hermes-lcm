@@ -158,6 +158,12 @@ def _cmd_run(args: argparse.Namespace) -> int:
     if args.limit is not None and args.limit <= 0:
         raise SystemExit("--limit must be a positive integer")
     output_dir = _validate_output_path(Path(args.output), allow_external=args.allow_external_output)
+    if args.prepared_dir is not None:
+        prepared_dir = Path(args.prepared_dir).resolve()
+        if output_dir.is_relative_to(prepared_dir):
+            raise SystemExit(
+                f"Refusing --output equal to or inside --prepared-dir: {output_dir}"
+            )
     output_dir.mkdir(parents=True, exist_ok=True)
 
     try:
@@ -193,25 +199,34 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 if args.limit is None
                 else min(prepared.question_count, args.limit)
             )
+            # Consume a bounded qid-only preflight before scoring so a short or
+            # reordered prepared iterator fails before an expensive medium run.
+            prepared.validate_question_ids(limit=args.limit)
             questions = prepared.iter_questions(limit=args.limit)
     except (OSError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc
 
-    with tempfile.TemporaryDirectory(prefix="lcm-longmemeval-") as tmp:
-        tmp_dir = Path(tmp)
-        os.environ.setdefault("HERMES_HOME", str(tmp_dir / "hermes-home"))
-        report = run_harness(
-            questions,
-            provider_name=args.provider,
-            model=args.model,
-            tmp_dir=tmp_dir,
-            use_rerank=args.rerank,
-            reuse_db_template=args.reuse_db_template,
-            question_count=question_count,
-            dataset_label=args.dataset_label,
-            source_sha256=source_sha256,
-            manifest_sha256=manifest_sha256,
-        )
+    # PreparedDataset.iter_questions is lazy: checksum and id failures occur
+    # only while run_harness consumes it. Keep that consumption inside the
+    # same clean CLI error boundary as the initial load/manifest checks.
+    try:
+        with tempfile.TemporaryDirectory(prefix="lcm-longmemeval-") as tmp:
+            tmp_dir = Path(tmp)
+            os.environ.setdefault("HERMES_HOME", str(tmp_dir / "hermes-home"))
+            report = run_harness(
+                questions,
+                provider_name=args.provider,
+                model=args.model,
+                tmp_dir=tmp_dir,
+                use_rerank=args.rerank,
+                reuse_db_template=args.reuse_db_template,
+                question_count=question_count,
+                dataset_label=args.dataset_label,
+                source_sha256=source_sha256,
+                manifest_sha256=manifest_sha256,
+            )
+    except (OSError, ValueError) as exc:
+        raise SystemExit(str(exc)) from exc
 
     metrics_path = output_dir / "longmemeval_metrics.json"
     metrics_path.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")

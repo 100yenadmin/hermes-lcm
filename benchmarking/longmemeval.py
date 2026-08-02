@@ -337,8 +337,25 @@ def _iter_dataset_rows(source) -> Iterator[dict[str, Any]]:
             if not isinstance(row, dict):
                 raise ValueError("LongMemEval dataset entries must be JSON objects")
             yield row
-    except ijson.JSONError as exc:
-        raise ValueError("invalid LongMemEval dataset JSON") from exc
+    except (ijson.JSONError, ValueError, KeyError, TypeError) as exc:
+        detail = str(exc).strip()
+        offset = next(
+            (
+                getattr(exc, attribute, None)
+                for attribute in ("pos", "position", "offset")
+                if getattr(exc, attribute, None) is not None
+            ),
+            None,
+        )
+        if offset is not None and str(offset) not in detail:
+            detail = f"{detail} (offset {offset})" if detail else f"offset {offset}"
+        message = "invalid LongMemEval dataset JSON"
+        if detail:
+            # Backend builders may report their byte/character offset only in
+            # the exception text. Preserve that context while normalizing the
+            # backend-specific exception type for callers.
+            message = f"{message}: {detail}"
+        raise ValueError(message) from exc
 
 
 def _question_filename(question_id: str) -> str:
@@ -428,20 +445,60 @@ class PreparedDataset:
     question_count: int
     questions: tuple[dict[str, str], ...]
 
-    def iter_questions(self, *, limit: int | None = None) -> Iterator[Question]:
+    def _selected_entries(self, limit: int | None) -> tuple[dict[str, str], ...]:
         if limit is not None and limit <= 0:
             raise ValueError("--limit must be a positive integer")
-        entries = self.questions if limit is None else self.questions[:limit]
-        for entry in entries:
-            path = self.directory / entry["file"]
-            payload = path.read_bytes()
-            actual_sha = hashlib.sha256(payload).hexdigest()
-            if actual_sha != entry["sha256"]:
-                raise ValueError(f"prepared question checksum mismatch: {entry['file']}")
+        return self.questions if limit is None else self.questions[:limit]
+
+    def _read_entry(self, entry: dict[str, str]) -> dict[str, Any]:
+        path = self.directory / entry["file"]
+        payload = path.read_bytes()
+        actual_sha = hashlib.sha256(payload).hexdigest()
+        if actual_sha != entry["sha256"]:
+            raise ValueError(f"prepared question checksum mismatch: {entry['file']}")
+        try:
             raw = json.loads(payload)
-            if str(raw.get("question_id", "")) != entry["question_id"]:
-                raise ValueError(f"prepared question id mismatch: {entry['file']}")
-            yield parse_question(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"invalid prepared question JSON: {entry['file']}") from exc
+        if not isinstance(raw, dict):
+            raise ValueError(f"prepared question must be a JSON object: {entry['file']}")
+        if str(raw.get("question_id", "")) != entry["question_id"]:
+            raise ValueError(f"prepared question id mismatch: {entry['file']}")
+        return raw
+
+    def validate_question_ids(self, *, limit: int | None = None) -> None:
+        """Preflight the lazy reader against the manifest qid sequence.
+
+        The pass deliberately retains only one decoded question at a time. A
+        short, corrupt, or mismatched iterator therefore fails before the
+        scoring harness starts without materializing the medium corpus.
+        """
+        expected_entries = self._selected_entries(limit)
+        actual = iter(self.iter_questions(limit=limit))
+        for entry in expected_entries:
+            try:
+                question = next(actual)
+            except StopIteration as exc:
+                raise ValueError(
+                    "prepared question sequence ended early: "
+                    f"expected {entry['question_id']!r}"
+                ) from exc
+            if question.question_id != entry["question_id"]:
+                raise ValueError(
+                    "prepared question sequence id mismatch: "
+                    f"expected {entry['question_id']!r}, got {question.question_id!r}"
+                )
+        try:
+            extra = next(actual)
+        except StopIteration:
+            return
+        raise ValueError(
+            f"prepared question sequence has unexpected extra id: {extra.question_id!r}"
+        )
+
+    def iter_questions(self, *, limit: int | None = None) -> Iterator[Question]:
+        for entry in self._selected_entries(limit):
+            yield parse_question(self._read_entry(entry))
 
 
 def load_prepared_dataset(
@@ -1328,10 +1385,11 @@ def _embedding_batch_size() -> int:
     raw = os.environ.get("LCM_EMBEDDING_MAX_BATCH_ITEMS")
     if raw is None:
         return EMBED_BATCH_SIZE
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise ValueError("LCM_EMBEDDING_MAX_BATCH_ITEMS must be an integer") from exc
+    if re.fullmatch(r"[0-9]+", raw) is None:
+        raise ValueError(
+            "LCM_EMBEDDING_MAX_BATCH_ITEMS must be an integer; must match ^[0-9]+$"
+        )
+    value = int(raw)
     if value <= 0:
         raise ValueError("LCM_EMBEDDING_MAX_BATCH_ITEMS must be positive")
     return value
