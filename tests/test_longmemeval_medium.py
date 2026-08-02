@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import hashlib
-import importlib.util
 import json
+import os
 import platform
 import sqlite3
 import sys
@@ -16,14 +16,15 @@ from types import SimpleNamespace
 import pytest
 
 import benchmarking.longmemeval as lme
-
-_SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "lcm_longmemeval.py"
+from tests.conftest import load_cli as _load_cli
 _BANKED_METRICS = (
     Path(__file__).resolve().parents[1]
     / "benchmarks"
     / "results"
     / "longmemeval-v3-500q-fastembed-metrics.json"
 )
+_REAL_DATASET = os.environ.get("LME_M_REAL_DATASET")
+_REAL_DATASET_PATH = Path(_REAL_DATASET) if _REAL_DATASET else None
 
 # The banked golden SHA below was recorded on Darwin arm64.
 _GOLDEN_PLATFORM = ("darwin", "arm64")
@@ -31,13 +32,6 @@ _GOLDEN_REGEN_COMMAND = (
     "uv run --with pytest --with ijson python3 -m pytest "
     "tests/test_longmemeval_medium.py::test_small_default_cli_report_is_byte_identical_to_golden"
 )
-
-
-def _load_cli():
-    spec = importlib.util.spec_from_file_location("lcm_longmemeval_medium_cli", _SCRIPT)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
 
 
 def _raw_question(index: int) -> dict:
@@ -126,6 +120,52 @@ def test_prepare_streams_and_writes_checksum_manifest(tmp_path, monkeypatch):
         "manifest.json",
         "q0.json",
     ]
+
+
+@pytest.mark.parametrize(
+    ("root", "root_pattern"),
+    [({"item": [_raw_question(0)]}, r"got object"), (17, r"got scalar \(number\)")],
+)
+def test_prepare_rejects_non_array_roots(tmp_path, root, root_pattern):
+    pytest.importorskip("ijson", reason="prepare path requires ijson; the run env installs it explicitly")
+    source = tmp_path / lme.DATASET_COORDS["m"]["file"]
+    source.write_text(json.dumps(root), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=rf"dataset root must be a JSON array; {root_pattern}"):
+        lme.prepare_dataset(source, tmp_path / "prepared", dataset_label="m")
+
+
+@pytest.mark.skipif(
+    _REAL_DATASET_PATH is None or not _REAL_DATASET_PATH.is_file(),
+    reason="set LME_M_REAL_DATASET to an existing real longmemeval_m JSON file",
+)
+def test_real_medium_prepare_first_three_round_trip(tmp_path):
+    ijson = pytest.importorskip("ijson")
+    first_three = []
+    with _REAL_DATASET_PATH.open("rb") as source:
+        for row in ijson.items(source, "item", use_float=True):
+            first_three.append(row)
+            if len(first_three) == 3:
+                break
+    assert len(first_three) == 3
+
+    source = tmp_path / lme.DATASET_COORDS["m"]["file"]
+    source.write_text(json.dumps(first_three) + "\n", encoding="utf-8")
+    prepared_dir = tmp_path / "prepared"
+    manifest = lme.prepare_dataset(source, prepared_dir, dataset_label="m")
+    prepared = lme.load_prepared_dataset(prepared_dir, dataset_label="m")
+    questions = list(prepared.iter_questions())
+
+    assert [question.question_id for question in questions] == [
+        str(row["question_id"]) for row in first_three
+    ]
+    for row, question, entry in zip(first_three, questions, manifest["questions"]):
+        assert question.question_type == str(row["question_type"])
+        assert question.question == str(row["question"])
+        assert question.haystack_session_ids == [str(value) for value in row["haystack_session_ids"]]
+        assert question.haystack_sessions == row["haystack_sessions"]
+        assert question.answer_session_ids == [str(value) for value in row["answer_session_ids"]]
+        assert lme.sha256_file(prepared_dir / entry["file"]) == entry["sha256"]
 
 
 def test_prepared_manifest_fails_closed_on_label_count_and_content_mismatch(tmp_path):
@@ -509,6 +549,9 @@ def test_small_default_cli_report_is_byte_identical_to_golden(tmp_path, monkeypa
     assert "source_sha256" not in report["dataset"]
     assert "manifest_sha256" not in report["dataset"]
     assert "embedding_batch_size" not in report["ingest"]
+    # This full-report byte hash is intentional. If it legitimately breaks, run the
+    # CLI on the pinned platform, verify the dataset block field-by-field, then re-bank
+    # the hash and golden file together in the same commit.
     assert hashlib.sha256(report_bytes).hexdigest() == (
         "b8952714d53f1ae819770c513d42421cdf6396bced2dc03f2aa8ca8b2209bc07"
     )

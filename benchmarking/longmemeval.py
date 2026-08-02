@@ -24,6 +24,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import logging
 import math
 import os
 import re
@@ -39,6 +40,7 @@ from typing import Any, Iterable, Iterator, Sequence
 from .standalone import ensure_agent_context_engine_importable
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
+_LOGGER = logging.getLogger(__name__)
 
 BENCHMARK_VERSION = 1
 SCHEMA_VERSION = 1
@@ -72,6 +74,7 @@ DATASET_COORDS = {
 }
 PREPARED_MANIFEST_SCHEMA_VERSION = 1
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_IJSON_MIN_VERSION = (3, 2)
 
 PROVIDERS = ("stub", "fastembed", "voyage", "ollama")
 # ``chunk_vectors`` scores the raw-chunk KNN corpus; ``hybrid_rrf3`` fuses it as a
@@ -324,20 +327,82 @@ class _HashingReader:
         return self._digest.hexdigest()
 
 
-def _iter_dataset_rows(source) -> Iterator[dict[str, Any]]:
-    """Incrementally yield top-level array items from a LongMemEval corpus."""
+def _require_ijson():
     try:
         import ijson
     except ImportError as exc:
         raise RuntimeError(
             "ijson is required for `prepare`; install it for that command only"
         ) from exc
+
+    installed = getattr(ijson, "__version__", None)
+    if installed is None:
+        try:
+            from importlib.metadata import version
+
+            installed = version("ijson")
+        except Exception:
+            installed = None
+    if installed is not None:
+        match = re.match(r"^(\d+)\.(\d+)", str(installed))
+        if match and tuple(map(int, match.groups())) < _IJSON_MIN_VERSION:
+            raise RuntimeError(
+                "ijson >= 3.2 is required for `prepare`; "
+                f"found ijson {installed!r}"
+            )
+    return ijson
+
+
+def _root_type(event: str | None) -> str:
+    return {
+        "start_map": "object",
+        "start_array": "array",
+        "string": "scalar (string)",
+        "number": "scalar (number)",
+        "boolean": "scalar (boolean)",
+        "null": "scalar (null)",
+    }.get(event or "", "empty input")
+
+
+def _peek_dataset_root(source_path: Path) -> None:
+    ijson = _require_ijson()
+    try:
+        with source_path.open("rb") as source:
+            first = next(ijson.parse(source, use_float=True), None)
+    except TypeError as exc:
+        raise RuntimeError(
+            "ijson >= 3.2 is required for `prepare`; "
+            "upgrade it for that command only"
+        ) from exc
+    except ijson.JSONError as exc:
+        detail = str(exc).strip()
+        message = "invalid LongMemEval dataset JSON"
+        if detail:
+            message = f"{message}: {detail}"
+        raise ValueError(message) from exc
+
+    if first != ("", "start_array", None):
+        event = first[1] if first is not None else None
+        raise ValueError(
+            "LongMemEval dataset root must be a JSON array; "
+            f"got {_root_type(event)}"
+        )
+
+
+def _iter_dataset_rows(source) -> Iterator[dict[str, Any]]:
+    """Incrementally yield top-level array items from a LongMemEval corpus."""
+    ijson = _require_ijson()
     try:
         for row in ijson.items(source, "item", use_float=True):
             if not isinstance(row, dict):
                 raise ValueError("LongMemEval dataset entries must be JSON objects")
             yield row
-    except (ijson.JSONError, ValueError, KeyError, TypeError) as exc:
+    except TypeError as exc:
+        raise RuntimeError(
+            "ijson >= 3.2 is required for `prepare`; "
+            "upgrade it for that command only"
+        ) from exc
+    except (ijson.JSONError, ValueError, KeyError) as exc:
         detail = str(exc).strip()
         offset = next(
             (
@@ -381,21 +446,43 @@ def prepare_dataset(
     *,
     dataset_label: str,
 ) -> dict[str, Any]:
-    """Stream a corpus into checksum-addressed, per-question prepared files."""
+    """Stream a corpus into checksum-addressed, per-question prepared files.
+
+    The hidden ``.{name}.prepare-*`` staging directory is adjacent to the
+    destination and renamed into place atomically.
+    """
     source_path = Path(source_path)
     validate_dataset_path_label(source_path, dataset_label)
     if not source_path.is_file():
         raise ValueError(f"dataset file not found: {source_path}")
 
     prepared_dir = Path(prepared_dir)
-    prepared_dir.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        prepared_dir.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise OSError(
+            "prepared staging parent is not writable: "
+            f"{prepared_dir.parent} (check --prepared-dir {prepared_dir})"
+        ) from exc
+    if not os.access(prepared_dir.parent, os.W_OK):
+        raise OSError(
+            "prepared staging parent is not writable: "
+            f"{prepared_dir.parent} (check --prepared-dir {prepared_dir})"
+        )
     if prepared_dir.exists():
         if not prepared_dir.is_dir() or any(prepared_dir.iterdir()):
             raise ValueError(f"prepared directory must be empty: {prepared_dir}")
 
-    staging_dir = Path(
-        tempfile.mkdtemp(prefix=f".{prepared_dir.name}.prepare-", dir=prepared_dir.parent)
-    )
+    _peek_dataset_root(source_path)
+    try:
+        staging_dir = Path(
+            tempfile.mkdtemp(prefix=f".{prepared_dir.name}.prepare-", dir=prepared_dir.parent)
+        )
+    except OSError as exc:
+        raise OSError(
+            "could not create prepared staging directory next to "
+            f"{prepared_dir.parent} (check --prepared-dir {prepared_dir})"
+        ) from exc
     try:
         questions: list[dict[str, str]] = []
         seen_ids: set[str] = set()
@@ -417,6 +504,8 @@ def prepare_dataset(
                 )
                 seen_ids.add(question_id)
             source.drain()
+            if not questions:
+                raise ValueError("LongMemEval dataset must contain at least one question")
 
             manifest = {
                 "schema_version": PREPARED_MANIFEST_SCHEMA_VERSION,
@@ -1428,6 +1517,18 @@ def _safe(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip("-._") or "question"
 
 
+def _cleanup_question_db(tmp_dir: Path, question_id: str) -> None:
+    """Remove one question's SQLite database and sidecar files after scoring."""
+    db_path = Path(tmp_dir) / f"{_safe(question_id)}.db"
+    if db_path.name == "_template.db":
+        return
+    for path in (db_path, Path(f"{db_path}-wal"), Path(f"{db_path}-shm")):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            _LOGGER.warning("could not delete LongMemEval question database %s: %s", path, exc)
+
+
 # --------------------------------------------------------------------------- #
 # Aggregation + report.
 # --------------------------------------------------------------------------- #
@@ -1557,6 +1658,7 @@ def run_harness(
             if turn["session_granularity"]:
                 bucket[arm].session_granularity = True
                 overall[arm].session_granularity = True
+        _cleanup_question_db(tmp_dir, question.question_id)
 
     if question_count is not None and consumed_count != question_count:
         raise ValueError(

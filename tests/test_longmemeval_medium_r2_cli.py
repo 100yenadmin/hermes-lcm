@@ -2,21 +2,12 @@
 
 from __future__ import annotations
 
-import importlib.util
 from pathlib import Path
 
 import pytest
 
 import benchmarking.longmemeval as lme
-
-_SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "lcm_longmemeval.py"
-
-
-def _load_cli():
-    spec = importlib.util.spec_from_file_location("lcm_longmemeval_medium_r2_cli", _SCRIPT)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+from tests.conftest import load_cli as _load_cli
 
 
 @pytest.mark.parametrize("value", ["+2", "-2", " 2", "2 ", " 2 ", "\t2", "2\n"])
