@@ -74,6 +74,9 @@ def test_run_converts_lazy_prepared_iterator_errors_to_system_exit(tmp_path, mon
         def validate_question_ids(self, *, limit=None):
             return None
 
+        def selected_question_ids(self, *, limit=None):
+            return ()
+
         def iter_questions(self, *, limit=None):
             def _lazy():
                 raise error

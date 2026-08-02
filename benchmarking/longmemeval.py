@@ -73,6 +73,7 @@ DATASET_COORDS = {
     },
 }
 PREPARED_MANIFEST_SCHEMA_VERSION = 1
+PER_QUESTION_CHECKPOINT_FILENAME = "per_question_checkpoint.jsonl"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _IJSON_MIN_VERSION = (3, 2)
 
@@ -623,6 +624,10 @@ class PreparedDataset:
         }
         if actual_files != expected_files:
             raise ValueError("prepared directory JSON file set does not match manifest")
+
+    def selected_question_ids(self, *, limit: int | None = None) -> tuple[str, ...]:
+        """Return the manifest-selected ids without reading question payloads."""
+        return tuple(entry["question_id"] for entry in self._selected_entries(limit))
 
     def iter_questions(self, *, limit: int | None = None) -> Iterator[Question]:
         for entry in self._selected_entries(limit):
@@ -1612,6 +1617,138 @@ def _aggregate_rerank_mode(mode_counts: dict[str, int]) -> dict[str, Any]:
     }
 
 
+def _load_question_checkpoint(
+    path: Path, *, selected_question_ids: set[str]
+) -> list[dict[str, Any]]:
+    """Load a checkpoint, truncating only a malformed final crash-torn line."""
+    payload = path.read_bytes()
+    lines = payload.splitlines(keepends=True)
+    records: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    offset = 0
+    dropped_torn_line = False
+    for index, raw_line in enumerate(lines):
+        try:
+            record = json.loads(raw_line)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            if index != len(lines) - 1:
+                raise ValueError(
+                    f"invalid checkpoint JSON at line {index + 1}: {path}"
+                ) from exc
+            _LOGGER.warning(
+                "dropping torn final checkpoint line %d from %s; its question will be rerun",
+                index + 1,
+                path,
+            )
+            with path.open("r+b") as checkpoint_file:
+                checkpoint_file.truncate(offset)
+            dropped_torn_line = True
+            break
+        if not isinstance(record, dict):
+            raise ValueError(f"checkpoint line {index + 1} must be a JSON object: {path}")
+        question_id = record.get("question_id")
+        if not isinstance(question_id, str) or not question_id:
+            raise ValueError(f"checkpoint line {index + 1} has no question_id: {path}")
+        if question_id not in selected_question_ids:
+            raise ValueError(
+                f"checkpoint question_id {question_id!r} is not in the selected question set; "
+                f"refusing wrong output directory: {path}"
+            )
+        if question_id in seen:
+            raise ValueError(f"duplicate checkpoint question_id {question_id!r}: {path}")
+        seen.add(question_id)
+        records.append(record)
+        offset += len(raw_line)
+    if payload and not dropped_torn_line and not payload.endswith(b"\n"):
+        # A crash may land after the JSON object but before its newline. Preserve
+        # the valid record and restore the separator before later appends.
+        with path.open("ab") as checkpoint_file:
+            checkpoint_file.write(b"\n")
+    return records
+
+
+def _question_checkpoint_record(
+    question: Question, scored: dict[str, Any] | None
+) -> dict[str, Any]:
+    if scored is None:
+        return {
+            "question_id": question.question_id,
+            "category": question.category,
+            "abstention": True,
+            "rerank_mode": None,
+            "ingest_ms": 0.0,
+            "arms": {},
+        }
+    ingest_ms = scored.pop("ingest_ms", 0.0)
+    rerank_mode = scored["hybrid_rerank"].pop(
+        "rerank_mode", RERANK_MODE_PLACEHOLDER
+    )
+    return {
+        "question_id": question.question_id,
+        "category": question.category,
+        "abstention": False,
+        "rerank_mode": rerank_mode,
+        "ingest_ms": ingest_ms,
+        "arms": scored,
+    }
+
+
+def _accumulate_question_checkpoint(
+    record: dict[str, Any],
+    *,
+    by_category: dict[str, dict[str, ArmSamples]],
+    overall: dict[str, ArmSamples],
+    ingest_samples: list[float],
+    rerank_mode_counts: dict[str, int],
+) -> tuple[int, int]:
+    """Seed aggregate state from one live or resumed per-question record."""
+    if record.get("abstention") is True:
+        return 0, 1
+    if record.get("abstention") is not False:
+        raise ValueError(f"checkpoint question {record.get('question_id')!r} has invalid abstention")
+    category = record.get("category")
+    rerank_mode = record.get("rerank_mode")
+    arms = record.get("arms")
+    if not isinstance(category, str) or not category:
+        raise ValueError(f"checkpoint question {record.get('question_id')!r} has invalid category")
+    if not isinstance(rerank_mode, str) or not rerank_mode:
+        raise ValueError(
+            f"checkpoint question {record.get('question_id')!r} has invalid rerank_mode"
+        )
+    if not isinstance(arms, dict) or set(arms) != set(ARMS):
+        raise ValueError(f"checkpoint question {record.get('question_id')!r} has invalid arms")
+    ingest_ms = record.get("ingest_ms")
+    if not isinstance(ingest_ms, (int, float)) or isinstance(ingest_ms, bool):
+        raise ValueError(f"checkpoint question {record.get('question_id')!r} has invalid ingest_ms")
+
+    ingest_samples.append(float(ingest_ms))
+    rerank_mode_counts[rerank_mode] = rerank_mode_counts.get(rerank_mode, 0) + 1
+    bucket = by_category.setdefault(category, _new_arm_samples())
+    try:
+        for arm in ARMS:
+            metrics = arms[arm]
+            turn = metrics["turn"]
+            for k in (1, 5, 10):
+                bucket[arm].recalls[k].append(metrics[f"recall@{k}"])
+                overall[arm].recalls[k].append(metrics[f"recall@{k}"])
+                bucket[arm].turn_recalls[k].append(turn[f"recall@{k}"])
+                overall[arm].turn_recalls[k].append(turn[f"recall@{k}"])
+            bucket[arm].ndcg10.append(metrics["ndcg@10"])
+            overall[arm].ndcg10.append(metrics["ndcg@10"])
+            bucket[arm].turn_ndcg10.append(turn["ndcg@10"])
+            overall[arm].turn_ndcg10.append(turn["ndcg@10"])
+            bucket[arm].latency_ms.append(metrics["latency_ms"])
+            overall[arm].latency_ms.append(metrics["latency_ms"])
+            if turn["session_granularity"]:
+                bucket[arm].session_granularity = True
+                overall[arm].session_granularity = True
+    except (KeyError, TypeError) as exc:
+        raise ValueError(
+            f"checkpoint question {record.get('question_id')!r} has invalid arm metrics"
+        ) from exc
+    return 1, 0
+
+
 def run_harness(
     questions: Iterable[Question],
     *,
@@ -1625,6 +1762,9 @@ def run_harness(
     dataset_label: str = "s",
     source_sha256: str | None = None,
     manifest_sha256: str | None = None,
+    checkpoint_path: Path | None = None,
+    resume: bool = False,
+    selected_question_ids: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     """Run every arm over every question and return an aggregate-only report."""
     dataset_report: dict[str, Any] = dataset_coordinates(dataset_label)
@@ -1636,6 +1776,27 @@ def run_harness(
         if not _SHA256_RE.fullmatch(manifest_sha256):
             raise ValueError("manifest_sha256 must be a lowercase SHA-256 hex digest")
         dataset_report["manifest_sha256"] = manifest_sha256
+    if resume and selected_question_ids is None:
+        if isinstance(questions, Sequence):
+            selected_question_ids = tuple(question.question_id for question in questions)
+        else:
+            raise ValueError(
+                "selected_question_ids is required to resume a streaming question iterator"
+            )
+    selected_id_sequence = tuple(selected_question_ids or ())
+    selected_ids = set(selected_id_sequence)
+    if resume and len(selected_ids) != len(selected_id_sequence):
+        raise ValueError("selected question ids must be unique when resuming")
+
+    checkpoint_records: list[dict[str, Any]] = []
+    if checkpoint_path is not None:
+        checkpoint_path = Path(checkpoint_path)
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        if resume and checkpoint_path.exists():
+            checkpoint_records = _load_question_checkpoint(
+                checkpoint_path, selected_question_ids=selected_ids
+            )
+
     if embeddings_enabled is None:
         embeddings_enabled = provider_name != "none"
     effective_embedding_batch_size = (
@@ -1669,46 +1830,75 @@ def run_harness(
     rerank_mode_counts: dict[str, int] = {}
     consumed_count = 0
 
-    for question in questions:
-        consumed_count += 1
-        try:
-            if question.is_abstention:
-                abstention_count += 1
+    completed_question_ids = {
+        str(record["question_id"]) for record in checkpoint_records
+    }
+    for record in checkpoint_records:
+        scored_delta, abstention_delta = _accumulate_question_checkpoint(
+            record,
+            by_category=by_category,
+            overall=overall,
+            ingest_samples=ingest_samples,
+            rerank_mode_counts=rerank_mode_counts,
+        )
+        scored_count += scored_delta
+        abstention_count += abstention_delta
+
+    checkpoint_file = None
+    if checkpoint_path is not None:
+        checkpoint_file = checkpoint_path.open("a" if resume else "w", encoding="utf-8")
+
+    observed_question_ids: set[str] = set()
+    try:
+        for question in questions:
+            consumed_count += 1
+            observed_question_ids.add(question.question_id)
+            if resume and question.question_id not in selected_ids:
+                raise ValueError(
+                    f"question_id {question.question_id!r} is not in the selected question set"
+                )
+            if question.question_id in completed_question_ids:
                 continue
-            scored = evaluate_question(
-                question,
-                embedder,
-                provider_name=provider_name,
-                tmp_dir=tmp_dir,
-                embeddings_enabled=embeddings_enabled,
-                use_rerank=use_rerank,
-                db_template=db_template,
-                embedding_batch_size=effective_embedding_batch_size,
-            )
-            scored_count += 1
-            ingest_samples.append(scored.pop("ingest_ms", 0.0))
-            q_mode = scored["hybrid_rerank"].pop("rerank_mode", RERANK_MODE_PLACEHOLDER)
-            rerank_mode_counts[q_mode] = rerank_mode_counts.get(q_mode, 0) + 1
-            category = question.category
-            bucket = by_category.setdefault(category, _new_arm_samples())
-            for arm, metrics in scored.items():
-                turn = metrics["turn"]
-                for k in (1, 5, 10):
-                    bucket[arm].recalls[k].append(metrics[f"recall@{k}"])
-                    overall[arm].recalls[k].append(metrics[f"recall@{k}"])
-                    bucket[arm].turn_recalls[k].append(turn[f"recall@{k}"])
-                    overall[arm].turn_recalls[k].append(turn[f"recall@{k}"])
-                bucket[arm].ndcg10.append(metrics["ndcg@10"])
-                overall[arm].ndcg10.append(metrics["ndcg@10"])
-                bucket[arm].turn_ndcg10.append(turn["ndcg@10"])
-                overall[arm].turn_ndcg10.append(turn["ndcg@10"])
-                bucket[arm].latency_ms.append(metrics["latency_ms"])
-                overall[arm].latency_ms.append(metrics["latency_ms"])
-                if turn["session_granularity"]:
-                    bucket[arm].session_granularity = True
-                    overall[arm].session_granularity = True
-        finally:
-            _cleanup_question_db(tmp_dir, question.question_id)
+            try:
+                scored = None
+                if not question.is_abstention:
+                    scored = evaluate_question(
+                        question,
+                        embedder,
+                        provider_name=provider_name,
+                        tmp_dir=tmp_dir,
+                        embeddings_enabled=embeddings_enabled,
+                        use_rerank=use_rerank,
+                        db_template=db_template,
+                        embedding_batch_size=effective_embedding_batch_size,
+                    )
+                record = _question_checkpoint_record(question, scored)
+                scored_delta, abstention_delta = _accumulate_question_checkpoint(
+                    record,
+                    by_category=by_category,
+                    overall=overall,
+                    ingest_samples=ingest_samples,
+                    rerank_mode_counts=rerank_mode_counts,
+                )
+                scored_count += scored_delta
+                abstention_count += abstention_delta
+                if checkpoint_file is not None:
+                    checkpoint_file.write(
+                        json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
+                    )
+                    checkpoint_file.flush()
+            finally:
+                _cleanup_question_db(tmp_dir, question.question_id)
+    finally:
+        if checkpoint_file is not None:
+            checkpoint_file.close()
+
+    if resume and observed_question_ids != selected_ids:
+        missing = sorted(selected_ids - observed_question_ids)
+        extra = sorted(observed_question_ids - selected_ids)
+        raise ValueError(
+            f"selected question ids do not match consumed questions: missing={missing}, extra={extra}"
+        )
 
     if question_count is not None and consumed_count != question_count:
         raise ValueError(

@@ -27,6 +27,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from benchmarking.longmemeval import (  # noqa: E402
     DATASET_COORDS,
+    PER_QUESTION_CHECKPOINT_FILENAME,
     PROVIDERS,
     dataset_coordinates,
     load_questions_with_sha256,
@@ -98,6 +99,12 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         "from scratch). Mainly for measuring the F7 ingest speedup.",
     )
     run.add_argument("--json", action="store_true", help="Print the metrics JSON to stdout.")
+    run.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from per_question_checkpoint.jsonl in --output, failing closed "
+        "if it belongs to a different question selection.",
+    )
     run.add_argument(
         "--allow-external-output",
         action="store_true",
@@ -192,6 +199,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
             source_sha256 = parsed_sha256 if args.dataset_label != "s" else None
             manifest_sha256 = None
             question_count = len(questions)
+            selected_question_ids = tuple(question.question_id for question in questions)
         else:
             prepared = load_prepared_dataset(
                 Path(args.prepared_dir), dataset_label=args.dataset_label
@@ -206,6 +214,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
             # Consume a bounded qid-only preflight before scoring so a short or
             # reordered prepared iterator fails before an expensive medium run.
             prepared.validate_question_ids(limit=args.limit)
+            selected_question_ids = prepared.selected_question_ids(limit=args.limit)
             questions = prepared.iter_questions(limit=args.limit)
     except (OSError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc
@@ -228,6 +237,9 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 dataset_label=args.dataset_label,
                 source_sha256=source_sha256,
                 manifest_sha256=manifest_sha256,
+                checkpoint_path=output_dir / PER_QUESTION_CHECKPOINT_FILENAME,
+                resume=args.resume,
+                selected_question_ids=selected_question_ids,
             )
     except (OSError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc
