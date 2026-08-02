@@ -48,3 +48,13 @@ exists. Deferred until B3-A's measured effect is known (B3-A alone may capture m
 No store schema migration (prefix-in-content, not a new column) for the benchmark lane; a
 first-class speaker column is a product-roadmap item, not a benchmark prerequisite. No changes
 to role semantics. No judge/rubric changes (the F48 narrowed rubric stays the instrument).
+
+## ADDENDUM 2026-08-02 — §4 zero-spend pre-check EXECUTED: PASS (105.2% vs ≥90% bar)
+conv-26, 199 questions, C1 config (prose FTS + 1:1 quota + 25 slots), control-reproduction
+verified (419/419 messages, all-row content equality). Gold-turn delivery: control 172 →
+prefixed 181 (**105.23%**, orchestrator-recomputed from per_question.csv, exact match).
+Prefixing IMPROVES delivery net +9 (13 questions gained, 5 lost — losses are single-turn
+rank reshuffles). Seam confirmed: speaker present upstream (`locomo/index.ts:191-195`),
+dropped by bridge ingest (`hermes_lcm_bridge.py:512-517`) — B3-A implementation is a small
+bridge change. Zero LLM calls; offline socket guard clean. Artifacts: session-notes
+2026-08-02 `b3a-precheck/artifacts/`. C2 is now fully pre-staged pending C1 banking.
