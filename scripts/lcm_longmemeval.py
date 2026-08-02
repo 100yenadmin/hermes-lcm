@@ -164,6 +164,10 @@ def _cmd_run(args: argparse.Namespace) -> int:
             raise SystemExit(
                 f"Refusing --output equal to or inside --prepared-dir: {output_dir}"
             )
+        if prepared_dir.is_relative_to(output_dir):
+            raise SystemExit(
+                f"Refusing --prepared-dir inside --output (the run could clobber the corpus): {prepared_dir}"
+            )
     output_dir.mkdir(parents=True, exist_ok=True)
 
     try:

@@ -523,7 +523,12 @@ def prepare_dataset(
                         raise ValueError(
                             f"question {question_id!r} field {field!r} must be a list"
                         )
-                question_id = str(raw_question_id)
+                for index, session in enumerate(row["haystack_sessions"]):
+                    if not isinstance(session, list):
+                        raise ValueError(
+                            f"question {question_id!r} haystack_sessions[{index}] "
+                            "must be a list of messages"
+                        )
                 if question_id.casefold() in seen_ids:
                     raise ValueError(
                         f"duplicate question_id in dataset: {question_id!r} "
@@ -556,6 +561,10 @@ def prepare_dataset(
         (staging_dir / "manifest.json").write_text(
             json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
+        if prepared_dir.exists():
+            # Verified empty above; os.replace cannot replace an existing
+            # directory on Windows, so remove the empty target first.
+            prepared_dir.rmdir()
         os.replace(staging_dir, prepared_dir)
         return manifest
     finally:

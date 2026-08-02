@@ -148,6 +148,19 @@ def test_prepare_rejects_non_list_collection_fields_before_publish(tmp_path):
     assert not prepared_dir.exists()
 
 
+def test_prepare_rejects_null_haystack_session_before_publish(tmp_path):
+    pytest.importorskip("ijson", reason="prepare path requires ijson; the run env installs it explicitly")
+    source, rows = _write_dataset(tmp_path, count=1)
+    rows[0]["haystack_sessions"] = [None]
+    source.write_text(json.dumps(rows), encoding="utf-8")
+    prepared_dir = tmp_path / "prepared"
+
+    with pytest.raises(ValueError, match=r"haystack_sessions\[0\] must be a list of messages"):
+        lme.prepare_dataset(source, prepared_dir, dataset_label="m")
+
+    assert not prepared_dir.exists()
+
+
 def test_prepare_rejects_casefold_question_id_collision(tmp_path):
     pytest.importorskip("ijson", reason="prepare path requires ijson; the run env installs it explicitly")
     source, rows = _write_dataset(tmp_path, count=2)
