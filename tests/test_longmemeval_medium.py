@@ -507,13 +507,12 @@ def test_evaluate_question_keeps_session_insertion_order_when_summary_embedding_
 # for the single-platform banked run. Cross-platform libm last-bit drift is a known
 # caveat, but rounding the emitted metrics would itself change the banked schema.
 def test_small_default_cli_report_is_byte_identical_to_golden(tmp_path, monkeypatch):
-    """Freeze CLI-emitted bytes; regenerate only from the pinned banked platform."""
-    current_platform = (sys.platform, platform.machine())
-    if current_platform != _GOLDEN_PLATFORM:
-        pytest.skip(
-            f"golden bytes were recorded on Darwin arm64; regenerate with: "
-            f"{_GOLDEN_REGEN_COMMAND}"
-        )
+    """Freeze CLI-emitted bytes; regenerate only from the pinned banked platform.
+
+    The CLI run, dataset-block, and structural assertions execute on EVERY
+    platform (so CI enforces them); only the final byte-identity hash is
+    gated to the pinned banked platform.
+    """
     cli = _load_cli()
     monkeypatch.delenv("LCM_EMBEDDING_MAX_BATCH_ITEMS", raising=False)
     _zero_timing(monkeypatch)
@@ -549,6 +548,11 @@ def test_small_default_cli_report_is_byte_identical_to_golden(tmp_path, monkeypa
     assert "source_sha256" not in report["dataset"]
     assert "manifest_sha256" not in report["dataset"]
     assert "embedding_batch_size" not in report["ingest"]
+    if (sys.platform, platform.machine()) != _GOLDEN_PLATFORM:
+        pytest.skip(
+            "byte-identity enforced only on the pinned platform (Darwin arm64) — "
+            f"dataset-block/structural assertions ran; regenerate with: {_GOLDEN_REGEN_COMMAND}"
+        )
     # This full-report byte hash is intentional. If it legitimately breaks, run the
     # CLI on the pinned platform, verify the dataset block field-by-field, then re-bank
     # the hash and golden file together in the same commit.
