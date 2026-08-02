@@ -154,7 +154,13 @@ def test_prepare_rejects_trailing_content_after_array(tmp_path):
     source.write_text(json.dumps(rows) + json.dumps([_raw_question(1)]), encoding="utf-8")
     prepared_dir = tmp_path / "prepared"
 
-    with pytest.raises(ValueError, match="trailing content after the top-level array"):
+    # Read-ahead backends (yajl2, python) raise their own trailing-garbage
+    # JSONError before drain() sees the tail; drain()'s check covers backends
+    # that stop at the array close. Either way prepare fails closed.
+    with pytest.raises(
+        ValueError,
+        match="invalid LongMemEval dataset JSON|trailing content after the top-level array",
+    ):
         lme.prepare_dataset(source, prepared_dir, dataset_label="m")
 
     assert not prepared_dir.exists()
