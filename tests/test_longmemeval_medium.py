@@ -135,6 +135,32 @@ def test_prepare_rejects_missing_question_shape_before_publish(tmp_path):
     assert not prepared_dir.exists()
 
 
+def test_prepare_rejects_non_list_collection_fields_before_publish(tmp_path):
+    pytest.importorskip("ijson", reason="prepare path requires ijson; the run env installs it explicitly")
+    source, rows = _write_dataset(tmp_path, count=1)
+    rows[0]["haystack_session_ids"] = None
+    source.write_text(json.dumps(rows), encoding="utf-8")
+    prepared_dir = tmp_path / "prepared"
+
+    with pytest.raises(ValueError, match=r"question 'q0'.*'haystack_session_ids' must be a list"):
+        lme.prepare_dataset(source, prepared_dir, dataset_label="m")
+
+    assert not prepared_dir.exists()
+
+
+def test_prepare_rejects_casefold_question_id_collision(tmp_path):
+    pytest.importorskip("ijson", reason="prepare path requires ijson; the run env installs it explicitly")
+    source, rows = _write_dataset(tmp_path, count=2)
+    rows[1]["question_id"] = "Q0"
+    source.write_text(json.dumps(rows), encoding="utf-8")
+    prepared_dir = tmp_path / "prepared"
+
+    with pytest.raises(ValueError, match=r"duplicate question_id in dataset: 'Q0'"):
+        lme.prepare_dataset(source, prepared_dir, dataset_label="m")
+
+    assert not prepared_dir.exists()
+
+
 @pytest.mark.parametrize(
     ("root", "root_pattern"),
     [({"item": [_raw_question(0)]}, r"got object"), (17, r"got scalar \(number\)")],

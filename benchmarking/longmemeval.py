@@ -521,9 +521,20 @@ def prepare_dataset(
                         raise ValueError(
                             f"question {question_id!r} missing required field {field!r}"
                         )
+                # Mirror the consumption path's collection requirements so a
+                # malformed entry cannot publish and fail later at load time.
+                for field in ("haystack_session_ids", "haystack_sessions", "answer_session_ids"):
+                    if not isinstance(row.get(field), list):
+                        raise ValueError(
+                            f"question {question_id!r} field {field!r} must be a list"
+                        )
                 question_id = str(raw_question_id)
-                if question_id in seen_ids:
-                    raise ValueError(f"duplicate question_id in dataset: {question_id!r}")
+                if question_id.casefold() in seen_ids:
+                    raise ValueError(
+                        f"duplicate question_id in dataset: {question_id!r} "
+                        "(ids are compared case-insensitively; prepared filenames "
+                        "collide on case-insensitive filesystems)"
+                    )
                 filename = _question_filename(question_id)
                 payload = _canonical_json_bytes(row)
                 (staging_dir / filename).write_bytes(payload)
@@ -534,7 +545,7 @@ def prepare_dataset(
                         "sha256": hashlib.sha256(payload).hexdigest(),
                     }
                 )
-                seen_ids.add(question_id)
+                seen_ids.add(question_id.casefold())
             source.drain()
             if not questions:
                 raise ValueError("LongMemEval dataset must contain at least one question")
