@@ -2,7 +2,7 @@
 
 Every number ships with its full run config, variance, fail-close accounting, and known dataset defects — rows that cannot meet the standard do not render.
 
-Generated from `results.jsonl` (sha256: `1b9f6ab91f6afef9375d961f08c2b9f8e74268e1da45ad9d596ac677f1f412b7`, rows: 8)
+Generated from `results.jsonl` (sha256: `9a61109a62be3fbeef2c50b142473ce088133e4d88af7e76414e4c04bc3ed2da`, rows: 9)
 
 ## Summary
 
@@ -16,6 +16,7 @@ Generated from `results.jsonl` (sha256: `1b9f6ab91f6afef9375d961f08c2b9f8e74268e
 | LongMemEval-V1 (S, 500q) | latency_delta_s_per_q | −56.3 s/question vs vanilla (22% faster) | P | 2026-07-29 | [details](#longmemeval-v1-s500-latency-2026-07-29) |
 | LongMemEval-V2 (451q, agentic) | accuracy | 298/451 (66.1%) | P | 2026-07-27 | [details](#longmemeval-v2-451-agentic-2026-07-27) |
 | LongMemEval-V2 (451q, static) | accuracy | 123/451 (27.3%) — official static protocol, fixed weak reader | P | 2026-07-31 | [details](#longmemeval-v2-451-static-2026-07-31) |
+| LongMemEval-V2 static (451q) | judged accuracy, full set | 143/451 = 31.7% (web 97/240 = 40.4%, enterprise 46/211 = 21.8%) | F | 2026-08-03 | [details](#v2-static-451-sota-luna-2026-08-03) |
 
 ## Row disclosures
 
@@ -489,3 +490,61 @@ six gate executions, five root causes, mandatory confirmation-run protocol (F42 
 
 **caveats:**
 - uncontended latency is reported separately (P1/L4); this is the published cost-curve instrument
+
+### <a id="v2-static-451-sota-luna-2026-08-03"></a>v2-static-451-sota-luna-2026-08-03
+
+**id:**
+v2-static-451-sota-luna-2026-08-03
+
+**benchmark:**
+LongMemEval-V2 static (451q)
+
+**metric:**
+judged accuracy, full set
+
+**value:**
+0.3171
+
+**display:**
+143/451 = 31.7% (web 97/240 = 40.4%, enterprise 46/211 = 21.8%)
+
+**tier:**
+F
+
+**date:**
+2026-08-03
+
+**system_commit:**
+product wt-upstream-w1 @ 40f81bf (endorsed #436 head, F50 delivery-neutral verdict)
+
+**harness_commit:**
+lme-v2-official 6bfd58a; variant runner official_unit_runner_sota.py (models + batch-count relaxation only, documented)
+
+**judge:**
+anthropic/claude-sonnet-5 (cross-family; same pinned evaluator prompts as the official-config rows)
+
+**reader:**
+openai/gpt-5.6-luna (SOTA-models policy row)
+
+**retrieval_config:**
+identical to F47 instrument (memory config unchanged; ONLY reader+judge models differ)
+
+**dataset_exposure:**
+same frozen static-451 set as F47; no tuning on it
+
+**breakdown:**
+web 97/240=40.4%, enterprise 46/211=21.8%
+
+**variance:**
+A/A' 100q fixed-seed subset (seed 20260802) queued per run sheet — no delta narratives before it banks
+
+**failclose:**
+0/451 instrument failures both domains
+
+**evidence:**
+- bench/specs/RUN-SHEET-V2-SOTA-LUNA.md (incl. Amendment 1)
+- session-notes 2026-08-02 v2-sota-luna artifacts (full-web, full-enterprise, per-question)
+
+**caveats:**
+- Cross-config context: official-config (qwen3.5-9b reader) row is 123/451=27.3%; the +4.4pt is READER-dominated by design — this row anchors the SOTA-reader funnel, it is NOT a memory-delta claim
+- Official-config rows remain visible; both configs disclosed side by side
