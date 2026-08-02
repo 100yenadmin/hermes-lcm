@@ -51,3 +51,14 @@ Registered BEFORE launch; this sheet is the registration. G0 channel: coverage r
 - Voyage 429 sustained >30 min across shards → halve shard count, document, continue (same
   registration: shard topology is operational, not measured-surface).
 - Disk <15 GB free on LEXAR → park (each question's store ~30–37 MB; 500q ≈ 15–18 GB + prepared).
+
+## AMENDMENT 2 (2026-08-03 — CORRECTION + restart after host reboot killed all 6 shards)
+CORRECTION: §2's recovery claim ("a dead shard resumes by re-running its qid file — completed
+questions detected + skipped") was WRONG — the instrument accumulated results in memory and
+wrote the report only at run end. It was an UNVERIFIED capability written into a registered
+document; ~17h × 6 shards of progress (~190 questions of Voyage ingest, est. $5–15) was lost
+to a host reboot with only env captures on disk. Process failure banked to memory.
+REMEDY BEFORE RESTART: checkpoint/resume patch (per-question progressive jsonl + --resume,
+fail-closed torn-line handling, uninterrupted-run report-equivalence test) — implemented, PR'd,
+and merged BEFORE relaunch; the restarted run pins the new instrument sha. The restart is a
+fresh registration of the same design (this sheet + amendments); no partial results carry over.

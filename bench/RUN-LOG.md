@@ -40,3 +40,5 @@ Older lineage (R1→R2) is indexed by finding docs; this log is authoritative fr
 - v2-sota-aprime-100q | LAUNCHED 2026-08-03 | pre-declared in RUN-SHEET-V2-SOTA-LUNA §3 (seed 20260802: web 54 + ent 46) | session-notes/2026-08-02/v2-sota-luna/artifacts/aprime-* | RUNNING
 - ama-aprime-30ep | LAUNCHED 2026-08-03 | pre-declared in RUN-SHEET-AMA-208 §3 (seed 20260802, 30 eps) | session-notes/2026-08-03/hermes-ama-aprime | RUNNING
 - v2-sota-aprime-100q | COMPLETE 2026-08-03 | (see entry above) | — | session-notes/2026-08-02/v2-sota-luna/artifacts/aprime-* | DONE → 11/100 discordant (11.0%), spread 1.0pt (32.0 vs 33.0), 0 inst-failures; variance field completed on the scoreboard row
+- v1m-registered-6shard | KILLED 2026-08-03 (host reboot ~hour 17) | all 6 shards dead, ZERO results on disk (report-at-end design; the run sheet's resume claim was wrong — Amendment 2 correction) | est. $5-15 Voyage lost | RESTART after checkpoint/resume patch merges
+- ama-aprime-30ep | RESUMED 2026-08-03 | 3/30 survived reboot (per-episode outputs independent); remaining 27 relaunched | session-notes/2026-08-03/hermes-ama-aprime | RUNNING
