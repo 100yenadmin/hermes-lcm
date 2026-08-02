@@ -122,6 +122,19 @@ def test_prepare_streams_and_writes_checksum_manifest(tmp_path, monkeypatch):
     ]
 
 
+def test_prepare_rejects_missing_question_shape_before_publish(tmp_path):
+    pytest.importorskip("ijson", reason="prepare path requires ijson; the run env installs it explicitly")
+    source, rows = _write_dataset(tmp_path, count=1)
+    rows[0].pop("question_type")
+    source.write_text(json.dumps(rows), encoding="utf-8")
+    prepared_dir = tmp_path / "prepared"
+
+    with pytest.raises(ValueError, match=r"question 'q0'.*'question_type'"):
+        lme.prepare_dataset(source, prepared_dir, dataset_label="m")
+
+    assert not prepared_dir.exists()
+
+
 @pytest.mark.parametrize(
     ("root", "root_pattern"),
     [({"item": [_raw_question(0)]}, r"got object"), (17, r"got scalar \(number\)")],
@@ -187,8 +200,9 @@ def test_prepared_manifest_fails_closed_on_label_count_and_content_mismatch(tmp_
     manifest["question_count"] -= 1
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     (prepared_dir / "q1.json").write_text("{}", encoding="utf-8")
+    prepared = lme.load_prepared_dataset(prepared_dir, dataset_label="m")
     with pytest.raises(ValueError, match="checksum mismatch"):
-        lme.load_prepared_dataset(prepared_dir, dataset_label="m")
+        list(prepared.iter_questions())
 
     guard_cases = [
         ("schema_version", "schema_version"),

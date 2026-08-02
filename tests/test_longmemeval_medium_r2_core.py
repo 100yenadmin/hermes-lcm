@@ -59,6 +59,8 @@ def _question(question_id: str) -> lme.Question:
 
 
 def _prepared_dataset(tmp_path, question_ids: tuple[str, ...]) -> lme.PreparedDataset:
+    for question_id in question_ids:
+        (tmp_path / f"{question_id}.json").write_text("{}", encoding="utf-8")
     return lme.PreparedDataset(
         directory=tmp_path,
         dataset_label="m",
@@ -76,37 +78,115 @@ def _prepared_dataset(tmp_path, question_ids: tuple[str, ...]) -> lme.PreparedDa
     )
 
 
-def test_prepared_qid_preflight_rejects_short_iterator_before_scoring(
-    tmp_path, monkeypatch
-):
+def test_prepared_qid_preflight_rejects_missing_file_before_scoring(tmp_path):
     prepared = _prepared_dataset(tmp_path, ("q0", "q1"))
-    scoring_started = False
+    (tmp_path / "q1.json").unlink()
 
-    def _short_iterator(_self, *, limit=None):
-        assert limit is None
-        yield _question("q0")
-
-    monkeypatch.setattr(lme.PreparedDataset, "iter_questions", _short_iterator)
-
-    with pytest.raises(ValueError, match="ended early.*'q1'"):
+    with pytest.raises(ValueError, match="prepared question file not found"):
         prepared.validate_question_ids()
-        scoring_started = True
-
-    assert scoring_started is False
 
 
-def test_prepared_qid_preflight_rejects_mismatched_sequence(tmp_path, monkeypatch):
+def test_prepared_qid_preflight_rejects_extra_file_before_scoring(tmp_path):
+    prepared = _prepared_dataset(tmp_path, ("q0", "q1"))
+    (tmp_path / "extra.json").write_text("{}", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="file set does not match manifest"):
+        prepared.validate_question_ids()
+
+
+def test_prepared_qid_preflight_does_not_hash_question_bytes(tmp_path, monkeypatch):
     prepared = _prepared_dataset(tmp_path, ("q0", "q1"))
 
-    def _mismatched_iterator(_self, *, limit=None):
-        assert limit is None
-        yield _question("q0")
-        yield _question("wrong-qid")
+    def _unexpected_hash(_path):
+        raise AssertionError("preflight hashed bytes")
 
-    monkeypatch.setattr(lme.PreparedDataset, "iter_questions", _mismatched_iterator)
+    monkeypatch.setattr(lme, "sha256_file", _unexpected_hash)
+    prepared.validate_question_ids()
 
-    with pytest.raises(
-        ValueError,
-        match="sequence id mismatch: expected 'q1', got 'wrong-qid'",
-    ):
-        prepared.validate_question_ids()
+
+def test_prepared_iterator_verifies_checksum_at_consumption(tmp_path):
+    prepared = _prepared_dataset(tmp_path, ("q0",))
+
+    with pytest.raises(ValueError, match="prepared question checksum mismatch: q0.json"):
+        list(prepared.iter_questions())
+
+
+def test_prepared_iterator_rejects_question_id_mismatch(tmp_path):
+    # Checksum-valid file whose embedded id differs from the manifest entry —
+    # only reachable via manifest corruption, still fails closed at consumption.
+    payload = b'{"question_id": "q-other"}'
+    (tmp_path / "q0.json").write_bytes(payload)
+    prepared = lme.PreparedDataset(
+        directory=tmp_path,
+        dataset_label="m",
+        source_sha256="0" * 64,
+        manifest_sha256="1" * 64,
+        question_count=1,
+        questions=(
+            {
+                "question_id": "q0",
+                "file": "q0.json",
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            },
+        ),
+    )
+
+    with pytest.raises(ValueError, match="prepared question id mismatch: q0.json"):
+        list(prepared.iter_questions())
+
+
+def test_question_filename_reserves_template():
+    with pytest.raises(ValueError, match="unsafe question_id"):
+        lme._question_filename("_TEMPLATE")
+
+
+@pytest.mark.parametrize(
+    "question_id",
+    [
+        "CON",
+        "prn.txt",
+        "AUX",
+        "nul",
+        "COM1",
+        "com9.json",
+        "LPT1",
+        "lpt9.txt",
+        "question:name",
+        "question*name",
+        "question?name",
+        'question"name',
+        "question<name",
+        "question>name",
+        "question|name",
+    ],
+)
+def test_question_filename_rejects_cross_platform_unsafe_names(question_id):
+    with pytest.raises(ValueError, match="unsafe question_id"):
+        lme._question_filename(question_id)
+
+
+def test_run_harness_cleans_question_db_when_evaluation_raises(tmp_path, monkeypatch):
+    question = _question("q0")
+    error = RuntimeError("evaluation failed")
+    cleanup_calls = []
+
+    def _evaluate(*_args, **_kwargs):
+        raise error
+
+    def _cleanup(tmp_dir, question_id):
+        cleanup_calls.append((tmp_dir, question_id))
+
+    monkeypatch.setattr(lme, "evaluate_question", _evaluate)
+    monkeypatch.setattr(lme, "_cleanup_question_db", _cleanup)
+
+    with pytest.raises(RuntimeError) as caught:
+        lme.run_harness(
+            [question],
+            provider_name="stub",
+            model="",
+            tmp_dir=tmp_path,
+            reuse_db_template=False,
+        )
+
+    assert caught.value is error
+    assert cleanup_calls == [(tmp_path, "q0")]

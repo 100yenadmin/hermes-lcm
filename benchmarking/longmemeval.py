@@ -353,41 +353,44 @@ def _require_ijson():
     return ijson
 
 
-def _root_type(event: str | None) -> str:
-    return {
-        "start_map": "object",
-        "start_array": "array",
-        "string": "scalar (string)",
-        "number": "scalar (number)",
-        "boolean": "scalar (boolean)",
-        "null": "scalar (null)",
-    }.get(event or "", "empty input")
+def _dataset_root_type(first_byte: int | None) -> str:
+    if first_byte is None:
+        return "empty input"
+    if first_byte == ord("{"):
+        return "object"
+    if first_byte == ord('"'):
+        return "scalar (string)"
+    if first_byte in b"-0123456789":
+        return "scalar (number)"
+    if first_byte in b"tf":
+        return "scalar (boolean)"
+    if first_byte == ord("n"):
+        return "scalar (null)"
+    return "invalid"
 
 
-def _peek_dataset_root(source_path: Path) -> None:
-    ijson = _require_ijson()
-    try:
-        with source_path.open("rb") as source:
-            first = next(ijson.parse(source, use_float=True), None)
-    except (ijson.JSONError, TypeError) as exc:
-        # A TypeError from the call signature means an ijson too old for
-        # ``use_float``; any other TypeError is a backend data error.
-        if isinstance(exc, TypeError) and "use_float" in str(exc):
-            raise RuntimeError(
-                "ijson >= 3.2 is required for `prepare`; "
-                "upgrade it for that command only"
-            ) from exc
-        detail = str(exc).strip()
-        message = "invalid LongMemEval dataset JSON"
-        if detail:
-            message = f"{message}: {detail}"
-        raise ValueError(message) from exc
+def _validate_dataset_root(source) -> None:
+    """Check the JSON root on the same stream that prepare later consumes."""
+    prefix = source.read(3)
+    if prefix == b"\xef\xbb\xbf":
+        prefix = b""
 
-    if first != ("", "start_array", None):
-        event = first[1] if first is not None else None
+    first_byte: int | None = None
+    while first_byte is None:
+        for byte in prefix:
+            if byte not in b" \t\r\n":
+                first_byte = byte
+                break
+        if first_byte is not None:
+            break
+        prefix = source.read(4096)
+        if not prefix:
+            break
+
+    if first_byte != ord("["):
         raise ValueError(
             "LongMemEval dataset root must be a JSON array; "
-            f"got {_root_type(event)}"
+            f"got {_dataset_root_type(first_byte)}"
         )
 
 
@@ -429,11 +432,22 @@ def _iter_dataset_rows(source) -> Iterator[dict[str, Any]]:
 
 
 def _question_filename(question_id: str) -> str:
+    stem = Path(question_id).stem.casefold()
+    windows_reserved = {
+        "con",
+        "prn",
+        "aux",
+        "nul",
+        *(f"com{index}" for index in range(1, 10)),
+        *(f"lpt{index}" for index in range(1, 10)),
+    }
     if (
         not question_id
-        or question_id.casefold() in {".", "..", "manifest"}
+        or question_id.casefold() in {".", "..", "manifest", "_template"}
+        or stem in windows_reserved
         or "/" in question_id
         or "\\" in question_id
+        or any(character in question_id for character in ':*?"<>|')
     ):
         raise ValueError(f"unsafe question_id for prepared output: {question_id!r}")
     return f"{question_id}.json"
@@ -478,7 +492,6 @@ def prepare_dataset(
         if not prepared_dir.is_dir() or any(prepared_dir.iterdir()):
             raise ValueError(f"prepared directory must be empty: {prepared_dir}")
 
-    _peek_dataset_root(source_path)
     try:
         staging_dir = Path(
             tempfile.mkdtemp(prefix=f".{prepared_dir.name}.prepare-", dir=prepared_dir.parent)
@@ -492,9 +505,18 @@ def prepare_dataset(
         questions: list[dict[str, str]] = []
         seen_ids: set[str] = set()
         with source_path.open("rb") as raw_source:
+            _validate_dataset_root(raw_source)
+            raw_source.seek(0)
             source = _HashingReader(raw_source)
             for row in _iter_dataset_rows(source):
-                question_id = str(row.get("question_id", ""))
+                raw_question_id = row.get("question_id")
+                question_id = "" if raw_question_id is None else str(raw_question_id)
+                for field in ("question_id", "question_type", "question"):
+                    if field not in row or row[field] is None:
+                        raise ValueError(
+                            f"question {question_id!r} missing required field {field!r}"
+                        )
+                question_id = str(raw_question_id)
                 if question_id in seen_ids:
                     raise ValueError(f"duplicate question_id in dataset: {question_id!r}")
                 filename = _question_filename(question_id)
@@ -561,34 +583,18 @@ class PreparedDataset:
         return raw
 
     def validate_question_ids(self, *, limit: int | None = None) -> None:
-        """Preflight the lazy reader against the manifest qid sequence.
-
-        The pass deliberately retains only one decoded question at a time. A
-        short, corrupt, or mismatched iterator therefore fails before the
-        scoring harness starts without materializing the medium corpus.
-        """
-        expected_entries = self._selected_entries(limit)
-        actual = iter(self.iter_questions(limit=limit))
-        for entry in expected_entries:
-            try:
-                question = next(actual)
-            except StopIteration as exc:
-                raise ValueError(
-                    "prepared question sequence ended early: "
-                    f"expected {entry['question_id']!r}"
-                ) from exc
-            if question.question_id != entry["question_id"]:
-                raise ValueError(
-                    "prepared question sequence id mismatch: "
-                    f"expected {entry['question_id']!r}, got {question.question_id!r}"
-                )
-        try:
-            extra = next(actual)
-        except StopIteration:
-            return
-        raise ValueError(
-            f"prepared question sequence has unexpected extra id: {extra.question_id!r}"
-        )
+        """Preflight manifest ids and files without reading question bytes."""
+        self._selected_entries(limit)
+        expected_files = {entry["file"] for entry in self.questions}
+        for entry in self.questions:
+            path = self.directory / entry["file"]
+            if not path.is_file():
+                raise ValueError(f"prepared question file not found: {path}")
+        actual_files = {
+            path.name for path in self.directory.glob("*.json") if path.name != "manifest.json"
+        }
+        if actual_files != expected_files:
+            raise ValueError("prepared directory JSON file set does not match manifest")
 
     def iter_questions(self, *, limit: int | None = None) -> Iterator[Question]:
         for entry in self._selected_entries(limit):
@@ -651,8 +657,6 @@ def load_prepared_dataset(
         path = prepared_dir / filename
         if not path.is_file():
             raise ValueError(f"prepared question file not found: {path}")
-        if sha256_file(path) != checksum:
-            raise ValueError(f"prepared question checksum mismatch: {filename}")
         questions.append(
             {"question_id": question_id, "file": filename, "sha256": checksum}
         )
@@ -1628,42 +1632,44 @@ def run_harness(
 
     for question in questions:
         consumed_count += 1
-        if question.is_abstention:
-            abstention_count += 1
-            continue
-        scored = evaluate_question(
-            question,
-            embedder,
-            provider_name=provider_name,
-            tmp_dir=tmp_dir,
-            embeddings_enabled=embeddings_enabled,
-            use_rerank=use_rerank,
-            db_template=db_template,
-            embedding_batch_size=effective_embedding_batch_size,
-        )
-        scored_count += 1
-        ingest_samples.append(scored.pop("ingest_ms", 0.0))
-        q_mode = scored["hybrid_rerank"].pop("rerank_mode", RERANK_MODE_PLACEHOLDER)
-        rerank_mode_counts[q_mode] = rerank_mode_counts.get(q_mode, 0) + 1
-        category = question.category
-        bucket = by_category.setdefault(category, _new_arm_samples())
-        for arm, metrics in scored.items():
-            turn = metrics["turn"]
-            for k in (1, 5, 10):
-                bucket[arm].recalls[k].append(metrics[f"recall@{k}"])
-                overall[arm].recalls[k].append(metrics[f"recall@{k}"])
-                bucket[arm].turn_recalls[k].append(turn[f"recall@{k}"])
-                overall[arm].turn_recalls[k].append(turn[f"recall@{k}"])
-            bucket[arm].ndcg10.append(metrics["ndcg@10"])
-            overall[arm].ndcg10.append(metrics["ndcg@10"])
-            bucket[arm].turn_ndcg10.append(turn["ndcg@10"])
-            overall[arm].turn_ndcg10.append(turn["ndcg@10"])
-            bucket[arm].latency_ms.append(metrics["latency_ms"])
-            overall[arm].latency_ms.append(metrics["latency_ms"])
-            if turn["session_granularity"]:
-                bucket[arm].session_granularity = True
-                overall[arm].session_granularity = True
-        _cleanup_question_db(tmp_dir, question.question_id)
+        try:
+            if question.is_abstention:
+                abstention_count += 1
+                continue
+            scored = evaluate_question(
+                question,
+                embedder,
+                provider_name=provider_name,
+                tmp_dir=tmp_dir,
+                embeddings_enabled=embeddings_enabled,
+                use_rerank=use_rerank,
+                db_template=db_template,
+                embedding_batch_size=effective_embedding_batch_size,
+            )
+            scored_count += 1
+            ingest_samples.append(scored.pop("ingest_ms", 0.0))
+            q_mode = scored["hybrid_rerank"].pop("rerank_mode", RERANK_MODE_PLACEHOLDER)
+            rerank_mode_counts[q_mode] = rerank_mode_counts.get(q_mode, 0) + 1
+            category = question.category
+            bucket = by_category.setdefault(category, _new_arm_samples())
+            for arm, metrics in scored.items():
+                turn = metrics["turn"]
+                for k in (1, 5, 10):
+                    bucket[arm].recalls[k].append(metrics[f"recall@{k}"])
+                    overall[arm].recalls[k].append(metrics[f"recall@{k}"])
+                    bucket[arm].turn_recalls[k].append(turn[f"recall@{k}"])
+                    overall[arm].turn_recalls[k].append(turn[f"recall@{k}"])
+                bucket[arm].ndcg10.append(metrics["ndcg@10"])
+                overall[arm].ndcg10.append(metrics["ndcg@10"])
+                bucket[arm].turn_ndcg10.append(turn["ndcg@10"])
+                overall[arm].turn_ndcg10.append(turn["ndcg@10"])
+                bucket[arm].latency_ms.append(metrics["latency_ms"])
+                overall[arm].latency_ms.append(metrics["latency_ms"])
+                if turn["session_granularity"]:
+                    bucket[arm].session_granularity = True
+                    overall[arm].session_granularity = True
+        finally:
+            _cleanup_question_db(tmp_dir, question.question_id)
 
     if question_count is not None and consumed_count != question_count:
         raise ValueError(
