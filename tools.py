@@ -11,7 +11,12 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, TYPE_CHECKING
+from typing import Any, Dict, Mapping, TYPE_CHECKING
+
+from . import access_policy as _access_policy
+AuthorizationRequiredError = _access_policy.AuthorizationRequiredError
+policy_for_engine = _access_policy.policy_for_engine
+policy_access_context = _access_policy.policy_access_context
 
 from .externalize import (
     _inspect_top_level_json_string_fields_before_content as _externalized_top_level_fields_before_content,
@@ -35,6 +40,7 @@ from .db_bootstrap import (
     inspect_lcm_schema_health,
     load_integrity_failed,
 )
+from .scope_storage import teams_enabled as storage_teams_enabled, verify_scope_storage
 from .extraction import sanitize_pre_compaction_content
 from .ingest_protection import (
     externalized_payload_stats,
@@ -427,6 +433,20 @@ def lcm_query_state(args: Dict[str, Any], **kwargs) -> str:
     requested_limit = parsed_limit
     limit = min(requested_limit, _LCM_QUERY_STATE_LIMIT_CAP)
 
+    # The owner predicate comes from the POLICY, never from `args` -- this tool
+    # addresses assertions by `subject_key`, which names no row, so the
+    # tool-boundary gate has nothing to attach an owner to and allows. Without
+    # this, the query returned assertions extracted from EVERY principal's
+    # messages, each carrying the source quote verbatim plus the foreign
+    # session_id and store_id.
+    _state_policy = policy_for_engine(engine)
+    _state_scope = _state_policy.resolve_authorized_targets(
+        policy_access_context(engine), "read", {}
+    )
+    _state_access_scope = (
+        _state_scope.get("access_scope") if isinstance(_state_scope, Mapping) else None
+    )
+
     try:
         result = query_assertion_state(
             store,
@@ -436,6 +456,7 @@ def lcm_query_state(args: Dict[str, Any], **kwargs) -> str:
             scope_key=scope_key,
             speaker_role=speaker_role,
             as_of=as_of,
+            access_scope=_state_access_scope,
             limit=limit,
         )
     except (TypeError, ValueError, sqlite3.Error) as exc:
@@ -904,6 +925,51 @@ def lcm_compile_evidence(args: Dict[str, Any], **kwargs) -> str:
     mode = str(args.get("mode") or "proposal").strip().casefold()
     if mode not in {"proposal", "auto"}:
         return json.dumps({"error": "mode must be one of: proposal, auto"})
+    if mode == "proposal" and args.get("persist_view") is True:
+        # The persisted query view is principal-scoped data. Keep the write
+        # decision beside the branch that can materialize it so direct handler
+        # calls cannot bypass the engine's ordinary tool-boundary gate.
+        policy = policy_for_engine(engine)
+        access_context = policy_access_context(engine)
+        target_scope = {
+            key: args[key]
+            for key in ("baseline_refs", "proposal")
+            if key in args
+        }
+        expected_scope = {
+            "kind": "tool_call",
+            "tool_name": "lcm_compile_evidence",
+            "caller_session_id": engine._session_id,
+            "caller_conversation_id": engine._conversation_id,
+            "target_scope": target_scope,
+            **target_scope,
+            "required_scope": "write",
+        }
+        decision = policy.authorize_operation(
+            access_context, "write", expected_scope
+        )
+        policy.audit_decision(
+            access_context, "write", decision.denial_reason, decision.public()
+        )
+        if not decision.allowed:
+            raise AuthorizationRequiredError(
+                "authorize_operation", decision.public().denial_reason
+            )
+        authorized_scope = policy.resolve_authorized_targets(
+            access_context, "write", expected_scope
+        )
+        if isinstance(authorized_scope, Mapping):
+            resolved_target_scope = authorized_scope.get(
+                "target_scope", authorized_scope
+            )
+            if isinstance(resolved_target_scope, Mapping):
+                narrowed_args = dict(args)
+                for key in ("baseline_refs", "proposal"):
+                    if key in resolved_target_scope:
+                        narrowed_args[key] = resolved_target_scope[key]
+                    else:
+                        narrowed_args.pop(key, None)
+                args = narrowed_args
     if mode == "auto":
         result = compile_preanswer_evidence(
             args.get("question"),
@@ -2434,6 +2500,10 @@ def _lcm_grep_full_text(args: Dict[str, Any], **kwargs) -> str:
                 externalized_refs.append(ref)
 
     requested_session_scope = str(args.get("session_scope", "current")).lower()
+    # The OWNER predicate a Teams policy narrows with. Absent (default-off and
+    # every non-Teams caller) it stays None and the query is byte-identical to
+    # what it was before.
+    requested_access_scope = args.get("access_scope")
     raw_session_id_arg = args.get("session_id")
     explicit_session_id = (
         str(raw_session_id_arg).strip() if raw_session_id_arg is not None else ""
@@ -2521,6 +2591,12 @@ def _lcm_grep_full_text(args: Dict[str, Any], **kwargs) -> str:
                 "role": role,
                 "time_from": time_from,
                 "time_to": time_to,
+                # SECURITY: the per-principal owner predicate. It lives in this
+                # dict because upstream refactored the call to `**kwargs`, and
+                # the refactor's dict did not carry it -- taking that side
+                # verbatim silently unscopes message search and every principal
+                # reads every other principal's memory, with all tests green.
+                "access_scope": requested_access_scope,
             }
             if fts_prose_mode:
                 message_search_kwargs["fts_prose_mode"] = True
@@ -3105,6 +3181,15 @@ def _lcm_grep_semantic(
     knn_limit = candidate_limit if candidate_limit is not None else limit
 
     requested_session_scope = str(args.get("session_scope", "current")).lower()
+    # NOTE: this arm deliberately does NOT read an `access_scope` ARGUMENT.
+    # The owner predicate is resolved from the POLICY inside `run_knn`
+    # (retrieval_core.py: `access_scope = authorized_scope.get("access_scope")`),
+    # which is authoritative and cannot be steered by model-authored tool
+    # arguments. An earlier version assigned `requested_access_scope` here and
+    # never used it, which reads like missing enforcement -- hence this note:
+    # the scoping is real, it just does not come from `args` on this path.
+    # The `degraded()` fallback forwards `dict(args)` to the FTS arm, which
+    # takes its predicate from args in the ordinary way.
     raw_session_id_arg = args.get("session_id")
     explicit_session_id = (
         str(raw_session_id_arg).strip() if raw_session_id_arg is not None else ""
@@ -4715,13 +4800,61 @@ def _lcm_recall_fts_arm(
     engine: "LCMEngine", query: str, *, candidate_limit: int, deadline: float
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
     """FTS arm: raw messages across ALL sessions (no conversation filter)."""
+    policy = policy_for_engine(engine)
+    access_context = policy_access_context(engine)
+    expected_scope = {
+        "kind": "recall_corpus",
+        "tool_name": "lcm_recall",
+        "arm": "fts",
+        "session_scope": "all",
+        "session_id": None,
+        "conversation_ids": None,
+        "source": None,
+    }
+    decision = policy.authorize_operation(access_context, "read", expected_scope)
+    policy.audit_decision(
+        access_context, "read", decision.denial_reason, decision.public()
+    )
+    if not decision.allowed:
+        raise AuthorizationRequiredError(
+            "authorize_operation", decision.public().denial_reason
+        )
+    authorized_scope = policy.resolve_authorized_targets(
+        access_context, "read", expected_scope
+    )
+    if isinstance(authorized_scope, Mapping):
+        authorized_scope = authorized_scope.get("target_scope", authorized_scope)
+    fts_args = {
+        "query": query,
+        "mode": "recall",
+        "session_scope": "all",
+        "limit": candidate_limit,
+    }
+    if isinstance(authorized_scope, Mapping):
+        # The resolved mapping is authoritative for the target dimension: a key
+        # the policy OMITS is a target it did not authorize, so the permissive
+        # default is REMOVED rather than left standing. Keeping the hard-coded
+        # session_scope="all" meant a policy narrowing the corpus to a single
+        # session -- or authorizing nothing at all -- still searched every
+        # session. Dropping the key degrades to this tool's own "current"
+        # default, which is the narrowest scope it offers.
+        for key in ("session_scope", "session_id", "source", "conversation_id"):
+            if key in authorized_scope:
+                fts_args[key] = authorized_scope[key]
+            else:
+                fts_args.pop(key, None)
+        # The owner predicate is ADDED, never removed by the loop above: a
+        # policy that scopes to a principal must be able to say so in a term
+        # the stored rows actually carry.
+        if authorized_scope.get("access_scope"):
+            fts_args["access_scope"] = authorized_scope["access_scope"]
+        # A resolved session_id with no scope is incoherent for this tool
+        # ("session_id is only valid with session_scope=session"), so name the
+        # scope the policy's own narrowing implies instead of erroring out.
+        if "session_id" in fts_args and "session_scope" not in authorized_scope:
+            fts_args["session_scope"] = "session"
     payload = _lcm_grep_full_text_with_deadline(
-        {
-            "query": query,
-            "mode": "recall",
-            "session_scope": "all",
-            "limit": candidate_limit,
-        },
+        fts_args,
         engine=engine,
         deadline=deadline,
         limit_cap=_LCM_GREP_HYBRID_CANDIDATE_CAP,
@@ -7172,6 +7305,36 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
     except Exception as e:
         checks.append({
             "check": "database_integrity",
+            "status": "fail",
+            "detail": str(e),
+        })
+
+    # Per-item scope staging is intentionally Teams-aware: legacy NULLs are
+    # expected while Teams is off, but an enabled store must have checked every
+    # observed row. Static writer coverage belongs to the test suite because
+    # it describes the source tree, not this database.
+    try:
+        scope_storage = verify_scope_storage(
+            engine._store.connection,
+            teams_enabled=storage_teams_enabled(engine),
+        )
+        scope_status = str(scope_storage.get("status"))
+        checks.append({
+            "check": "scope_storage",
+            "status": (
+                # stamped-without-marker is a FAILURE, not a variety of
+                # not-enabled: real per-owner stamps with no recorded decision.
+                # The previous mapping was an else-pass, so this state -- the
+                # one worth running a doctor for -- reported green.
+                "fail" if scope_status in {"fail", "stamped-without-marker"}
+                else "warn" if scope_status == "nothing-to-verify"
+                else "pass"
+            ),
+            "detail": scope_storage,
+        })
+    except Exception as e:
+        checks.append({
+            "check": "scope_storage",
             "status": "fail",
             "detail": str(e),
         })

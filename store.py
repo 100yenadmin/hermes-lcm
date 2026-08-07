@@ -264,11 +264,22 @@ def build_message_fts_spec() -> ExternalContentFtsSpec:
 class MessageStore:
     """SQLite-backed immutable message store."""
 
-    def __init__(self, db_path: str | Path, *, ingest_protection_config=None, hermes_home: str = ""):
+    def __init__(
+        self,
+        db_path: str | Path,
+        *,
+        ingest_protection_config=None,
+        hermes_home: str = "",
+        access_scope_provider: Callable[[str], str | None] | None = None,
+    ):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._ingest_protection_config = ingest_protection_config or LCMConfig(database_path=str(self.db_path))
         self._hermes_home = hermes_home or str(self.db_path.parent)
+        # The provider is intentionally optional.  With Teams disabled it
+        # returns None and the nullable column preserves the legacy write
+        # semantics byte-for-byte at the product boundary.
+        self._access_scope_provider = access_scope_provider
         self._conn: Optional[sqlite3.Connection] = None
         # ``self._conn`` is shared across threads (the connection is opened with
         # ``check_same_thread=False``). SQLite's own C-level mutex serializes
@@ -309,7 +320,8 @@ class MessageStore:
                 pinned INTEGER DEFAULT 0,
                 ingested_at REAL,
                 observed_at REAL,
-                observed_at_source TEXT
+                observed_at_source TEXT,
+                access_scope TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_msg_session
                 ON messages(session_id, store_id);
@@ -321,11 +333,14 @@ class MessageStore:
                 value TEXT
             );
         """)
+        run_versioned_migrations(self._conn)
+        # Finish additive columns before constructing the external-content FTS
+        # table.  This avoids a one-time FTS schema-cache race on old stores
+        # whose messages table is altered during startup.
         ensure_external_content_fts(
             self._conn,
             build_message_fts_spec(),
         )
-        run_versioned_migrations(self._conn)
         self._ensure_source_column()
         self._ensure_conversation_id_column()
         self._ensure_time_contract_columns()
@@ -389,9 +404,18 @@ class MessageStore:
 
     # -- Write operations ---------------------------------------------------
 
+    def _access_scope_for_session(
+        self, session_id: str, explicit: str | None
+    ) -> str | None:
+        if explicit is not None:
+            return explicit
+        if self._access_scope_provider is None:
+            return None
+        return self._access_scope_provider(session_id)
+
     def append(self, session_id: str, msg: Dict[str, Any],
                token_estimate: int = 0, source: str = "",
-               conversation_id: str = "") -> int:
+               conversation_id: str = "", access_scope: str | None = None) -> int:
         """Persist a message and return its store_id."""
         msg = protect_message_for_ingest(
             msg,
@@ -403,14 +427,15 @@ class MessageStore:
         tc_json = json.dumps(tool_calls) if tool_calls else None
         observed_at = _normalize_observed_at(msg.get("timestamp"))
         ingested_at = time.time()
+        resolved_access_scope = self._access_scope_for_session(session_id, access_scope)
 
         with self._write_lock:
             cur = self._conn.execute(
                 """INSERT INTO messages
                    (session_id, source, conversation_id, role, content, tool_call_id, tool_calls,
                     tool_name, timestamp, token_estimate, pinned, ingested_at,
-                    observed_at, observed_at_source)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    observed_at, observed_at_source, access_scope)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     _normalize_source_value(source),
@@ -426,6 +451,7 @@ class MessageStore:
                     ingested_at,
                     observed_at,
                     "host_message_timestamp" if observed_at is not None else None,
+                    resolved_access_scope,
                 ),
             )
             self._conn.commit()
@@ -435,7 +461,7 @@ class MessageStore:
                      messages: List[Dict[str, Any]],
                      token_estimates: List[int] | None = None,
                      source: str = "",
-                     conversation_id: str = "") -> List[int]:
+                     conversation_id: str = "", access_scope: str | None = None) -> List[int]:
         """Persist multiple messages in one transaction. Returns store_ids."""
         protected_messages = protect_messages_for_ingest(
             messages,
@@ -449,13 +475,15 @@ class MessageStore:
             token_estimates,
             source=source,
             conversation_id=conversation_id,
+            access_scope=access_scope,
         )
 
     def _append_protected_batch(self, session_id: str,
                                 messages: List[Dict[str, Any]],
                                 token_estimates: List[int] | None = None,
                                 source: str = "",
-                                conversation_id: str = "") -> List[int]:
+                                conversation_id: str = "",
+                                access_scope: str | None = None) -> List[int]:
         """Persist messages that already passed ingest protection.
 
         This is an internal fast path for callers that need the protected form
@@ -467,6 +495,7 @@ class MessageStore:
             token_estimates = [0] * len(messages)
 
         ids = []
+        resolved_access_scope = self._access_scope_for_session(session_id, access_scope)
         with self._write_lock, self._conn:
             for msg, est in zip(messages, token_estimates):
                 tc = msg.get("tool_calls")
@@ -477,8 +506,8 @@ class MessageStore:
                     """INSERT INTO messages
                        (session_id, source, conversation_id, role, content, tool_call_id, tool_calls,
                         tool_name, timestamp, token_estimate, pinned, ingested_at,
-                        observed_at, observed_at_source)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        observed_at, observed_at_source, access_scope)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         session_id,
                         _normalize_source_value(source),
@@ -494,6 +523,7 @@ class MessageStore:
                         ts,
                         observed_at,
                         "host_message_timestamp" if observed_at is not None else None,
+                        resolved_access_scope,
                     ),
                 )
                 ids.append(cur.lastrowid)
@@ -1107,6 +1137,7 @@ class MessageStore:
                role: str | None = None,
                time_from: float | None = None,
                time_to: float | None = None,
+               access_scope: str | None = None,
                allow_operators: bool = False,
                fts_prose_mode: bool = False) -> List[Dict[str, Any]]:
         """FTS5 search across raw messages.
@@ -1163,6 +1194,12 @@ class MessageStore:
                 role=role,
                 time_from=time_from,
                 time_to=time_to,
+                # The owner predicate must survive THIS fallback too. It is
+                # taken for CJK and emoji queries, so omitting it here meant a
+                # non-ASCII search silently escaped scoping while the identical
+                # ASCII search was scoped -- a leak that depends on the alphabet
+                # the query is written in.
+                access_scope=access_scope,
                 prose_mode=fts_prose_mode and not allow_operators,
             )
 
@@ -1187,6 +1224,15 @@ class MessageStore:
                 if session_id is not None:
                     where.append("m.session_id = ?")
                     args.append(session_id)
+                if access_scope is not None:
+                    # The OWNER predicate. Teams scoping cannot ride on `source`:
+                    # a caller's collection id is not a property stored rows
+                    # carry, so filtering by it matched nothing on real data and
+                    # returned an empty corpus to everyone -- isolation by
+                    # breaking retrieval. The stamp is the thing rows actually
+                    # have, and it is the same value the write path assigns.
+                    where.append("m.access_scope = ?")
+                    args.append(access_scope)
                 if source_clause:
                     where.append(source_clause)
                     args.extend(source_args)
@@ -1226,6 +1272,7 @@ class MessageStore:
                     source=source,
                     conversation_id=conversation_id,
                     role=role,
+                    access_scope=access_scope,
                     time_from=time_from,
                     time_to=time_to,
                     prose_mode=fts_prose_mode and not allow_operators,
@@ -1270,6 +1317,7 @@ class MessageStore:
                      role: str | None = None,
                      time_from: float | None = None,
                      time_to: float | None = None,
+                     access_scope: str | None = None,
                      prose_mode: bool = False) -> List[Dict[str, Any]]:
         # LIKE keeps every character the index cannot spell (emoji, punctuation)
         # because substring matching is the only way to find those rows.
@@ -1293,6 +1341,12 @@ class MessageStore:
         if session_id is not None:
             where.append("session_id = ?")
             args.append(session_id)
+        if access_scope is not None:
+            # Same owner predicate as the FTS path. The fallback runs whenever
+            # FTS errors, so omitting it here would mean a query failure quietly
+            # WIDENS the corpus back to every principal.
+            where.append("access_scope = ?")
+            args.append(access_scope)
         source_clause, source_args = _source_filter_clause("source", source)
         if source_clause:
             where.append(source_clause)
